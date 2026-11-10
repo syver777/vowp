@@ -67,16 +67,17 @@ graph, the state machine, the evidence and the handoff format.
 ```
 
 One `vowp` binary contains everything. `vowp up` is the long-running supervisor; every other
-invocation is a short-lived client of the same SQLite database (WAL mode). A node runs at most one supervisor per
-project home, enforced by a lock file. There is no daemon, no listening socket and no network listener in
-v0.1.
+invocation is a short-lived client of that home's SQLite database (WAL mode). Each VOWP home runs one
+project and at most one supervisor in v0.1, enforced by a home-wide lock file (`supervisor.lock`). To
+run more than one project on a machine, give each project its own `VOWP_HOME`; there is no global
+cross-project scheduler. There is no daemon, no listening socket and no network listener in v0.1.
 
 ## Vocabulary
 
 | Term | Meaning |
 |---|---|
 | **Node** | A machine running VOWP: your laptop (`local`), a VPS (`vps`), any server. |
-| **Project** | A repository homed on one node, registered by `vowp init`. |
+| **Project** | A repository registered in a node home by `vowp init`; v0.1 runs one project's supervisor per home. |
 | **Harness** | An agent program: Claude Code, opencode, Codex, Gemini CLI, … |
 | **Adapter** | VOWP code that drives one harness headlessly and turns its output into canonical events. |
 | **Session** | A universal, harness-neutral conversation with a stable id and an append-only event log. |
@@ -125,7 +126,10 @@ create a decision job or an inbox item. The full table is in
 ## Where state lives
 
 The CLI resolves the node home from `--home <dir>`, else `$VOWP_HOME`, else `~/.vowp`; tests always
-pass an explicit temporary directory.
+pass an explicit temporary directory. Each home has its own database, supervisor lock and tmux server.
+The database is `$VOWP_HOME/vowp.db` (`~/.vowp/vowp.db` by default), never `<repo>/.vowp/vowp.db`. To
+run several projects on one machine, give each project a separate home; see
+[multiple projects and worker capacity](../guides/vps.md#multiple-projects-and-worker-capacity).
 
 ```
 ~/.vowp/
@@ -148,9 +152,10 @@ pass an explicit temporary directory.
 
 Inside a project, `vowp init` writes `vowp.toml`, the embedded framework files sourced from
 [`framework/`](../../framework/README.md), and a `.vowp/` directory for job briefs, reports, optional graph
-snapshots and planner checkpoints. The release log lives in the node home (`~/.vowp/releases.log`), not
-in the repository. Job worktrees live outside the repository, by default in
-`<repo>/../<repo-name>-wt/<job-id>`.
+snapshots and planner checkpoints. That directory holds project runtime content, not the database; the
+database lives in the node home (`$VOWP_HOME/vowp.db`, default `~/.vowp/vowp.db`). The release log
+lives in the node home (`~/.vowp/releases.log`), not in the repository. Job worktrees live outside the
+repository, by default in `<repo>/../<repo-name>-wt/<job-id>`.
 
 The session log is the authority for conversation content. The corresponding rows in `vowp.db` are an
 index that `vowp reindex` can rebuild. Deleting the database never loses session content;

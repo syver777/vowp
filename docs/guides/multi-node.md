@@ -1,14 +1,16 @@
 # Multiple nodes
 
 A VOWP project is homed on one node. That node runs the supervisor, owns the database and the job
-worktrees, and decides job state. Other nodes are reachable over SSH; in v0.1 there is no cross-node
-sync, replication or shared database.
+worktrees, and decides job state. In v0.1 one VOWP home runs one project's supervisor; to host several
+projects on one machine, give each project its own `VOWP_HOME`. Other nodes are reachable over SSH; in
+v0.1 there is no cross-node sync, replication or shared database.
 
 The recommended production layout is **VPS project home + local control**. The VPS owns the repository,
 database, worktrees and workers; your computer runs the orchestrator/communicator session and the
-`vowp --node vps ...` CLI. Several projects can be homed on one VPS; each has its own supervisor and
-slot budget, and the VPS's CPU/RAM plus provider limits are the shared ceiling. v0.1 has no global
-cross-project scheduler, so size each project's `max_workers`/`max_verifiers` to fit the total.
+`vowp --node vps ...` CLI. Several projects can be homed on one VPS, each in its own home and with its
+own supervisor and slot budget; the VPS's CPU/RAM plus provider limits are the shared ceiling. v0.1 has
+no global cross-project scheduler, so size each project's `max_workers`/`max_verifiers` to fit the
+total.
 
 > **Status: current.** `vowp init`, `vowp doctor`, the `--node` flag, node registration
 > (`vowp node add/ls/rm`) and cross-node session commands are implemented.
@@ -21,9 +23,11 @@ cross-project scheduler, so size each project's `max_workers`/`max_verifiers` to
 | `vps` | A server. Runs the same `vowp` binary; can host a project or be a switch target for a profile. |
 | any named node | A row in `nodes` with an SSH target and capabilities. |
 
-The supervisor and the project graph live on one node. The `--node <name>` flag runs a command on that
-node and forwards stdout, stderr and the exit code. It is SSH, not an API: no port is opened and no token
-is sent.
+The supervisor and the project graph live on one node. The database lives in that node's VOWP home
+(`$VOWP_HOME/vowp.db`, default `~/.vowp/vowp.db`), not in the project checkout. Each home has its own
+supervisor lock and tmux server, so separate homes do not collide. The `--node <name>` flag runs a
+command on that node and forwards stdout, stderr and the exit code. It is SSH, not an API: no port is
+opened and no token is sent.
 
 ## Prepare the remote node
 

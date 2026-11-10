@@ -52,7 +52,7 @@ flowchart LR
 | Your computer | The VPS |
 |---|---|
 | Orchestrator/communicator session | Project checkout and `vowp.toml` |
-| `vowp` CLI and node registry | `.vowp/vowp.db` — the authoritative job/session state |
+| `vowp` CLI and node registry | `$VOWP_HOME/vowp.db` (default `~/.vowp/vowp.db`) — the authoritative job/session state |
 | SSH key | `vowp up` supervisor and loop engine |
 | `vowp --node vps status`, `board`, `job`, `session` | Job worktrees, tmux windows, workers and verifiers |
 | A local editor or browser | Harness binaries, sign-ins and provider rate limits |
@@ -70,13 +70,29 @@ for people who prefer those ecosystems; you do not need more than one.
 
 ### Multiple projects and VPS capacity
 
-One project is one repository with its own `vowp.toml`, `.vowp/` database and supervisor. You can home
-several projects on the same VPS, or use several VPSs. Each supervisor queues its own jobs and tracks
-its own worker slots (`max_workers`, `max_verifiers`, and the provider `max_concurrent` limits).
+In v0.1, one VOWP home runs one project's supervisor. The supervisor lock is home-wide
+(`$VOWP_HOME/supervisor.lock`, default `~/.vowp/supervisor.lock`), so a second `vowp up` for another
+project in the same home exits 4 with `supervisor already running`. To home several projects on one VPS,
+give each project its own `VOWP_HOME`:
 
-The real limit is the VPS: CPU, RAM, disk, and the model providers' rate limits. In v0.1 there is no
-single global scheduler across project homes, so set each project's slots to fit within the VPS
-capacity in total, and watch `vowp --node vps status` / `vowp --node vps board` as you add projects.
+```sh
+# project A
+cd ~/src/project-a
+VOWP_HOME=$HOME/.vowp-project-a vowp init --name project-a
+VOWP_HOME=$HOME/.vowp-project-a vowp up
+
+# project B, in another terminal
+cd ~/src/project-b
+VOWP_HOME=$HOME/.vowp-project-b vowp init --name project-b
+VOWP_HOME=$HOME/.vowp-project-b vowp up
+```
+
+Each home has its own database, supervisor lock and tmux server, so the supervisors do not collide.
+They share the VPS's CPU, RAM, disk and the model providers' rate limits. In v0.1 there is no single
+global scheduler across homes, so size each project's `[node] max_workers` and `max_verifiers`, and
+its provider `max_concurrent` limits, to fit within the VPS capacity in total, and watch
+`vowp --node vps status` / `vowp --node vps board` as you add projects.
+
 The local orchestrator can manage several projects through one or more registered nodes; the
 supervisors keep queueing and reporting, and the VPS capacity is the shared ceiling.
 
@@ -176,10 +192,13 @@ For a single-machine trial, run the same three commands on your computer in the 
 VPS layout is the production path.
 
 The merge queue requires a clean main checkout; ignoring `.vowp/` keeps it clean as `vowp job add`
-writes briefs and the supervisor writes checkpoints there. `vowp doctor` must report no `fail` before
-you start. `vowp up` starts the supervisor and opens its tmux windows on the project home; use
-`vowp status`/`board` there or `vowp --node vps status`/`board` from your computer. `vowp down` stops
-it cleanly.
+writes briefs and the supervisor writes checkpoints there. A project's `.vowp/` directory holds that
+runtime content, not the node database. `vowp doctor` must report no `fail` before you start. `vowp up`
+starts the supervisor and opens its tmux windows on the project home; use `vowp status`/`board` there
+or `vowp --node vps status`/`board` from your computer. `vowp down` stops it cleanly.
+
+A VOWP home runs one project in v0.1. If you want a second project on the same machine or VPS, give it
+its own `VOWP_HOME`; see [Multiple projects and VPS capacity](#multiple-projects-and-vps-capacity).
 
 Add work with `vowp job add ...` or `vowp plan "..."`, or run the
 [hello-vowp example](examples/hello-vowp/README.md) first: it exercises a three-job graph with fake
@@ -200,9 +219,14 @@ node (laptop or VPS)
    └─ windows            tmux views: board, supervisor, planner, keeper, job-*, inbox
 ```
 
-A **node** owns the SQLite database and session store. A **project** is one repository registered on a
-node. **Jobs** form a graph; **loops** move them; **sessions** keep the conversation; **windows** are
-views onto running work. The [concepts overview](docs/concepts/overview.md) has the full vocabulary.
+A **node home** (`~/.vowp` by default, or `$VOWP_HOME`) owns the SQLite database and session store. A
+**project** is one repository registered in that home; in v0.1 one home runs one project's supervisor,
+so run additional projects with separate homes. **Jobs** form a graph; **loops** move them;
+**sessions** keep the conversation; **windows** are views onto running work. The
+[concepts overview](docs/concepts/overview.md) has the full vocabulary.
+
+The database is `$VOWP_HOME/vowp.db` (`~/.vowp/vowp.db` by default), never `<repo>/.vowp/vowp.db`. A
+project's `.vowp/` directory holds briefs, reports and checkpoints, not the database.
 
 ## Why VOWP
 
