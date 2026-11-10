@@ -1,0 +1,87 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // VOWP role presets for opencode V2. No model is pinned here: VOWP selects the
+  // model from the job's profile and passes it with `--model` or the session.
+  // Every rule resolves to allow or deny, so a headless run never waits for a
+  // permission keystroke.
+  "permissions": [
+    // Read the project, but never secret files. The last matching rule wins.
+    { "action": "read", "resource": "*", "effect": "allow" },
+    { "action": "read", "resource": "*.env", "effect": "deny" },
+    { "action": "read", "resource": "*.env.*", "effect": "deny" },
+    { "action": "read", "resource": "*.env.example", "effect": "allow" },
+    { "action": "read", "resource": "*/.ssh/*", "effect": "deny" },
+    { "action": "read", "resource": "*id_rsa*", "effect": "deny" },
+    { "action": "read", "resource": "*id_ed25519*", "effect": "deny" },
+    { "action": "read", "resource": "*.pem", "effect": "deny" },
+    { "action": "read", "resource": "*.key", "effect": "deny" },
+
+    // Agents may read reference material outside the project; the job contract
+    // still limits writes to the paths the brief owns.
+    { "action": "external_directory", "resource": "*", "effect": "allow" },
+
+    // A headless agent must never open an interactive question or prompt.
+    { "action": "question", "resource": "*", "effect": "deny" },
+    { "action": "subagent", "resource": "*", "effect": "deny" },
+    { "action": "skill", "resource": "*", "effect": "allow" }
+  ],
+
+  "agents": {
+    "planner": {
+      "description": "Owns the job graph: decomposes goals into small jobs, writes precise briefs, and reviews reports against evidence.",
+      "mode": "primary",
+      "system": "You are the VOWP planner. Load the `vowp-planner` skill with the skill tool before planning. You own the graph and the briefs, not the implementation: decompose work into small jobs with disjoint `owns` globs, write the brief from the template, keep gates executable, and review reports against the diff and real gate output. Never push and never do a worker's job yourself.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": ".vowp/*", "effect": "allow" },
+        { "action": "edit", "resource": ".vowp/**", "effect": "allow" },
+        { "action": "edit", "resource": "docs/*", "effect": "allow" },
+        { "action": "edit", "resource": "docs/**", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "git push*", "effect": "deny" },
+        { "action": "shell", "resource": "sudo*", "effect": "deny" }
+      ]
+    },
+
+    "keeper": {
+      "description": "Diagnoses stalled or failed jobs from logs and event state, then returns one bounded next action; never writes product code.",
+      "mode": "primary",
+      "system": "You are the VOWP keeper. Load the `vowp-keeper` skill with the skill tool before diagnosing. Read the event log, gate results and process state, classify the stall or failure, and return exactly one bounded action (`nudge`, `continue`, `restart`, `replan`, `fix`, or `park`) with the concrete next text or command. Never edit implementation code, commit, push, answer a permission dialog with keystrokes, or mark unfinished work done.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "edit", "resource": ".vowp/*", "effect": "allow" },
+        { "action": "edit", "resource": ".vowp/**", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "git commit*", "effect": "deny" },
+        { "action": "shell", "resource": "git push*", "effect": "deny" },
+        { "action": "shell", "resource": "sudo*", "effect": "deny" }
+      ]
+    },
+
+    "worker": {
+      "description": "Executes exactly one VOWP job from its brief in its own worktree, runs the gates, commits locally, and writes the report.",
+      "mode": "primary",
+      "system": "You are the VOWP worker. Load the `vowp-worker` skill with the skill tool before you start. Read the brief and the project AGENTS.md, change only the paths under `owns`, add real tests, run every gate, commit locally with the required trailer, and write the report before you stop. Never push; the supervisor merges. If you need the owner, set `status: blocked` and put the question in `questions_for_owner`.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "git push*", "effect": "deny" },
+        { "action": "shell", "resource": "sudo*", "effect": "deny" }
+      ]
+    },
+
+    "verifier": {
+      "description": "Independently verifies a job's diff, tests and gate evidence, and reports concrete findings without editing anything.",
+      "mode": "primary",
+      "system": "You are the VOWP verifier. Load the `vowp-verifier` skill with the skill tool before reviewing. Read the brief, report and actual diff; run the gates yourself; check ownership, test quality, hermeticity, secrets and honest status. Return a verdict and file/line findings. Do not edit files, commit, push, or fix the work yourself.",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "git commit*", "effect": "deny" },
+        { "action": "shell", "resource": "git push*", "effect": "deny" },
+        { "action": "shell", "resource": "sudo*", "effect": "deny" }
+      ]
+    }
+  }
+}

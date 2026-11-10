@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake `systemctl` for scripts/tests/run.sh. Logs every call and exits with
+# $FAKE_SYSTEMCTL_EXIT (default 0); tests set it to 1 to exercise fallback.
+
+set -eu
+
+printf 'systemctl %s\n' "$*" >> "${FAKE_SYSTEMCTL_LOG:?FAKE_SYSTEMCTL_LOG is not set}"
+exit "${FAKE_SYSTEMCTL_EXIT:-0}"

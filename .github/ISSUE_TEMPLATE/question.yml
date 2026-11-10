@@ -1,0 +1,65 @@
+name: Question
+description: Ask how to use VOWP or whether it fits your workflow
+title: "[question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, check the
+        [guides](https://github.com/syver777/vowp/blob/main/docs/guides/README.md),
+        [troubleshooting](https://github.com/syver777/vowp/blob/main/docs/troubleshooting.md)
+        and [SUPPORT.md](https://github.com/syver777/vowp/blob/main/SUPPORT.md).
+
+        **Do not paste secrets.** Remove API keys, tokens, `.env` contents, private
+        hostnames, home paths and any log line that may contain them. Refer to a secret
+        by its environment-variable name only, never by value.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you ask
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the goal, not only the command that failed.
+      placeholder: "I want a worker on a VPS to pick up jobs from my laptop..."
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: The commands, configuration and documentation you already used, and what happened.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "`vowp --version` output"
+      description: Paste the complete line, or write "not built yet".
+      placeholder: "vowp 0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (x86_64)
+        - Linux (arm64)
+        - macOS (arm64)
+        - macOS (x86_64)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Configuration and logs
+      description: |
+        Optional. Relevant parts of `vowp.toml`, `vowp status` or the supervisor log.
+        Redact secrets, hostnames and home paths.
+      render: text

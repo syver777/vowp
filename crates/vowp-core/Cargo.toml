@@ -1,0 +1,39 @@
+[package]
+name = "vowp-core"
+description = "VOWP supervisor core: loops, gates, ledger, schedules, sessions and promotion."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/vowp-core"
+readme = "README.md"
+keywords = ["vowp", "supervisor", "agents", "orchestration", "automation"]
+categories = ["development-tools", "concurrency", "artificial-intelligence", "command-line-utilities"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+cron = "0.17.0"
+globset = "0.4.19"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+time = "0.3.45"
+toml = "1.2.1"
+ulid = "3.0.0"
+vowp-adapters = { version = "0.1.0", path = "../vowp-adapters" }
+vowp-graph = { version = "0.1.0", path = "../vowp-graph" }
+vowp-protocol = { version = "0.1.0", path = "../vowp-protocol" }
+vowp-store = { version = "0.1.0", path = "../vowp-store" }
+vowp-tmux = { version = "0.1.0", path = "../vowp-tmux" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"

@@ -1,0 +1,28 @@
+[package]
+name = "vowp-graph"
+description = "Deterministic job graph, state machine, ownership and scheduling for VOWP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/vowp-graph"
+readme = "README.md"
+keywords = ["vowp", "graph", "scheduler", "dag", "state-machine"]
+categories = ["development-tools", "data-structures", "algorithms", "concurrency"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+globset = "0.4.19"
+serde = "1.0.229"
+serde_yaml_ng = "0.10.0"
+thiserror = "2.0.21"
+vowp-protocol = { version = "0.1.0", path = "../vowp-protocol" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"

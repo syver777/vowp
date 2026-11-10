@@ -1,0 +1,33 @@
+[package]
+name = "vowp-store"
+description = "SQLite storage, JSONL logs and blobs for VOWP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/vowp-store"
+readme = "README.md"
+keywords = ["vowp", "sqlite", "storage", "persistence", "jsonl"]
+categories = ["database", "filesystem", "development-tools", "data-structures"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+hex = "0.4.3"
+rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+time = "0.3.45"
+ulid = "3.0.0"
+vowp-protocol = { version = "0.1.0", path = "../vowp-protocol" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"

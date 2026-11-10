@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"6f7a8b9c-0d1e-4f2a-3b4c-5d6e7f8a9b0c","model":"example-model","permissionMode":"auto","cwd":"/home/user/project"}
+{"type":"assistant","message":{"model":"example-model","role":"assistant","content":[{"type":"text","text":"partial output before the process died"}]},"session_id":"6f7a8b9c-0d1e-4f2a-3b4c-5d6e7f8a9b0c","timestamp":"2026-03-10T21:00:00.000Z"}

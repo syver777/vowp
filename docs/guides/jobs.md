@@ -1,0 +1,270 @@
+# Writing jobs
+
+A job is the unit of work in VOWP. It has a brief (the contract), owned paths (the write lock), gates
+(the checks), a report (the result) and a state in the graph. This guide covers creating a job, writing
+a brief that an agent can follow, choosing gates that prove the work, and reading the result.
+
+> **Status: current.** The `vowp job`, `vowp graph` and supervisor commands (`vowp up`, `vowp status`)
+> are implemented.
+
+## Create a job
+
+```sh
+vowp job add \
+  --id example-graph \
+  --title "Graph engine: DAG, state machine, scheduler" \
+  --kind build \
+  --role worker \
+  --profile worker \
+  --needs setup-protocol \
+  --owns "crates/vowp-graph/**" \
+  --reads "crates/vowp-protocol/**,docs/design/**" \
+  --gates rust_build \
+  --priority 50 \
+  --max-attempts 3 \
+  --brief-file /tmp/example-brief.md
+```
+
+| Flag | Meaning |
+|---|---|
+| `--id <slug>` | Stable job id. Jobs are addressed by the full slug. |
+| `--title <text>` | Human summary. |
+| `--kind <k>` | `plan`, `spec`, `build`, `test`, `verify`, `fix`, `merge`, `docs`, `research`, `promote`, `release`, `decision`. |
+| `--role <r>` | `planner`, `keeper`, `worker`, `verifier`. Defaults from the kind. |
+| `--profile <p>` | Model ladder. Defaults to the role name. |
+| `--needs a,b` | Jobs that must be done first. |
+| `--owns glob,…` | The only paths this job may change. |
+| `--reads glob,…` | Paths the job should read (not a lock). |
+| `--gates <set\|short,…>` | A named set from `[gates]` or short gate names; defaults depend on the kind. |
+| `--priority n` | Higher runs first among ready jobs; default 50. |
+| `--max-attempts n` | Fix rounds before `on_exhausted`; default 3. |
+| `--brief-file <path>` / `--brief -` | Brief body from a file or stdin. Without either, a template brief is written. |
+
+The command validates the id and the dependency graph (unknown needs and cycles are rejected) and
+parses the gate list (named sets and short forms). It does not validate a custom command gate at add
+time: an anti-pattern such as `test -f README.md` is stored and is rejected later, when the gate runs.
+It writes the generated front-matter plus your body to `.vowp/jobs/<id>/brief.md`, inserts the job and
+edges, and leaves the job `pending`; on success it prints `added job <id> (pending)`. It exits 4 if the
+id already exists.
+
+`vowp job update <id>` changes `--title`, `--priority`, `--profile`, `--owns`, `--reads`, `--gates`,
+`--add-needs`, `--remove-needs` or `--note`. A job in `running`, `gating`, `reviewing` or `merging` may
+not change `owns` or `gates`; finish or park it first.
+
+## Write a brief
+
+The brief is what the worker reads first. The front-matter is the machine-readable contract; the body
+says what to do and what not to do.
+
+```markdown
+---
+job: example-graph
+owns: ["crates/vowp-graph/**"]
+must_not_touch: ["everything else"]
+needs_done: [setup-protocol]
+gates: [report, "cargo test -p vowp-graph", owns_respected, secret_scan, review]
+done_when: "report has status: done and every gate passes"
+---
+
+# Goal
+
+Implement the pure graph engine: DAG validation, the job state machine, ownership overlap and dispatch
+planning. It must compile and pass its named tests without touching any other crate.
+
+# Read first
+
+- `docs/design/crates/vowp-graph.md`
+- `docs/design/loops.md` §2 (the transition table)
+- `crates/vowp-protocol/src/` for the types you consume.
+
+# Deliverables
+
+- `Graph`, `transition`, `OwnsLocks`, `plan_dispatch` and rendering with the exact signatures in the
+  crate spec.
+- Unit and integration tests named in the spec.
+- No `todo!()`, no stub presented as a feature.
+
+# Tests required
+
+- `cargo test -p vowp-graph`
+- `cargo clippy -p vowp-graph --all-targets -- -D warnings`
+
+# Out of scope
+
+- Any file outside `crates/vowp-graph/**`.
+- Changes to the protocol types; raise a question instead.
+
+# Done when
+
+`cargo test -p vowp-graph` passes, the diff touches only owned paths, and the report records the exact
+commands and results.
+```
+
+A good brief has five properties:
+
+1. **One outcome.** A job that tries to do three things is usually three jobs.
+2. **Real owned paths.** `owns` is a write lock; too broad blocks parallelism, too narrow fails
+   `owns_respected`.
+3. **Executable checks.** Gates and "tests required" name commands that fail if the work is wrong.
+4. **Explicit out-of-scope.** Say what must not change, not only what must.
+5. **An honest definition of done.** "It works" is not a definition; a command and an expected result is.
+
+## Owned paths
+
+`owns` entries are repo-relative globs using `/` separators, for example `crates/vowp-graph/**`,
+`docs/reference/**/*.md` or `Cargo.lock`. During dispatch, no two lock-holding jobs may have overlapping
+globs. At gate time, `owns_respected` checks both the merge-base diff
+(`git diff <default>...job/<id>`) and uncommitted files from `git status --porcelain`.
+
+`[project].always_allowed` lists paths any job may touch, normally `["Cargo.lock"]`. Lock files are
+regenerated by the tool that owns them, never edited by hand and never merged by hand.
+
+If two jobs genuinely need the same file at the same time, the graph is wrong. Split the work or add a
+`needs` edge; do not widen `owns` until the conflict disappears.
+
+## Gates
+
+Gates are data. The default set for a `build` job is `report`, `owns_respected`, `secret_scan` and
+`review`; command gates are added per job because only the job knows what to run.
+
+A named gate set lives in `vowp.toml`:
+
+```toml
+[gates]
+rust_build = [
+  { report = { fields = ["status", "branch", "commits", "tests"] } },
+  { cmd = { run = "cargo test --workspace", expect_exit = 0, timeout_secs = 1800 } },
+  { owns_respected = true },
+  { secret_scan = true },
+  { review = { by = "verifier" } },
+]
+```
+
+Then `vowp job add --gates rust_build` uses it. A `cmd` gate runs with `sh -c` in the job worktree,
+merges stdout and stderr, records the exit code and the last 200 lines, and kills the process group at
+`timeout_secs` (default 1800). It can require a regex with `expect_pattern`.
+
+Rules for a useful gate:
+
+- It must execute the thing that can fail. `test -f`, `ls`, `stat`, `cat`, `true` and `:` are rejected
+  as anti-patterns.
+- A negative gate (`expect_exit` other than 0) must also set `expect_pattern`, so it cannot pass on any
+  unrelated failure.
+- Use the smallest command that proves the behavior, not the entire repository suite. Repository-wide
+  checks belong to the merge queue.
+- Keep a gate deterministic and offline. Tests never touch the network, the real home directory or a
+  user's tmux server.
+
+See [graph and loops](../concepts/graph-and-loops.md#gates) for the full gate table and evidence.
+
+## Write the report
+
+The worker writes `.vowp/jobs/<id>/report.md` before it stops. The report gate parses it; a missing or
+invalid report is not a partial success.
+
+```markdown
+---
+job: example-graph
+status: done
+branch: job/example-graph
+commits: [a1b2c3d, e4f5a6b]
+tests: { command: "cargo test -p vowp-graph", passed: 31, failed: 0 }
+files_changed:
+  - crates/vowp-graph/src/lib.rs
+  - crates/vowp-graph/tests/graph.rs
+open_items: []
+questions_for_owner: []
+---
+
+# Summary
+
+The graph engine is implemented and the named tests pass.
+
+# What changed
+
+- DAG validation, transition table, ownership locks, dispatch planning and rendering.
+
+# Verification
+
+- `cargo test -p vowp-graph` — 31 passed, 0 failed.
+- `cargo clippy -p vowp-graph --all-targets -- -D warnings` — clean.
+```
+
+Requirements enforced by the gate:
+
+- `job` equals the job id and `branch` equals the job branch.
+- `status` is `done`, `partial` or `blocked`; only `done` passes the report gate.
+- Every commit sha in `commits` exists in the repository (`git cat-file -e`).
+- Required fields are present and non-empty. `tests` may be the structured form above or a plain string.
+- The report must be newer than the current attempt's start; a stale report from a previous attempt is
+  ignored, and a fix must rewrite it.
+
+A `blocked` report parks the job and puts `questions_for_owner` into the inbox. A `partial` report is an
+honest status but does not pass the gate; it should become a follow-up job or a fix.
+
+Verifier reports add `verdict: pass|fail` and, on failure, `findings` as concrete, checkable problems:
+file, command, expected, actual. A fail without findings is treated as `partial`, retried once, then
+parked so a human can decide.
+
+## The verify and fix loop
+
+A `review` gate is not evaluated by the command-gate runner. It is satisfied by an automatic verify job:
+
+1. The original reaches `reviewing`; the supervisor creates `<id>-verify-<attempt>` with role `verifier`,
+   `reads` = the original's `owns` plus `reads`, `owns: []`, gates `[report]` and a `verifies` edge.
+2. The verifier runs in the original's worktree, read-only by policy, in its own session.
+3. Pass → the original moves to `merging`.
+4. Fail → a `<id>-fix-<attempt>` job is created with the findings, a `fixes` edge and the original's
+   `owns`, role and worktree. When it finishes, the original re-runs its command gates (including a new
+   verify).
+5. After `max_attempts` fix rounds, `on_exhausted` applies: `escalate` creates a decision job and an
+   inbox item; `park` parks the job; `fail` fails it and wakes the keeper.
+
+A fix job never creates a fix-of-a-fix. If a fix job itself fails, the original fails and the keeper is
+woken.
+
+## Inspecting and changing state
+
+```sh
+vowp job ls
+vowp job show example-graph --runs --gates
+vowp job show example-graph --brief
+vowp job show example-graph --report
+vowp graph --mermaid
+vowp graph --export .vowp/graph.yaml
+```
+
+`vowp job ls` hides terminal `done`, `cancelled` and `replanned` jobs unless you pass `--all`. `job show`
+prints the job and its edges; `--runs` adds recent runs with outcomes and costs, and `--gates` adds gate
+results with evidence tails. `--brief` and `--report` print the file contents and return immediately, so
+they are used on their own rather than combined with `--runs`/`--gates`. `graph --export` writes YAML;
+`graph --import` validates and inserts missing jobs and edges but never overwrites an existing job.
+
+Safe state changes:
+
+| Command | Effect |
+|---|---|
+| `vowp job retry <id>` | `failed → ready` (resets `attempts`, `continues` and `hang_restarts`), `parked → ready` or `stalled → running` (both reset only `continues`); other states exit 4. |
+| `vowp job park <id> [--reason t]` | Any non-terminal → `parked(manual)`; stops the run. Resume with `retry`. |
+| `vowp job cancel <id>` | Any non-terminal → `cancelled`; keeps branch and worktree for inspection. Dependents stay `pending` and are flagged `blocked-by-cancelled`. |
+| `vowp job nudge <id>` | Keeper request: ask the stalled run to continue. |
+| `vowp job restart <id>` | Keeper request: start a fresh process in the same session. |
+| `vowp job replan <id>` | Hand the work back to the planner (`replanned`). |
+| `vowp job fail <id> --reason t` | Keeper request: fail the job with a reason. |
+
+The keeper commands write a request row; the next supervisor tick applies it. The `retry`, `park` and
+`cancel` mutations apply directly through the state machine when no supervisor is running; keeper
+requests need a running supervisor to be applied.
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `owns_respected` fails | The worker edited a path outside `owns`. | Move the change into an owned path or split the job. |
+| The report gate says "missing report" | The worker stopped before writing it, or wrote it in the wrong worktree. | The L2 continue prompt names the exact path; check `.vowp/jobs/<id>/report.md` in the job worktree. |
+| The report gate says "commit not found" | The report lists a sha from before a rebase, or a fabricated sha. | Commit first, then write the report with the real shas. |
+| A job waits in `ready` | No free slot, an overlapping ownership lock, or a limited provider. | Check `vowp status`, `vowp job show`, and the limits section. Do not force a second worker. |
+| A verifier keeps failing | The findings are vague or the job is too large. | Make the verifier's findings concrete; split the job. |
+| A fix loop repeats | The same command fails without new evidence. | After three identical fingerprints the job is moved to `failed` with a no-progress note and a decision item is opened in the inbox. It does not create a `<id>-decision` job; only `on_exhausted = escalate` does that. Read the gate tails. |
+
+Next: [operating a node](operating.md) to run the supervisor that executes these jobs.

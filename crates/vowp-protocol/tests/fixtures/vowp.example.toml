@@ -1,0 +1,110 @@
+# vowp.toml — project configuration (committed). Node-wide defaults may live in ~/.vowp/config.toml.
+
+[node]
+name = "vps"                 # this node's name
+max_workers = 4              # concurrent worker slots (each is a tmux window)
+max_verifiers = 2
+tick_secs = 60               # L1 supervisor tick
+tz_offset_minutes = 120      # to read "resets 11pm" style limit messages (Europe/Oslo summer: 120)
+
+[project]
+name = "vowp"
+remote = "origin"
+default_branch = "main"
+check_cmds = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings", "cargo test --workspace"]
+lock_files = ["Cargo.lock"]
+always_allowed = ["Cargo.lock"]
+
+# ---- profiles: a role's model ladder; rung 0 is preferred ---------------------------------------------
+[profiles.planner]
+ladder = ["claude-code:example-model@medium", "opencode:example/model#max"]
+on_quota = "next_then_probe_back"      # on a provider limit: capsule -> the next rung; probe the first after the reset
+
+[profiles.keeper]
+ladder = ["opencode:example/model#max"]
+
+[profiles.worker]
+ladder = ["opencode:example/model#max"]
+
+[profiles.verifier]
+ladder = ["opencode:example/model#max"]
+
+# ---- providers ---------------------------------------------------------------------------------------
+[providers.example]
+max_concurrent = 6
+on_credits_exhausted = "park"          # never silently switch to another paid provider
+
+[providers.example.prices."model"]   # only used when a harness reports no cost receipt
+input_per_m = 0.15
+output_per_m = 0.60
+cache_read_per_m = 0.003
+
+[providers.claude]
+max_concurrent = 1                     # the planner shares the owner's subscription
+
+# ---- harness overrides ------------------------------------------------------------------------------------
+[harnesses.claude-code]
+permission_mode = "auto"
+env_pass = []                          # NAMES of env vars to forward (never values)
+
+[harnesses.opencode]
+extra_args = []                        # extra flags appended after the adapter's own argv (the adapter already passes --auto, do not repeat it)
+
+[harnesses.codex]                      # a generic cli adapter entry, driven by a mapping file
+mapping = ".vowp/adapters/codex.toml"
+
+# ---- named gate sets (used as defaults or via `vowp job add --gates rust_build`) -------------------------
+[gates]
+rust_build = [
+  { report = { fields = ["status", "branch", "commits", "tests"] } },
+  { cmd = { run = "cargo test --workspace", expect_exit = 0, timeout_secs = 1800 } },
+  { owns_respected = true },
+  { secret_scan = true },
+  { review = { by = "verifier" } },
+]
+
+# ---- environments (Work -> Production) --------------------------------------------------------------------
+[env.work]
+checkout = "~/myapp"
+deploy = ["./scripts/deploy-work.sh"]
+
+[env.prod]
+checkout = "~/myapp-prod"              # fast-forward-only clone of main
+deploy = ["vercel deploy --prod"]
+guards = ["clean_tree", "head_equals_remote", "build", "no_active_jobs"]
+approval = "human"                     # human | policy
+serving_bank = "./scripts/bank-serving.sh {target}"   # snapshot what is live BEFORE deploying
+probe = "./scripts/probe-prod.sh"
+
+# ---- loop overrides ---------------------------------------------------------------------------------------
+[loops.l1-supervisor]
+stall_minutes = 20
+silent_minutes = 8
+same_action_max = 3
+
+[loops.l4-planner]
+interval_secs = 1800                   # planner heartbeat (30 min)
+
+# ---- schedules (L9) ------------------------------------------------------------------------------------------
+[[schedules]]
+name = "morning-report"
+cron = "0 7 * * 1-5"                   # 5-field cron, evaluated in `tz` (UTC or a fixed offset in v0.1)
+tz = "+02:00"
+missed = "run_once"                    # run_once | skip
+action = { kind = "loop", loop_name = "l4-planner" }
+
+[[schedules]]
+name = "nightly-backup"
+cron = "0 1 * * *"
+action = { kind = "command", argv = ["vowp", "backup"], timeout_secs = 600 }
+
+# ---- capsule writer and merge queue --------------------------------------------------------------------------------
+[capsule]
+executor = "opencode:example/model#max"
+min_interval_secs = 120
+tail_turns = 2
+
+[merge]
+rebase = true
+timeout_secs = 2700
+secret_scan = true

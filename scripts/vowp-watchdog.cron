@@ -1,0 +1,5 @@
+# VOWP L8 watchdog: check the supervisor heartbeat every five minutes.
+# Spec: docs/design/loops.md §10; heartbeat layout: docs/design/architecture.md §3.
+# scripts/install.sh installs the same schedule with the absolute watchdog path.
+# Keep this template in sync with vowp_core::loops::l8::CRON_CHECK_SH.
+*/5 * * * * "$HOME/.local/bin/vowp-watchdog.sh" >/dev/null 2>&1

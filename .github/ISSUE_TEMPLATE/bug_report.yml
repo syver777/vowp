@@ -1,0 +1,107 @@
+name: Bug report
+description: Report a reproducible problem with VOWP
+title: "[bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please search existing issues first.
+
+        **Do not paste secrets.** Remove API keys, tokens, `.env` contents, private
+        hostnames, home paths and any log line that may contain them. Refer to a secret
+        by its environment-variable name only, never by value. See
+        [SECURITY.md](https://github.com/syver777/vowp/blob/main/SECURITY.md) for the security policy.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I am running the latest `main` or the latest release.
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear, short description of the problem.
+      placeholder: "`vowp up` exits 4 after a restart..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem. Include the project setup and any config or fixture needed.
+      placeholder: |
+        1. Run `vowp init --name repro`
+        2. Run `vowp job add ...`
+        3. Run `vowp up`
+        4. See the error
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include the exact error message or exit code.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "`vowp --version` output"
+      description: Paste the complete line. If you built from source, also give the commit.
+      placeholder: "vowp 0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (x86_64)
+        - Linux (arm64)
+        - macOS (arm64)
+        - macOS (x86_64)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: harness
+    attributes:
+      label: Harness and version
+      description: For example Claude Code, opencode or a generic CLI, with its version. Write "none" if the problem happens before a harness starts.
+      placeholder: "opencode 1.2.3"
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`vowp doctor` output"
+      description: |
+        Run `vowp doctor --no-color` from the project root and paste the complete output.
+        Redact secret names and values if needed. If you cannot run it, say why.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or status
+      description: |
+        Optional. Paste the relevant part of `vowp status`, the session log or
+        `~/.vowp/logs/supervisor.log`. Redact secrets, hostnames and home paths.
+      render: text
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Related issues, recent changes, or a guess at the cause.

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fake `loginctl` for scripts/tests/run.sh. Logs every call.
+
+set -eu
+
+printf 'loginctl %s\n' "$*" >> "${FAKE_LOGINCTL_LOG:?FAKE_LOGINCTL_LOG is not set}"
+exit "${FAKE_LOGINCTL_EXIT:-0}"

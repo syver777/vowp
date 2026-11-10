@@ -1,0 +1,15 @@
+name = "gemini"
+provider = "google"
+[command]
+argv = ["gemini", "-p"]
+prompt_via = "arg"
+env = ["GEMINI_API_KEY"]
+[output]
+format = "text"
+text_chunk_lines = 40
+[limits]
+quota = ["quota exceeded", "RESOURCE_EXHAUSTED"]
+rate = ["429"]
+auth = ["API key not valid"]
+[exit]
+ok = [0]

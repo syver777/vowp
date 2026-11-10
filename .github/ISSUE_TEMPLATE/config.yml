@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/syver777/vowp/blob/main/README.md
+    about: Start with the README, then the concepts and guides linked from it.
+  - name: Guides and troubleshooting
+    url: https://github.com/syver777/vowp/blob/main/docs/guides/README.md
+    about: Install, quickstart, jobs, operating a node, sessions, schedules and more.
+  - name: Support
+    url: https://github.com/syver777/vowp/blob/main/SUPPORT.md
+    about: Where to ask what, what to include, and what to expect.
+  - name: Report a security vulnerability
+    url: https://github.com/syver777/vowp/security/advisories/new
+    about: Report vulnerabilities privately. Do not open a public issue.

@@ -1,0 +1,17 @@
+# Generic cli-adapter mapping for the example's fake worker.
+# Schema: docs/design/adapters.md §4.1. run.sh installs this file at
+# <project>/.vowp/adapters/fake-worker.toml and puts fake-worker.sh on PATH.
+
+name = "fake-worker"
+provider = "fake"
+
+[command]
+argv = ["fake-worker.sh"]
+prompt_via = "stdin"
+
+[output]
+format = "text"
+text_chunk_lines = 1
+
+[exit]
+ok = [0]

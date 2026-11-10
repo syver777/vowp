@@ -1,0 +1,40 @@
+[package]
+name = "vowp-adapters"
+description = "Claude Code, opencode and generic CLI harness adapters for VOWP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/vowp-adapters"
+readme = "README.md"
+keywords = ["vowp", "claude-code", "opencode", "agents", "adapters"]
+categories = ["development-tools", "command-line-interface", "api-bindings", "artificial-intelligence"]
+include = ["src/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+time = "0.3.45"
+toml = "1.2.1"
+vowp-protocol = { version = "0.1.0", path = "../vowp-protocol" }
+
+[features]
+default = []
+testing = []
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# `FixtureKind::Cli(Mapping)` in `src/testing.rs` holds a mapping by value. `Mapping`
+# follows the crate spec's unboxed field types, so the size difference between that
+# test-helper variant and the unit variants is intentional.
+large_enum_variant = "allow"
+
+[dev-dependencies]
+tempfile = "3.27.0"

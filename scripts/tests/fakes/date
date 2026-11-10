@@ -1,0 +1,14 @@
+#!/bin/sh
+# Fake `date` for scripts/tests/run.sh boundary tests. `+%s` returns
+# $FAKE_NOW; every other format is delegated to the real /bin/date.
+
+set -eu
+
+case "${1:-}" in
+    +%s)
+        printf '%s\n' "${FAKE_NOW:?FAKE_NOW is not set}"
+        ;;
+    *)
+        exec /bin/date "$@"
+        ;;
+esac

@@ -1,0 +1,226 @@
+name: Release
+
+# A v* tag builds the four supported targets and creates a DRAFT GitHub
+# release. A manual workflow_dispatch run is a dry run: it builds and uploads
+# the same artifacts but never creates or edits a release.
+#
+# Third-party actions below are pinned to the commit SHA that the named tag
+# pointed at on 2026-11-09. Update the SHA and the comment together.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (default: Cargo.toml workspace version)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace has no [profile.release] overrides. Set the release profile
+  # from the environment so the archive is small and shipping builds are LTO'd
+  # without changing Cargo.toml.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  CARGO_PROFILE_RELEASE_LTO: thin
+  COPYFILE_DISABLE: "1"
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      notes: ${{ steps.meta.outputs.notes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Resolve version and release notes
+        id: meta
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          version="${DISPATCH_VERSION:-}"
+          if [ -z "$version" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$version" ]; then
+            version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          fi
+
+          case "$version" in
+            ''|*[!0-9A-Za-z.+-]*)
+              echo "::error::invalid version: '$version'"
+              exit 1
+              ;;
+          esac
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::version is not semver-like: '$version'"
+            exit 1
+          fi
+
+          crate_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$crate_version" ]; then
+            echo "::error::version $version does not match Cargo.toml workspace version $crate_version"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version"
+            exit 1
+          fi
+
+          notes="docs/release/${version}.md"
+          if [ ! -f "$notes" ]; then
+            notes="CHANGELOG.md"
+          fi
+
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "notes=$notes"
+          } >> "$GITHUB_OUTPUT"
+          echo "version: $version"
+          echo "release notes: $notes"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # All four targets build on a native runner of the same architecture,
+          # so every archive gets a real `vowp --version` smoke test.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Rust from rust-toolchain.toml
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: ${{ matrix.target }}
+          cache: true
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p vowp-cli --bin vowp --target "$TARGET"
+
+      - name: Smoke test (native)
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$("./target/${TARGET}/release/vowp" --version)
+          printf 'vowp --version: %s\n' "$out"
+          case "$out" in
+            "vowp ${VERSION}"*) ;;
+            *)
+              echo "::error::unexpected --version output: $out"
+              exit 1
+              ;;
+          esac
+
+      - name: Check third-party licence bundle
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          python3 scripts/release/generate-third-party-licenses.py --check
+          test -s THIRD-PARTY-LICENSES.md
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/package-archive.sh \
+            --version "$VERSION" \
+            --target "$TARGET" \
+            --binary "target/${TARGET}/release/vowp" \
+            --dist dist
+
+      - name: Upload archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    name: Assemble checksums
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate and verify SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum --check --strict ./*.sha256
+          cat SHA256SUMS
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: [prepare, checksums]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: VOWP ${{ needs.prepare.outputs.version }}
+          draft: true
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-') }}
+          body_path: ${{ needs.prepare.outputs.notes }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: false

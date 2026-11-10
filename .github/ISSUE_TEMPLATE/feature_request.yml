@@ -1,0 +1,61 @@
+name: Feature request
+description: Suggest a new capability or an improvement to VOWP
+title: "[feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping shape VOWP. Please describe the problem first, then the
+        change you have in mind. Check the
+        [documentation](https://github.com/syver777/vowp/blob/main/docs/guides/README.md)
+        and existing issues before opening a new one.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you file
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I checked the documentation and this is not already supported.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation you are in and why the current behavior is not enough.
+      placeholder: "When several jobs touch the same crate, I cannot..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should VOWP do? Be concrete about commands, config or behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other designs you considered.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of VOWP does this touch?
+      options:
+        - CLI and configuration
+        - Supervisor and loops
+        - Planner and job graph
+        - Harness adapters
+        - Sessions and context
+        - Work-to-production and promotion
+        - Documentation and examples
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Sketches, links, related issues or a suggested implementation.

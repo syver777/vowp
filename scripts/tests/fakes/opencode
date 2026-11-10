@@ -1,0 +1,9 @@
+#!/bin/sh
+# Fake `opencode` for scripts/tests/run.sh. Prints a version so `vowp doctor`
+# never probes a real opencode installation. The adapter probes clear the
+# child environment, so this script must not depend on test variables.
+
+set -eu
+
+printf 'opencode 0.0.0-fake\n'
+exit "${FAKE_OPENCODE_EXIT:-0}"

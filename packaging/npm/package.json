@@ -1,0 +1,50 @@
+{
+  "name": "vowp",
+  "version": "0.1.0",
+  "description": "Local-first supervisor for AI coding agents",
+  "keywords": [
+    "ai",
+    "agents",
+    "agent-orchestration",
+    "claude-code",
+    "opencode",
+    "supervisor",
+    "cli",
+    "tmux"
+  ],
+  "homepage": "https://github.com/syver777/vowp#readme",
+  "bugs": {
+    "url": "https://github.com/syver777/vowp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/syver777/vowp.git"
+  },
+  "license": "MIT",
+  "author": "Syver-August Meyer",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "bin": {
+    "vowp": "bin/vowp.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "scripts/postinstall.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "test": "node --test test/*.test.js"
+  }
+}

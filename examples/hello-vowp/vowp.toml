@@ -1,0 +1,41 @@
+# vowp.toml — the fake-adapter configuration used by examples/hello-vowp/run.sh.
+#
+# The example runs a real supervisor, real git worktrees, real gates and the real merge
+# queue. Only the model harness is fake: the `cli` adapter below drives fake-worker.sh.
+
+[node]
+name = "local"
+max_workers = 4
+max_verifiers = 2
+tick_secs = 1              # fast enough to watch the whole graph in under a minute
+tz_offset_minutes = 0
+
+[project]
+name = "hello-vowp"
+remote = "origin"
+default_branch = "main"
+check_cmds = []            # the merge queue has nothing repo-wide to run in this demo
+push = true                # origin is a local bare repository created by run.sh
+
+# All four profiles are required by VowpConfig::validate. The example only dispatches
+# worker jobs; planner and keeper are stubs in v0.1 and never start a turn here.
+[profiles.planner]
+ladder = ["cli:fake-worker"]
+on_quota = "park"
+
+[profiles.keeper]
+ladder = ["cli:fake-worker"]
+on_quota = "park"
+
+[profiles.worker]
+ladder = ["cli:fake-worker"]
+on_quota = "park"
+
+[profiles.verifier]
+ladder = ["cli:fake-worker"]
+on_quota = "park"
+
+[harnesses.fake-worker]
+# Resolved relative to the process working directory when [project].path is unset;
+# run.sh starts every command from the checkout.
+mapping = ".vowp/adapters/fake-worker.toml"

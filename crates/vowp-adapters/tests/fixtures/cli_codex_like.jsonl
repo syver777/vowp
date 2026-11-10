@@ -1,0 +1,5 @@
+{"type":"session","session_id":"thr_abc123"}
+{"type":"agent_message","text":"hello from codex"}
+{"type":"command_execution","id":"call_1","command":"echo hi"}
+{"type":"command_result","id":"call_1","ok":true,"output":"hi"}
+{"type":"token_count","usage":{"input_tokens":12,"output_tokens":5,"cost_usd":0.0012}}

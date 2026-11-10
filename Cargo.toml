@@ -1,0 +1,156 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/vowp-protocol",
+  "crates/vowp-store",
+  "crates/vowp-graph",
+  "crates/vowp-tmux",
+  "crates/vowp-adapters",
+  "crates/vowp-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/syver777/vowp"
+homepage = "https://github.com/syver777/vowp"
+authors = ["Syver-August Meyer"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# The `vowp-cli` package lives at the workspace root on purpose: its source embeds
+# `framework/` with include_str!, and a crates.io package can only contain files inside
+# its own package directory. The source itself stays in crates/vowp-cli/src.
+[package]
+name = "vowp-cli"
+description = "The VOWP command-line interface and `vowp` binary."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/vowp-cli"
+readme = "crates/vowp-cli/README.md"
+keywords = ["vowp", "cli", "agents", "supervisor", "command-line"]
+categories = ["command-line-utilities", "command-line-interface", "development-tools", "artificial-intelligence"]
+include = [
+  "crates/vowp-cli/src/**",
+  "framework/templates/**",
+  "framework/skills/**",
+  "framework/opencode/**",
+  "crates/vowp-cli/README.md",
+  "Cargo.toml",
+]
+
+[lib]
+name = "vowp_cli"
+path = "crates/vowp-cli/src/lib.rs"
+
+[[bin]]
+name = "vowp"
+path = "crates/vowp-cli/src/main.rs"
+
+[[test]]
+name = "board"
+path = "crates/vowp-cli/tests/board.rs"
+
+[[test]]
+name = "core"
+path = "crates/vowp-cli/tests/core.rs"
+
+[[test]]
+name = "cost"
+path = "crates/vowp-cli/tests/cost.rs"
+
+[[test]]
+name = "doctor"
+path = "crates/vowp-cli/tests/doctor.rs"
+
+[[test]]
+name = "graph"
+path = "crates/vowp-cli/tests/graph.rs"
+
+[[test]]
+name = "inbox"
+path = "crates/vowp-cli/tests/inbox.rs"
+
+[[test]]
+name = "init"
+path = "crates/vowp-cli/tests/init.rs"
+
+[[test]]
+name = "job"
+path = "crates/vowp-cli/tests/job.rs"
+
+[[test]]
+name = "loops"
+path = "crates/vowp-cli/tests/loops.rs"
+
+[[test]]
+name = "maint"
+path = "crates/vowp-cli/tests/maint.rs"
+
+[[test]]
+name = "promote"
+path = "crates/vowp-cli/tests/promote.rs"
+
+[[test]]
+name = "remote"
+path = "crates/vowp-cli/tests/remote.rs"
+
+[[test]]
+name = "schedule"
+path = "crates/vowp-cli/tests/schedule.rs"
+
+[[test]]
+name = "session"
+path = "crates/vowp-cli/tests/session.rs"
+
+[[test]]
+name = "signals"
+path = "crates/vowp-cli/tests/signals.rs"
+
+[[test]]
+name = "status"
+path = "crates/vowp-cli/tests/status.rs"
+
+[[test]]
+name = "tmux_isolation"
+path = "crates/vowp-cli/tests/tmux_isolation.rs"
+
+[[test]]
+name = "up"
+path = "crates/vowp-cli/tests/up.rs"
+
+# The version test lives under scripts/release/ so it can be updated with the release
+# version. It asserts the actual package version (0.1.0).
+[[test]]
+name = "version"
+path = "scripts/release/version-test.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+signal-hook = "0.4.6"
+thiserror = "2.0.21"
+time = "0.3.45"
+toml = "1.2.1"
+vowp-adapters = { version = "0.1.0", path = "crates/vowp-adapters" }
+vowp-core = { version = "0.1.0", path = "crates/vowp-core" }
+vowp-graph = { version = "0.1.0", path = "crates/vowp-graph" }
+vowp-protocol = { version = "0.1.0", path = "crates/vowp-protocol" }
+vowp-store = { version = "0.1.0", path = "crates/vowp-store" }
+vowp-tmux = { version = "0.1.0", path = "crates/vowp-tmux" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

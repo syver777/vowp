@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake `vowp` for scripts/tests/run.sh. Logs every call and exits with
+# $FAKE_VOWP_EXIT (default 0); tests use it to observe the watchdog fallback.
+
+set -eu
+
+printf 'vowp %s\n' "$*" >> "${FAKE_VOWP_LOG:?FAKE_VOWP_LOG is not set}"
+exit "${FAKE_VOWP_EXIT:-0}"

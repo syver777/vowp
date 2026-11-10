@@ -1,0 +1,29 @@
+name = "codex"
+provider = "openai"
+[command]
+argv = ["codex", "exec", "--json"]
+prompt_via = "arg"
+resume_argv = ["codex", "exec", "resume", "{native_id}", "--json"]
+env = ["OPENAI_API_KEY"]
+[output]
+format = "jsonl"
+native_session_pointer = "/session_id"
+[[map]]
+match = { pointer = "/type", equals = "agent_message" }
+emit = "assistant.message"
+fields = { text = "/text" }
+[[map]]
+match = { pointer = "/type", equals = "command_execution" }
+emit = "tool.call"
+fields = { call_id = "/id", name = "=shell", input = "/command" }
+[[map]]
+match = { pointer = "/type", equals = "command_result" }
+emit = "tool.result"
+fields = { call_id = "/id", ok = "/ok", output = "/output" }
+[limits]
+credits = ["insufficient_quota", "billing"]
+rate = ["429", "rate limit"]
+auth = ["invalid api key", "401"]
+[cost]
+input_pointer = "/usage/input_tokens"
+output_pointer = "/usage/output_tokens"

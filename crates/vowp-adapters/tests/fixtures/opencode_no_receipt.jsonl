@@ -1,0 +1,2 @@
+{"type":"step_start","timestamp":1773172400000,"sessionID":"ses_noreceipt00000000000000","part":{"id":"prt_step","sessionID":"ses_noreceipt00000000000000","messageID":"msg_nr","type":"step-start"}}
+{"type":"text","timestamp":1773172401000,"sessionID":"ses_noreceipt00000000000000","part":{"id":"prt_text","sessionID":"ses_noreceipt00000000000000","messageID":"msg_nr","type":"text","text":"Done without a receipt.","time":{"start":1773172400500,"end":1773172401000}}}

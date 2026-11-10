@@ -1,0 +1,8 @@
+{"version":1,"capsule_id":"cap_01KA1V2B000000000000000000","session_id":"01KA1V0Z7A0000000000000000","created_at":"2026-03-10T19:41:09.000Z","at_seq":142,"trigger":"limit",
+ "from":{"executor":"claude-code:example-model@medium","node":"vps"},
+ "intent":"Plan the project job graph and keep the job table consistent.",
+ "constraints":["no external actions"],"decisions":[{"what":"fix jobs reuse the job branch","why":"keeps one diff to review","at_seq":88}],
+ "state":{"done":["review complete"],"in_progress":["plan split"],"blocked":[],"next_steps":["dispatch workers"]},
+ "files":[{"path":"docs/design/loops.md","role":"modified","note":"added L6"}],
+ "gotchas":["cargo builds can take several minutes"],"open_questions":[],
+ "telemetry":{"turns":12,"tokens_in":84000,"tokens_out":9100,"usd":0.25}}

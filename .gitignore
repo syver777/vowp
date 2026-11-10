@@ -1,0 +1,15 @@
+target/
+.DS_Store
+.vowp/
+.env
+.env.*
+!.env.example
+# Never commit private keys or SSH state; the public audit checks paths too.
+*.pem
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+.ssh/
+__pycache__/
+*.pyc
