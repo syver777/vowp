@@ -89,7 +89,8 @@ started in v0.1 or v0.2.
   budget, compare evidence and pick a winner. Requires graph-level fan-out/fan-in and explicit cost
   bounds.
 - **Hosted relay.** Connect nodes behind NAT without SSH. Requires a relay protocol, authentication,
-  end-to-end encryption and abuse/cost controls. The default deployment remains local-first.
+  end-to-end encryption and abuse/cost controls. The default deployment remains self-hosted on the
+  user's own VPS.
 
 ## Ideas / help wanted
 

@@ -22,7 +22,7 @@ python3 docs/reference/check-reference.py
 
 | Command | Purpose |
 |---|---|
-| [`vowp`](#vowp) | VOWP: local-first supervisor for AI coding agents |
+| [`vowp`](#vowp) | VOWP: VPS-first supervisor for AI coding agents |
 | [`vowp init`](#vowp-init) | Initialise this git repository as a VOWP project |
 | [`vowp doctor`](#vowp-doctor) | Check the node, database, harnesses and providers |
 | [`vowp up`](#vowp-up) | Create the tmux layout and start the supervisor |
@@ -91,7 +91,7 @@ python3 docs/reference/check-reference.py
 ## `vowp`
 
 ```text
-VOWP: local-first supervisor for AI coding agents
+VOWP: VPS-first supervisor for AI coding agents
 
 Usage: vowp [OPTIONS] <COMMAND>
 

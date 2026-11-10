@@ -4,6 +4,12 @@ A VOWP project is homed on one node. That node runs the supervisor, owns the dat
 worktrees, and decides job state. Other nodes are reachable over SSH; in v0.1 there is no cross-node
 sync, replication or shared database.
 
+The recommended production layout is **VPS project home + local control**. The VPS owns the repository,
+database, worktrees and workers; your computer runs the orchestrator/communicator session and the
+`vowp --node vps ...` CLI. Several projects can be homed on one VPS; each has its own supervisor and
+slot budget, and the VPS's CPU/RAM plus provider limits are the shared ceiling. v0.1 has no global
+cross-project scheduler, so size each project's `max_workers`/`max_verifiers` to fit the total.
+
 > **Status: current.** `vowp init`, `vowp doctor`, the `--node` flag, node registration
 > (`vowp node add/ls/rm`) and cross-node session commands are implemented.
 

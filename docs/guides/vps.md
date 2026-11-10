@@ -1,8 +1,34 @@
 # Running VOWP on a VPS
 
-VOWP runs on any Linux server that can run the supported toolchain, `git`, `tmux` and a signed-in
-harness. A VPS is not a special kind of node: it is a Linux account with its own VOWP home, its own
-project checkout and its own harness logins. This guide takes a fresh server to a supervised project.
+**The VPS is the recommended project home for VOWP.** It runs the supervisor, owns the
+`vowp.db` (jobs, sessions, loops), creates the worktrees and hosts the tmux windows where the agents
+work. Your local computer is the orchestration and control surface: it runs the communicator session
+and the `vowp` CLI, and talks to the VPS over SSH.
+
+```mermaid
+flowchart LR
+    subgraph LOCAL["Your computer"]
+        O["Orchestrator / communicator"]
+        C["vowp CLI + node registry"]
+    end
+    subgraph VPS["VPS - project home + worker fleet"]
+        S["vowp up - supervisor"]
+        D[("vowp.db - jobs, sessions, loops")]
+        W["tmux windows - workers + verifiers"]
+        H["Claude Code, opencode, other harnesses"]
+        R["Project checkout + worktrees"]
+    end
+    O --> C
+    C -- "SSH: vowp --node vps ..." --> S
+    S --> D
+    S --> W
+    W --> H
+    S --> R
+```
+
+A VPS is a Linux account with its own VOWP home, its own project checkout and its own harness logins.
+This guide takes a fresh server to a supervised project. The same `vowp` binary is installed on the
+VPS and on your computer; there is no separate server edition.
 
 The examples use placeholders so they work with any server, provider and harness:
 
@@ -24,8 +50,9 @@ The examples use placeholders so they work with any server, provider and harness
 ## Requirements
 
 - Linux on x86_64 or arm64. The v0.1 release supports Linux and macOS; this guide covers Linux.
-- Rust from the pinned [`rust-toolchain.toml`](../../rust-toolchain.toml), `git`, `tmux`, and a C
-  toolchain for the bundled SQLite build.
+- `vowp` from the prebuilt release (or the Rust toolchain from
+  [`rust-toolchain.toml`](../../rust-toolchain.toml) if you build from source), `git`, `tmux`, and a
+  C toolchain for the bundled SQLite build only when building from source.
 - A harness installed and signed in as the dedicated user. VOWP drives the harness's documented
   headless interface and never reads or stores its login.
 - A git repository with a remote and a default branch. The merge queue fetches and pushes that remote.
@@ -87,20 +114,45 @@ A harness that needs a provider key reads it from the environment exactly as it 
 VOWP stores only environment-variable **names**, never values. See the
 [security model](../security.md#secrets).
 
-## Clone, build and install
+## Install VOWP and clone the project
+
+On the VPS, install the prebuilt release (no Rust needed):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
+vowp --version
+```
+
+The installer puts `vowp` in `~/.local/bin`; add that directory to `PATH` for the dedicated user and
+for non-interactive SSH shells. If you prefer a source build, clone the checkout and run
+`cargo install --path . --locked` as before.
+
+Then clone the project the VPS will own:
 
 ```sh
 mkdir -p ~/src
 git clone <your-repo> ~/src/<your-project>
 cd ~/src/<your-project>
-cargo build --release --workspace
-cargo install --path . --locked
 vowp --version
 ```
 
-`cargo install` writes the binary to `~/.cargo/bin`. If that directory is not on `PATH` for
-non-interactive shells, add it in your shell profile or use the absolute path
-`/home/<your-user>/.cargo/bin/vowp` in the systemd unit below. The first build takes a few minutes.
+`cargo install` (source build) writes to `~/.cargo/bin`; the prebuilt installer writes to
+`~/.local/bin`. Use whichever path is on the VPS user's `PATH` in the systemd unit below.
+
+### The local control side
+
+Install the same binary on your computer, then point it at the VPS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
+vowp init --name control
+vowp node add vps <your-vps>
+vowp --node vps status
+```
+
+The local `control` project is only a small VOWP home that stores the SSH target; the real project,
+database and worktrees stay on the VPS. If you do not want a local control project, SSH into the VPS
+and run the CLI there instead.
 
 ## Initialise the project
 
@@ -208,6 +260,37 @@ All four roles must have a profile. Points to check:
 To try more than one harness or model, add rungs to a ladder in preference order. A session can also
 be moved to a different executor later with `vowp session switch`; see the
 [sessions guide](sessions.md).
+
+## Multiple projects and worker capacity
+
+A project is one repository with its own `vowp.toml`, `.vowp/` database and supervisor. You can home
+several projects on the same VPS; each project has its own queue, worktrees and worker slots.
+
+- `[node] max_workers` and `max_verifiers` cap concurrent work for that project.
+- `[providers.<name>] max_concurrent` caps concurrent calls to one provider.
+- The VPS CPU, RAM, disk and the providers' rate limits are the real ceiling.
+- v0.1 schedules and queues per project; there is no global cross-project scheduler. Set each
+  project's slots so their sum fits the VPS, and watch `vowp --node vps status` and
+  `vowp --node vps board` as you add projects.
+- A local orchestrator can manage several registered projects/nodes; each supervisor keeps its own
+  queue and reports its own state. Jobs that cannot start stay `pending` until a slot and their
+  dependencies are free.
+
+## Windows and interchangeable sessions
+
+Active jobs run in tmux windows on the VPS. From the local control project:
+
+```sh
+vowp --node vps board
+vowp --node vps attach
+vowp --node vps session chat <id>
+vowp --node vps session tail <id> --follow
+```
+
+A session is one stable id with an append-only event log, not a harness-specific conversation.
+`vowp session switch` moves it to another harness, model, provider or node with a structured capsule;
+the windows and the local CLI are views onto the same session. See the
+[sessions guide](sessions.md) and [sessions and switching](../concepts/sessions-and-switching.md).
 
 ## Check the node
 

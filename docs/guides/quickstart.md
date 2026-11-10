@@ -3,6 +3,10 @@
 This walkthrough takes one git repository from "nothing installed" to a supervisor with a first job
 running, then stops it cleanly. Every command shown is implemented in 0.1.0.
 
+Run it on the **project home**. In production that is your VPS; a laptop is fine for a first trial.
+For the recommended VPS layout — project home on the server, orchestration from your computer — see
+[Running VOWP on a VPS](vps.md) first.
+
 > **Status: current.** `vowp init`, `vowp doctor`, `vowp job`, `vowp graph`, `vowp plan`, `vowp up`,
 > `vowp status`, `vowp board`, `vowp attach`, `vowp inbox` and `vowp down` are implemented. The
 > prebuilt installer, the source build and the package alternatives in [Install](install.md) work

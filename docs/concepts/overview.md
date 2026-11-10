@@ -1,8 +1,15 @@
 # Concepts overview
 
-VOWP is a supervisor for AI coding agents. It turns a goal into a graph of small jobs, gives each job
-one git worktree and one agent session, checks the result with instrumented gates and an independent
-verifier, merges through a single queue, and can promote the merged result through guarded environments.
+VOWP is a **VPS-first** supervisor for AI coding agents. The VPS is the recommended project home: it
+runs the supervisor, owns the job/session database and worktrees, and hosts the worker windows. Your
+computer is the control and orchestration surface, reaching the VPS over SSH. It turns a goal into a
+graph of small jobs, gives each job one git worktree and one agent session, checks the result with
+instrumented gates and an independent verifier, merges through a single queue, and can promote the
+merged result through guarded environments.
+
+The same `vowp` binary runs on both machines; there is no server edition. A local control project only
+needs the node registration and SSH access — the VPS database remains authoritative. See
+[How it fits together](../../README.md#how-it-fits-together) for the picture.
 
 It is **not** a harness: it does not embed a model, replace Claude Code or opencode, or hold anyone's
 login. It is closer to a build system and foreman for agents. The harnesses stay stock; VOWP supplies the

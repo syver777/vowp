@@ -1,6 +1,6 @@
 # vowp-cli
 
-The command-line interface for [VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI
+The command-line interface for [VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI
 coding agents. This crate is part of the VOWP workspace.
 
 The crate is named `vowp-cli`; the binary it builds and installs is named `vowp`. There is no separate

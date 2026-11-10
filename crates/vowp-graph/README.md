@@ -1,7 +1,7 @@
 # vowp-graph
 
 Deterministic job graph, state machine, ownership checks and dispatch planning for
-[VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI coding agents. This crate is part
+[VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI coding agents. This crate is part
 of the VOWP workspace.
 
 ## What it provides

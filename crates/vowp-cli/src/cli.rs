@@ -22,7 +22,7 @@ pub const V0_1_COMMANDS: &[&str] = &[
 #[command(
     name = "vowp",
     version,
-    about = "VOWP: local-first supervisor for AI coding agents",
+    about = "VOWP: VPS-first supervisor for AI coding agents",
     disable_help_subcommand = true
 )]
 pub struct Cli {

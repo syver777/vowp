@@ -7,6 +7,18 @@ what the user, the model and the tools did, and a capsule carries the context ac
 > **Status: current.** The store, adapters, session core and the `vowp session`/`vowp chat` commands
 > are implemented.
 
+```mermaid
+flowchart LR
+    L["log.jsonl - canonical session"] --> C["capsule - structured handoff"]
+    C --> A["Claude Code"]
+    C --> B["opencode"]
+    C --> G["generic CLI"]
+    C --> N["another harness, model or node"]
+```
+
+The same session id stays with the work while the executor underneath changes. Windows, chat, tail and
+attach are views onto this log, not separate conversations.
+
 ## Why a universal session
 
 Harnesses keep their own session ids and formats. If a Claude limit hits, or you want to move a job from
