@@ -6,8 +6,8 @@ already use as a small engineering team on your own machines.
 | | |
 |---|---|
 | **Who it is for** | Developers and small teams who already drive Claude Code, opencode or another headless agent and want reviewed, gated work to keep moving unattended. |
-| **What it needs** | Rust (to build from source), `git`, `tmux`, and a signed-in harness such as Claude Code or opencode. |
-| **Install** | `cargo install --path .` from a clone of this repository. |
+| **What it needs** | `git`, `tmux`, and a signed-in harness such as Claude Code or opencode. Rust is only needed to build from source. |
+| **Install** | `curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh \| sh -s -- --download` |
 | **3-command quickstart** | `vowp init --name <your-project>`<br>`vowp doctor`<br>`vowp up` |
 | **Read next** | [Getting started](docs/guides/quickstart.md) · [hello-vowp example](examples/hello-vowp/README.md) · [Concepts in 60 seconds](#concepts-in-60-seconds) |
 
@@ -26,16 +26,26 @@ profile ladder, not assumptions baked into a job.
 
 ## Getting started
 
-You need Rust from [`rust-toolchain.toml`](rust-toolchain.toml), `git`, `tmux`, and a harness such as
-Claude Code or opencode, installed and signed in. The
-[install guide](docs/guides/install.md#prerequisites) covers each requirement.
+You need `git`, `tmux`, and a harness such as Claude Code or opencode, installed and signed in.
+The [install guide](docs/guides/install.md#prerequisites) covers each requirement. Rust is only
+needed if you build from source.
 
-Clone the repository, then install the binary once from the checkout:
+On macOS or Linux, one command downloads the prebuilt release for your machine, verifies its
+SHA256 and installs `vowp` into `~/.local/bin`:
 
 ```sh
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
+```
+
+Add `~/.local/bin` to your `PATH` if the installer says it is missing, then check:
+
+```sh
 vowp --version
 ```
+
+The curl installer, `cargo install vowp-cli` and the npm wrapper are **alternative** ways to
+install the same `vowp` binary; use whichever fits your machine. The
+[install guide](docs/guides/install.md) lists them.
 
 Then, in a git repository with a remote and a clean working tree, run three commands:
 

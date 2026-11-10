@@ -5,8 +5,9 @@ running, then stops it cleanly. Every command shown is implemented in 0.1.0.
 
 > **Status: current.** `vowp init`, `vowp doctor`, `vowp job`, `vowp graph`, `vowp plan`, `vowp up`,
 > `vowp status`, `vowp board`, `vowp attach`, `vowp inbox` and `vowp down` are implemented. The
-> build-from-source steps in [Install](install.md) work today. For a runnable three-job graph with
-> fake adapters, see the [hello-vowp example](../../examples/hello-vowp/README.md).
+> prebuilt installer, the source build and the package alternatives in [Install](install.md) work
+> today. For a runnable three-job graph with fake adapters, see the
+> [hello-vowp example](../../examples/hello-vowp/README.md).
 
 The examples use placeholders:
 
@@ -20,9 +21,18 @@ The examples use placeholders:
 
 ## 1. Install
 
-You need Rust from [`rust-toolchain.toml`](../../rust-toolchain.toml), `git`, `tmux`, and a harness
-installed and signed in with its own tooling. The [install guide](install.md#prerequisites) covers
-harness setup and the other requirements. Clone this repository and, from its root, run:
+You need `git`, `tmux`, and a harness installed and signed in with its own tooling. Rust is only
+needed for a source build. The [install guide](install.md#prerequisites) covers harness setup and
+the other requirements.
+
+The shortest path on macOS or Linux is the prebuilt installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
+vowp --version
+```
+
+Or build from source:
 
 ```sh
 cargo build --workspace

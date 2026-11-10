@@ -1,20 +1,53 @@
 # Install
 
-VOWP is a single Rust binary. The 0.1.0 release is built from source in this guide; the release also
-carries prebuilt archives, crates.io/npm packages and a Homebrew formula template prepared by the
-release process (see the [roadmap](../roadmap.md)). A Homebrew tap is not published. The repository also
+VOWP is a single Rust binary. The simplest install is the prebuilt release for your machine; the
+same binary can also be installed with `cargo install vowp-cli` or the npm wrapper. The repository also
 ships a per-user [install script](../../scripts/README.md) that installs the binary, the systemd user
 unit and the cron watchdog. For a server deployment, see [Running VOWP on a VPS](vps.md).
 
-> **Status: current.** The build commands, `vowp init`, `vowp doctor` and the install script work today;
-> every command referenced on this page is implemented.
+> **Status: current.** The prebuilt installer, the build commands, `vowp init`, `vowp doctor` and the
+> install script work today; every command referenced on this page is implemented.
+
+## One-line install (macOS and Linux)
+
+This downloads the release archive for your OS/architecture from the latest GitHub release, verifies
+its SHA256, and installs `vowp` into `~/.local/bin`. It does not need Rust, Node or root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
+```
+
+If the installer reports that `~/.local/bin` is not on your `PATH`, add it in your shell profile.
+Then check:
+
+```sh
+vowp --version
+```
+
+The [`scripts/install.sh`](../../scripts/install.sh) script also supports `--version`, `--prefix`,
+`--dry-run`, and a source checkout can install the systemd unit and watchdog as well.
+
+### Alternative installs
+
+Use one of these instead of the curl installer; they all install the same `vowp` binary.
+
+```sh
+# From crates.io (needs Rust)
+cargo install vowp-cli --version 0.1.0
+
+# From npm (needs Node; npm 12 blocks install scripts by default)
+npm install -g @syver_august/vowp --allow-scripts=@syver_august/vowp
+```
+
+The [GitHub release](https://github.com/syver777/vowp/releases/tag/v0.1.0) also carries the four
+prebuilt archives and their checksums. A Homebrew tap is not published.
 
 ## Prerequisites
 
 | Requirement | Why |
 |---|---|
 | Linux (x86_64/arm64) or macOS (arm64/x86_64) | The v0.1 platforms. |
-| Rust from [`rust-toolchain.toml`](../../rust-toolchain.toml) | The workspace pins a stable toolchain and edition 2024. With `rustup`, any `cargo` command uses it automatically. |
+| Rust from [`rust-toolchain.toml`](../../rust-toolchain.toml) | Only needed for source builds and `cargo install`; the prebuilt installer does not need it. The workspace pins a stable toolchain and edition 2024. |
 | `git` | Worktrees, branches, the merge queue and release checks. |
 | `tmux` | Job and board windows. `--no-tmux` skips the initial supervisor layout, but a dispatched job still needs a window, so install tmux before running jobs. |
 | A harness such as [Claude Code](https://code.claude.com/docs/en/overview) or [opencode](https://opencode.ai/docs/) | The agent that actually does the work. Install and sign in with the harness's own tooling. |
