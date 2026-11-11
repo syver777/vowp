@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use time::{OffsetDateTime, macros::format_description};
 use vowp_core::session::bundle;
+use vowp_core::session::remote::{BeginTurn, IngestGrant, IngestSession, begin_turn};
 use vowp_core::session::service::SessionService;
 use vowp_protocol::{
-    Actor, AttachAction, CancelToken, CapsuleTrigger, EventBody, EventEnvelope, EventSource, Executor, ExecutorRef,
-    HarnessKind, NewSession, NodeName, RunOutcome, RunPurpose, RunRole, Session, SessionId, SessionRole, SessionState,
-    Switch, SwitchEvent, SwitchId, SwitchReason, SwitchState, Timestamp, TurnRequest,
+    Actor, AttachAction, CapsuleTrigger, EventBody, EventEnvelope, EventSource, Executor, ExecutorRef, HarnessKind,
+    NewSession, NodeName, RunPurpose, Session, SessionId, SessionRole, SessionState, Switch, SwitchEvent, SwitchId,
+    SwitchReason, SwitchState, Timestamp,
 };
 use vowp_store::session_log::SessionLog;
 use vowp_store::{SessionFilter, Store};
@@ -24,6 +25,7 @@ use crate::cli::{
     ChatArgs, Global, SessionCapsuleArgs, SessionCommand, SessionExportArgs, SessionImportArgs, SessionLsArgs,
     SessionNewArgs, SessionShowArgs, SessionSwitchArgs, SessionTailArgs, SessionWatchArgs,
 };
+use crate::node_ctx::NodeRole;
 use crate::output::{Table, local_time_at, print_json};
 use crate::{CliError, Ctx, IoStreams};
 
@@ -40,6 +42,10 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &SessionCommand) -> Resul
         SessionCommand::Import(args) => import(ctx, io, args),
         SessionCommand::Watch(args) => watch(ctx, io, args),
         SessionCommand::Tail(args) => tail(ctx, io, args),
+        SessionCommand::TurnBegin(args) => turn_begin(ctx, io, args),
+        SessionCommand::Ingest(args) => ingest(ctx, io, args),
+        SessionCommand::Lease(args) => crate::cmd::lease::lease(ctx, io, args),
+        SessionCommand::Takeover(args) => crate::cmd::lease::takeover(ctx, io, args),
     }
 }
 
@@ -54,9 +60,38 @@ pub fn maybe_run_remote(
     io: &mut dyn IoStreams,
     command: &crate::cli::Command,
 ) -> Result<Option<i32>, CliError> {
+    // `chat --node` names the executor node, but the global `--node` flag accepts the same
+    // spelling. Clap stores it in `global.node`; treat it as chat's executor node instead
+    // of forwarding the whole command over ssh. A control machine keeps the generic route.
+    if let Some(args) = chat_args(command)
+        && let Some(node) = &global.node
+    {
+        let mut local = global.clone();
+        local.node = None;
+        let ctx = Ctx::build(&local, io)?;
+        if ctx.role() == NodeRole::Home {
+            let node = NodeName::parse(node)?;
+            return Ok(Some(run_chat_args(&ctx, io, args, Some(node))?));
+        }
+        return Ok(None);
+    }
+
     let crate::cli::Command::Session { command } = command else {
         return Ok(None);
     };
+    // The hidden session interfaces run on the home that owns the session. Their `--node`
+    // names the executor or surface, not a redirect target, so they must not go through the
+    // generic `--node` SSH redirect below.
+    if matches!(
+        command,
+        SessionCommand::TurnBegin(_)
+            | SessionCommand::Ingest(_)
+            | SessionCommand::Lease(_)
+            | SessionCommand::Takeover(_)
+    ) {
+        let ctx = Ctx::build(global, io)?;
+        return Ok(Some(run(&ctx, io, command)?));
+    }
     let node = match command {
         SessionCommand::New(args) => args.node.as_deref().or(global.node.as_deref()),
         SessionCommand::Switch(args) => args.node.as_deref().or(global.node.as_deref()),
@@ -427,6 +462,110 @@ fn reason_name(reason: SwitchReason) -> &'static str {
         SwitchReason::Context => "context",
         SwitchReason::Failover => "failover",
         SwitchReason::ProbeBack => "probe_back",
+        SwitchReason::Takeover => "takeover",
+    }
+}
+
+/// Begins a remote turn and prints its grant.
+fn turn_begin(ctx: &Ctx, io: &mut dyn IoStreams, args: &crate::cli::TurnBeginArgs) -> Result<i32, CliError> {
+    let text = if args.request == "-" {
+        crate::read_stdin(io)?
+    } else {
+        std::fs::read_to_string(&args.request)?
+    };
+    let request: crate::cmd::exec::TurnBeginRequest = serde_json::from_str(&text)
+        .map_err(|error| CliError::Invalid(format!("{}: invalid turn request: {error}", args.request)))?;
+    if let Some(executor) = &request.executor
+        && executor != &args.executor
+    {
+        return Err(CliError::Invalid(format!(
+            "request executor {executor} does not match --executor {}",
+            args.executor
+        )));
+    }
+    if let Some(purpose) = &request.purpose
+        && purpose != &args.purpose
+    {
+        return Err(CliError::Invalid(format!(
+            "request purpose {purpose} does not match --purpose {}",
+            args.purpose
+        )));
+    }
+    if let Some(node) = &request.node
+        && node != &args.node
+    {
+        return Err(CliError::Invalid(format!(
+            "request node {node} does not match --node {}",
+            args.node
+        )));
+    }
+    let store = ctx.store()?;
+    let session = resolve_session(&store, &args.id)?;
+    let executor = Executor::parse(&args.executor)?;
+    let purpose = parse_purpose(&args.purpose)?;
+    let node = NodeName::parse(&args.node)?;
+    let grant = begin_turn(
+        ctx.deps(),
+        &store,
+        &BeginTurn {
+            session: session.id,
+            lease: request.lease,
+            executor: ExecutorRef {
+                executor,
+                node: Some(node.clone()),
+            },
+            purpose,
+            node,
+            cwd: request.cwd,
+            prompt: request.prompt,
+        },
+    )?;
+    print_json(io, &grant)?;
+    Ok(0)
+}
+
+/// Ingests remote JSON lines on stdin and writes one ack per line on stdout.
+fn ingest(ctx: &Ctx, io: &mut dyn IoStreams, args: &crate::cli::IngestArgs) -> Result<i32, CliError> {
+    let store = ctx.store()?;
+    let session = resolve_session(&store, &args.id)?;
+    let run = vowp_protocol::RunId::parse(&args.run)?;
+    let grant = IngestGrant {
+        session: session.id,
+        // The token travels in RemoteLine::Hello, never on argv or in `ps`.
+        lease: String::new(),
+        run,
+    };
+    let mut ingest = IngestSession::begin(ctx.deps(), &store, &grant)?;
+    loop {
+        let mut line = String::new();
+        let read = io.input().read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        if ingest.line(&line, io.out())? {
+            break;
+        }
+    }
+    // Streaming commands write only their wire frames on stdout: an extra report document
+    // after the acknowledgements would make `--json` output unparsable.
+    ingest.finish()?;
+    Ok(0)
+}
+
+/// Parses a run purpose name.
+fn parse_purpose(value: &str) -> Result<RunPurpose, CliError> {
+    match value {
+        "start" => Ok(RunPurpose::Start),
+        "continue" => Ok(RunPurpose::Continue),
+        "fix" => Ok(RunPurpose::Fix),
+        "verify" => Ok(RunPurpose::Verify),
+        "plan" => Ok(RunPurpose::Plan),
+        "keep" => Ok(RunPurpose::Keep),
+        "capsule" => Ok(RunPurpose::Capsule),
+        "probe" => Ok(RunPurpose::Probe),
+        "merge" => Ok(RunPurpose::Merge),
+        "gate" => Ok(RunPurpose::Gate),
+        other => Err(CliError::Invalid(format!("unknown run purpose: {other}"))),
     }
 }
 
@@ -492,10 +631,22 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionLsArgs) -> Result<i32, 
 fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionShowArgs) -> Result<i32, CliError> {
     let store = ctx.store()?;
     let session = resolve_session(&store, &args.id)?;
-    let events = SessionLog::open_read(ctx.paths(), &session.id)
-        .map_err(vowp_core::CoreError::from)?
-        .read_all()
-        .map_err(vowp_core::CoreError::from)?;
+    // Compaction deletes log.jsonl, so the compacted check must happen before any read
+    // path opens the log. `--capsule` alone is a valid inspection of the surviving history.
+    let compacted = compacted_capsule(ctx, &store, &session)?;
+    if let Some(capsule_id) = &compacted
+        && args.events.is_some()
+    {
+        return Err(CliError::NotFound(compacted_message(capsule_id)));
+    }
+    let events = if compacted.is_some() {
+        Vec::new()
+    } else {
+        SessionLog::open_read(ctx.paths(), &session.id)
+            .map_err(vowp_core::CoreError::from)?
+            .read_all()
+            .map_err(vowp_core::CoreError::from)?
+    };
     let executor_history: Vec<EventEnvelope> = events
         .iter()
         .filter(|event| event.event_type == vowp_protocol::EventType::SessionExecutor)
@@ -503,7 +654,7 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionShowArgs) -> Result<i32
         .collect();
     let switches = store.list_switches(&session.id)?;
     let capsule = if args.capsule {
-        store.latest_capsule(&session.id)?
+        latest_capsule(ctx, &store, &session)?
     } else {
         None
     };
@@ -643,6 +794,54 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionShowArgs) -> Result<i32
     Ok(0)
 }
 
+/// Returns the capsule that replaced the log when `session` was compacted.
+///
+/// `sessions.compacted_at` is the authoritative flag; a missing log with no flag is treated
+/// the same way because there is nothing left to replay. Callers must check this before
+/// opening `log.jsonl`, which compaction deletes.
+fn compacted_capsule(
+    ctx: &Ctx,
+    store: &Store,
+    session: &Session,
+) -> Result<Option<vowp_protocol::CapsuleId>, CliError> {
+    let compacted = store.lifecycle_compacted_at(&session.id)?.is_some();
+    if !compacted && ctx.paths().log_path(&session.id).is_file() {
+        return Ok(None);
+    }
+    Ok(latest_capsule(ctx, store, session)?
+        .map(|capsule| capsule.capsule_id)
+        .or_else(|| session.last_capsule_id.clone()))
+}
+
+/// Returns the latest capsule from the index, or from the authoritative capsule files.
+///
+/// Compaction keeps the capsule files even when the index cache is rebuilt, so the file
+/// scan keeps `show --capsule` and the compacted-session refusals working.
+fn latest_capsule(ctx: &Ctx, store: &Store, session: &Session) -> Result<Option<vowp_protocol::Capsule>, CliError> {
+    if let Some(capsule) = store.latest_capsule(&session.id)? {
+        return Ok(Some(capsule));
+    }
+    let mut latest: Option<vowp_protocol::Capsule> = None;
+    for path in vowp_store::session_files::list_capsule_files(ctx.paths(), &session.id)? {
+        let capsule = vowp_store::session_files::read_capsule_file(&path)?;
+        if capsule.session_id != session.id {
+            continue;
+        }
+        let newer = latest
+            .as_ref()
+            .is_none_or(|current| (capsule.at_seq, capsule.created_at) > (current.at_seq, current.created_at));
+        if newer {
+            latest = Some(capsule);
+        }
+    }
+    Ok(latest)
+}
+
+/// Returns the exact refusal for an event read on a compacted session.
+fn compacted_message(capsule_id: &vowp_protocol::CapsuleId) -> String {
+    format!("session compacted to capsule {capsule_id}; use 'session show --capsule'")
+}
+
 /// Creates an interactive session and prints its id.
 fn new_session(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionNewArgs) -> Result<i32, CliError> {
     if let Some(title) = &args.title
@@ -687,139 +886,53 @@ fn new_session(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionNewArgs) -> Resu
 
 /// Runs the interactive chat loop.
 fn chat(ctx: &Ctx, io: &mut dyn IoStreams, args: &ChatArgs) -> Result<i32, CliError> {
-    let store = ctx.store()?;
-    let mut session = resolve_session(&store, &args.id)?;
-    if let Some(executor) = &args.executor {
-        let target = Executor::parse(executor)?;
-        switch_to(ctx, &session.id, target, None, SwitchReason::User, false)?;
-        session = store.require_session(&session.id)?;
-    }
-    let mut lines = String::new();
-    loop {
-        lines.clear();
-        let read = io.input().read_line(&mut lines)?;
-        if read == 0 {
-            break;
-        }
-        let line = lines.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('/') {
-            let mut parts = rest.split_whitespace();
-            match parts.next().unwrap_or_default() {
-                "quit" | "q" => break,
-                "switch" => {
-                    let Some(target) = parts.next() else {
-                        writeln!(io.err(), "usage: /switch <harness:model[@effort][#variant]> [--node n]")?;
-                        continue;
-                    };
-                    let target = Executor::parse(target)?;
-                    let node = match (parts.next(), parts.next()) {
-                        (Some("--node"), Some(node)) => Some(vowp_protocol::NodeName::parse(node)?),
-                        (None, None) => None,
-                        _ => {
-                            writeln!(io.err(), "usage: /switch <executor> [--node n]")?;
-                            continue;
-                        }
-                    };
-                    match switch_to(ctx, &session.id, target.clone(), node, SwitchReason::User, true) {
-                        Ok(_) => {
-                            session = store.require_session(&session.id)?;
-                            writeln!(io.out(), "switched to {target}")?;
-                        }
-                        Err(error) => writeln!(io.err(), "vowp: {error}")?,
-                    }
-                }
-                "capsule" => {
-                    let service = SessionService::new(ctx.deps().clone());
-                    let capsule = service.write_capsule(&session.id, CapsuleTrigger::Manual)?;
-                    writeln!(io.out(), "{}", capsule.capsule_id)?;
-                }
-                "export" => {
-                    let Some(path) = parts.next() else {
-                        writeln!(io.err(), "usage: /export <file>")?;
-                        continue;
-                    };
-                    let bundle = bundle::export(ctx.deps(), &session.id, 20)?;
-                    let text = bundle::to_json(&bundle)?;
-                    std::fs::write(path, text)?;
-                    writeln!(io.out(), "{path}")?;
-                }
-                "events" => {
-                    let count = parts.next().and_then(|value| value.parse::<usize>().ok()).unwrap_or(10);
-                    let events = SessionLog::open_read(ctx.paths(), &session.id)
-                        .map_err(vowp_core::CoreError::from)?
-                        .read_all()
-                        .map_err(vowp_core::CoreError::from)?;
-                    let start = events.len().saturating_sub(count);
-                    for event in &events[start..] {
-                        writeln!(io.out(), "{}", pretty_event(event, ctx.tz_offset_minutes()))?;
-                    }
-                }
-                other => writeln!(io.err(), "unknown command: /{other}")?,
-            }
-            continue;
-        }
+    run_chat_args(ctx, io, args, None)
+}
 
-        let executor = session
-            .executor
-            .clone()
-            .or_else(|| {
-                ctx.config()
-                    .profiles
-                    .get("worker")
-                    .and_then(|profile| profile.ladder.first().cloned())
-            })
-            .ok_or_else(|| CliError::Invalid("session has no executor; use /switch".to_owned()))?;
-        let before = SessionLog::open_read(ctx.paths(), &session.id)
-            .map_err(vowp_core::CoreError::from)?
-            .last_seq()
-            .map_err(vowp_core::CoreError::from)?;
-        let service = SessionService::new(ctx.deps().clone());
-        let result = service.run_turn(
-            TurnRequest {
-                session_id: session.id.clone(),
-                executor: ExecutorRef { executor, node: None },
-                purpose: RunPurpose::Start,
-                role: RunRole::Worker,
-                job_id: None,
-                prompt: line.to_owned(),
-                profile: None,
-                rung: 0,
-                window: None,
-                timeout: None,
-            },
-            &CancelToken::default(),
-        )?;
-        let after = SessionLog::open_read(ctx.paths(), &session.id)
-            .map_err(vowp_core::CoreError::from)?
-            .read_from(before, None)
-            .map_err(vowp_core::CoreError::from)?;
-        for event in after {
-            match event.body() {
-                Ok(EventBody::AssistantMessage(payload)) => writeln!(io.out(), "{}", payload.text)?,
-                Ok(EventBody::ToolCall(payload)) => writeln!(io.out(), "· tool: {}", payload.name)?,
-                _ => {}
-            }
-        }
-        if matches!(
-            result.summary.outcome,
-            RunOutcome::Limit | RunOutcome::Credits | RunOutcome::Auth
-        ) {
-            return Err(CliError::Limited(
-                "provider limit reached; use /switch <executor>".to_owned(),
-            ));
-        }
-        session = store.require_session(&session.id)?;
-        if session.state == SessionState::Blocked {
-            return Err(CliError::Limited(
-                "session is blocked by a provider limit; use /switch <executor>".to_owned(),
-            ));
-        }
-        io.out().flush()?;
+/// Runs the chat handler with an executor-node override from the global `--node` flag.
+fn run_chat_args(
+    ctx: &Ctx,
+    io: &mut dyn IoStreams,
+    args: &ChatArgs,
+    node_override: Option<vowp_protocol::NodeName>,
+) -> Result<i32, CliError> {
+    let store = ctx.store()?;
+    let session = resolve_session(&store, &args.id)?;
+    let node = match node_override {
+        Some(node) => Some(node),
+        None => args.node.as_deref().map(vowp_protocol::NodeName::parse).transpose()?,
+    };
+    let executor = args
+        .executor
+        .as_deref()
+        .map(Executor::parse)
+        .transpose()?
+        .map(|executor| ExecutorRef {
+            executor,
+            node: node.clone(),
+        });
+    crate::chat::run_shared(
+        ctx,
+        io,
+        &crate::chat::ChatOptions {
+            session: session.id,
+            executor,
+            node,
+            follow: args.follow,
+            takeover: args.takeover,
+        },
+    )
+}
+
+/// Returns the chat arguments of either chat spelling.
+fn chat_args(command: &crate::cli::Command) -> Option<&ChatArgs> {
+    match command {
+        crate::cli::Command::Chat(args) => Some(args),
+        crate::cli::Command::Session {
+            command: SessionCommand::Chat(args),
+        } => Some(args),
+        _ => None,
     }
-    Ok(0)
 }
 
 /// Switches a session, checking the running-turn guard and target limits first.
@@ -861,7 +974,7 @@ fn switch(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionSwitchArgs) -> Result
 }
 
 /// Runs the core switch protocol after the CLI guards.
-fn switch_to(
+pub(crate) fn switch_to(
     ctx: &Ctx,
     session: &SessionId,
     target: Executor,
@@ -1200,6 +1313,9 @@ fn transcript_body(value: &serde_json::Value) -> Option<EventBody> {
 fn tail(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionTailArgs) -> Result<i32, CliError> {
     let store = ctx.store()?;
     let session = resolve_session(&store, &args.id)?;
+    if let Some(capsule_id) = compacted_capsule(ctx, &store, &session)? {
+        return Err(CliError::NotFound(compacted_message(&capsule_id)));
+    }
     let reader = SessionLog::open_read(ctx.paths(), &session.id).map_err(vowp_core::CoreError::from)?;
     let after = args.from.unwrap_or(0);
     let mut last = after;

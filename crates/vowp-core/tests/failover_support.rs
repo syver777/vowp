@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use vowp_core::deps::AdapterRegistry;
 use vowp_protocol::{
-    Cost, Executor, Job, JobId, LimitEvent, LimitKind, NodeName, Profile, Run, RunId, RunOutcome, RunPurpose, RunRole,
-    RunSummary, Session, SessionId, SessionRole, StopReason, Switch, SwitchReason, SwitchState, Timestamp, VowpConfig,
+    Cost, Executor, Job, JobId, LedgerKind, LimitEvent, LimitKind, NodeName, Profile, Run, RunId, RunOutcome,
+    RunPurpose, RunRole, RunSummary, Session, SessionId, SessionRole, StopReason, Switch, SwitchReason, SwitchState,
+    Timestamp, VowpConfig,
 };
-use vowp_store::Store;
+use vowp_store::{LedgerFilter, Store};
 
 /// A valid capsule draft that the capsule writer accepts.
 pub fn draft_json(intent: &str) -> String {
@@ -261,6 +262,56 @@ pub fn completed_switch_reasons(node: &TestNode, role: SessionRole) -> Vec<Switc
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Returns whether the switch ledger contains an entry for `reason` on the planner session.
+///
+/// L6 finishes the session switch row before it appends the matching `switch` ledger row
+/// (the two writes use different store handles), so a test that only waits for the
+/// completed switch can observe it while the ledger row is still missing. Wait on this
+/// durable condition before asserting the ledger contents. The ledger spans every session,
+/// so match `session_id` as well as the reason.
+pub fn switch_ledger_reason_recorded(node: &TestNode, reason: &str) -> bool {
+    let Some(session) = planner_session(node) else {
+        return false;
+    };
+    node.store()
+        .ledger_since(&LedgerFilter {
+            kind: Some(LedgerKind::Switch),
+            ..LedgerFilter::default()
+        })
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry.session_id.as_ref() == Some(&session.id)
+                    && entry.detail.get("reason").and_then(|value| value.as_str()) == Some(reason)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Returns true when L6 has recorded its policy for every job's newest run and no
+/// `park:<provider>` request is still queued.
+///
+/// The runner thread ends the run row inside `run_turn`, then applies L6 (which writes
+/// the limit and `park:<provider>` request) and only then writes the `l6:<run>` marker.
+/// A test that answers a provider notice in that gap can have the answer resolve the jobs
+/// at tick step 0 and the same tick's harvest step drain the stale park request and park
+/// them again. Wait for the durable marker and an empty park queue before answering.
+pub fn l6_policy_settled(node: &TestNode, jobs: &[JobId]) -> bool {
+    let store = node.store();
+    let parks_clear = store
+        .kv_prefix("park:")
+        .map(|entries| entries.is_empty())
+        .unwrap_or(false);
+    if !parks_clear {
+        return false;
+    }
+    jobs.iter().all(|job| match store.last_run_of_job(job) {
+        Ok(Some(run)) => run.ended_at.is_some() && store.kv_get(&format!("l6:{}", run.id)).ok().flatten().is_some(),
+        // A job parked before its first run has no L6 work to wait for.
+        Ok(None) => true,
+        Err(_) => false,
+    })
 }
 
 /// Counts jobs whose id starts with `prefix`.

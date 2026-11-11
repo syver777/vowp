@@ -12,7 +12,7 @@ const pkg = require("../package.json");
 
 test("package manifest matches the release contract", () => {
   assert.equal(pkg.name, "vowp");
-  assert.equal(pkg.version, "0.1.0");
+  assert.equal(pkg.version, "0.2.0");
   assert.deepEqual(pkg.bin, { vowp: "bin/vowp.js" });
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.engines.node, ">=18");

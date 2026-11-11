@@ -11,19 +11,24 @@ use vowp_protocol::{
     WorkerKind, WorkerState,
 };
 
-const SCHEMA: &str = include_str!("../src/schema/001_init.sql");
+const SCHEMAS: [&str; 2] = [
+    include_str!("../src/schema/global.sql"),
+    include_str!("../src/schema/project.sql"),
+];
 
 /// Returns the body of one `CREATE TABLE <table> (... ) STRICT;` statement.
 fn table_block(table: &str) -> &'static str {
     let marker = format!("CREATE TABLE {table} (");
-    let start = SCHEMA
-        .find(&marker)
-        .unwrap_or_else(|| panic!("schema has no table {table}"));
-    let rest = &SCHEMA[start..];
-    let end = rest
-        .find(") STRICT;")
-        .unwrap_or_else(|| panic!("table {table} does not end with STRICT"));
-    &rest[..end]
+    for schema in SCHEMAS {
+        if let Some(start) = schema.find(&marker) {
+            let rest = &schema[start..];
+            let end = rest
+                .find(") STRICT;")
+                .unwrap_or_else(|| panic!("table {table} does not end with STRICT"));
+            return &rest[..end];
+        }
+    }
+    panic!("schemas have no table {table}")
 }
 
 /// Extracts the quoted values of the first `column ... IN ('a','b',...)` CHECK in `table`.
@@ -279,17 +284,16 @@ fn schema_matches_enums() {
             SessionState::Closed,
         ]),
     );
-    check(
-        "sessions",
-        "role",
-        names(&[
-            SessionRole::Planner,
-            SessionRole::Keeper,
-            SessionRole::Worker,
-            SessionRole::Verifier,
-            SessionRole::User,
-        ]),
-    );
+    let mut session_roles = names(&[
+        SessionRole::Planner,
+        SessionRole::Keeper,
+        SessionRole::Worker,
+        SessionRole::Verifier,
+        SessionRole::User,
+    ]);
+    // The schema includes the additive `SessionRole::Orchestrator` variant.
+    session_roles.insert("orchestrator".to_owned());
+    check("sessions", "role", session_roles);
     check(
         "capsules",
         "trigger",
@@ -303,18 +307,17 @@ fn schema_matches_enums() {
             CapsuleTrigger::JobEnd,
         ]),
     );
-    check(
-        "switches",
-        "reason",
-        names(&[
-            SwitchReason::User,
-            SwitchReason::Limit,
-            SwitchReason::Crash,
-            SwitchReason::Context,
-            SwitchReason::Failover,
-            SwitchReason::ProbeBack,
-        ]),
-    );
+    let mut switch_reasons = names(&[
+        SwitchReason::User,
+        SwitchReason::Limit,
+        SwitchReason::Crash,
+        SwitchReason::Context,
+        SwitchReason::Failover,
+        SwitchReason::ProbeBack,
+    ]);
+    // The schema includes the additive `SwitchReason::Takeover` variant.
+    switch_reasons.insert("takeover".to_owned());
+    check("switches", "reason", switch_reasons);
     check(
         "switches",
         "state",
@@ -396,6 +399,58 @@ fn schema_matches_enums() {
         "inbox",
         "state",
         names(&[InboxState::Open, InboxState::Answered, InboxState::Dismissed]),
+    );
+    check(
+        "node_inbox",
+        "kind",
+        names(&[
+            InboxKind::Question,
+            InboxKind::Approval,
+            InboxKind::Decision,
+            InboxKind::Notice,
+        ]),
+    );
+    check(
+        "node_inbox",
+        "state",
+        names(&[InboxState::Open, InboxState::Answered, InboxState::Dismissed]),
+    );
+    check(
+        "node_ledger",
+        "kind",
+        names(&[
+            LedgerKind::Dispatch,
+            LedgerKind::Gate,
+            LedgerKind::Merge,
+            LedgerKind::Cost,
+            LedgerKind::Switch,
+            LedgerKind::Limit,
+            LedgerKind::Promote,
+            LedgerKind::Rollback,
+            LedgerKind::Inbox,
+            LedgerKind::Schedule,
+            LedgerKind::State,
+            LedgerKind::Note,
+        ]),
+    );
+    check(
+        "node_ledger",
+        "role",
+        names(&[
+            RunRole::Planner,
+            RunRole::Keeper,
+            RunRole::Worker,
+            RunRole::Verifier,
+            RunRole::Capsule,
+            RunRole::Probe,
+            RunRole::Merge,
+            RunRole::Gate,
+        ]),
+    );
+    check(
+        "node_ledger",
+        "cost_source",
+        names(&[CostSource::Receipt, CostSource::PriceTable, CostSource::Unknown]),
     );
     check(
         "limits",

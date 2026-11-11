@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use vowp_core::fleet;
 use vowp_core::ledger::BoardSnapshot;
+use vowp_core::ledger::board::FleetBoard;
 
 use crate::cli::BoardArgs;
 use crate::cmd::status::LimitOutput;
@@ -55,20 +57,31 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &BoardArgs) -> Result<i32, C
 }
 
 /// Prints one board frame in the human or JSON shape.
+///
+/// One project keeps the v0.1 board and its golden output; several projects (or a fleet
+/// context with no project selected) get the fleet board with a project column so every
+/// project is visible. The fleet board reads the global store; only the v0.1 frame needs a
+/// bound project.
 pub(crate) fn render(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<(), CliError> {
-    let snapshot = collect(ctx)?;
+    let now = ctx.clock().now();
+    let fleet_store = ctx.fleet_store()?;
+    if fleet::project_names(&fleet_store)?.len() != 1 || !ctx.project_selected() {
+        let board = FleetBoard::collect(ctx.deps(), &fleet_store, now)?;
+        if ctx.json() {
+            crate::output::print_json(io, &board)?;
+        } else {
+            write!(io.out(), "{}", board.render_text(ctx.color()))?;
+        }
+        return Ok(());
+    }
+    let store = ctx.store()?;
+    let snapshot = BoardSnapshot::collect(&store, ctx.config(), now)?;
     if ctx.json() {
         crate::output::print_json(io, &json_view(&snapshot))?;
     } else {
         write!(io.out(), "{}", snapshot.render_text(ctx.color()))?;
     }
     Ok(())
-}
-
-/// Returns the current snapshot for this project.
-pub(crate) fn collect(ctx: &Ctx) -> Result<BoardSnapshot, CliError> {
-    let store = ctx.store()?;
-    Ok(BoardSnapshot::collect(&store, ctx.config(), ctx.clock().now())?)
 }
 
 /// Converts a snapshot to the CLI's JSON shape.

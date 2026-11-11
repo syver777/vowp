@@ -1,0 +1,19 @@
+[Unit]
+Description=VOWP node supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One supervisor for every active project on this home. It runs in the foreground
+# under systemd and restarts on failure. `vowp down` stops it through ~/.vowp/stop.
+# Spec: docs/design/v0.2/home-and-surfaces.md §4.1; heartbeat: docs/design/loops.md §10.
+Environment=VOWP_HOME=%h/.vowp
+ExecStart=%h/.local/bin/vowp up --foreground
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+WorkingDirectory=%h/.vowp
+
+[Install]
+WantedBy=default.target

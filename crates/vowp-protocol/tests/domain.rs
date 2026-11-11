@@ -211,14 +211,14 @@ fn domain_ledger_node_project_release_rows_serde() {
     assert_eq!(entry.kind, LedgerKind::Cost);
 
     let node: Node = roundtrip(json!({
-        "name": "vps",
-        "ssh_target": "dev@vps",
+        "name": "home-node",
+        "ssh_target": "vowp@home.example",
         "is_local": false,
         "capabilities": {"gpu": false},
         "last_seen_at": "2026-03-10T20:00:00.000Z",
         "created_at": "2026-03-10T19:00:00.000Z"
     }));
-    assert_eq!(node.name.as_str(), "vps");
+    assert_eq!(node.name.as_str(), "home-node");
 
     let project: Project = roundtrip(json!({
         "name": "vowp",

@@ -54,23 +54,6 @@ impl Fixture {
         }
     }
 
-    fn project_named(&self, name: &str) -> ProjectName {
-        let project = ProjectName::parse(name).expect("project");
-        let now = self.clock.now();
-        self.store
-            .upsert_project(&Project {
-                name: project.clone(),
-                path: format!("/tmp/{name}"),
-                remote_url: None,
-                default_branch: "main".to_owned(),
-                config: serde_json::json!({}),
-                created_at: now,
-                updated_at: now,
-            })
-            .expect("insert project");
-        project
-    }
-
     fn job(&self, project: &ProjectName, id: &str, needs: Vec<JobId>) -> Job {
         self.store
             .insert_job(
@@ -229,12 +212,15 @@ fn inbox_answer_flow() {
     fixture.store.insert_inbox(&open).expect("insert open item");
     let connection = Connection::open(fixture.paths.db_path()).expect("raw connection");
     let error = connection
-        .execute("UPDATE inbox SET state = 'answered' WHERE id = ?1", [open.id.as_str()])
+        .execute(
+            "UPDATE node_inbox SET state = 'answered' WHERE id = ?1",
+            [open.id.as_str()],
+        )
         .expect_err("answered without answered_at must fail the CHECK");
     assert!(error.to_string().contains("CHECK"), "got {error}");
     let error = connection
         .execute(
-            "UPDATE inbox SET answered_at = ?1 WHERE id = ?2",
+            "UPDATE node_inbox SET answered_at = ?1 WHERE id = ?2",
             [fixture.clock.now().as_rfc3339(), open.id.as_str().to_owned()],
         )
         .expect_err("open with answered_at must fail the CHECK");
@@ -496,34 +482,31 @@ fn kv_and_requests_queue() {
 }
 
 #[test]
-fn fk_cascade_project_delete() {
+fn project_delete_keeps_other_projects_rows() {
     let fixture = Fixture::new();
-    let alpha = fixture.project_named("alpha");
-    let beta = fixture.project_named("beta");
-    let alpha_a = fixture.job(&alpha, "alpha-a", Vec::new());
-    let alpha_b = fixture.job(&alpha, "alpha-b", vec![alpha_a.id.clone()]);
-    let beta_job = fixture.job(&beta, "beta-job", Vec::new());
-    let session = fixture.session(Some(alpha.clone()), Some(alpha_a.id.clone()));
+    let job = fixture.job(&fixture.project, "kept-job", Vec::new());
+    let job_id = job.id.clone();
+    let session = fixture.session(Some(fixture.project.clone()), Some(job_id.clone()));
     fixture.store.upsert_session(&session).expect("insert session");
 
+    let project_store = Store::open_with_project(&fixture.paths, &fixture.project).expect("project store");
     let connection = Connection::open(fixture.paths.db_path()).expect("raw connection");
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .expect("enable foreign keys");
     connection
-        .execute("DELETE FROM projects WHERE name = ?1", [alpha.as_str()])
-        .expect("delete project");
+        .execute("DELETE FROM projects WHERE name = ?1", [fixture.project.as_str()])
+        .expect("delete project registry row");
 
-    assert!(fixture.store.job(&alpha_a.id).expect("job").is_none());
-    assert!(fixture.store.job(&alpha_b.id).expect("job").is_none());
-    assert_eq!(fixture.store.job(&beta_job.id).expect("beta job"), Some(beta_job));
-    assert!(
-        fixture.store.list_edges(Some(&alpha)).expect("alpha edges").is_empty(),
-        "edges cascade with their jobs"
+    // No cross-file foreign key removes the project rows.
+    assert_eq!(project_store.job(&job_id).expect("job"), Some(job));
+    assert_eq!(
+        project_store.list_edges(Some(&fixture.project)).expect("edges"),
+        Vec::new()
     );
     let surviving = fixture.store.session(&session.id).expect("session").expect("row");
-    assert_eq!(surviving.project, None, "sessions.project is set NULL");
-    assert_eq!(surviving.job_id, None, "sessions.job_id is set NULL");
+    assert_eq!(surviving.project, Some(fixture.project.clone()));
+    assert_eq!(surviving.job_id, Some(job_id));
 }
 
 #[test]
@@ -556,17 +539,37 @@ fn backup_produces_openable_copy() {
     fixture.store.backup(&destination).expect("backup");
     let copy = Store::open_path(&destination).expect("open backup");
     copy.integrity_check().expect("backup integrity");
+    assert_eq!(copy.global_schema_version().expect("global version"), 2);
+    assert!(copy.bound_project().is_none(), "the legacy file is a global-only copy");
     assert_eq!(
-        copy.require_project(&fixture.project).expect("project"),
-        fixture
-            .store
-            .require_project(&fixture.project)
-            .expect("original project")
+        copy.list_projects().expect("projects").len(),
+        1,
+        "the global copy includes the registry"
     );
-    assert_eq!(copy.job(&job.id).expect("job"), Some(job));
-    assert_eq!(copy.session(&session.id).expect("session"), Some(session));
-    assert_eq!(copy.inbox_item(&item.id).expect("inbox"), Some(item));
-    let copied_ledger = copy.ledger_since(&LedgerFilter::default()).expect("ledger");
+    assert_eq!(copy.session(&session.id).expect("session"), Some(session.clone()));
+    assert!(matches!(copy.job(&job.id), Err(vowp_store::StoreError::NoProject)));
+
+    // A split backup unit is the global copy plus each project file.
+    let restored_root = tempfile::tempdir().expect("restored root");
+    let restored = NodePaths::new(restored_root.path());
+    restored.ensure().expect("restored dirs");
+    std::fs::copy(&destination, restored.db_path()).expect("copy global");
+    std::fs::create_dir_all(restored.project_dir(&fixture.project)).expect("project dir");
+    let project_conn = Connection::open(fixture.paths.project_db_path(&fixture.project)).expect("project checkpoint");
+    project_conn
+        .execute_batch("PRAGMA wal_checkpoint(FULL)")
+        .expect("checkpoint project");
+    drop(project_conn);
+    std::fs::copy(
+        fixture.paths.project_db_path(&fixture.project),
+        restored.project_db_path(&fixture.project),
+    )
+    .expect("copy project");
+    let project_copy = Store::open_with_project(&restored, &fixture.project).expect("open copied project");
+    project_copy.integrity_check().expect("project integrity");
+    assert_eq!(project_copy.job(&job.id).expect("job"), Some(job));
+    assert_eq!(project_copy.inbox_item(&item.id).expect("inbox"), Some(item));
+    let copied_ledger = project_copy.ledger_since(&LedgerFilter::default()).expect("ledger");
     assert_eq!(copied_ledger.len(), 1);
     assert_eq!(copied_ledger[0].summary, "backup test");
 }

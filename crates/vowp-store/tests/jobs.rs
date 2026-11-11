@@ -132,7 +132,7 @@ fn job_insert_duplicate_and_unknown_need() {
         )
         .expect_err("unknown project");
     assert!(
-        matches!(error, vowp_store::StoreError::NotFound { .. }),
+        matches!(error, vowp_store::StoreError::WrongProject { .. }),
         "got {error:?}"
     );
 
@@ -292,7 +292,11 @@ fn list_jobs_filter_and_order() {
         project: Some(ProjectName::parse("other").expect("project")),
         ..JobFilter::default()
     };
-    assert!(ids(&other_project).is_empty());
+    let error = fixture.store.list_jobs(&other_project).expect_err("wrong project");
+    assert!(
+        matches!(error, vowp_store::StoreError::WrongProject { .. }),
+        "got {error:?}"
+    );
 
     let this_project = JobFilter {
         project: Some(fixture.project.clone()),
@@ -344,7 +348,11 @@ fn edges_add_remove_and_queries() {
     listed.sort_by(|left, right| left.dst.cmp(&right.dst));
     assert_eq!(listed, vec![needs.clone(), verifies.clone()]);
     let other = ProjectName::parse("other").expect("project");
-    assert!(fixture.store.list_edges(Some(&other)).expect("list edges").is_empty());
+    let error = fixture.store.list_edges(Some(&other)).expect_err("wrong project");
+    assert!(
+        matches!(error, vowp_store::StoreError::WrongProject { .. }),
+        "got {error:?}"
+    );
 
     let self_edge = Edge {
         src: a.id.clone(),
@@ -474,12 +482,13 @@ fn count_jobs_by_state_groups_and_filters() {
     assert_eq!(project, counts);
 
     let other = ProjectName::parse("other").expect("project");
+    let error = fixture
+        .store
+        .count_jobs_by_state(Some(&other))
+        .expect_err("wrong project");
     assert!(
-        fixture
-            .store
-            .count_jobs_by_state(Some(&other))
-            .expect("other counts")
-            .is_empty()
+        matches!(error, vowp_store::StoreError::WrongProject { .. }),
+        "got {error:?}"
     );
 }
 

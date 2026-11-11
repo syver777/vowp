@@ -1,17 +1,19 @@
 [Unit]
-Description=VOWP supervisor
+Description=VOWP node supervisor
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# L8: the supervisor runs in the foreground under systemd and restarts on any exit.
-# Spec: docs/design/loops.md §10; heartbeat layout: docs/design/architecture.md §3.
-# This template must match vowp_core::loops::l8::SYSTEMD_UNIT.
+# One supervisor for every active project on this home. It runs in the foreground
+# under systemd and restarts on failure. `vowp down` stops it through ~/.vowp/stop.
+# Spec: docs/design/v0.2/home-and-surfaces.md §4.1; heartbeat: docs/design/loops.md §10.
+Environment=VOWP_HOME=%h/.vowp
 ExecStart=%h/.local/bin/vowp up --foreground
-Restart=always
+Restart=on-failure
 RestartSec=5
-WorkingDirectory=%h
+KillMode=mixed
+WorkingDirectory=%h/.vowp
 
 [Install]
 WantedBy=default.target

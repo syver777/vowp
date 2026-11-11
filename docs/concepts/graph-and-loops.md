@@ -4,8 +4,8 @@ The graph is the plan; the loops are what keep it moving. A job is a node in the
 does it, and a gate is how the result is checked. The supervisor is a deterministic program that walks
 the graph every tick, starts work, records evidence and moves states. Models are asked for judgment only.
 
-> **Status: current.** The graph engine and the `vowp job`/`vowp graph` commands are implemented; the
-> supervisor commands such as `vowp up` and `vowp status` that drive the loops are implemented too.
+> **Status: current.** The graph engine and the `vowp job`/`vowp graph` commands are implemented. One
+> node supervisor (`vowp up`) runs the loops for every active project on the home, in fairness order.
 
 ## Jobs
 
@@ -97,12 +97,19 @@ These commands are implemented today, including the supervisor commands (`vowp u
 
 ## Scheduling rules
 
-1. **Only `ready` jobs are dispatched**, by priority and then age.
+1. **Only `ready` jobs are dispatched**, by priority and then age, after capacity admission succeeds.
 2. **Ownership locks.** No two running jobs may have overlapping `owns` globs. Conflicts wait. A fix job
    and the job it fixes are treated as one holder, so the fix does not deadlock the original.
-3. **Slots and provider concurrency.** `[node].max_workers` (default 4) and `max_verifiers` (default 2)
-   bound concurrency; `[providers.<p>].max_concurrent` bounds each provider and is lowered after rate
-   limits.
+3. **Measured capacity, provider concurrency and ordering.** The node capacity manager checks the brake,
+   the provider limit, the worker target, RAM, CPU and disk before a job is dispatched; a wait leaves the
+   job `ready` with a reason. Planner and keeper turns start when due outside this path, and the merge
+   queue bypasses it. Projects tick by fairness weight, highest first; inside one weight the project
+   admitted last moves to the back of its group, and a rotating offset starts a group with no recorded
+   last admission. The registry's `project weight` is reported and sets that order. Within a project,
+   priority and then age order ready jobs. `[node].max_workers` (default 4) is a preference for the
+   advised target, not a hard cap; `max_verifiers` (default 2) bounds the verifier share.
+   `[providers.<p>].max_concurrent` bounds each provider and is lowered after rate limits. See
+   [capacity](capacity.md).
 4. **One worktree per job** on branch `job/<id>`. Workers run in that worktree. Verify, fix and merge jobs
    reuse the original's worktree and branch.
 5. **Single writer to the default branch.** Only the supervisor's merge queue writes and pushes the
@@ -125,7 +132,9 @@ These commands are implemented today, including the supervisor commands (`vowp u
 
 ### The L1 tick
 
-Each tick is wrapped so one failing step never aborts the rest. The order is:
+A node tick first samples capacity, sweeps stale leases and runs the lifecycle tick, then runs each
+active project's L1 steps in fairness order. Within one project, each tick is wrapped so one failing
+step never aborts the rest. The order is:
 
 0. Apply pause and CLI request rows (`retry`, `park`, `cancel`, `nudge`, `restart`, `replan`, `fail`,
    inbox answers, loop pause/resume, wake).
@@ -136,7 +145,7 @@ Each tick is wrapped so one failing step never aborts the rest. The order is:
 5. Run command gates for `gating` jobs.
 6. Create a verify job for `reviewing` jobs that do not have one.
 7. Run at most one merge.
-8. Dispatch ready jobs within slots, ownership and provider capacity.
+8. Dispatch ready jobs within measured capacity, slots, ownership and provider limits.
 9. Start a planner turn and a keeper turn when due.
 10. Probe limited providers whose reset time has passed.
 11. Fire due schedules.

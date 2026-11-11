@@ -103,20 +103,41 @@ impl ScriptAction {
     }
 }
 
+/// How often a condition-based hold re-checks its condition.
+const HOLD_POLL: Duration = Duration::from_millis(10);
+
+/// Upper bound for a condition-based hold, so a broken condition cannot block a runner forever.
+const HOLD_MAX_WAIT: Duration = Duration::from_secs(120);
+
 /// A test-controlled gate that holds one scripted run open.
 ///
 /// [`ScriptHold::wait_started`] proves the adapter has actually recorded the start, not
-/// merely that a run row is open; wall-clock delays cannot provide that ordering.
+/// merely that a run row is open; wall-clock delays cannot provide that ordering. A hold can
+/// also release itself when a test condition becomes true ([`ScriptHold::release_when`]), so a
+/// run stays open until the supervisor has applied the state or counter change the test needs
+/// instead of racing a sleep.
 #[derive(Clone, Default)]
 pub struct ScriptHold {
     started: Arc<(Mutex<bool>, Condvar)>,
     released: Arc<(Mutex<bool>, Condvar)>,
+    condition: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl ScriptHold {
     /// Creates a hold that is closed until [`ScriptHold::release`] is called.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Releases the held run as soon as `condition` returns true.
+    ///
+    /// The condition is polled while the run waits. This keeps a run alive across supervisor
+    /// ticks without assuming the machine will schedule the test thread within a fixed delay,
+    /// and it releases the run when the supervisor applies the transition (for example a
+    /// stall counter or a terminal state) that the test is waiting for.
+    pub fn release_when(mut self, condition: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        self.condition = Some(Arc::new(condition));
+        self
     }
 
     /// Waits until the adapter has started the held run, or `timeout` elapses.
@@ -140,10 +161,27 @@ impl ScriptHold {
     fn wait_released(&self) {
         let (lock, condvar) = &*self.released;
         let mut released = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*released {
-            released = condvar
-                .wait(released)
+        let Some(condition) = &self.condition else {
+            while !*released {
+                released = condvar
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            return;
+        };
+        let deadline = Instant::now() + HOLD_MAX_WAIT;
+        loop {
+            if *released || condition() {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            let (guard, _) = condvar
+                .wait_timeout(released, HOLD_POLL.min(deadline - now))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            released = guard;
         }
     }
 

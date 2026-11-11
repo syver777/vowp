@@ -89,7 +89,7 @@ impl SessionIndex {
     /// Inserts the rebuilt row for a database that has lost its index.
     fn insert(&self, conn: &Connection) -> Result<(), StoreError> {
         conn.execute(
-            "INSERT INTO sessions (id, project, job_id, role, title, parent_session_id, node, cwd, state,
+            "INSERT INTO main.sessions (id, project, job_id, role, title, parent_session_id, node, cwd, state,
                                    executor, last_seq, last_capsule_id, log_bytes, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'idle', ?9, ?10, NULL, ?11, ?12, ?13)",
             params![
@@ -114,7 +114,7 @@ impl SessionIndex {
     /// Refreshes the fields reindex owns on an existing row; everything else is preserved.
     fn refresh(&self, conn: &Connection) -> Result<(), StoreError> {
         conn.execute(
-            "UPDATE sessions SET last_seq = ?2, log_bytes = ?3, updated_at = ?4, executor = ?5 WHERE id = ?1",
+            "UPDATE main.sessions SET last_seq = ?2, log_bytes = ?3, updated_at = ?4, executor = ?5 WHERE id = ?1",
             params![
                 self.id,
                 sql_i64(self.last_seq, "session last_seq")?,
@@ -224,11 +224,19 @@ fn reindex_session(
 
     let counts = store.transaction(|store| {
         let conn = &store.conn;
-        conn.execute("DELETE FROM session_events WHERE session_id = ?1", params![session.id])?;
-        conn.execute("DELETE FROM session_natives WHERE session_id = ?1", params![session.id])?;
+        conn.execute(
+            "DELETE FROM main.session_events WHERE session_id = ?1",
+            params![session.id],
+        )?;
+        conn.execute(
+            "DELETE FROM main.session_natives WHERE session_id = ?1",
+            params![session.id],
+        )?;
 
         let exists = conn
-            .query_row("SELECT 1 FROM sessions WHERE id = ?1", params![session.id], |_| Ok(()))
+            .query_row("SELECT 1 FROM main.sessions WHERE id = ?1", params![session.id], |_| {
+                Ok(())
+            })
             .optional()?
             .is_some();
         if exists {
@@ -246,7 +254,7 @@ fn reindex_session(
                 event.envelope.body().map(|body| body.summary()).unwrap_or_default(),
             );
             conn.execute(
-                "INSERT INTO session_events (session_id, seq, id, ts, type, actor, harness, model, byte_offset,
+                "INSERT INTO main.session_events (session_id, seq, id, ts, type, actor, harness, model, byte_offset,
                                              byte_len, summary)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
@@ -269,7 +277,7 @@ fn reindex_session(
         let mut natives_written = 0_u32;
         for native in &natives {
             natives_written += conn.execute(
-                "INSERT INTO session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
+                "INSERT INTO main.session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(session_id, harness, native_session_id) DO NOTHING",
                 params![
@@ -284,7 +292,7 @@ fn reindex_session(
         }
         for mapping in &adapters {
             natives_written += conn.execute(
-                "INSERT INTO session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
+                "INSERT INTO main.session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(session_id, harness, native_session_id) DO NOTHING",
                 params![
@@ -339,7 +347,9 @@ fn build_session_row(
     report: &mut ReindexReport,
 ) -> Result<SessionIndex, StoreError> {
     let project = match &created.project {
-        Some(project) if row_exists(&store.conn, "projects", "name", project.as_str())? => Some(project.to_string()),
+        Some(project) if row_exists(&store.conn, "main.projects", "name", project.as_str())? => {
+            Some(project.to_string())
+        }
         Some(project) => {
             report.problems.push(format!(
                 "session {id}: project {project} is not in the database; left null"
@@ -349,11 +359,12 @@ fn build_session_row(
         None => None,
     };
     let job_id = match &created.job_id {
-        Some(job) if row_exists(&store.conn, "jobs", "id", job.as_str())? => Some(job.to_string()),
+        Some(job) if store.bound_project().is_none() => Some(job.to_string()),
+        Some(job) if store.job(job)?.is_some() => Some(job.to_string()),
         Some(job) => {
-            report
-                .problems
-                .push(format!("session {id}: job {job} is not in the database; left null"));
+            report.problems.push(format!(
+                "session {id}: job {job} is not in the bound project; left null"
+            ));
             None
         }
         None => None,
@@ -467,7 +478,7 @@ fn upsert_capsule(conn: &Connection, capsule: &Capsule, path: &Path) -> Result<(
     let body = json_to_text(capsule)?;
     let author = capsule.from.executor.to_string();
     conn.execute(
-        "INSERT INTO capsules (id, session_id, at_seq, version, trigger, author, path, body_json, created_at)
+        "INSERT INTO main.capsules (id, session_id, at_seq, version, trigger, author, path, body_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, at_seq = excluded.at_seq,
                                        version = excluded.version, trigger = excluded.trigger,
@@ -494,7 +505,7 @@ fn report_missing_capsule_files(
     id: &SessionId,
     report: &mut ReindexReport,
 ) -> Result<(), StoreError> {
-    let mut statement = conn.prepare("SELECT id, path FROM capsules WHERE session_id = ?1")?;
+    let mut statement = conn.prepare("SELECT id, path FROM main.capsules WHERE session_id = ?1")?;
     let rows = statement.query_map(params![id.to_string()], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -513,14 +524,14 @@ fn report_missing_capsule_files(
 fn set_last_capsule(conn: &Connection, id: &str) -> Result<(), StoreError> {
     let latest = conn
         .query_row(
-            "SELECT id FROM capsules WHERE session_id = ?1 ORDER BY at_seq DESC, created_at DESC LIMIT 1",
+            "SELECT id FROM main.capsules WHERE session_id = ?1 ORDER BY at_seq DESC, created_at DESC LIMIT 1",
             params![id],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
     if let Some(capsule_id) = latest {
         conn.execute(
-            "UPDATE sessions SET last_capsule_id = ?2 WHERE id = ?1",
+            "UPDATE main.sessions SET last_capsule_id = ?2 WHERE id = ?1",
             params![id, capsule_id],
         )?;
     }
@@ -549,7 +560,7 @@ fn insert_missing_switch(
 ) -> Result<(), StoreError> {
     let exists = conn
         .query_row(
-            "SELECT 1 FROM switches WHERE id = ?1",
+            "SELECT 1 FROM main.switches WHERE id = ?1",
             params![switch.switch_id.to_string()],
             |_| Ok(()),
         )
@@ -559,12 +570,14 @@ fn insert_missing_switch(
         return Ok(());
     }
     let capsule_id = match &switch.capsule_id {
-        Some(capsule_id) if row_exists(conn, "capsules", "id", capsule_id.as_str())? => Some(capsule_id.to_string()),
+        Some(capsule_id) if row_exists(conn, "main.capsules", "id", capsule_id.as_str())? => {
+            Some(capsule_id.to_string())
+        }
         _ => None,
     };
     let started_at = ts_to_text(ts);
     conn.execute(
-        "INSERT INTO switches (id, session_id, from_executor, to_executor, from_node, to_node, capsule_id, reason,
+        "INSERT INTO main.switches (id, session_id, from_executor, to_executor, from_node, to_node, capsule_id, reason,
                                state, error, started_at, ended_at, at_seq)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'completed', NULL, ?9, ?9, ?10)",
         params![

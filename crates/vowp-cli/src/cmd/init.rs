@@ -48,6 +48,36 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
             ProjectName::parse(&slugify(&directory))?
         }
     };
+    if name.as_str() == vowp_store::RESERVED_NODE_PROJECT {
+        return Err(CliError::Invalid(
+            "`_node` is reserved and cannot be initialised as a user project".to_owned(),
+        ));
+    }
+    // Check the registry before touching the checkout. `init` registers through the same
+    // path as `project add` (§12.2), and a conflict must not leave a half-initialised
+    // checkout that names a project the registry points elsewhere.
+    let paths = crate::ctx::node_paths(global)?;
+    let store = Store::open(&paths)?;
+    if let Some(existing) = store.project(&name)? {
+        if !same_checkout(&existing.path, &root) {
+            return Err(CliError::Conflict(format!(
+                "project {name} is already registered at {}",
+                existing.path
+            )));
+        }
+    } else if let Some(existing) = store
+        .list_project_entries()?
+        .into_iter()
+        .find(|entry| same_checkout(&entry.path, &root))
+    {
+        return Err(CliError::Conflict(format!(
+            "{} is already registered as project {}",
+            root.display(),
+            existing.name
+        )));
+    }
+    drop(store);
+
     let config = default_config(name, local_offset_minutes())?;
     config.validate()?;
     let config_text =
@@ -74,9 +104,25 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
         written.push(".gitignore".to_owned());
     }
 
-    let paths = crate::ctx::node_paths(global)?;
+    crate::node_ctx::ensure_home_project_file(&paths)?;
     let store = Store::open(&paths)?;
     let now = store.clock().now();
+    // The reserved `_node` project owns project-less session runs and node-wide history.
+    // It is created here so a fresh home always has the row and its database.
+    let node_project = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT)?;
+    if store.project(&node_project)?.is_none() {
+        store.upsert_project(&Project {
+            name: node_project.clone(),
+            path: paths.root().display().to_string(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            config: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        })?;
+    } else {
+        Store::create_project_db(&paths, &node_project)?;
+    }
     store.upsert_node(&Node {
         name: config.node.name.clone(),
         ssh_target: None,
@@ -85,6 +131,9 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
         last_seen_at: Some(now),
         created_at: now,
     })?;
+    // The preflight above already applied `project add`'s name/path conflict rules, so
+    // this write is the same registry operation without requiring the checkout to be a
+    // full git repository (the preflight is enough for a fresh `vowp.toml`).
     let project_config = serde_json::to_value(&config).map_err(vowp_protocol::ProtocolError::from)?;
     store.upsert_project(&Project {
         name: config.project.name.clone(),
@@ -95,9 +144,26 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
         created_at: now,
         updated_at: now,
     })?;
+    // A home with several projects is fleet-only until the caller says which project it
+    // means. Open the registered project explicitly for its loop rows and worker slots.
+    drop(store);
+    Store::create_project_db(&paths, &config.project.name)?;
+    let store = Store::open_with_project(&paths, &config.project.name)?;
     for loop_ in default_loops(&config.project.name, now) {
         store.upsert_loop(&loop_)?;
     }
+    // The node supervisor ticks every registered project, so a slot row must exist before
+    // the first dispatch, not only when a single-project `Supervisor::new` runs.
+    store.ensure_worker_slots(
+        &config.node.name,
+        vowp_protocol::WorkerKind::Worker,
+        config.node.max_workers,
+    )?;
+    store.ensure_worker_slots(
+        &config.node.name,
+        vowp_protocol::WorkerKind::Verifier,
+        config.node.max_verifiers,
+    )?;
 
     if global.json {
         crate::output::print_json(
@@ -197,6 +263,18 @@ fn default_loops(project: &ProjectName, now: vowp_protocol::Timestamp) -> Vec<Lo
             updated_at: now,
         })
         .collect()
+}
+
+/// Returns whether a registered path names `root`, following symlinks when possible.
+fn same_checkout(registered: &str, root: &Path) -> bool {
+    let registered = Path::new(registered);
+    if registered == root {
+        return true;
+    }
+    match (std::fs::canonicalize(registered), std::fs::canonicalize(root)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Writes one file relative to the project root, skipping an existing file unless forced.

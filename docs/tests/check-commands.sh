@@ -5,10 +5,11 @@
 # must not be.
 #
 # The command surface is parsed from docs/design/cli.md (the written contract)
-# and cross-checked against V0_1_COMMANDS in crates/vowp-cli/src/cli.rs. The
-# implementation status comes from the CLI dispatch table: a command is current
-# when its handler module is real code, not an explicit NotImplemented stub. A
-# required-set assertion catches parser drift.
+# and cross-checked against V0_1_COMMANDS + V0_2_COMMANDS in
+# crates/vowp-cli/src/cli.rs. The implementation status comes from the CLI
+# dispatch table: a command is current when its handler module is real code,
+# not an explicit NotImplemented stub. A required-set assertion catches parser
+# drift.
 #
 # Scope: README.md, docs/concepts/**, docs/guides/**, docs/security.md,
 # docs/troubleshooting.md, docs/roadmap.md and docs/design/v0.2/**. Other
@@ -121,9 +122,10 @@ for family in families:
 
 # --- Parse the real CLI's top-level command list and dispatch --------------
 #
-# V0_1_COMMANDS is the clap surface: every command the binary parses. The
-# dispatch table maps each Command variant to its handler module. A module is
-# a stub when it only returns CliError::NotImplemented. This check therefore
+# V0_1_COMMANDS and V0_2_COMMANDS are the clap surface: every command the
+# binary parses, including the hidden implementation interfaces. The dispatch
+# table maps each Command variant to its handler module and function. A module
+# is a stub when it only returns CliError::NotImplemented. This check therefore
 # distinguishes a command that merely appears in --help from one that actually
 # runs.
 
@@ -134,19 +136,28 @@ if not cli_rs_path.is_file() or not dispatch_path.is_file():
     sys.exit(1)
 
 cli_rs = cli_rs_path.read_text(encoding="utf-8")
-const_match = re.search(
-    r"pub const V0_1_COMMANDS:.*?=.*?\[(.*?)\];", cli_rs, re.DOTALL
-)
-if not const_match:
-    print("FAIL  cannot parse V0_1_COMMANDS from cli.rs", file=sys.stderr)
-    sys.exit(1)
-real_top = set(re.findall(r'"(__window|[a-z_][a-z0-9_-]*)"', const_match.group(1)))
+
+
+def parse_command_const(name):
+    match = re.search(
+        r"pub const " + name + r":.*?=.*?\[(.*?)\];", cli_rs, re.DOTALL
+    )
+    if not match:
+        print(f"FAIL  cannot parse {name} from cli.rs", file=sys.stderr)
+        sys.exit(1)
+    return set(re.findall(r'"(__window|[a-z_][a-z0-9_-]*)"', match.group(1)))
+
+
+real_top = parse_command_const("V0_1_COMMANDS") | parse_command_const("V0_2_COMMANDS")
 real_top.add("--version")
 
 dispatch = dispatch_path.read_text(encoding="utf-8")
 module_for_variant = {}
+# The hidden vault helpers dispatch to a function other than `run` in their
+# module (`secret::vault_exec` / `secret::vault_admin`), so capture the module
+# before any function name.
 for variant, module in re.findall(
-    r"Command::(\w+)(?:\s*\{[^}]*\}|\s*\([^)]*\))?\s*=>\s*([a-z_]+)::run", dispatch
+    r"Command::(\w+)(?:\s*\{[^}]*\}|\s*\([^)]*\))?\s*=>\s*([a-z_]+)::[a-z_]+", dispatch
 ):
     module_for_variant[variant] = module
 if not module_for_variant:
@@ -155,9 +166,10 @@ if not module_for_variant:
 
 
 def variant_for(command):
-    if command == "__window":
-        return "Window"
-    return "".join(part.capitalize() for part in command.split("_"))
+    # Strip the hidden-command underscores and turn a hyphenated name such as
+    # `__vault-exec` into the clap variant `VaultExec`.
+    name = command.strip("_").replace("-", "_")
+    return "".join(part.capitalize() for part in name.split("_"))
 
 
 def module_is_stub(module):

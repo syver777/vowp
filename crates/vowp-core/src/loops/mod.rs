@@ -33,11 +33,42 @@ pub mod l8_watchdog;
 pub mod merge_queue;
 pub mod prompts;
 pub mod reconcile;
+pub mod registry;
 pub mod runner;
 pub mod supervisor;
 
 pub use runner::{RunnerPool, SessionRunPool, WakeHandle};
-pub use supervisor::{ReconcileReport, StepReport, Supervisor, TickReport};
+pub use supervisor::{
+    NodeReconcileReport, NodeSupervisor, NodeTickReport, ProjectSupervisor, ReconcileReport, StepReport, Supervisor,
+    TickReport,
+};
+
+/// Prepares a newly registered project: loop rows and worker slots.
+///
+/// `deps.config.project.name` must be the registered project. The store binding follows
+/// the per-project rule in the v0.2 spec (§3.8), so a handle bound to another project is
+/// never used for these writes.
+pub fn prepare_project(deps: &Deps, project: &ProjectName) -> Result<(), CoreError> {
+    if &deps.config.project.name != project {
+        return Err(CoreError::Invalid(format!(
+            "deps project {} does not match {project}",
+            deps.config.project.name
+        )));
+    }
+    let store = deps.open_store()?;
+    reconcile::ensure_loops(&store, deps)?;
+    store.ensure_worker_slots(
+        &deps.node,
+        vowp_protocol::WorkerKind::Worker,
+        deps.config.node.max_workers,
+    )?;
+    store.ensure_worker_slots(
+        &deps.node,
+        vowp_protocol::WorkerKind::Verifier,
+        deps.config.node.max_verifiers,
+    )?;
+    Ok(())
+}
 
 /// L6 failover helpers (spec: `loops.md` §8).
 pub mod l6 {
@@ -51,7 +82,29 @@ pub mod l7 {
 
 /// L8 watchdog helpers (spec: `loops.md` §10).
 pub mod l8 {
-    pub use super::l8_watchdog::{CRON_CHECK_SH, STALE_AFTER_SECS, SYSTEMD_UNIT, heartbeat_age, write_heartbeat};
+    pub use super::l8_watchdog::{CRON_CHECK_SH, STALE_AFTER_SECS, heartbeat_age, write_heartbeat};
+
+    /// The `vowp.service` systemd user unit text, aligned with `scripts/vowp.service`.
+    ///
+    /// The v0.1 constant in `l8_watchdog` is kept for source compatibility; this public
+    /// module value is the one `vowp init` and the L8 tests use. `Restart=on-failure` is
+    /// deliberate: a clean `vowp down` exits 0 and must not be restarted by systemd.
+    pub const SYSTEMD_UNIT: &str = "[Unit]\n\
+Description=VOWP node supervisor\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+Environment=VOWP_HOME=%h/.vowp\n\
+ExecStart=%h/.local/bin/vowp up --foreground\n\
+Restart=on-failure\n\
+RestartSec=5\n\
+KillMode=mixed\n\
+WorkingDirectory=%h/.vowp\n\
+\n\
+[Install]\n\
+WantedBy=default.target\n";
 }
 
 /// L2 prompt templates (spec: `loops.md` §3).

@@ -1,10 +1,12 @@
 # types.md — protocol types (crate `vowp-protocol`)
 
+Status: current for v0.2.
+
 Every type here lives in `vowp-protocol` and is the **only** definition: other crates import it, never redefine it.
 All types derive `Debug, Clone, PartialEq, Serialize, Deserialize` (and `Eq`/`Hash`/`Copy` where noted as "plain
 enum/id") and `schemars::JsonSchema`. JSON is the wire format for logs, bundles, `--json` CLI output and the DB JSON
-columns (`schema.sql`). Names are `snake_case` in JSON, except event-type strings (`session.created`) and executor
-strings (`opencode:provider/model#max`).
+columns (`schema/global.sql`, `schema/project.sql`). Names are `snake_case` in JSON, except event-type strings
+(`session.created`) and executor strings (`opencode:provider/model#max`).
 
 Module → file map:
 
@@ -13,6 +15,11 @@ Module → file map:
 | `ids`, `time`, `error`, `cost`, `limit`, `executor` | foundations |
 | `event`, `capsule` | event log + capsule |
 | `job`, `gate`, `report`, `run`, `session`, `inbox`, `loops`, `release` | domain rows |
+| `capacity` | v0.2 host samples, run usage, estimates, admission, brakes, targets, advice (§16.1) |
+| `surface` | v0.2 surfaces, leases, remote-exec lines, orchestrator cards (§16.2) |
+| `snapshot` | v0.2 `snapshot.json` and the project registry view (§16.3) |
+| `catalog` | v0.2 lifecycle classes, catalog rows, GC and backup reports (§16.4) |
+| `vault` | v0.2 secret names, metadata, modes and the one-time request (§16.5) |
 | `config`, `adapter`, `services`, `schema` | `vowp.toml`, adapter trait, service traits, JSON Schema export |
 
 `lib.rs` re-exports everything at the crate root (`vowp_protocol::Job`), plus `vowp_protocol::prelude::*`.
@@ -1093,8 +1100,11 @@ pub enum ServiceError { #[error("{0}")] Failed(String), #[error("not found: {0}"
 ## 14. JSON Schema export (`schema`)
 
 ```rust
-/// name -> JSON Schema document for every public wire type (EventEnvelope, Capsule, CapsuleDraft, Job, NewJob, Gate, Evidence,
-/// ReportFrontMatter, BriefFrontMatter, VowpConfig, Schedule, Release, InboxItem, Run, Session, Limit, Cost, ...).
+/// name -> JSON Schema document for every public wire type (the v0.1 set: EventEnvelope,
+/// Capsule, CapsuleDraft, Job, NewJob, Gate, Evidence, ReportFrontMatter, BriefFrontMatter,
+/// VowpConfig, Schedule, Release, InboxItem, Run, Session, Limit, Cost, ...; plus the v0.2
+/// capacity, surface/lease, snapshot, catalog, vault, fleet, tunnel and migration types in
+/// §16).
 pub fn all_schemas() -> std::collections::BTreeMap<&'static str, serde_json::Value>;
 pub fn schema_for_name(name: &str) -> Option<serde_json::Value>;
 ```
@@ -1188,3 +1198,325 @@ Each block is copied to `crates/vowp-protocol/tests/fixtures/<type>.json` and va
  "from_node":"local","to_node":"server","capsule_id":"cap_01KA1V2B000000000000000000","reason":"limit","state":"completed","error":null,
  "started_at":"2026-11-08T19:41:03.000Z","ended_at":"2026-11-08T19:41:08.000Z","at_seq":142}
 ```
+
+---
+
+## 16. v0.2 protocol additions
+
+These types are the v0.2 wire/CLI/database shapes. The normative spec is
+[`v0.2/home-and-surfaces.md`](v0.2/home-and-surfaces.md) §5–§10 and §13.1; each module is
+re-exported at the crate root and every type is exported by `vowp schema`.
+
+### 16.1 Capacity (`capacity`)
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum SampleSource { Proc, Fallback }
+
+pub struct HostSample {
+    pub at: Timestamp, pub interval_secs: u64,
+    pub mem_total_bytes: u64, pub mem_available_bytes: u64, pub swap_used_bytes: u64,
+    pub load1: f64, pub load5: f64, pub load15: f64, pub cpu_count: u32,
+    pub cpu_quota_cores: Option<f64>,
+    pub disk_free_home_bytes: u64, pub disk_free_worktrees_bytes: Option<u64>,
+    pub pressure_cpu_avg10: Option<f64>, pub pressure_mem_avg10: Option<f64>,
+    pub pressure_io_avg10: Option<f64>, pub source: SampleSource,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource { Cgroup, ProcTree, Default }
+#[serde(rename_all = "snake_case"), Default]
+pub enum BuildMode { Cold, Warm, Incremental, #[default] Unknown }
+
+pub struct RunUsage {
+    pub run_id: RunId, pub project: ProjectName, pub job_id: Option<JobId>,
+    pub job_kind: Option<JobKind>, pub role: RunRole,
+    pub harness: Option<HarnessKind>, pub model: Option<String>, pub provider: Option<String>,
+    pub node: NodeName, pub started_at: Timestamp, pub ended_at: Timestamp,
+    pub duration_ms: u64, pub peak_rss_bytes: u64,
+    pub anon_peak_bytes: Option<u64>, pub file_peak_bytes: Option<u64>,
+    pub kernel_peak_bytes: Option<u64>, pub cpu_usec: u64,
+    pub mean_cpu_cores: f64, pub max_cpu_cores: f64,
+    pub build_mode: BuildMode, pub source: UsageSource,
+    pub oom_killed: bool, pub exit_code: Option<i32>,
+}
+
+pub struct RemoteUsage {
+    pub peak_rss_bytes: u64, pub anon_peak_bytes: Option<u64>,
+    pub file_peak_bytes: Option<u64>, pub kernel_peak_bytes: Option<u64>,
+    pub cpu_usec: u64, pub mean_cpu_cores: f64, pub max_cpu_cores: f64,
+    pub build_mode: BuildMode, pub oom_killed: bool, pub source: UsageSource,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum EstimateSource { Measured, Pooled, Default }
+
+pub struct UsageEstimate {
+    pub project: Option<ProjectName>, pub job_kind: Option<JobKind>,
+    pub harness: Option<HarnessKind>, pub model: Option<String>,
+    pub build_mode: Option<BuildMode>, pub samples: u32,
+    pub ram_p50_bytes: u64, pub ram_p90_bytes: u64,
+    pub cpu_p50_cores: f64, pub cpu_p90_cores: f64,
+    pub duration_p50_ms: u64, pub duration_p90_ms: u64, pub source: EstimateSource,
+}
+
+pub struct AdmitRequest {
+    pub project: ProjectName, pub job: Option<JobId>, pub kind: JobKind,
+    pub role: RunRole, pub harness: Option<HarnessKind>, pub model: Option<String>,
+    pub provider: Option<String>, pub node: NodeName,
+}
+pub enum AdmitDecision { Admit, Wait(WaitReason) }
+
+#[serde(rename_all = "snake_case")]
+pub enum WaitCode { Ram, Cpu, Disk, Provider, Brake, Target }
+pub struct WaitReason { pub code: WaitCode, pub detail: String }
+
+#[derive(Default)]
+pub struct BrakeState { pub active: bool, pub reasons: Vec<BrakeReason>, pub since: Option<Timestamp> }
+#[serde(rename_all = "snake_case")]
+pub enum BrakeCode { MemoryPressure, SwapGrowth, DiskLow, Provider }
+pub struct BrakeReason { pub code: BrakeCode, pub detail: String }
+
+#[serde(rename_all = "snake_case")]
+pub enum TargetMode { Auto, Fixed }
+pub struct CapacityTarget {
+    pub mode: TargetMode, pub target_workers: u32, pub advised_workers: Option<u32>,
+    pub is_override: bool, pub set_by: String, pub set_at: Timestamp, pub reason: String,
+}
+impl Default for CapacityTarget { /* auto, 1 worker, set_by "supervisor" */ }
+
+#[serde(rename_all = "snake_case")]
+pub enum AdviceState { Open, Applied, Dismissed }
+pub struct CapacityAdvice {
+    pub id: String, pub created_at: Timestamp,
+    pub current_target: u32, pub proposed_target: u32, pub mode: TargetMode,
+    pub reasons: Vec<String>, pub expected_effect: String,
+    pub inbox_id: Option<InboxId>, pub state: AdviceState,
+    pub applied_at: Option<Timestamp>, pub applied_by: Option<String>,
+}
+
+#[derive(Default)]
+pub struct RunningCapacity { pub runs: u32, pub ram_p90_bytes: u64, pub cpu_p90_cores: f64 }
+pub struct WaitingJob { pub project: ProjectName, pub job: JobId, pub reason: WaitReason, pub since: Timestamp }
+
+#[derive(Default)]
+pub struct CapacitySnapshot {
+    pub measured: Option<HostSample>, pub running: RunningCapacity, pub target: CapacityTarget,
+    pub advised_target: Option<u32>, pub brake: BrakeState,
+    pub reserve_ram_bytes: u64, pub min_disk_bytes: u64,
+}
+pub struct CapacityReport {
+    pub generated_at: Timestamp, pub host: Option<HostSample>, pub target: CapacityTarget,
+    pub running: RunningCapacity, pub brakes: BrakeState,
+    pub reserve_ram_bytes: u64, pub min_disk_bytes: u64,
+    pub estimates: Vec<UsageEstimate>, pub waiting: Vec<WaitingJob>, pub limits: Vec<Limit>,
+}
+```
+
+### 16.2 Surfaces, leases, remote execution and orchestrators (`surface`)
+
+```rust
+#[serde(transparent)] pub struct SurfaceId(pub String);   // fresh ULID
+pub fn new_lease_token() -> String;                       // two ULIDs, 160 random bits
+
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKind { Chat, Opencode, ClaudeCode, Mcp, Mirror, Api }
+
+pub struct Surface {
+    pub id: SurfaceId, pub kind: SurfaceKind, pub node: NodeName, pub holder: String,
+    pub app: Option<String>, pub cwd: Option<String>, pub metadata: serde_json::Value,
+    pub created_at: Timestamp, pub last_seen_at: Timestamp,
+}
+
+pub struct Lease {
+    pub session_id: SessionId, pub surface_id: Option<SurfaceId>,
+    pub surface_kind: SurfaceKind, pub node: NodeName, pub holder: String,
+    pub token: String, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
+}
+pub struct SurfaceRef {
+    pub surface_id: SurfaceId, pub kind: SurfaceKind, pub holder: String,
+    pub node: NodeName, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
+}
+pub struct LeaseStatus {
+    pub held: bool, pub holder: Option<String>, pub kind: Option<SurfaceKind>,
+    pub node: Option<NodeName>, pub acquired_at: Option<Timestamp>,
+    pub heartbeat_at: Option<Timestamp>, pub token: Option<String>,  // only on --acquire
+}
+pub struct TakeoverReport {
+    pub previous: Option<String>, pub drained: bool, pub capsule_id: Option<CapsuleId>,
+}
+
+pub struct RemoteEvent {
+    pub id: EventId, pub ts: Timestamp, #[serde(rename = "type")] pub event_type: EventType,
+    pub actor: Actor, pub source: EventSource, pub payload: serde_json::Value,
+    pub raw: Option<serde_json::Value>, pub replayable: bool,
+}
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteLine {
+    Hello { session_id: SessionId, run_id: RunId, executor: String, node: NodeName,
+            spool_id: String, lease: String },
+    Event { event: RemoteEvent },
+    Heartbeat { at: Timestamp },
+    Summary { exit_code: Option<i32>, outcome: RunOutcome, native_session_id: Option<String>,
+              cost: Cost, limit: Option<LimitEvent>, result_text: Option<String>,
+              stop_reason: StopReason, usage: Option<RemoteUsage> },
+}
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngestAck {
+    Ack { event_id: EventId, seq: u64 },
+    Duplicate { event_id: EventId, seq: u64 },
+    Summary { run_id: RunId, done: bool },
+    LeaseRevoked { reason: String, by: String, at: Timestamp, last_seq: u64 },
+    Error { kind: ErrorKind, message: String },
+}
+
+pub struct TurnGrant {
+    pub run_id: RunId, pub session_id: SessionId, pub executor: String,
+    pub purpose: RunPurpose, pub node: NodeName, pub cwd: String, pub prompt: String,
+    pub resume_native: Option<String>, pub native_hint: Option<String>,
+    pub env_names: Vec<String>, pub lease_token: String, pub tail_seq: u64,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorApp { Opencode, ClaudeCode, Chat }
+pub struct JoinInstructions { pub desktop: String, pub phone: String, pub chat: String }
+pub struct OrchestratorCard {
+    pub name: String, pub session_id: SessionId, pub project: Option<ProjectName>,
+    pub app: OrchestratorApp, pub state: String, pub join: JoinInstructions,
+}
+
+// Changed enums:
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole { User, Worker, Planner, Verifier, Keeper, Orchestrator }
+#[serde(rename_all = "snake_case")]
+pub enum SwitchReason { User, Limit, Crash, Context, Failover, ProbeBack, Takeover }
+```
+
+### 16.3 Snapshot and project registry (`snapshot`)
+
+```rust
+pub const SNAPSHOT_FORMAT: &str = "vowp-snapshot/1";
+pub const SNAPSHOT_VERSION: u32 = 1;
+
+#[serde(rename_all = "snake_case")]
+pub enum ProjectState { Active, Paused, Archived }
+
+pub struct ProjectEntry {
+    pub name: ProjectName, pub path: String, pub remote_url: Option<String>,
+    pub default_branch: String, pub state: ProjectState, pub weight: u8,
+    pub paused_reason: String, pub archived_at: Option<Timestamp>,
+    pub created_at: Timestamp, pub updated_at: Timestamp,
+}
+
+pub struct SupervisorSnapshot {
+    pub running: bool, pub pid: Option<u32>, pub started_at: Option<Timestamp>,
+    pub last_tick: Option<Timestamp>, pub tick_secs: u64, pub paused: bool,
+    pub fail_streak: u32, pub version: String,
+}
+pub struct RunningJobCard {
+    pub job: JobId, pub kind: JobKind, pub role: Role, pub executor: Option<String>,
+    pub node: NodeName, pub age_secs: u64, pub last_event_age_secs: Option<u64>,
+    pub session_id: Option<SessionId>,
+}
+pub struct BlockedJobCard {
+    pub job: JobId, pub state: JobState, pub reason: String,
+    pub detail: String, pub since: Timestamp,
+}
+pub struct QueueJobCard {
+    pub job: JobId, pub title: String, pub kind: JobKind, pub role: Role,
+    pub priority: i32, pub state: JobState, pub age_secs: u64,
+    pub waiting_reason: Option<String>,
+}
+pub struct MergeCard { pub job: JobId, pub at: Timestamp, pub commit: String, pub branch: String }
+pub struct GateFailureCard { pub job: JobId, pub gate: String, pub at: Timestamp, pub evidence: String }
+pub struct InboxSummary {
+    pub id: InboxId, pub project: Option<ProjectName>, pub job_id: Option<JobId>,
+    pub kind: InboxKind, pub title: String, pub created_at: Timestamp, pub age_secs: u64,
+}
+pub struct SessionSurfaceCard {
+    pub id: SessionId, pub project: Option<ProjectName>, pub job_id: Option<JobId>,
+    pub role: Option<SessionRole>, pub title: String, pub state: SessionState,
+    pub executor: Option<String>, pub node: NodeName,
+    pub active_surface: Option<SurfaceRef>, pub last_event_at: Timestamp,
+}
+pub struct ProjectSnapshot {
+    pub name: ProjectName, pub path: String, pub state: ProjectState, pub weight: u8,
+    pub paused_reason: String, pub jobs_by_state: BTreeMap<String, u32>,
+    pub running: Vec<RunningJobCard>, pub blocked: Vec<BlockedJobCard>,
+    pub queue: Vec<QueueJobCard>, pub last_merge: Option<MergeCard>,
+    pub gate_failures: Vec<GateFailureCard>, pub cost_today_usd: Option<f64>,
+}
+pub struct Snapshot {
+    pub schema: String, pub version: u32, pub sequence: u64, pub generated_at: Timestamp,
+    pub home: NodeName, pub supervisor: SupervisorSnapshot,
+    pub projects: Vec<ProjectSnapshot>, pub capacity: CapacitySnapshot,
+    pub limits: Vec<Limit>, pub inbox: Vec<InboxSummary>,
+    pub sessions: Vec<SessionSurfaceCard>, pub orchestrators: Vec<OrchestratorCard>,
+}
+```
+
+The snapshot is derived. In this build the capacity card's `measured` is `null` and
+`running.runs` is populated from the open runs, while its p90 RAM/CPU fields stay zero; a session
+card's `active_surface` is `null`. `vowp capacity show` is the measured report and the lease is live
+in `vowp session lease`.
+
+### 16.4 Lifecycle catalog (`catalog`)
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum CatalogClass {
+    Production, Truth, OpenWork, Secrets, ClosedSession,
+    RunOutput, Worktree, Sample, Cache,
+}
+pub struct CatalogEntry {
+    pub id: String, pub path: String, pub class: CatalogClass,
+    pub project: Option<ProjectName>, pub environment: String,
+    pub job_id: Option<JobId>, pub session_id: Option<SessionId>,
+    pub bytes: Option<u64>, pub expires_at: Option<Timestamp>, pub note: String,
+    pub created_at: Timestamp, pub updated_at: Timestamp, pub deleted_at: Option<Timestamp>,
+}
+pub struct GcClassReport { pub class: CatalogClass, pub files: u64, pub bytes: u64, pub sample_paths: Vec<String> }
+pub struct GcReport {
+    pub generated_at: Timestamp, pub dry_run: bool, pub classes: Vec<GcClassReport>,
+    pub deleted_files: u64, pub freed_bytes: u64, pub compacted_sessions: u64,
+    pub errors: Vec<String>,
+}
+pub struct BackupFile { pub path: String, pub bytes: u64, pub kind: String }
+pub struct BackupReport {
+    pub at: Timestamp, pub directory: String, pub files: Vec<BackupFile>,
+    pub bytes: u64, pub offsite: Option<String>, pub encrypted: bool, pub skipped: Vec<String>,
+}
+pub struct CatalogFilter {
+    pub class: Option<CatalogClass>, pub project: Option<ProjectName>,
+    pub expired_before: Option<Timestamp>, pub limit: Option<u32>,
+}
+```
+
+### 16.5 Vault (`vault`)
+
+```rust
+#[serde(transparent)] pub struct SecretName(pub String);  // ^[A-Z][A-Z0-9_]{0,63}$
+pub struct SecretInfo {
+    pub name: SecretName, pub last4: String,
+    pub created_at: Timestamp, pub updated_at: Timestamp,
+}
+#[serde(rename_all = "snake_case")]
+pub enum VaultMode { VaultUser, Basic }
+pub struct SecretRequest {
+    pub name: SecretName, pub url: String, pub expires_at: Timestamp, pub single_use: bool,
+}
+```
+
+Values never appear in these types. The vault stores files, keeps only the last four characters
+for display, and `secret request` returns a loopback URL and expiry, never the value.
+
+### 16.6 CLI-local result types
+
+Some `--json` results are defined next to their command because they are not protocol
+storage types: `FleetStatus {snapshot, source, fetched_at, stale}`, `FleetQueueRow`, `Tunnel`,
+`MigrationReport`, `MigrationCount` and the CLI status summaries. Those are exported by
+`vowp schema` and have pages under [`docs/reference/schema/`](../reference/schema/README.md).
+`ControlConfig` and the setup plan/report types are CLI-local `Serialize` shapes (not protocol
+storage types); their fields are described in `v0.2/home-and-surfaces.md` §8 and §11.

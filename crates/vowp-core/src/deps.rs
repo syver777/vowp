@@ -19,7 +19,9 @@ use vowp_adapters::claude_code::{ClaudeCodeAdapter, ClaudeConfig};
 use vowp_adapters::cli::CliAdapter;
 use vowp_adapters::opencode::{OpencodeAdapter, OpencodeConfig};
 use vowp_adapters::proc::{Signal, signal_group};
-use vowp_protocol::{Adapter, Clock, Executor, HarnessKind, Log, NodeName, Timestamp, VowpConfig};
+use vowp_protocol::{
+    Adapter, Clock, Executor, HarnessKind, Log, NodeName, Project, ProjectName, Timestamp, VowpConfig,
+};
 use vowp_store::{NodePaths, Store};
 
 use crate::CoreError;
@@ -64,7 +66,42 @@ impl Deps {
     /// Each thread owns its connection: SQLite connections are not shared across threads.
     /// The store stamps rows with this node's injected clock.
     pub fn open_store(&self) -> Result<Store, CoreError> {
-        Ok(Store::open(&self.paths)?.with_clock(self.clock.clone()))
+        let global = Store::open_global(&self.paths)?.with_clock(self.clock.clone());
+        let projects = global.list_projects()?;
+        let real = projects
+            .iter()
+            .filter(|project| project.name.as_str() != "_node")
+            .count();
+        let name = if projects.iter().any(|project| project.name == self.config.project.name) {
+            self.config.project.name.clone()
+        } else if real == 1 {
+            projects
+                .iter()
+                .find(|project| project.name.as_str() != "_node")
+                .map(|project| project.name.clone())
+                .ok_or(vowp_store::StoreError::NoProject)?
+        } else if real == 0 {
+            let node = ProjectName::parse("_node")?;
+            if !projects.iter().any(|project| project.name == node) {
+                let now = self.clock.now();
+                global.upsert_project(&Project {
+                    name: node.clone(),
+                    path: self.paths.root().display().to_string(),
+                    remote_url: None,
+                    default_branch: "main".to_owned(),
+                    config: serde_json::json!({}),
+                    created_at: now,
+                    updated_at: now,
+                })?;
+            } else {
+                Store::create_project_db(&self.paths, &node)?;
+            }
+            node
+        } else {
+            return Err(CoreError::Store(vowp_store::StoreError::NoProject));
+        };
+        drop(global);
+        Ok(Store::open_with_project(&self.paths, &name)?.with_clock(self.clock.clone()))
     }
 }
 

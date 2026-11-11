@@ -32,6 +32,20 @@ pub enum StoreError {
         /// Highest version this binary knows.
         supported: i64,
     },
+    /// The operation named a project other than the one this handle is bound to.
+    #[error("wrong project: handle is bound to {bound:?}, operation names {found:?}")]
+    WrongProject {
+        /// Project this handle is attached to.
+        bound: vowp_protocol::ProjectName,
+        /// Project the operation named.
+        found: vowp_protocol::ProjectName,
+    },
+    /// A project-scoped operation ran on a handle with no project attached.
+    #[error("no project bound to this store handle")]
+    NoProject,
+    /// The database is still the v0.1 single-file schema and must be migrated.
+    #[error("schema v0.1 database: run `vowp migrate` before opening it")]
+    MigrationRequired,
     /// Stored data or a file could not be parsed or failed an integrity check.
     #[error("corrupt data in {path:?} (line {line:?}): {reason}")]
     Corrupt {
@@ -104,7 +118,8 @@ impl StoreError {
             | Self::SeqGap { .. }
             | Self::SessionMismatch { .. }
             | Self::Poisoned => ErrorKind::Conflict,
-            Self::InvalidInput(_) => ErrorKind::InvalidInput,
+            Self::InvalidInput(_) | Self::WrongProject { .. } | Self::NoProject => ErrorKind::InvalidInput,
+            Self::MigrationRequired => ErrorKind::Conflict,
             Self::SchemaTooNew { .. } | Self::Sqlite(_) | Self::Busy => ErrorKind::Db,
             Self::Corrupt { .. } | Self::Json(_) => ErrorKind::Parse,
             Self::Io { .. } => ErrorKind::Io,

@@ -4,9 +4,9 @@ The npm package for **VOWP** — a local-first supervisor for AI coding agents.
 It installs the prebuilt `vowp` binary for your platform; Rust is not
 required.
 
-> **Status: early release (0.1.0).** The v0.1 CLI is complete, but VOWP is
-> young and interfaces may still change. The source, documentation and issue
-> tracker live at [github.com/syver777/vowp](https://github.com/syver777/vowp).
+> **Status: early release (0.2.0).** The v0.2 command surface is complete, but
+> VOWP is young and interfaces may still change. The source, documentation and
+> issue tracker live at [github.com/syver777/vowp](https://github.com/syver777/vowp).
 
 ## Install
 

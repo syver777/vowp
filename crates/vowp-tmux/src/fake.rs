@@ -76,6 +76,15 @@ impl FakeWindows {
         self.state().killed.clone()
     }
 
+    /// Whether the fake manager still holds this session.
+    ///
+    /// Real tmux drops a session when its last window dies. Tests use this to assert that
+    /// `project archive`/`project rm` called `kill_session` instead of only killing the
+    /// windows and leaving an empty session object behind.
+    pub fn has_session(&self, session: &str) -> bool {
+        self.state().sessions.contains_key(session)
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         match self.inner.lock() {
             Ok(guard) => guard,
@@ -190,6 +199,24 @@ impl WindowManager for FakeWindows {
             }
         }
         state.killed.push((session.to_owned(), name.to_owned()));
+        Ok(())
+    }
+
+    fn kill_session(&self, session: &str) -> Result<(), TmuxError> {
+        require_vowp_session(session)?;
+        let mut state = self.state();
+        let untagged = state
+            .sessions
+            .get(session)
+            .and_then(|found| found.windows.iter().find(|window| !window.tagged))
+            .map(|window| window.name.clone());
+        if let Some(name) = untagged {
+            return Err(TmuxError::NotTagged {
+                session: session.to_owned(),
+                name,
+            });
+        }
+        state.sessions.remove(session);
         Ok(())
     }
 
@@ -338,6 +365,37 @@ mod tests {
         fake.kill_window("vowp-demo", "job-1").unwrap();
         assert_eq!(fake.killed(), vec![("vowp-demo".to_owned(), "job-1".to_owned())]);
         assert!(!fake.window_exists("vowp-demo", "job-1").unwrap());
+    }
+
+    #[test]
+    fn fake_kill_session_removes_the_session_and_refuses_untagged_windows() {
+        let fake = FakeWindows::new();
+        let spec = LayoutSpec {
+            board: vec!["sleep".to_owned(), "30".to_owned()],
+            supervisor: vec!["sleep".to_owned(), "30".to_owned()],
+            planner: vec!["sleep".to_owned(), "30".to_owned()],
+            keeper: vec!["sleep".to_owned(), "30".to_owned()],
+            inbox: vec!["sleep".to_owned(), "30".to_owned()],
+            cwd: None,
+        };
+        fake.ensure_layout("demo", &spec).expect("layout");
+        assert!(fake.has_session("vowp-demo"));
+        fake.kill_session("vowp-demo").expect("kill session");
+        assert!(!fake.has_session("vowp-demo"), "the session object is gone");
+        assert!(fake.list_windows("vowp-demo").unwrap().is_empty());
+
+        // A foreign untagged window blocks the session kill and survives.
+        fake.ensure_layout("demo", &spec).expect("layout again");
+        fake.untagged_window("vowp-demo", "foreign");
+        assert!(matches!(
+            fake.kill_session("vowp-demo"),
+            Err(TmuxError::NotTagged { .. })
+        ));
+        assert!(fake.has_session("vowp-demo"));
+        assert!(fake.window_exists("vowp-demo", "foreign").unwrap());
+
+        // A missing session is a no-op.
+        fake.kill_session("vowp-absent").expect("missing session");
     }
 
     #[test]

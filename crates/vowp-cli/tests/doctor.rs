@@ -120,6 +120,29 @@ fn doctor_flags_invalid_cron_schedule() {
 }
 
 #[test]
+fn doctor_fails_when_snapshot_tmp_is_not_a_writable_directory() {
+    let env = common::TestEnv::new();
+    let tmp = env.home_path().join("tmp");
+    std::fs::remove_dir_all(&tmp).expect("remove tmp dir");
+    std::fs::write(&tmp, b"not a directory").expect("replace tmp with a file");
+
+    let bin = fake_bin();
+    let output = run_doctor(&env, bin.path());
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "doctor must fail; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor prints JSON");
+    let snapshot = find_check(&value, "snapshot");
+    assert_eq!(snapshot["status"], "fail", "{snapshot}");
+    let detail = snapshot["detail"].as_str().expect("detail");
+    assert!(detail.contains("tmp"), "the check names tmp/: {detail}");
+}
+
+#[test]
 fn doctor_accepts_valid_schedules() {
     let env = common::TestEnv::new();
     write_schedules(

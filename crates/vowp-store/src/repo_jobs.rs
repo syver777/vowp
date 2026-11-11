@@ -145,9 +145,10 @@ impl Store {
     /// Errors: [`StoreError::Conflict`] for a duplicate id, [`StoreError::NotFound`] for an
     /// unknown project or need.
     pub fn insert_job(&self, project: &ProjectName, new: &NewJob, created_by: &str) -> Result<Job, StoreError> {
+        let bound = self.check_bound(project)?;
         self.transaction(|tx| {
-            if tx.project(project)?.is_none() {
-                return Err(StoreError::not_found("project", project.as_str()));
+            if tx.project(&bound)?.is_none() {
+                return Err(StoreError::not_found("project", bound.as_str()));
             }
             if tx.job_exists(&new.id)? {
                 return Err(StoreError::Conflict(format!("job {} already exists", new.id)));
@@ -168,7 +169,7 @@ impl Store {
             let report = format!(".vowp/jobs/{}/report.md", new.id.as_str());
 
             tx.conn.execute(
-                "INSERT INTO jobs (
+                "INSERT INTO project.jobs (
                     id, project, title, kind, role, profile, state, priority, owns_json, reads_json,
                     brief_path, report_path, gates_json, loop_json, branch, worktree, attempts, continues,
                     hang_restarts, parked_reason, note, created_by, last_progress_at, state_changed_at,
@@ -179,7 +180,7 @@ impl Store {
                  )",
                 params![
                     new.id.as_str(),
-                    project.as_str(),
+                    bound.as_str(),
                     new.title,
                     enum_to_text(&new.kind)?,
                     role_text,
@@ -198,7 +199,7 @@ impl Store {
 
             for need in &new.needs {
                 tx.conn.execute(
-                    "INSERT OR IGNORE INTO edges (src, dst, kind, created_at) VALUES (?1, ?2, 'needs', ?3)",
+                    "INSERT OR IGNORE INTO project.edges (src, dst, kind, created_at) VALUES (?1, ?2, 'needs', ?3)",
                     params![new.id.as_str(), need.as_str(), now_text],
                 )?;
             }
@@ -209,10 +210,11 @@ impl Store {
 
     /// Returns the job called `id`, with `needs` filled from the edge rows.
     pub fn job(&self, id: &JobId) -> Result<Option<Job>, StoreError> {
+        let bound = self.require_bound()?;
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
+                &format!("SELECT {JOB_COLUMNS} FROM project.jobs WHERE id = ?1"),
                 [id.as_str()],
                 read_job_row,
             )
@@ -221,6 +223,12 @@ impl Store {
             None => Ok(None),
             Some(raw) => {
                 let mut job = job_from_row(raw)?;
+                if job.project != bound {
+                    return Err(crate::convert::corrupt(
+                        "jobs.project",
+                        format!("row names {} but the handle is bound to {bound}", job.project),
+                    ));
+                }
                 job.needs = self.needs_of(id)?;
                 Ok(Some(job))
             }
@@ -234,7 +242,11 @@ impl Store {
 
     /// Lists jobs matching `filter`, ordered by priority descending, then creation time, then id.
     pub fn list_jobs(&self, filter: &JobFilter) -> Result<Vec<Job>, StoreError> {
-        let mut query = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE 1 = 1");
+        let bound = match &filter.project {
+            Some(project) => self.check_bound(project)?,
+            None => self.require_bound()?,
+        };
+        let mut query = format!("SELECT {JOB_COLUMNS} FROM project.jobs WHERE 1 = 1");
         let mut values: Vec<Box<dyn ToSql>> = Vec::new();
         if let Some(project) = &filter.project {
             query.push_str(" AND project = ?");
@@ -275,6 +287,12 @@ impl Store {
         let mut jobs = Vec::new();
         for row in rows {
             let mut job = job_from_row(row?)?;
+            if job.project != bound {
+                return Err(crate::convert::corrupt(
+                    "jobs.project",
+                    format!("row names {} but the handle is bound to {bound}", job.project),
+                ));
+            }
             job.needs = self.needs_of(&job.id)?;
             jobs.push(job);
         }
@@ -296,7 +314,7 @@ impl Store {
                 None
             };
             tx.conn.execute(
-                "UPDATE jobs SET state = ?1, state_changed_at = ?2, updated_at = ?2,
+                "UPDATE project.jobs SET state = ?1, state_changed_at = ?2, updated_at = ?2,
                     note = COALESCE(?3, note), parked_reason = ?4
                  WHERE id = ?5",
                 params![enum_to_text(&state)?, now, change.note.as_deref(), parked, id.as_str()],
@@ -312,49 +330,49 @@ impl Store {
             let now = ts_to_text(tx.clock().now());
             if let Some(title) = &patch.title {
                 tx.conn.execute(
-                    "UPDATE jobs SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET title = ?1, updated_at = ?2 WHERE id = ?3",
                     params![title, now, id.as_str()],
                 )?;
             }
             if let Some(priority) = patch.priority {
                 tx.conn.execute(
-                    "UPDATE jobs SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET priority = ?1, updated_at = ?2 WHERE id = ?3",
                     params![priority, now, id.as_str()],
                 )?;
             }
             if let Some(profile) = &patch.profile {
                 tx.conn.execute(
-                    "UPDATE jobs SET profile = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET profile = ?1, updated_at = ?2 WHERE id = ?3",
                     params![profile, now, id.as_str()],
                 )?;
             }
             if let Some(owns) = &patch.owns {
                 tx.conn.execute(
-                    "UPDATE jobs SET owns_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET owns_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![json_to_text(owns)?, now, id.as_str()],
                 )?;
             }
             if let Some(reads) = &patch.reads {
                 tx.conn.execute(
-                    "UPDATE jobs SET reads_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET reads_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![json_to_text(reads)?, now, id.as_str()],
                 )?;
             }
             if let Some(gates) = &patch.gates {
                 tx.conn.execute(
-                    "UPDATE jobs SET gates_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET gates_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![json_to_text(gates)?, now, id.as_str()],
                 )?;
             }
             if let Some(loop_) = &patch.loop_ {
                 tx.conn.execute(
-                    "UPDATE jobs SET loop_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET loop_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![json_to_text(loop_)?, now, id.as_str()],
                 )?;
             }
             if let Some(note) = &patch.note {
                 tx.conn.execute(
-                    "UPDATE jobs SET note = ?1, updated_at = ?2 WHERE id = ?3",
+                    "UPDATE project.jobs SET note = ?1, updated_at = ?2 WHERE id = ?3",
                     params![note, now, id.as_str()],
                 )?;
             }
@@ -384,8 +402,9 @@ impl Store {
         continues: Option<u32>,
         hang_restarts: Option<u32>,
     ) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE jobs SET attempts = COALESCE(?1, attempts), continues = COALESCE(?2, continues),
+            "UPDATE project.jobs SET attempts = COALESCE(?1, attempts), continues = COALESCE(?2, continues),
                 hang_restarts = COALESCE(?3, hang_restarts), updated_at = ?4
              WHERE id = ?5",
             params![
@@ -409,8 +428,9 @@ impl Store {
         branch: Option<&str>,
         worktree: Option<&str>,
     ) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE jobs SET branch = ?1, worktree = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE project.jobs SET branch = ?1, worktree = ?2, updated_at = ?3 WHERE id = ?4",
             params![branch, worktree, ts_to_text(self.clock().now()), id.as_str()],
         )?;
         if changed == 0 {
@@ -421,8 +441,9 @@ impl Store {
 
     /// Moves `last_progress_at` forward to `at`, never backwards.
     pub fn touch_job_progress(&self, id: &JobId, at: Timestamp) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE jobs SET last_progress_at =
+            "UPDATE project.jobs SET last_progress_at =
                 CASE WHEN last_progress_at IS NULL OR last_progress_at < ?1 THEN ?1 ELSE last_progress_at END
              WHERE id = ?2",
             params![ts_to_text(at), id.as_str()],
@@ -435,8 +456,9 @@ impl Store {
 
     /// Replaces the job's status note.
     pub fn set_job_note(&self, id: &JobId, note: &str) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE jobs SET note = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE project.jobs SET note = ?1, updated_at = ?2 WHERE id = ?3",
             params![note, ts_to_text(self.clock().now()), id.as_str()],
         )?;
         if changed == 0 {
@@ -447,6 +469,7 @@ impl Store {
 
     /// Deletes a job only while it has not started: `pending`, `cancelled` or `replanned`.
     pub fn delete_job(&self, id: &JobId) -> Result<(), StoreError> {
+        self.require_bound()?;
         let job = self.require_job(id)?;
         if !matches!(job.state, JobState::Pending | JobState::Cancelled | JobState::Replanned) {
             return Err(StoreError::Conflict(format!(
@@ -455,12 +478,14 @@ impl Store {
                 job.state.as_str()
             )));
         }
-        self.conn.execute("DELETE FROM jobs WHERE id = ?1", [id.as_str()])?;
+        self.conn
+            .execute("DELETE FROM project.jobs WHERE id = ?1", [id.as_str()])?;
         Ok(())
     }
 
     /// Adds one edge; duplicate edges are ignored and self-edges are rejected.
     pub fn add_edge(&self, edge: &Edge) -> Result<(), StoreError> {
+        self.require_bound()?;
         if edge.src == edge.dst {
             return Err(StoreError::InvalidInput(
                 "edge source and destination are the same".to_owned(),
@@ -473,7 +498,7 @@ impl Store {
             return Err(StoreError::not_found("job (edge destination)", edge.dst.as_str()));
         }
         self.conn.execute(
-            "INSERT OR IGNORE INTO edges (src, dst, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO project.edges (src, dst, kind, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![
                 edge.src.as_str(),
                 edge.dst.as_str(),
@@ -486,8 +511,9 @@ impl Store {
 
     /// Removes one edge, returning whether a row was deleted.
     pub fn remove_edge(&self, edge: &Edge) -> Result<bool, StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "DELETE FROM edges WHERE src = ?1 AND dst = ?2 AND kind = ?3",
+            "DELETE FROM project.edges WHERE src = ?1 AND dst = ?2 AND kind = ?3",
             params![edge.src.as_str(), edge.dst.as_str(), enum_to_text(&edge.kind)?],
         )?;
         Ok(changed > 0)
@@ -495,11 +521,15 @@ impl Store {
 
     /// Lists edges, optionally restricted to those whose source is in `project`.
     pub fn list_edges(&self, project: Option<&ProjectName>) -> Result<Vec<Edge>, StoreError> {
+        let _bound = match project {
+            Some(project) => self.check_bound(project)?,
+            None => self.require_bound()?,
+        };
         let rows = match project {
             Some(project) => {
                 let mut statement = self.conn.prepare(
-                    "SELECT src, dst, kind FROM edges
-                     WHERE src IN (SELECT id FROM jobs WHERE project = ?1)
+                    "SELECT src, dst, kind FROM project.edges
+                     WHERE src IN (SELECT id FROM project.jobs WHERE project = ?1)
                      ORDER BY src, dst, kind",
                 )?;
                 let rows = statement.query_map([project.as_str()], read_edge_row)?;
@@ -508,7 +538,7 @@ impl Store {
             None => {
                 let mut statement = self
                     .conn
-                    .prepare("SELECT src, dst, kind FROM edges ORDER BY src, dst, kind")?;
+                    .prepare("SELECT src, dst, kind FROM project.edges ORDER BY src, dst, kind")?;
                 let rows = statement.query_map([], read_edge_row)?;
                 collect_edges(rows)?
             }
@@ -518,18 +548,20 @@ impl Store {
 
     /// Lists every edge that touches `id` as source or destination.
     pub fn edges_of(&self, id: &JobId) -> Result<Vec<Edge>, StoreError> {
+        self.require_bound()?;
         let mut statement = self
             .conn
-            .prepare("SELECT src, dst, kind FROM edges WHERE src = ?1 OR dst = ?1 ORDER BY src, dst, kind")?;
+            .prepare("SELECT src, dst, kind FROM project.edges WHERE src = ?1 OR dst = ?1 ORDER BY src, dst, kind")?;
         let rows = statement.query_map([id.as_str()], read_edge_row)?;
         collect_edges(rows)
     }
 
     /// Returns the destinations of the `needs` edges whose source is `id`.
     pub fn needs_of(&self, id: &JobId) -> Result<Vec<JobId>, StoreError> {
+        self.require_bound()?;
         let mut statement = self
             .conn
-            .prepare("SELECT dst FROM edges WHERE src = ?1 AND kind = 'needs' ORDER BY dst")?;
+            .prepare("SELECT dst FROM project.edges WHERE src = ?1 AND kind = 'needs' ORDER BY dst")?;
         let rows = statement.query_map([id.as_str()], |row| row.get::<_, String>(0))?;
         let mut needs = Vec::new();
         for row in rows {
@@ -541,9 +573,10 @@ impl Store {
 
     /// Returns the sources of the `needs` edges whose destination is `id`.
     pub fn dependents_of(&self, id: &JobId) -> Result<Vec<JobId>, StoreError> {
+        self.require_bound()?;
         let mut statement = self
             .conn
-            .prepare("SELECT src FROM edges WHERE dst = ?1 AND kind = 'needs' ORDER BY src")?;
+            .prepare("SELECT src FROM project.edges WHERE dst = ?1 AND kind = 'needs' ORDER BY src")?;
         let rows = statement.query_map([id.as_str()], |row| row.get::<_, String>(0))?;
         let mut dependents = Vec::new();
         for row in rows {
@@ -559,17 +592,27 @@ impl Store {
     /// implement `Ord`, so a `BTreeMap<JobState, u32>` cannot be built without changing the
     /// protocol crate.
     pub fn count_jobs_by_state(&self, project: Option<&ProjectName>) -> Result<BTreeMap<String, u32>, StoreError> {
+        match project {
+            Some(project) => {
+                self.check_bound(project)?;
+            }
+            None => {
+                self.require_bound()?;
+            }
+        }
         let mut counts = BTreeMap::new();
         if let Some(project) = project {
             let mut statement = self
                 .conn
-                .prepare("SELECT state, COUNT(*) FROM jobs WHERE project = ?1 GROUP BY state")?;
+                .prepare("SELECT state, COUNT(*) FROM project.jobs WHERE project = ?1 GROUP BY state")?;
             let rows = statement.query_map([project.as_str()], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })?;
             collect_state_counts(rows, &mut counts)?;
         } else {
-            let mut statement = self.conn.prepare("SELECT state, COUNT(*) FROM jobs GROUP BY state")?;
+            let mut statement = self
+                .conn
+                .prepare("SELECT state, COUNT(*) FROM project.jobs GROUP BY state")?;
             let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
             collect_state_counts(rows, &mut counts)?;
         }
@@ -578,9 +621,10 @@ impl Store {
 
     /// Returns true when a job row with `id` exists.
     pub(crate) fn job_exists(&self, id: &JobId) -> Result<bool, StoreError> {
+        self.require_bound()?;
         Ok(self
             .conn
-            .query_row("SELECT 1 FROM jobs WHERE id = ?1", [id.as_str()], |_| Ok(()))
+            .query_row("SELECT 1 FROM project.jobs WHERE id = ?1", [id.as_str()], |_| Ok(()))
             .optional()?
             .is_some())
     }

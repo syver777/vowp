@@ -9,6 +9,8 @@ use vowp_protocol::{Cost, JobId, Node, NodeName, Project, ProjectName, Run, RunI
 use vowp_store::{NodePaths, Store, StoreError};
 
 const SCHEMA: &str = include_str!("../src/schema/001_init.sql");
+const GLOBAL_SCHEMA: &str = include_str!("../src/schema/global.sql");
+const PROJECT_SCHEMA: &str = include_str!("../src/schema/project.sql");
 
 /// Opens a file-backed store plus its temporary root.
 fn file_store() -> (TempDir, NodePaths, Store) {
@@ -48,10 +50,12 @@ fn schema_file_is_identical_to_design() {
 #[test]
 fn open_creates_schema_version_1() {
     let (_tmp, paths, store) = file_store();
-    assert_eq!(store.schema_version().expect("schema version"), 1);
+    assert_eq!(store.schema_version().expect("compat version"), 1);
+    assert_eq!(store.global_schema_version().expect("global version"), 2);
+    assert!(store.bound_project().is_none(), "a fresh home binds no project");
+    assert!(matches!(store.project_schema_version(), Err(StoreError::NoProject)));
 
-    let tables = schema_table_names(SCHEMA);
-    assert_eq!(tables.len(), 19, "the v0.1 schema declares 19 tables");
+    let tables = schema_table_names(GLOBAL_SCHEMA);
     let connection = Connection::open(paths.db_path()).expect("reopen for inspection");
     for table in tables {
         let found: i64 = connection
@@ -61,24 +65,40 @@ fn open_creates_schema_version_1() {
                 |row| row.get(0),
             )
             .expect("table lookup");
-        assert_eq!(found, 1, "missing table {table}");
+        assert_eq!(found, 1, "missing global table {table}");
     }
+    let project_tables = schema_table_names(PROJECT_SCHEMA);
+    assert_eq!(project_tables.len(), 10, "the project schema declares ten tables");
+
+    let project = ProjectName::parse("proj").expect("project");
+    store
+        .upsert_project(&Project {
+            name: project.clone(),
+            path: "/tmp/proj".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            config: serde_json::json!({}),
+            created_at: Timestamp::parse("2026-01-01T00:00:00.000Z").expect("time"),
+            updated_at: Timestamp::parse("2026-01-01T00:00:00.000Z").expect("time"),
+        })
+        .expect("create project");
+    assert_eq!(store.bound_project(), Some(&project));
+    assert_eq!(store.project_schema_version().expect("project version"), 1);
+    let project_conn = Connection::open(paths.project_db_path(&project)).expect("project db");
+    let version: i64 = project_conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("project user_version");
+    assert_eq!(version, 1);
 
     let mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .expect("journal mode");
     assert_eq!(mode.to_ascii_lowercase(), "wal");
 
-    // foreign_keys is per connection; prove it is enabled on the store by triggering an FK.
+    let unbound = Store::open_global(&paths).expect("global handle");
     let run = sample_run(JobId::parse("no-such-job").expect("job id"));
-    let error = match store.insert_run(&run) {
-        Ok(()) => panic!("foreign key must be enforced"),
-        Err(error) => error,
-    };
-    assert!(
-        matches!(error, StoreError::InvalidInput(_)),
-        "expected an FK-driven InvalidInput, got {error:?}"
-    );
+    let error = unbound.insert_run(&run).expect_err("unbound handle");
+    assert!(matches!(error, StoreError::NoProject), "got {error:?}");
 }
 
 #[test]
@@ -100,7 +120,7 @@ fn open_refuses_newer_schema() {
     match error {
         StoreError::SchemaTooNew { found, supported } => {
             assert_eq!(found, 99);
-            assert_eq!(supported, 1);
+            assert_eq!(supported, 2);
         }
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }

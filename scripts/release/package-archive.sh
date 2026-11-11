@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/release/package-archive.sh \
-#     --version 0.1.0 \
+#     --version 0.2.0 \
 #     --target x86_64-unknown-linux-gnu \
 #     --binary target/x86_64-unknown-linux-gnu/release/vowp \
 #     --dist dist

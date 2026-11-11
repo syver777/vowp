@@ -145,7 +145,8 @@ doctor_check_ok() {
 # --- Templates -------------------------------------------------------------
 
 assert_contains "$SCRIPTS_DIR/vowp.service" 'ExecStart=%h/.local/bin/vowp up --foreground'
-assert_contains "$SCRIPTS_DIR/vowp.service" 'Restart=always'
+assert_contains "$SCRIPTS_DIR/vowp.service" 'Restart=on-failure'
+assert_not_contains "$SCRIPTS_DIR/vowp.service" 'Restart=always'
 assert_contains "$SCRIPTS_DIR/vowp.service" 'RestartSec=5'
 assert_contains "$SCRIPTS_DIR/vowp.service" 'WantedBy=default.target'
 assert_contains "$SCRIPTS_DIR/vowp-watchdog.cron" '*/5 * * * *'

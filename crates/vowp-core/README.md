@@ -1,6 +1,6 @@
 # vowp-core
 
-The supervisor core of [VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI coding
+The supervisor core of [VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI coding
 agents. This crate is part of the VOWP workspace.
 
 ## What it provides
@@ -19,7 +19,7 @@ contains the rules; the `vowp` binary wires them to the command line.
 
 ## Status
 
-VOWP 0.1.0 is an early release. Some supervisor loops are merged but not yet complete against the design
+VOWP 0.2.0 is an early release. Some supervisor loops are merged but not yet complete against the design
 spec; the release notes list the known gaps. The Rust API is not yet stable while VOWP is in 0.x.
 
 ## Links

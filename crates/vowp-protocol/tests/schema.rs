@@ -26,8 +26,8 @@ use vowp_protocol::run::{Run, Worker};
 use vowp_protocol::schema::{all_schemas, schema_for_name};
 use vowp_protocol::session::{Session, Switch};
 
-/// The type names rule 12 of the crate spec requires.
-const LISTED_TYPES: [&str; 27] = [
+/// The type names rule 12 of the crate spec requires, plus the v0.2 documents.
+const LISTED_TYPES: &[&str] = &[
     "EventEnvelope",
     "Capsule",
     "CapsuleDraft",
@@ -55,6 +55,51 @@ const LISTED_TYPES: [&str; 27] = [
     "Profile",
     "Edge",
     "LedgerEntry",
+    "HostSample",
+    "RunUsage",
+    "UsageEstimate",
+    "WaitReason",
+    "BrakeState",
+    "CapacityTarget",
+    "CapacityAdvice",
+    "CapacityReport",
+    "RunningCapacity",
+    "WaitingJob",
+    "CapacitySnapshot",
+    "Surface",
+    "Lease",
+    "SurfaceRef",
+    "LeaseStatus",
+    "TakeoverReport",
+    "RemoteEvent",
+    "RemoteLine",
+    "IngestAck",
+    "TurnGrant",
+    "OrchestratorCard",
+    "JoinInstructions",
+    "Snapshot",
+    "SupervisorSnapshot",
+    "ProjectEntry",
+    "ProjectSnapshot",
+    "RunningJobCard",
+    "BlockedJobCard",
+    "QueueJobCard",
+    "MergeCard",
+    "GateFailureCard",
+    "InboxSummary",
+    "SessionSurfaceCard",
+    "CatalogEntry",
+    "GcReport",
+    "GcClassReport",
+    "BackupReport",
+    "BackupFile",
+    "SecretInfo",
+    "SecretRequest",
+    "FleetStatus",
+    "FleetQueueRow",
+    "Tunnel",
+    "MigrationReport",
+    "MigrationCount",
 ];
 
 /// Decodes one JSON value into a concrete type.

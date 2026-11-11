@@ -48,6 +48,8 @@ pub enum SessionRole {
     Verifier,
     /// A human-started session.
     User,
+    /// A fleet-wide or project-bound orchestrator session.
+    Orchestrator,
 }
 
 /// Where an event came from: the harness, and optionally its model, node and native session.
@@ -724,6 +726,8 @@ pub enum SwitchReason {
     Failover,
     /// The preferred rung became available again.
     ProbeBack,
+    /// Another surface took the session over.
+    Takeover,
 }
 
 /// Payload of `switch`.

@@ -6,7 +6,8 @@ trigger a loop (for example the planner), or run a command. Schedules are rows i
 `vowp.toml`.
 
 > **Status: current.** The schedule engine, `vowp doctor` validation and the `vowp schedule` commands
-> are implemented.
+> are implemented. Schedules are per project; with several projects on the home, select a checkout,
+> pass `--project <name>`, or use `--all` where the command supports it.
 
 ## Add a schedule
 
@@ -30,7 +31,7 @@ Options:
 | Flag | Meaning |
 |---|---|
 | `--name <name>` | Stable schedule name; unique per project. |
-| `--tz <UTC\|+HH:MM>` | Evaluation timezone. v0.1 supports `UTC` and fixed offsets only. |
+| `--tz <UTC\|+HH:MM>` | Evaluation timezone. VOWP supports `UTC` and fixed offsets only. |
 | `--missed run_once\|skip` | What to do when a run was missed while the node was down. |
 | `--template-file <path>` | `NewJob` JSON for `job-template`. |
 
@@ -41,13 +42,14 @@ cron or an interval under 60 seconds exits 2.
 
 ```sh
 vowp schedule ls
+vowp schedule --all ls
 vowp schedule pause daily-backup
 vowp schedule resume daily-backup
 vowp schedule rm daily-backup
 ```
 
-`ls` prints `NAME SPEC ACTION STATE LAST NEXT STATUS`. A paused schedule keeps its row and next-run
-calculation but does not fire. `rm` deletes it.
+`ls` prints `NAME SPEC ACTION STATE LAST NEXT STATUS`; `--all` adds every project's rows on the home.
+A paused schedule keeps its row and next-run calculation but does not fire. `rm` deletes it.
 
 ## Or declare schedules in `vowp.toml`
 
@@ -118,4 +120,4 @@ Loops are the supervisor's own periodic work (L1–L9); schedules are user-defin
 Pause a loop with `vowp loops pause <name>` when you want to stop that category of work; pause
 a schedule when you want to stop one cron entry. Neither cancels a run that is already in progress.
 
-Next: [operating a node](operating.md) for the loop table and backups.
+Next: [operating a home](operating.md) for the loop table and backups.

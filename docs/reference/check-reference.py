@@ -2,8 +2,9 @@
 """Check the committed reference pages against the binary's command and schema constants.
 
 This is the acceptance check for the reference docs: the CLI page must cover exactly the
-`V0_1_COMMANDS` constant (the same set `help_lists_every_v0_1_command` asserts), and every
-type exported by `vowp_protocol::schema::all_schemas` must have a parseable schema page.
+`V0_1_COMMANDS` and `V0_2_COMMANDS` constants (the same set `help_lists_every_v0_1_command`
+asserts), and every type exported by `vowp_protocol::schema::all_schemas` must have a parseable
+schema page.
 
 It reads repository files only, so it runs without a built binary. Use
 `python3 docs/reference/generate.py --check` to also compare the pages with fresh output.
@@ -30,12 +31,17 @@ def fail(message: str) -> None:
     print(f"FAIL  reference: {message}", file=sys.stderr)
 
 
-def top_level_commands() -> list[str]:
+def command_const(name: str) -> list[str]:
     text = CLI_RS.read_text(encoding="utf-8")
-    match = re.search(r"pub const V0_1_COMMANDS:.*?=\s*&\[(.*?)\];", text, re.DOTALL)
+    match = re.search(rf"pub const {name}:.*?=\s*&\[(.*?)\];", text, re.DOTALL)
     if not match:
-        raise SystemExit(f"cannot parse V0_1_COMMANDS from {CLI_RS}")
+        raise SystemExit(f"cannot parse {name} from {CLI_RS}")
     return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def top_level_commands() -> list[str]:
+    commands = command_const("V0_1_COMMANDS") + command_const("V0_2_COMMANDS")
+    return list(dict.fromkeys(commands))
 
 
 def schema_names() -> list[str]:
@@ -79,12 +85,12 @@ def check_cli() -> list[str]:
     missing = [name for name in expected if name not in documented]
     extra = [name for name in documented if name not in expected]
     if missing:
-        failures.append("commands in V0_1_COMMANDS but not in cli.md: " + ", ".join(missing))
+        failures.append("commands in V0_1_COMMANDS/V0_2_COMMANDS but not in cli.md: " + ", ".join(missing))
     if extra:
-        failures.append("commands in cli.md but not in V0_1_COMMANDS: " + ", ".join(extra))
+        failures.append("commands in cli.md but not in V0_1_COMMANDS/V0_2_COMMANDS: " + ", ".join(extra))
     for path, number in sections:
         if path and path[0] not in expected:
-            failures.append(f"cli.md:{number}: `vowp {' '.join(path)}` is not in V0_1_COMMANDS")
+            failures.append(f"cli.md:{number}: `vowp {' '.join(path)}` is not in V0_1_COMMANDS/V0_2_COMMANDS")
     if "__window" in expected and "__window" not in documented:
         failures.append("the hidden __window command is missing from cli.md")
     return failures
@@ -154,8 +160,9 @@ def main() -> int:
     commands = top_level_commands()
     schemas = schema_names()
     print(
-        f"PASS  reference: cli.md covers {len(commands)} V0_1_COMMANDS "
-        f"(including hidden __window) and {len(schemas)} JSON Schema pages parse"
+        f"PASS  reference: cli.md covers {len(commands)} top-level commands "
+        f"(V0_1_COMMANDS + V0_2_COMMANDS, hidden interfaces included) "
+        f"and {len(schemas)} JSON Schema pages parse"
     )
     return 0
 

@@ -1,7 +1,8 @@
-# v0.2 — phone-friendly board
+# v0.3 — phone-friendly board
 
-Status: current for the commands shown; this note is design only. v0.1 has a terminal board
-(`vowp board`) and no browser UI.
+Status: moved from `docs/design/v0.2/` by the v0.2 spec; planned for v0.3, not v0.2. In v0.2 the
+phone uses an SSH app and `vowp chat`, so no browser board is needed. This note is design only.
+v0.1 has a terminal board (`vowp board`) and no browser UI.
 
 ## Goal
 

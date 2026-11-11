@@ -9,8 +9,8 @@ mod support;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use support::fake_adapter::FakeAdapter;
@@ -18,18 +18,22 @@ use support::fake_git::FakeGit;
 use support::signal_child::shell_command;
 use tempfile::{TempDir, tempdir};
 use vowp_core::session::service::SessionService;
-use vowp_core::session::switch::{run_switch, run_switch_with_input};
-use vowp_core::{AdapterRegistry, CoreError, Deps};
+use vowp_core::session::switch::{DrainSleeper, run_switch, run_switch_with_input, run_switch_with_sleeper};
+use vowp_core::{AdapterRegistry, CommandOutput, CommandRunner, CommandSpec, CoreError, Deps};
 use vowp_protocol::{
     Actor, Adapter, AdapterCapabilities, AdapterError, AdapterRun, AssistantMessage, AttachAction, CancelToken, Clock,
     Cost, EventBody, EventEnvelope, EventId, EventIndexRow, EventSource, EventType, Executor, ExecutorRef, FakeClock,
-    HarnessEvent, HarnessKind, Limit, LimitRowKind, MemoryLog, NodeName, ProbeResult, Run, RunId, RunOutcome,
-    RunPurpose, RunRole, RunSummary, SessionId, SessionOps, SessionRole, StartInput, StopReason, SwitchReason,
-    SwitchRequest, SwitchState, Timestamp, TurnRequest,
+    HarnessEvent, HarnessKind, Lease, Limit, LimitRowKind, MemoryLog, Node, NodeName, ProbeResult, Run, RunId,
+    RunOutcome, RunPurpose, RunRole, RunSummary, SecretName, SessionId, SessionOps, SessionRole, StartInput,
+    StopReason, Surface, SurfaceId, SurfaceKind, SwitchReason, SwitchRequest, SwitchState, Timestamp, TurnRequest,
 };
-use vowp_store::NodePaths;
+use vowp_store::session_files::list_capsule_files;
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
+use vowp_store::{NodePaths, Store};
 use vowp_tmux::fake::FakeWindows;
+
+/// Upper bound for asynchronous test waits: child markers, run rows and drain hooks.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn ts() -> Timestamp {
     Timestamp::parse("2026-11-08T18:00:00Z").expect("test timestamp")
@@ -126,6 +130,36 @@ fn create_session(service: &SessionService, tmp: &TempDir, name: &str) -> Sessio
     create_session_at(service, name, opencode(), tmp.path().join("project"))
 }
 
+fn surface(holder: &str) -> Surface {
+    Surface {
+        id: SurfaceId::new(),
+        kind: SurfaceKind::Chat,
+        node: node(),
+        holder: holder.to_owned(),
+        app: None,
+        cwd: None,
+        metadata: serde_json::json!({}),
+        created_at: ts(),
+        last_seen_at: ts(),
+    }
+}
+
+fn hold_lease(store: &Store, session: &SessionId, surface: &Surface) {
+    store.upsert_surface(surface).expect("surface");
+    store
+        .take_lease(&Lease {
+            session_id: session.clone(),
+            surface_id: Some(surface.id.clone()),
+            surface_kind: surface.kind,
+            node: surface.node.clone(),
+            holder: surface.holder.clone(),
+            token: vowp_protocol::surface::new_lease_token(),
+            acquired_at: ts(),
+            heartbeat_at: ts(),
+        })
+        .expect("lease");
+}
+
 fn request(session: &SessionId, to: Executor, reason: SwitchReason) -> SwitchRequest {
     SwitchRequest {
         session_id: session.clone(),
@@ -148,10 +182,10 @@ fn read_events(deps: &Deps, session: &SessionId) -> Vec<EventEnvelope> {
 /// Poll a file written asynchronously by a fake child until every `marker` appears.
 ///
 /// Signal handlers run asynchronously, so reading the file once right after the child
-/// is signalled can race under load. Re-read every 20 ms for up to 10 s, then panic
-/// with the file's actual contents.
+/// is signalled can race under load. Re-read every 20 ms up to [`WAIT_TIMEOUT`], then
+/// panic with the file's actual contents.
 fn wait_for_markers(path: &Path, markers: &[&str]) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WAIT_TIMEOUT;
     loop {
         let contents = std::fs::read_to_string(path).unwrap_or_default();
         if markers.iter().all(|marker| contents.contains(marker)) {
@@ -159,7 +193,7 @@ fn wait_for_markers(path: &Path, markers: &[&str]) -> String {
         }
         if Instant::now() >= deadline {
             panic!(
-                "timed out after 10s waiting for {markers:?} in {}; contents: {contents:?}",
+                "timed out after {WAIT_TIMEOUT:?} waiting for {markers:?} in {}; contents: {contents:?}",
                 path.display()
             );
         }
@@ -515,6 +549,55 @@ fn switch_happy_path_events_rows_and_lineage() {
 }
 
 #[test]
+fn switch_redacts_secret_from_written_capsule_file_and_row() {
+    let tmp = tempdir().expect("tempdir");
+    let secret = "switch-\"quoted\"\\path\nsecond line";
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new()
+            .with("opencode", Arc::new(capsule_adapter(&format!("handoff {secret}"))))
+            .with(
+                "claude-code",
+                Arc::new(FakeAdapter::new(HarnessKind::ClaudeCode, Vec::new())),
+            ),
+    );
+    let name = SecretName::parse("SWITCH_KEY").expect("secret name");
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, "switch redaction");
+    let store = deps.open_store().expect("store");
+
+    let switch = run_switch(
+        &deps,
+        &request(&session, claude(), SwitchReason::User),
+        &CancelToken::default(),
+    )
+    .expect("switch");
+
+    let marker = "[REDACTED:SWITCH_KEY]";
+    let capsule = store
+        .latest_capsule(&session)
+        .expect("latest capsule")
+        .expect("capsule row");
+    assert_eq!(capsule.intent, format!("handoff {marker}"));
+    assert_eq!(Some(&capsule.capsule_id), switch.capsule_id.as_ref());
+
+    let files = list_capsule_files(&deps.paths, &session).expect("capsule files");
+    assert!(!files.is_empty(), "the switch wrote a capsule file");
+    let escaped = serde_json::to_string(secret).expect("json-escape the secret");
+    let escaped = &escaped[1..escaped.len() - 1];
+    for path in files {
+        let text = std::fs::read_to_string(path).expect("read capsule file");
+        assert!(!text.contains(secret), "the capsule file does not hold the raw secret");
+        assert!(
+            !text.contains(escaped),
+            "the capsule file does not hold the JSON-escaped secret"
+        );
+        assert!(text.contains(marker), "the capsule file records the redaction");
+    }
+}
+
+#[test]
 fn session_ops_switch_uses_run_switch() {
     let tmp = tempdir().expect("tempdir");
     let deps = deps(
@@ -798,6 +881,226 @@ fn switch_target_probe_fails_stays_on_source() {
     );
 }
 
+/// A command runner that answers the remote doctor probe and records its argv.
+struct DoctorRunner {
+    calls: Arc<Mutex<Vec<CommandSpec>>>,
+    output: CommandOutput,
+}
+
+impl CommandRunner for DoctorRunner {
+    fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CoreError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(spec.clone());
+        Ok(self.output.clone())
+    }
+}
+
+#[test]
+fn remote_probe_uses_remote_node_and_switch() {
+    let tmp = tempdir().expect("tempdir");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let runner = Arc::new(DoctorRunner {
+        calls: Arc::clone(&calls),
+        output: CommandOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            output: br#"{"ok":true,"checks":[]}"#.to_vec(),
+            duration: Duration::from_millis(5),
+        },
+    });
+    let mut deps = deps(
+        &tmp,
+        AdapterRegistry::new().with("opencode", Arc::new(capsule_adapter("remote handoff"))),
+    );
+    deps.cmd = runner;
+    let store = deps.open_store().expect("store");
+    let now = store.clock().now();
+    store
+        .upsert_node(&Node {
+            name: NodeName::parse("laptop").expect("node"),
+            ssh_target: Some("laptop.example".to_owned()),
+            is_local: false,
+            capabilities: serde_json::json!({}),
+            last_seen_at: None,
+            created_at: now,
+        })
+        .expect("node row");
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, "remote switch");
+    let request = SwitchRequest {
+        session_id: session.clone(),
+        to: ExecutorRef {
+            executor: claude(),
+            node: Some(NodeName::parse("laptop").expect("node")),
+        },
+        reason: SwitchReason::User,
+        drain_secs: 5,
+    };
+    let switched = run_switch(&deps, &request, &CancelToken::default()).expect("remote switch");
+    assert_eq!(switched.state, SwitchState::Completed);
+    assert_eq!(switched.to_node.to_string(), "laptop");
+
+    let calls = calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(calls.len(), 1, "the remote probe ran once");
+    let argv = &calls[0].argv;
+    assert_eq!(argv[0], "ssh");
+    assert!(argv.iter().any(|part| part == "laptop.example"), "{argv:?}");
+    assert!(
+        argv.windows(2).any(|pair| pair[0] == "doctor" && pair[1] == "--json"),
+        "{argv:?}"
+    );
+    assert_eq!(
+        calls[0].timeout,
+        Duration::from_secs(30),
+        "the probe keeps the documented connect bound"
+    );
+
+    let store = deps.open_store().expect("store");
+    let row = store.require_session(&session).expect("session");
+    assert_eq!(row.executor, Some(claude()));
+    let events = read_events(&deps, &session);
+    assert!(
+        events.iter().any(|event| matches!(
+            event.body(),
+            Ok(EventBody::SessionExecutor(payload))
+                if payload.action == AttachAction::Attach
+                    && payload.node.to_string() == "laptop"
+        )),
+        "the switch attached the target on the laptop"
+    );
+}
+
+#[test]
+fn remote_probe_failure_keeps_source() {
+    let tmp = tempdir().expect("tempdir");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let runner = Arc::new(DoctorRunner {
+        calls: Arc::clone(&calls),
+        output: CommandOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            output: br#"{"ok":false,"checks":[{"name":"harness","status":"fail"}]}"#.to_vec(),
+            duration: Duration::from_millis(5),
+        },
+    });
+    let mut deps = deps(
+        &tmp,
+        AdapterRegistry::new().with("opencode", Arc::new(capsule_adapter("local source"))),
+    );
+    deps.cmd = runner;
+    let store = deps.open_store().expect("store");
+    let now = store.clock().now();
+    store
+        .upsert_node(&Node {
+            name: NodeName::parse("laptop").expect("node"),
+            ssh_target: Some("laptop.example".to_owned()),
+            is_local: false,
+            capabilities: serde_json::json!({}),
+            last_seen_at: None,
+            created_at: now,
+        })
+        .expect("node row");
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, "failed remote switch");
+    let request = SwitchRequest {
+        session_id: session.clone(),
+        to: ExecutorRef {
+            executor: claude(),
+            node: Some(NodeName::parse("laptop").expect("node")),
+        },
+        reason: SwitchReason::User,
+        drain_secs: 5,
+    };
+    let error = run_switch(&deps, &request, &CancelToken::default()).expect_err("failed probe aborts");
+    assert!(matches!(error, CoreError::SwitchAborted(_)), "got {error:?}");
+    let store = deps.open_store().expect("store");
+    let row = store.require_session(&session).expect("session");
+    assert_eq!(row.executor, Some(opencode()), "the source executor stays attached");
+    let switch = store
+        .list_switches(&session)
+        .expect("switches")
+        .into_iter()
+        .next()
+        .expect("switch row");
+    assert_eq!(switch.state, SwitchState::Aborted);
+    assert!(
+        switch.error.as_deref().is_some_and(|detail| detail.contains("probe")),
+        "{:?}",
+        switch.error
+    );
+    assert_eq!(
+        calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len(),
+        1,
+        "the failed probe ran once"
+    );
+}
+
+#[test]
+fn unregistered_switch_node_fails_probe() {
+    let tmp = tempdir().expect("tempdir");
+    // The local registry has a healthy target adapter. Before the fix the missing node
+    // row fell back to this probe and completed a "remote" switch without probing it.
+    let target = Arc::new(FakeAdapter::new(HarnessKind::ClaudeCode, Vec::new()));
+    let target_adapter: Arc<dyn Adapter> = target.clone();
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new()
+            .with("opencode", Arc::new(capsule_adapter("source handoff")))
+            .with("claude-code", target_adapter),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, "ghost switch");
+    let ghost = NodeName::parse("ghost").expect("node");
+    let request = SwitchRequest {
+        session_id: session.clone(),
+        to: ExecutorRef {
+            executor: claude(),
+            node: Some(ghost.clone()),
+        },
+        reason: SwitchReason::User,
+        drain_secs: 5,
+    };
+
+    let error =
+        run_switch(&deps, &request, &CancelToken::default()).expect_err("an unregistered node must fail the probe");
+    assert!(matches!(error, CoreError::SwitchAborted(_)), "got {error:?}");
+
+    let store = deps.open_store().expect("store");
+    let row = store.require_session(&session).expect("session");
+    assert_eq!(row.executor, Some(opencode()), "the source stays attached");
+    let switch = store
+        .list_switches(&session)
+        .expect("switches")
+        .into_iter()
+        .next()
+        .expect("switch row");
+    assert_eq!(switch.state, SwitchState::Aborted);
+    assert!(
+        switch.error.as_deref().is_some_and(|detail| detail.contains("probe")),
+        "{:?}",
+        switch.error
+    );
+    assert!(
+        target.starts().is_empty(),
+        "the local adapter was started for a node it cannot represent"
+    );
+    let events = read_events(&deps, &session);
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.body(),
+            Ok(EventBody::SessionExecutor(payload))
+                if payload.action == AttachAction::Attach && payload.node == ghost
+        )),
+        "the switch attached the target on the unregistered node"
+    );
+    assert!(
+        !events.iter().any(|event| event.event_type == EventType::Capsule),
+        "no capsule is written for an unregistered target"
+    );
+}
+
 #[test]
 fn switch_drain_timeout_interrupts_after_5s_fakeclock() {
     let tmp = tempdir().expect("tempdir");
@@ -832,7 +1135,9 @@ fn switch_drain_timeout_interrupts_after_5s_fakeclock() {
         worker_service.run_turn(turn(&worker_session, opencode(), "long running turn"), &worker_cancel)
     });
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The worker thread inserts its run row asynchronously. Under parallel test load
+    // that can take longer than a couple of seconds, so poll up to the shared bound.
+    let deadline = Instant::now() + WAIT_TIMEOUT;
     let mut active_run = None;
     while Instant::now() < deadline {
         let open = store.open_runs().expect("open runs");
@@ -845,7 +1150,7 @@ fn switch_drain_timeout_interrupts_after_5s_fakeclock() {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let active_run = active_run.expect("the service run is active");
+    let active_run = active_run.expect("the service run is active within the wait bound");
 
     // The fake child writes `ready` only after both traps are installed. Wait for it
     // before the switch can reach its signal phase; otherwise a fast fake clock can
@@ -1063,6 +1368,45 @@ fn switch_seed_rejected_retries_capsule_only_then_aborts() {
     assert_eq!(last_attach, opencode());
 }
 
+/// A sleeper that hands the first drain poll to a writer and waits for its append.
+///
+/// The drained-limit test must append `TurnEnded{Limit}` after the drain has captured
+/// its start sequence but before the next poll. A fixed sleep raced with the switch
+/// startup under load; the first drain sleep is the deterministic point to append.
+struct FirstDrainPoll {
+    ready: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    appended: Mutex<Receiver<()>>,
+}
+
+impl FirstDrainPoll {
+    fn new(ready: std::sync::mpsc::Sender<()>, appended: Receiver<()>) -> Self {
+        Self {
+            ready: Mutex::new(Some(ready)),
+            appended: Mutex::new(appended),
+        }
+    }
+}
+
+impl DrainSleeper for FirstDrainPoll {
+    fn sleep(&self, duration: Duration) {
+        let sender = self
+            .ready
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            sender.send(()).expect("writer waits for the drain poll");
+            self.appended
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(WAIT_TIMEOUT)
+                .expect("writer appends the limit event");
+        } else {
+            std::thread::sleep(duration);
+        }
+    }
+}
+
 #[test]
 fn switch_drained_limit_then_capsule_failure_restores_blocked() {
     let tmp = tempdir().expect("tempdir");
@@ -1088,11 +1432,15 @@ fn switch_drained_limit_then_capsule_failure_restores_blocked() {
         EventBody::TurnStarted(vowp_protocol::TurnStarted { turn: 1 }),
     );
 
+    let (ready_tx, ready_rx) = channel();
+    let (appended_tx, appended_rx) = channel();
     let writer = {
         let deps = deps.clone();
         let session = session.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            ready_rx
+                .recv_timeout(WAIT_TIMEOUT)
+                .expect("drain reaches its first poll");
             append_event(
                 &deps,
                 &session,
@@ -1102,13 +1450,16 @@ fn switch_drained_limit_then_capsule_failure_restores_blocked() {
                     duration_ms: None,
                 }),
             );
+            appended_tx.send(()).expect("sleeper waits for the append");
         })
     };
 
-    let error = run_switch(
+    let sleeper = FirstDrainPoll::new(ready_tx, appended_rx);
+    let error = run_switch_with_sleeper(
         &deps,
         &request(&session, claude(), SwitchReason::Failover),
         &CancelToken::default(),
+        &sleeper,
     )
     .expect_err("capsule failure aborts after the drained limit");
     writer.join().expect("writer");
@@ -1243,6 +1594,107 @@ fn seeded_switch_outside_cwd_is_refused() {
     let current = store.require_session(&session).expect("session");
     assert_eq!(current.state, vowp_protocol::SessionState::Idle);
     assert_eq!(current.executor, Some(opencode()));
+}
+
+#[test]
+fn takeover_from_orchestrator_cwd_writes_valid_capsule() {
+    let tmp = tempdir().expect("tempdir");
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new().with("opencode", Arc::new(capsule_adapter("orchestrator takeover handoff"))),
+    );
+    let orchestrator_cwd = deps.paths.root().join("orchestrators").join("night");
+    std::fs::create_dir_all(&orchestrator_cwd).expect("orchestrator dir");
+    let service = SessionService::new(deps.clone());
+    let session = create_session_at(&service, "orchestrator takeover", opencode(), orchestrator_cwd);
+    let store = deps.open_store().expect("store");
+    hold_lease(&store, &session, &surface("laptop"));
+
+    let report = vowp_core::takeover(&deps, &store, &session, &surface("phone"), ts()).expect("takeover");
+
+    assert_eq!(report.previous.as_deref(), Some("laptop"));
+    assert!(!report.drained);
+    let capsule_id = report.capsule_id.expect("the takeover writes a capsule");
+    let capsule = store
+        .latest_capsule(&session)
+        .expect("latest capsule")
+        .expect("capsule");
+    assert_eq!(capsule.capsule_id, capsule_id);
+    assert_eq!(capsule.intent, "orchestrator takeover handoff");
+    capsule.validate().expect("the capsule is valid after the repair path");
+    let switches = store.list_switches(&session).expect("switches");
+    assert_eq!(switches.len(), 1);
+    assert_eq!(switches[0].state, SwitchState::Completed);
+    assert_eq!(switches[0].reason, SwitchReason::Takeover);
+}
+
+#[test]
+fn takeover_from_outside_cwd_is_refused() {
+    let tmp = tempdir().expect("tempdir");
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new().with("opencode", Arc::new(capsule_adapter("never written"))),
+    );
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("outside dir");
+    let service = SessionService::new(deps.clone());
+    let session = create_session_at(&service, "outside takeover", opencode(), outside);
+    let store = deps.open_store().expect("store");
+    hold_lease(&store, &session, &surface("laptop"));
+
+    let error = vowp_core::takeover(&deps, &store, &session, &surface("phone"), ts())
+        .expect_err("an unrelated cwd refuses the takeover");
+    assert!(
+        error.to_string().contains("outside the allow-list"),
+        "the allow-list error is preserved: {error:?}"
+    );
+    assert!(
+        store.latest_capsule(&session).expect("latest capsule").is_none(),
+        "a refused takeover writes no capsule"
+    );
+    assert_eq!(
+        store.require_session(&session).expect("session").executor,
+        Some(opencode())
+    );
+}
+
+#[test]
+fn seeded_switch_from_orchestrator_cwd_is_allowed() {
+    let tmp = tempdir().expect("tempdir");
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new()
+            .with("opencode", Arc::new(capsule_adapter("orchestrator seeded handoff")))
+            .with(
+                "claude-code",
+                Arc::new(FakeAdapter::new(HarnessKind::ClaudeCode, Vec::new())),
+            ),
+    );
+    let orchestrator_cwd = deps.paths.root().join("orchestrators").join("night");
+    std::fs::create_dir_all(&orchestrator_cwd).expect("orchestrator dir");
+    let service = SessionService::new(deps.clone());
+    let session = create_session_at(&service, "orchestrator seeded", opencode(), orchestrator_cwd);
+    let store = deps.open_store().expect("store");
+
+    let switch = run_switch_with_input(
+        &deps,
+        &request(&session, claude(), SwitchReason::User),
+        "continue",
+        &CancelToken::default(),
+    )
+    .expect("seeded switch from the VOWP orchestrator directory");
+
+    assert_eq!(switch.state, SwitchState::Completed);
+    let capsule = store
+        .latest_capsule(&session)
+        .expect("latest capsule")
+        .expect("capsule");
+    assert_eq!(Some(&capsule.capsule_id), switch.capsule_id.as_ref());
+    assert_eq!(capsule.intent, "orchestrator seeded handoff");
+    capsule.validate().expect("the capsule is valid after the repair path");
+    let current = store.require_session(&session).expect("session");
+    assert_eq!(current.executor, Some(claude()));
+    assert_eq!(current.state, vowp_protocol::SessionState::Idle);
 }
 
 #[test]

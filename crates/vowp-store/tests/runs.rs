@@ -214,7 +214,7 @@ fn run_lifecycle_and_open_runs() {
     assert!(matches!(error, vowp_store::StoreError::Conflict(_)), "got {error:?}");
 
     // The schema CHECK keeps ended_at and outcome in lockstep even for raw SQL.
-    let connection = Connection::open(fixture.paths.db_path()).expect("raw connection");
+    let connection = Connection::open(fixture.paths.project_db_path(&fixture.project)).expect("project raw connection");
     let error = connection
         .execute("UPDATE runs SET ended_at = NULL WHERE id = ?1", [run.id.as_str()])
         .expect_err("CHECK must reject half-finished state");

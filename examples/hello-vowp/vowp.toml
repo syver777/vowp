@@ -16,6 +16,10 @@ remote = "origin"
 default_branch = "main"
 check_cmds = []            # the merge queue has nothing repo-wide to run in this demo
 push = true                # origin is a local bare repository created by run.sh
+# run.sh replaces the placeholder with the absolute worktree root inside the temporary
+# checkout. The session cwd allow-list admits the project path and this root; keeping it
+# inside the checkout means a fresh home needs no extra `[node].cwd_allow` entry.
+worktree_root = "@WORKTREE_ROOT@"
 
 # All four profiles are required by VowpConfig::validate. The example only dispatches
 # worker jobs; planner and keeper are stubs in v0.1 and never start a turn here.

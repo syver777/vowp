@@ -6,7 +6,7 @@
 //! after the run's `turn.ended`. Capsules and seeds live in the sibling modules; this file
 //! wires them into the service and keeps the store's index rows in step with the log.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
@@ -116,6 +116,8 @@ impl SessionService {
             return Err(CoreError::Invalid("session is closed; no further turns".to_owned()));
         }
         self.check_cwd(&session.cwd)?;
+        // A live lease must match VOWP_LEASE_TOKEN.
+        crate::surface::check_lease(&self.deps, &store, &req.session_id)?;
         if cancel.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
@@ -136,7 +138,7 @@ impl SessionService {
             .saturating_add(1) as u32;
 
         let native = if adapter.capabilities().can_resume_native {
-            store.native_for(&req.session_id, executor.harness)?
+            native_for_node(&store, &req.session_id, executor.harness, &node)?
         } else {
             None
         };
@@ -233,6 +235,9 @@ impl SessionService {
         store.insert_run(&run)?;
         store.set_session_state(&req.session_id, SessionState::Running, Some(&executor))?;
 
+        // Inject exactly the configured secret names.
+        let mut start_env = self.start_env(&executor);
+        start_env.extend(crate::vault::env_for(&self.deps, &req)?);
         let start_input = vowp_protocol::StartInput {
             session_id: req.session_id.clone(),
             executor: executor.clone(),
@@ -240,7 +245,7 @@ impl SessionService {
             prompt,
             resume: native.clone(),
             new_native_id: native.is_none().then(|| self.fresh_native_id()),
-            env: self.start_env(&executor),
+            env: start_env,
             permission_mode: self
                 .harness_config(&executor)
                 .and_then(|config| config.permission_mode.clone()),
@@ -443,12 +448,17 @@ impl SessionService {
         }
         self.record_cost_ledger(&store, &run, &summary)?;
 
+        // Redact job artifacts written by the harness (report.md, raw mirror).
+        let _ = crate::vault::redact_job_artifacts(&self.deps, &store, req.job_id.as_ref());
         Ok(TurnResult { run_id, summary })
     }
 
     /// Writes a capsule through [`CapsuleWriter`].
     pub fn write_capsule(&self, session: &SessionId, trigger: CapsuleTrigger) -> Result<Capsule, CoreError> {
-        CapsuleWriter::new(self.deps.clone()).write(session, trigger)
+        let capsule = CapsuleWriter::new(self.deps.clone()).write(session, trigger)?;
+        // Redact the capsule file and body row.
+        let store = self.deps.open_store()?;
+        crate::vault::redact_capsule(&self.deps, &store, &capsule)
     }
 
     /// Startup recovery: finish or abort switches left in `started`, close dangling runs.
@@ -467,31 +477,9 @@ impl SessionService {
         switch::run_switch(&self.deps, req, &CancelToken::default())
     }
 
-    /// Checks `cwd` against the project path, worktree root and `[node].cwd_allow`.
+    /// Checks session `cwd` against the shared allow-list.
     fn check_cwd(&self, cwd: &str) -> Result<(), CoreError> {
-        let path = Path::new(cwd);
-        let mut roots: Vec<&str> = Vec::new();
-        if let Some(project) = &self.deps.config.project.path {
-            roots.push(project);
-        }
-        if let Some(root) = &self.deps.config.project.worktree_root {
-            roots.push(root);
-        }
-        roots.extend(self.deps.config.node.cwd_allow.iter().map(String::as_str));
-        if roots.is_empty() {
-            return Ok(());
-        }
-        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        for root in roots {
-            let root_path = Path::new(root);
-            let root_path = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_path_buf());
-            if path.starts_with(&root_path) {
-                return Ok(());
-            }
-        }
-        Err(CoreError::Refused(format!(
-            "working directory {cwd} is outside the allow-list"
-        )))
+        check_cwd(&self.deps, cwd)
     }
 
     /// Returns the configured harness entry for `executor`.
@@ -583,13 +571,19 @@ impl SessionService {
             node,
             native_session_id: native,
         };
-        let appended = log.append(NewEvent {
-            actor: actor_for(&body),
-            source,
-            body,
-            raw: None,
-            ts,
-        })?;
+        let appended = log.append(
+            // Redact exact values before the log line is written.
+            crate::vault::redact_event(
+                &self.deps,
+                NewEvent {
+                    actor: actor_for(&body),
+                    source,
+                    body,
+                    raw: None,
+                    ts,
+                },
+            )?,
+        )?;
         store.index_event(&index_row(&appended))?;
         Ok(appended)
     }
@@ -610,13 +604,19 @@ impl SessionService {
             node: Some(node.clone()),
             native_session_id: native.map(str::to_owned),
         };
-        let appended = log.append(NewEvent {
-            actor: event.actor,
-            source,
-            body: event.body,
-            raw: event.raw,
-            ts: event.ts,
-        })?;
+        let appended = log.append(
+            // Redact exact values before the log line is written.
+            crate::vault::redact_event(
+                &self.deps,
+                NewEvent {
+                    actor: event.actor,
+                    source,
+                    body: event.body,
+                    raw: event.raw,
+                    ts: event.ts,
+                },
+            )?,
+        )?;
         store.index_event(&index_row(&appended))?;
         Ok(())
     }
@@ -742,6 +742,43 @@ impl SessionService {
     }
 }
 
+/// Checks `cwd` against the shared session allow-list.
+///
+/// The allowed roots are the project path, the worktree root, `[node].cwd_allow` and the
+/// VOWP-owned orchestrator root `<VOWP_HOME>/orchestrators`. Orchestrator sessions run in
+/// `<VOWP_HOME>/orchestrators/<name>/`, so a takeover or repair must accept that directory
+/// even though it is outside the project checkout.
+///
+/// A configuration with no project path, worktree root or `[node].cwd_allow` keeps the
+/// historical fallback: no allow-list is configured, so every directory is admitted.
+pub(crate) fn check_cwd(deps: &Deps, cwd: &str) -> Result<(), CoreError> {
+    let path = Path::new(cwd);
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(project) = &deps.config.project.path {
+        roots.push(PathBuf::from(project));
+    }
+    if let Some(root) = &deps.config.project.worktree_root {
+        roots.push(PathBuf::from(root));
+    }
+    roots.extend(deps.config.node.cwd_allow.iter().map(PathBuf::from));
+    if roots.is_empty() {
+        return Ok(());
+    }
+    // VOWP creates and owns this root; it is not a user-supplied `cwd_allow` entry.
+    roots.push(deps.paths.root().join("orchestrators"));
+
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    for root in &roots {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        if path.starts_with(&root) {
+            return Ok(());
+        }
+    }
+    Err(CoreError::Refused(format!(
+        "working directory {cwd} is outside the allow-list"
+    )))
+}
+
 impl SessionOps for SessionService {
     fn create_session(&self, req: NewSession) -> Result<SessionId, ServiceError> {
         SessionService::create_session(self, req).map_err(service_error)
@@ -793,6 +830,27 @@ fn limit_row_kind(kind: vowp_protocol::LimitKind) -> LimitRowKind {
         vowp_protocol::LimitKind::Context => LimitRowKind::Context,
         vowp_protocol::LimitKind::Auth => LimitRowKind::Auth,
     }
+}
+
+/// Returns the newest native session id for `harness` recorded on `node`.
+///
+/// A native id is only valid on the machine that homes it: resuming a session id from
+/// another node either fails or, worse, attaches to an unrelated conversation. The store
+/// keeps the node column; callers must pass the node the run will actually execute on.
+pub(crate) fn native_for_node(
+    store: &Store,
+    session: &SessionId,
+    harness: HarnessKind,
+    node: &NodeName,
+) -> Result<Option<String>, CoreError> {
+    // `natives_of` sorts oldest first by (created_at, first_seq, native_session_id), so the
+    // reverse scan returns the most recently recorded id for this node.
+    Ok(store
+        .natives_of(session)?
+        .into_iter()
+        .rev()
+        .find(|native| native.harness == harness && &native.node == node)
+        .map(|native| native.native_session_id))
 }
 
 /// Selects the events of the last `turns` complete turns from `events`.
@@ -858,23 +916,29 @@ pub(crate) fn last_assistant_text(
 /// Appends the `capsule` event to a summarised session and syncs the log.
 pub(crate) fn append_capsule_event(deps: &Deps, store: &Store, capsule: &Capsule) -> Result<(), CoreError> {
     let log = SessionLog::open(&deps.paths, &capsule.session_id, deps.clock.clone())?;
-    let appended = log.append(NewEvent {
-        actor: Actor::System,
-        source: EventSource {
-            harness: HarnessKind::Vowp,
-            model: None,
-            node: Some(deps.node.clone()),
-            native_session_id: None,
-        },
-        body: EventBody::Capsule(CapsuleEvent {
-            capsule_id: capsule.capsule_id.clone(),
-            version: capsule.version,
-            trigger: capsule.trigger,
-            at_seq: capsule.at_seq,
-        }),
-        raw: None,
-        ts: None,
-    })?;
+    let appended = log.append(
+        // Redact exact values before the log line is written.
+        crate::vault::redact_event(
+            deps,
+            NewEvent {
+                actor: Actor::System,
+                source: EventSource {
+                    harness: HarnessKind::Vowp,
+                    model: None,
+                    node: Some(deps.node.clone()),
+                    native_session_id: None,
+                },
+                body: EventBody::Capsule(CapsuleEvent {
+                    capsule_id: capsule.capsule_id.clone(),
+                    version: capsule.version,
+                    trigger: capsule.trigger,
+                    at_seq: capsule.at_seq,
+                }),
+                raw: None,
+                ts: None,
+            },
+        )?,
+    )?;
     store.index_event(&index_row(&appended))?;
     log.sync()?;
     Ok(())

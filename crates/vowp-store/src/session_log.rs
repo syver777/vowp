@@ -258,6 +258,32 @@ impl SessionLog {
         Ok(appended)
     }
 
+    /// Appends one event with a caller-supplied id, spilling oversized tool output.
+    ///
+    /// `ingest` uses this so a remote event keeps the id it was assigned before the spool.
+    pub fn append_with_id(&self, ev: NewEvent, id: vowp_protocol::EventId) -> Result<AppendedEvent, StoreError> {
+        let mut state = self.lock_state();
+        if state.poisoned {
+            return Err(StoreError::Poisoned);
+        }
+        if state.next_seq == u64::MAX {
+            return Err(StoreError::InvalidInput(
+                "session log sequence numbers are exhausted".to_owned(),
+            ));
+        }
+
+        let mut body = ev.body;
+        spill_tool_result(&self.blobs, &mut body)?;
+
+        let ts = ev.ts.unwrap_or_else(|| self.clock.now());
+        let mut envelope = EventEnvelope::new(self.session_id.clone(), state.next_seq, ts, ev.actor, ev.source, &body);
+        envelope.id = id;
+        envelope.raw = ev.raw.filter(|raw| serialises_at_most(raw, RAW_MAX_BYTES));
+
+        let line = encode_line(&envelope)?;
+        self.write_line(&mut state, envelope, &line)
+    }
+
     /// Appends a pre-built envelope verbatim (import and reindex tools).
     ///
     /// Requires `env.seq == last_seq + 1` and `env.session_id == self.session_id`.
@@ -814,7 +840,7 @@ pub fn valid_pid(pid: u32) -> bool {
 ///
 /// Invalid ids always count as not alive. Linux reads `/proc/<pid>`; other platforms use
 /// `kill -0`, which never signals the target.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     if !valid_pid(pid) {
         return false;
     }

@@ -1,9 +1,10 @@
-//! Repository methods for `inbox`, `limits`, `releases`, `kv` and the CLI request queue.
-//! Spec: `docs/design/crates/vowp-store.md` §3.4, `docs/design/types.md` §9–10 and
-//! `docs/design/crates/vowp-core.md` §2.
+//! Repository methods for inboxes, limits, releases, `kv` and the CLI request queue.
+//! Spec: `docs/design/v0.2/home-and-surfaces.md` §3.4, §3.6 and §3.7.
 //!
-//! Requests are rows in `kv` (`req:<ULID>`); the store treats `kind` and `payload` as opaque
-//! JSON so `vowp-core` remains the only owner of the request vocabulary.
+//! Project rows live in `project.inbox` and `project.releases`; node-wide inbox and ledger
+//! rows live in `main.node_inbox` and `main.node_ledger`. Requests are rows in `main.kv`;
+//! the store treats `kind` and `payload` as opaque JSON so `vowp-core` remains the only owner
+//! of the request vocabulary.
 
 use rusqlite::{OptionalExtension, Row, params};
 use vowp_protocol::{
@@ -18,7 +19,7 @@ use crate::convert::{
 use crate::db::{Request, RequestId, Store};
 use crate::error::StoreError;
 
-/// Column list shared by every `inbox` query.
+/// Column list shared by both inbox tables.
 const INBOX_COLUMNS: &str =
     "id, project, job_id, kind, title, body, options_json, state, answer, answered_by, created_at, answered_at";
 
@@ -30,7 +31,23 @@ const LIMIT_COLUMNS: &str = "provider, harness, kind, resets_at, detail, since, 
 const RELEASE_COLUMNS: &str = "id, project, env, change_ref, from_commit, to_commit, state, guards_json, \
      snapshot_path, rollback_cmd, probe_json, approved_by, rolled_back_by, note, created_at, finished_at";
 
-/// Raw values of one `inbox` row before protocol conversion.
+/// The two files an inbox row can live in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboxTable {
+    Node,
+    Project,
+}
+
+impl InboxTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Node => "main.node_inbox",
+            Self::Project => "project.inbox",
+        }
+    }
+}
+
+/// Raw values of one inbox row before protocol conversion.
 struct InboxRow {
     id: String,
     project: Option<String>,
@@ -46,7 +63,7 @@ struct InboxRow {
     answered_at: Option<String>,
 }
 
-/// Reads the textual columns of an `inbox` row.
+/// Reads the textual columns of an inbox row.
 fn read_inbox_row(row: &Row<'_>) -> rusqlite::Result<InboxRow> {
     Ok(InboxRow {
         id: row.get(0)?,
@@ -64,7 +81,7 @@ fn read_inbox_row(row: &Row<'_>) -> rusqlite::Result<InboxRow> {
     })
 }
 
-/// Converts a raw `inbox` row into a protocol [`InboxItem`].
+/// Converts a raw inbox row into a protocol [`InboxItem`].
 fn inbox_from_row(raw: InboxRow) -> Result<InboxItem, StoreError> {
     Ok(InboxItem {
         id: InboxId::parse(&raw.id)?,
@@ -200,67 +217,142 @@ fn release_from_row(raw: ReleaseRow) -> Result<Release, StoreError> {
 }
 
 impl Store {
-    /// Inserts one inbox item.
+    /// Inserts one inbox item, routing by `item.project`.
+    ///
+    /// `None` writes `node_inbox`; `Some(p)` writes the bound project's `inbox`. A job-bearing
+    /// item with no project is invalid because it would show in every project's L7.
     pub fn insert_inbox(&self, item: &InboxItem) -> Result<(), StoreError> {
-        self.conn.execute(
-            "INSERT INTO inbox (
-                id, project, job_id, kind, title, body, options_json, state, answer, answered_by,
-                created_at, answered_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                item.id.as_str(),
-                item.project.as_ref().map(ProjectName::as_str),
-                item.job_id.as_ref().map(JobId::as_str),
-                enum_to_text(&item.kind)?,
-                item.title,
-                item.body,
-                json_to_text(&item.options)?,
-                enum_to_text(&item.state)?,
-                item.answer,
-                item.answered_by,
-                ts_to_text(item.created_at),
-                opt_ts_to_text(item.answered_at),
-            ],
-        )?;
-        Ok(())
+        match &item.project {
+            None => {
+                if item.job_id.is_some() {
+                    return Err(StoreError::InvalidInput(
+                        "an inbox item with a job id must also name its project".to_owned(),
+                    ));
+                }
+                self.insert_node_inbox(item)
+            }
+            Some(project) => {
+                self.check_bound(project)?;
+                if let Some(job_id) = &item.job_id
+                    && !self.job_exists(job_id)?
+                {
+                    return Err(StoreError::not_found("job (inbox)", job_id.as_str()));
+                }
+                insert_inbox_row(&self.conn, InboxTable::Project, item)
+            }
+        }
     }
 
-    /// Returns the inbox item called `id`, when it exists.
+    /// Inserts one node-level inbox item into `node_inbox`.
+    ///
+    /// A project name must be registered; a job id requires a project.
+    pub fn insert_node_inbox(&self, item: &InboxItem) -> Result<(), StoreError> {
+        if item.job_id.is_some() && item.project.is_none() {
+            return Err(StoreError::InvalidInput(
+                "a node inbox item with a job id must name its project".to_owned(),
+            ));
+        }
+        if let Some(project) = &item.project
+            && !self.project_row_exists(project)?
+        {
+            return Err(StoreError::InvalidInput(format!(
+                "node inbox item names unregistered project {project}"
+            )));
+        }
+        insert_inbox_row(&self.conn, InboxTable::Node, item)
+    }
+
+    /// Returns the inbox item called `id`, looking in `node_inbox` first.
     pub fn inbox_item(&self, id: &InboxId) -> Result<Option<InboxItem>, StoreError> {
-        let raw = self
-            .conn
-            .query_row(
-                &format!("SELECT {INBOX_COLUMNS} FROM inbox WHERE id = ?1"),
-                [id.as_str()],
-                read_inbox_row,
-            )
-            .optional()?;
-        raw.map(inbox_from_row).transpose()
+        let node = inbox_by_id(&self.conn, InboxTable::Node, id)?;
+        if node.is_some() {
+            return Ok(node);
+        }
+        if self.bound_project().is_some() {
+            return inbox_by_id(&self.conn, InboxTable::Project, id);
+        }
+        Ok(None)
     }
 
     /// Lists inbox items, oldest first, optionally restricted to one state.
+    ///
+    /// A bound handle merges the project inbox with `node_inbox` rows whose project is `NULL`
+    /// or equals the bound project. An unbound (fleet) handle returns only `node_inbox` rows;
+    /// that is the deliberate extension to §3.6 used for fleet-wide reads.
     pub fn list_inbox(&self, state: Option<InboxState>) -> Result<Vec<InboxItem>, StoreError> {
+        let bound = self.bound_project().cloned();
         let mut items = Vec::new();
-        match state {
-            Some(state) => {
-                let mut statement = self.conn.prepare(&format!(
-                    "SELECT {INBOX_COLUMNS} FROM inbox WHERE state = ?1 ORDER BY created_at, id"
-                ))?;
-                let rows = statement.query_map([enum_to_text(&state)?], read_inbox_row)?;
-                for row in rows {
-                    items.push(inbox_from_row(row?)?);
+        if let Some(bound) = &bound {
+            match state {
+                Some(state) => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM project.inbox WHERE state = ?1 ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map([enum_to_text(&state)?], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
+                }
+                None => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM project.inbox ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map([], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
                 }
             }
-            None => {
-                let mut statement = self
-                    .conn
-                    .prepare(&format!("SELECT {INBOX_COLUMNS} FROM inbox ORDER BY created_at, id"))?;
-                let rows = statement.query_map([], read_inbox_row)?;
-                for row in rows {
-                    items.push(inbox_from_row(row?)?);
+            match state {
+                Some(state) => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM main.node_inbox
+                         WHERE state = ?1 AND (project IS NULL OR project = ?2) ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map(params![enum_to_text(&state)?, bound.as_str()], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
+                }
+                None => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM main.node_inbox
+                         WHERE project IS NULL OR project = ?1 ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map([bound.as_str()], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
+                }
+            }
+        } else {
+            match state {
+                Some(state) => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM main.node_inbox WHERE state = ?1 ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map([enum_to_text(&state)?], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
+                }
+                None => {
+                    let mut statement = self.conn.prepare(&format!(
+                        "SELECT {INBOX_COLUMNS} FROM main.node_inbox ORDER BY created_at, id"
+                    ))?;
+                    let rows = statement.query_map([], read_inbox_row)?;
+                    for row in rows {
+                        items.push(inbox_from_row(row?)?);
+                    }
                 }
             }
         }
+        items.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        items.dedup_by(|left, right| left.id == right.id);
         Ok(items)
     }
 
@@ -268,36 +360,41 @@ impl Store {
     ///
     /// A second answer is a [`StoreError::Conflict`]; the job is not touched.
     pub fn answer_inbox(&self, id: &InboxId, answer: &str, by: &str) -> Result<InboxItem, StoreError> {
+        let table = self.inbox_table(id)?;
         self.transaction(|tx| {
             let current = tx
-                .inbox_item(id)?
+                .item_in_table(table, id)?
                 .ok_or_else(|| StoreError::not_found("inbox item", id.as_str()))?;
             if current.state != InboxState::Open {
                 return Err(StoreError::Conflict(format!("inbox item {id} is not open")));
             }
             tx.conn.execute(
-                "UPDATE inbox SET state = 'answered', answer = ?1, answered_by = ?2, answered_at = ?3 WHERE id = ?4",
+                &format!(
+                    "UPDATE {} SET state = 'answered', answer = ?1, answered_by = ?2, answered_at = ?3 WHERE id = ?4",
+                    table.name()
+                ),
                 params![answer, by, ts_to_text(tx.clock().now()), id.as_str()],
             )?;
-            tx.inbox_item(id)?
+            tx.item_in_table(table, id)?
                 .ok_or_else(|| StoreError::not_found("inbox item", id.as_str()))
         })
     }
 
     /// Dismisses an open inbox item without an answer.
-    ///
-    /// The row keeps the schema's `(state = 'open') = (answered_at IS NULL)` invariant by
-    /// storing `answer = NULL` and an `answered_at`. A non-open item is a [`StoreError::Conflict`].
     pub fn dismiss_inbox(&self, id: &InboxId, by: &str) -> Result<(), StoreError> {
+        let table = self.inbox_table(id)?;
         self.transaction(|tx| {
             let current = tx
-                .inbox_item(id)?
+                .item_in_table(table, id)?
                 .ok_or_else(|| StoreError::not_found("inbox item", id.as_str()))?;
             if current.state != InboxState::Open {
                 return Err(StoreError::Conflict(format!("inbox item {id} is not open")));
             }
             tx.conn.execute(
-                "UPDATE inbox SET state = 'dismissed', answer = NULL, answered_by = ?1, answered_at = ?2 WHERE id = ?3",
+                &format!(
+                    "UPDATE {} SET state = 'dismissed', answer = NULL, answered_by = ?1, answered_at = ?2 WHERE id = ?3",
+                    table.name()
+                ),
                 params![by, ts_to_text(tx.clock().now()), id.as_str()],
             )?;
             Ok(())
@@ -305,12 +402,9 @@ impl Store {
     }
 
     /// Inserts or updates one provider limit row, keyed by provider.
-    ///
-    /// An existing row keeps its `since` when the new limit has the same kind; a different
-    /// kind starts a new observation window.
     pub fn upsert_limit(&self, limit: &Limit) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO limits (
+            "INSERT INTO main.limits (
                 provider, harness, kind, resets_at, detail, since, last_probe_at, probe_fail_streak,
                 concurrency_cap, cap_until, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -347,7 +441,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {LIMIT_COLUMNS} FROM limits WHERE provider = ?1"),
+                &format!("SELECT {LIMIT_COLUMNS} FROM main.limits WHERE provider = ?1"),
                 [provider],
                 read_limit_row,
             )
@@ -359,14 +453,14 @@ impl Store {
     pub fn clear_limit(&self, provider: &str) -> Result<bool, StoreError> {
         let changed = self
             .conn
-            .execute("DELETE FROM limits WHERE provider = ?1", [provider])?;
+            .execute("DELETE FROM main.limits WHERE provider = ?1", [provider])?;
         Ok(changed > 0)
     }
 
     /// Lists limits still in force at `now`: no reset time, or a reset after `now`.
     pub fn active_limits(&self, now: Timestamp) -> Result<Vec<Limit>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {LIMIT_COLUMNS} FROM limits WHERE resets_at IS NULL OR resets_at > ?1 ORDER BY provider"
+            "SELECT {LIMIT_COLUMNS} FROM main.limits WHERE resets_at IS NULL OR resets_at > ?1 ORDER BY provider"
         ))?;
         let rows = statement.query_map([ts_to_text(now)], read_limit_row)?;
         let mut limits = Vec::new();
@@ -379,7 +473,7 @@ impl Store {
     /// Records one probe of a limited provider: stamps `last_probe_at` and updates the streak.
     pub fn record_probe(&self, provider: &str, at: Timestamp, ok: bool) -> Result<(), StoreError> {
         let changed = self.conn.execute(
-            "UPDATE limits SET last_probe_at = ?1,
+            "UPDATE main.limits SET last_probe_at = ?1,
                 probe_fail_streak = CASE WHEN ?2 THEN 0 ELSE probe_fail_streak + 1 END,
                 updated_at = ?3
              WHERE provider = ?4",
@@ -391,10 +485,11 @@ impl Store {
         Ok(())
     }
 
-    /// Inserts one release row.
+    /// Inserts one release row in the bound project.
     pub fn insert_release(&self, release: &Release) -> Result<(), StoreError> {
+        self.check_bound(&release.project)?;
         self.conn.execute(
-            "INSERT INTO releases (
+            "INSERT INTO project.releases (
                 id, project, env, change_ref, from_commit, to_commit, state, guards_json,
                 snapshot_path, rollback_cmd, probe_json, approved_by, rolled_back_by, note,
                 created_at, finished_at
@@ -423,8 +518,9 @@ impl Store {
 
     /// Replaces a release's mutable fields, keyed by id; `created_at` is kept.
     pub fn update_release(&self, release: &Release) -> Result<(), StoreError> {
+        self.check_bound(&release.project)?;
         let changed = self.conn.execute(
-            "UPDATE releases SET
+            "UPDATE project.releases SET
                 project = ?1, env = ?2, change_ref = ?3, from_commit = ?4, to_commit = ?5, state = ?6,
                 guards_json = ?7, snapshot_path = ?8, rollback_cmd = ?9, probe_json = ?10, approved_by = ?11,
                 rolled_back_by = ?12, note = ?13, finished_at = ?14
@@ -453,26 +549,40 @@ impl Store {
         Ok(())
     }
 
-    /// Returns the release called `id`, when it exists.
+    /// Returns the release called `id`, when it exists in the bound project.
     pub fn release(&self, id: &ReleaseId) -> Result<Option<Release>, StoreError> {
+        let bound = self.require_bound()?;
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {RELEASE_COLUMNS} FROM releases WHERE id = ?1"),
+                &format!("SELECT {RELEASE_COLUMNS} FROM project.releases WHERE id = ?1"),
                 [id.as_str()],
                 read_release_row,
             )
             .optional()?;
-        raw.map(release_from_row).transpose()
+        match raw {
+            Some(raw) => {
+                let release = release_from_row(raw)?;
+                if release.project != bound {
+                    return Err(crate::convert::corrupt(
+                        "releases.project",
+                        format!("row names {} but the handle is bound to {bound}", release.project),
+                    ));
+                }
+                Ok(Some(release))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Lists a project's releases, newest first, optionally restricted to one environment.
     pub fn list_releases(&self, project: &ProjectName, env: Option<&str>) -> Result<Vec<Release>, StoreError> {
+        let bound = self.check_bound(project)?;
         let mut releases = Vec::new();
         match env {
             Some(env) => {
                 let mut statement = self.conn.prepare(&format!(
-                    "SELECT {RELEASE_COLUMNS} FROM releases WHERE project = ?1 AND env = ?2
+                    "SELECT {RELEASE_COLUMNS} FROM project.releases WHERE project = ?1 AND env = ?2
                      ORDER BY created_at DESC, id DESC"
                 ))?;
                 let rows = statement.query_map(params![project.as_str(), env], read_release_row)?;
@@ -482,12 +592,20 @@ impl Store {
             }
             None => {
                 let mut statement = self.conn.prepare(&format!(
-                    "SELECT {RELEASE_COLUMNS} FROM releases WHERE project = ?1 ORDER BY created_at DESC, id DESC"
+                    "SELECT {RELEASE_COLUMNS} FROM project.releases WHERE project = ?1 ORDER BY created_at DESC, id DESC"
                 ))?;
                 let rows = statement.query_map([project.as_str()], read_release_row)?;
                 for row in rows {
                     releases.push(release_from_row(row?)?);
                 }
+            }
+        }
+        for release in &releases {
+            if release.project != bound {
+                return Err(crate::convert::corrupt(
+                    "releases.project",
+                    format!("row names {} but the handle is bound to {bound}", release.project),
+                ));
             }
         }
         Ok(releases)
@@ -497,7 +615,7 @@ impl Store {
     pub fn kv_get(&self, key: &str) -> Result<Option<String>, StoreError> {
         let value = self
             .conn
-            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |row| {
+            .query_row("SELECT value FROM main.kv WHERE key = ?1", [key], |row| {
                 row.get::<_, String>(0)
             })
             .optional()?;
@@ -507,7 +625,7 @@ impl Store {
     /// Inserts or replaces a `kv` value, stamping `updated_at` from the clock.
     pub fn kv_set(&self, key: &str, value: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)
+            "INSERT INTO main.kv (key, value, updated_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![key, value, ts_to_text(self.clock().now())],
         )?;
@@ -516,7 +634,7 @@ impl Store {
 
     /// Removes a `kv` key, returning whether it existed.
     pub fn kv_delete(&self, key: &str) -> Result<bool, StoreError> {
-        let changed = self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        let changed = self.conn.execute("DELETE FROM main.kv WHERE key = ?1", [key])?;
         Ok(changed > 0)
     }
 
@@ -524,7 +642,7 @@ impl Store {
     pub fn kv_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, StoreError> {
         let mut statement = self
             .conn
-            .prepare("SELECT key, value FROM kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key")?;
+            .prepare("SELECT key, value FROM main.kv WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key")?;
         let rows = statement.query_map([prefix], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         let mut entries = Vec::new();
         for row in rows {
@@ -533,23 +651,32 @@ impl Store {
         Ok(entries)
     }
 
-    /// Enqueues one CLI-to-supervisor request as `kv` key `req:<ULID>`.
+    /// Enqueues one CLI-to-supervisor request.
+    ///
+    /// A bound handle writes `req:<project>:<ULID>` unless `kind == "wake"`, which writes
+    /// `req:node:<ULID>`; an unbound handle always writes the node key.
     pub fn push_request(&self, kind: &str, payload: &serde_json::Value) -> Result<RequestId, StoreError> {
-        // The protocol id generator is process-wide monotonic, so same-millisecond requests
-        // keep their push order and `take_requests` can return them in that order.
         let ulid = vowp_protocol::SessionId::new();
         let id = RequestId(ulid.as_str().to_owned());
         let value = serde_json::json!({ "kind": kind, "payload": payload });
-        self.kv_set(&format!("req:{}", id.0), &serde_json::to_string(&value)?)?;
+        let key = match self.bound_project() {
+            Some(project) if kind != "wake" => format!("req:{}:{}", project.as_str(), id.0),
+            _ => format!("req:node:{}", id.0),
+        };
+        self.kv_set(&key, &serde_json::to_string(&value)?)?;
         Ok(id)
     }
 
-    /// Atomically drains every `req:*` row in id order and deletes it.
+    /// Atomically drains the requests this handle may serve and deletes them.
+    ///
+    /// A bound handle drains its project's keys plus node-wide keys; an unbound handle drains
+    /// only node-wide keys.
     pub fn take_requests(&self) -> Result<Vec<Request>, StoreError> {
+        let bound = self.bound_project().cloned();
         self.transaction(|tx| {
             let mut statement = tx
                 .conn
-                .prepare("SELECT key, value, updated_at FROM kv WHERE substr(key, 1, 4) = 'req:' ORDER BY key")?;
+                .prepare("SELECT key, value, updated_at FROM main.kv WHERE substr(key, 1, 4) = 'req:' ORDER BY key")?;
             let rows = statement.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -565,6 +692,10 @@ impl Store {
 
             let mut requests = Vec::with_capacity(raw_requests.len());
             for (key, value, updated_at) in raw_requests {
+                let id = match request_id_from_key(&key, bound.as_ref()) {
+                    Some(id) => id,
+                    None => continue,
+                };
                 let value: serde_json::Value = serde_json::from_str(&value)?;
                 let kind =
                     value
@@ -576,20 +707,87 @@ impl Store {
                             reason: "request has no kind".to_owned(),
                         })?;
                 let payload = value.get("payload").cloned().unwrap_or(serde_json::Value::Null);
-                let id = key.strip_prefix("req:").ok_or_else(|| StoreError::Corrupt {
-                    path: format!("kv:{key}"),
-                    line: None,
-                    reason: "request key has no req: prefix".to_owned(),
-                })?;
                 requests.push(Request {
                     id: RequestId(id.to_owned()),
                     kind: kind.to_owned(),
                     payload,
                     created_at: ts_from_text(&updated_at, "kv.updated_at")?,
                 });
-                tx.conn.execute("DELETE FROM kv WHERE key = ?1", [&key])?;
+                tx.conn.execute("DELETE FROM main.kv WHERE key = ?1", [&key])?;
             }
+            requests.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.id.0.cmp(&right.id.0))
+            });
             Ok(requests)
         })
     }
+
+    /// Returns the table an inbox item lives in.
+    fn inbox_table(&self, id: &InboxId) -> Result<InboxTable, StoreError> {
+        if inbox_by_id(&self.conn, InboxTable::Node, id)?.is_some() {
+            return Ok(InboxTable::Node);
+        }
+        if self.bound_project().is_some() && inbox_by_id(&self.conn, InboxTable::Project, id)?.is_some() {
+            return Ok(InboxTable::Project);
+        }
+        Err(StoreError::not_found("inbox item", id.as_str()))
+    }
+
+    /// Reads one item from a specific table.
+    fn item_in_table(&self, table: InboxTable, id: &InboxId) -> Result<Option<InboxItem>, StoreError> {
+        inbox_by_id(&self.conn, table, id)
+    }
+}
+
+/// Inserts one inbox row into the chosen table.
+fn insert_inbox_row(conn: &rusqlite::Connection, table: InboxTable, item: &InboxItem) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO {} (
+                id, project, job_id, kind, title, body, options_json, state, answer, answered_by,
+                created_at, answered_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            table.name()
+        ),
+        params![
+            item.id.as_str(),
+            item.project.as_ref().map(ProjectName::as_str),
+            item.job_id.as_ref().map(JobId::as_str),
+            enum_to_text(&item.kind)?,
+            item.title,
+            item.body,
+            json_to_text(&item.options)?,
+            enum_to_text(&item.state)?,
+            item.answer,
+            item.answered_by,
+            ts_to_text(item.created_at),
+            opt_ts_to_text(item.answered_at),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Reads one inbox item from a specific table.
+fn inbox_by_id(conn: &rusqlite::Connection, table: InboxTable, id: &InboxId) -> Result<Option<InboxItem>, StoreError> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {INBOX_COLUMNS} FROM {} WHERE id = ?1", table.name()),
+            [id.as_str()],
+            read_inbox_row,
+        )
+        .optional()?;
+    raw.map(inbox_from_row).transpose()
+}
+
+/// Returns the request ULID when this key belongs to the handle, else `None`.
+fn request_id_from_key<'a>(key: &'a str, bound: Option<&ProjectName>) -> Option<&'a str> {
+    if let Some(bound) = bound {
+        let project_prefix = format!("req:{}:", bound.as_str());
+        if let Some(id) = key.strip_prefix(&project_prefix) {
+            return Some(id);
+        }
+    }
+    key.strip_prefix("req:node:")
 }

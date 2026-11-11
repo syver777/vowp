@@ -62,6 +62,11 @@ Exported by `vowp schema Switch` and generated from the protocol types in
           "const": "probe_back",
           "description": "The preferred rung became available again.",
           "type": "string"
+        },
+        {
+          "const": "takeover",
+          "description": "Another surface took the session over.",
+          "type": "string"
         }
       ]
     },

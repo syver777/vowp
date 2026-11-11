@@ -10,13 +10,15 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
 use vowp_protocol::{
-    Cost, CostSource, Executor, InboxState, JobId, Limit, LimitRowKind, ProjectName, Timestamp, Tokens, VowpConfig,
-    WorkerState,
+    Cost, CostSource, Executor, InboxState, JobId, Limit, LimitRowKind, NodeName, ProjectName, ProjectSnapshot,
+    ProjectState, Timestamp, Tokens, VowpConfig, WorkerState,
 };
 use vowp_store::{CostGroup, CostQuery, JobFilter, Store};
 
 use crate::CoreError;
+use crate::deps::Deps;
 
 /// One running job shown on the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +201,147 @@ impl BoardSnapshot {
             None => out.push_str("checkpoint: -\n"),
         }
         out
+    }
+}
+
+/// One node-wide board frame, built from the snapshot's project cards.
+///
+/// With one project the CLI keeps using [`BoardSnapshot`] so its output stays byte-compatible
+/// with v0.1; this view is the multi-project board and adds a project column.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FleetBoard {
+    /// Home the board describes.
+    pub home: NodeName,
+    /// Instant the frame was taken.
+    pub at: Timestamp,
+    /// Project cards in registry order.
+    pub projects: Vec<ProjectSnapshot>,
+    /// Provider limits still in force.
+    pub limits: Vec<Limit>,
+    /// Open inbox items.
+    pub inbox_open: u32,
+}
+
+impl FleetBoard {
+    /// Builds one board frame from the derived snapshot.
+    pub fn collect(deps: &Deps, store: &Store, now: Timestamp) -> Result<Self, CoreError> {
+        let snapshot = crate::fleet::build_snapshot(deps, store, now)?;
+        Ok(Self {
+            home: snapshot.home,
+            at: snapshot.generated_at,
+            projects: snapshot.projects,
+            limits: snapshot.limits,
+            inbox_open: snapshot.inbox.len().try_into().unwrap_or(u32::MAX),
+        })
+    }
+
+    /// Renders the multi-project board.
+    ///
+    /// Each project gets its own section with the project name as the heading; this is the
+    /// spec's "project column" (§12.2 wording) without restructuring the v0.1 line shape.
+    /// With `color`, the header is bold; without it the output contains no ANSI escapes.
+    pub fn render_text(&self, color: bool) -> String {
+        let mut out = String::new();
+        if color {
+            out.push_str("\x1b[1m");
+        }
+        out.push_str(&format!("{} @ {}", self.home, self.at.as_rfc3339()));
+        if color {
+            out.push_str("\x1b[0m");
+        }
+        out.push('\n');
+        out.push_str(&format!("projects: {}\n", self.projects.len()));
+        for project in &self.projects {
+            out.push_str(&format!("  {}  {}\n", project.name, project_state_label(project.state)));
+            if project.jobs_by_state.is_empty() {
+                out.push_str("    jobs: none\n");
+            } else {
+                let counts: Vec<String> = project
+                    .jobs_by_state
+                    .iter()
+                    .map(|(state, count)| format!("{state} {count}"))
+                    .collect();
+                out.push_str(&format!("    jobs: {}\n", counts.join(", ")));
+            }
+            if !project.running.is_empty() {
+                out.push_str("    running:\n");
+                for run in &project.running {
+                    let job = if color {
+                        format!("\x1b[32m{}\x1b[0m", run.job)
+                    } else {
+                        run.job.to_string()
+                    };
+                    let executor = run.executor.as_deref().unwrap_or("-");
+                    let last_event = run
+                        .last_event_age_secs
+                        .map(|secs| format!("{secs}s"))
+                        .unwrap_or_else(|| "-".to_owned());
+                    out.push_str(&format!("      {job}  {executor}  {}s  {last_event}\n", run.age_secs));
+                }
+            }
+            if !project.queue.is_empty() {
+                out.push_str("    queue:\n");
+                for job in &project.queue {
+                    out.push_str(&format!("      {}  {}  {}s", job.job, job.state.as_str(), job.age_secs));
+                    if let Some(reason) = &job.waiting_reason {
+                        out.push_str(&format!("  {reason}"));
+                    }
+                    out.push('\n');
+                }
+            }
+            if !project.blocked.is_empty() {
+                out.push_str("    blocked:\n");
+                for job in &project.blocked {
+                    out.push_str(&format!("      {}  {}  {}\n", job.job, job.reason, job.detail));
+                }
+            }
+            if let Some(merge) = &project.last_merge {
+                out.push_str(&format!("    last merge: {} {}\n", merge.job, merge.commit));
+            }
+            if !project.gate_failures.is_empty() {
+                out.push_str(&format!("    gate failures: {}\n", project.gate_failures.len()));
+            }
+            out.push_str(&format!(
+                "    cost today: {}\n",
+                optional_cost_amount(project.cost_today_usd)
+            ));
+        }
+
+        if self.limits.is_empty() {
+            out.push_str("limits: none\n");
+        } else {
+            out.push_str("limits:\n");
+            for limit in &self.limits {
+                let resets = limit
+                    .resets_at
+                    .map(|at| format!("resets {}", at.as_rfc3339()))
+                    .unwrap_or_else(|| "until resolved".to_owned());
+                out.push_str(&format!(
+                    "  {} {} {resets}\n",
+                    limit.provider,
+                    limit_kind_label(limit.kind)
+                ));
+            }
+        }
+        out.push_str(&format!("inbox: {} open\n", self.inbox_open));
+        out
+    }
+}
+
+/// Returns the lowercase name of a registry state.
+fn project_state_label(state: ProjectState) -> &'static str {
+    match state {
+        ProjectState::Active => "active",
+        ProjectState::Paused => "paused",
+        ProjectState::Archived => "archived",
+    }
+}
+
+/// Formats an optional USD amount for one line.
+fn optional_cost_amount(usd: Option<f64>) -> String {
+    match usd {
+        Some(usd) => format!("{usd:.2} USD"),
+        None => "? (unknown)".to_owned(),
     }
 }
 

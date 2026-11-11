@@ -2,14 +2,16 @@
 //! Spec: `docs/design/loops.md` §4.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use regex::Regex;
-use vowp_protocol::{CmdGate, Evidence};
+use vowp_protocol::{CmdGate, Evidence, Job, ProjectName, RunId, RunRole, RunUsage};
+use vowp_store::Store;
 use vowp_store::blobs::BlobStore;
 
 use crate::CoreError;
-use crate::deps::{CommandOutput, CommandSpec, Deps};
+use crate::capacity::{scope, usage};
+use crate::deps::{CommandOutput, Deps};
 
 use super::{GateCtx, Outcome};
 
@@ -18,14 +20,41 @@ const SPILL_BYTES: usize = 8192;
 
 /// Evaluates a `cmd` gate (or its `script` twin).
 pub(crate) fn evaluate(ctx: &GateCtx<'_>, gate: &CmdGate, script: bool) -> Outcome {
-    evaluate_at(ctx.deps, gate, ctx.worktree, script)
+    evaluate_inner(
+        ctx.deps,
+        gate,
+        ctx.worktree,
+        script,
+        Some((ctx.store, ctx.job, ctx.run_id.as_ref())),
+    )
 }
 
 /// Evaluates a command gate with `base` as the working directory.
 pub(crate) fn evaluate_at(deps: &Deps, gate: &CmdGate, base: &Path, script: bool) -> Outcome {
+    evaluate_inner(deps, gate, base, script, None)
+}
+
+/// Evaluates one command gate, optionally recording its measured usage.
+fn evaluate_inner(
+    deps: &Deps,
+    gate: &CmdGate,
+    base: &Path,
+    script: bool,
+    record: Option<(&Store, &Job, Option<&RunId>)>,
+) -> Outcome {
     let start = Instant::now();
     let cwd = resolve_cwd(base, gate.cwd.as_deref());
-    let output = run_shell(deps, &gate.run, &cwd, gate.timeout_secs);
+    let scoped = scope::run_scoped_shell(deps, &gate.run, &cwd, gate.timeout_secs, "gate");
+    let output = scoped.as_ref().map(|scoped| &scoped.output);
+    if let (Some(record), Ok(scoped)) = (record, &scoped)
+        && let Err(error) = record_gate_usage(deps, record.0, record.1, scoped, &cwd)
+    {
+        deps.log.log(
+            vowp_protocol::Level::Warn,
+            "capacity",
+            &format!("could not record gate usage: {error}"),
+        );
+    }
 
     match output {
         Ok(output) => {
@@ -79,15 +108,60 @@ pub(crate) fn evaluate_at(deps: &Deps, gate: &CmdGate, base: &Path, script: bool
     }
 }
 
+/// Records one gate command's measured usage under a synthetic run id.
+///
+/// A gate is not a `runs` row of its own; the synthetic id keeps several gates of one job from
+/// overwriting the adapter run's usage row while still tying the sample to the job and kind.
+fn record_gate_usage(
+    deps: &Deps,
+    store: &Store,
+    job: &Job,
+    scoped: &scope::ScopedShell,
+    cwd: &Path,
+) -> Result<(), CoreError> {
+    let project = match store.bound_project() {
+        Some(project) => project.clone(),
+        None => ProjectName::parse("_node")?,
+    };
+    let duration_ms = scoped
+        .ended_at
+        .since(scoped.started_at)
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let (sample, source) = scope::effective_sample(scoped.sample.clone().unwrap_or_default(), scoped.source);
+    let build_mode = scope::infer_build_mode(cwd);
+    let usage = RunUsage {
+        run_id: RunId::new(),
+        project,
+        job_id: Some(job.id.clone()),
+        job_kind: Some(job.kind),
+        role: RunRole::Gate,
+        harness: None,
+        model: None,
+        provider: None,
+        node: deps.node.clone(),
+        started_at: scoped.started_at,
+        ended_at: scoped.ended_at,
+        duration_ms,
+        peak_rss_bytes: sample.peak_rss_bytes.max(1),
+        anon_peak_bytes: sample.anon_peak_bytes,
+        file_peak_bytes: sample.file_peak_bytes,
+        kernel_peak_bytes: sample.kernel_peak_bytes,
+        cpu_usec: sample.cpu_usec,
+        mean_cpu_cores: sample.mean_cpu_cores,
+        max_cpu_cores: sample.max_cpu_cores,
+        build_mode,
+        source,
+        oom_killed: sample.oom_killed,
+        exit_code: scoped.output.exit_code,
+    };
+    usage::record(store, &usage)
+}
+
 /// Runs one shell command with the gate timeout.
 pub(crate) fn run_shell(deps: &Deps, run: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandOutput, CoreError> {
-    deps.cmd.run(&CommandSpec {
-        shell: Some(run.to_owned()),
-        argv: Vec::new(),
-        cwd: Some(cwd.to_path_buf()),
-        env: Vec::new(),
-        timeout: Duration::from_secs(timeout_secs.max(1)),
-    })
+    Ok(scope::run_scoped_shell(deps, run, cwd, timeout_secs, "gate")?.output)
 }
 
 /// Resolves a gate's optional relative working directory against the worktree.

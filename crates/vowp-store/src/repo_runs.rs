@@ -269,6 +269,7 @@ impl Store {
     ///
     /// A run carrying `ended_at` or `outcome` is rejected with [`StoreError::InvalidInput`].
     pub fn insert_run(&self, run: &Run) -> Result<(), StoreError> {
+        self.require_bound()?;
         if run.ended_at.is_some() || run.outcome.is_some() {
             return Err(StoreError::InvalidInput(
                 "insert_run requires a run that has not ended".to_owned(),
@@ -276,7 +277,7 @@ impl Store {
         }
         let (harness, model, effort) = executor_to_parts(run.executor.as_ref());
         self.conn.execute(
-            "INSERT INTO runs (
+            "INSERT INTO project.runs (
                 id, job_id, session_id, role, purpose, profile, rung, harness, model, effort, provider,
                 node, native_session_id, pid, window, cwd, started_at, ended_at, exit_code, outcome,
                 limit_kind, cost_usd, cost_source, tokens_in, tokens_out, tokens_reasoning,
@@ -322,10 +323,11 @@ impl Store {
 
     /// Returns the run called `id`, when it exists.
     pub fn run(&self, id: &RunId) -> Result<Option<Run>, StoreError> {
+        self.require_bound()?;
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"),
+                &format!("SELECT {RUN_COLUMNS} FROM project.runs WHERE id = ?1"),
                 [id.as_str()],
                 read_run_row,
             )
@@ -347,8 +349,9 @@ impl Store {
         window: Option<&str>,
         session_id: Option<&SessionId>,
     ) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE runs SET pid = COALESCE(?1, pid),
+            "UPDATE project.runs SET pid = COALESCE(?1, pid),
                 native_session_id = COALESCE(?2, native_session_id),
                 window = COALESCE(?3, window),
                 session_id = COALESCE(?4, session_id)
@@ -369,13 +372,14 @@ impl Store {
 
     /// Finishes a run once, writing its outcome, cost and the last 1500 characters of detail.
     pub fn finish_run(&self, id: &RunId, fin: &Finish) -> Result<(), StoreError> {
+        self.require_bound()?;
         let run = self.require_run(id)?;
         if run.ended_at.is_some() {
             return Err(StoreError::Conflict(format!("run {id} has already ended")));
         }
         let detail = tail_chars(&fin.detail, 1500);
         let changed = self.conn.execute(
-            "UPDATE runs SET ended_at = ?1, outcome = ?2, exit_code = ?3, limit_kind = ?4,
+            "UPDATE project.runs SET ended_at = ?1, outcome = ?2, exit_code = ?3, limit_kind = ?4,
                 cost_usd = ?5, cost_source = ?6, tokens_in = ?7, tokens_out = ?8,
                 tokens_reasoning = ?9, tokens_cache_read = ?10, tokens_cache_write = ?11,
                 native_session_id = COALESCE(?12, native_session_id), detail = ?13
@@ -408,8 +412,9 @@ impl Store {
 
     /// Lists runs that have not ended, oldest first.
     pub fn open_runs(&self) -> Result<Vec<Run>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {RUN_COLUMNS} FROM runs WHERE ended_at IS NULL ORDER BY started_at, id"
+            "SELECT {RUN_COLUMNS} FROM project.runs WHERE ended_at IS NULL ORDER BY started_at, id"
         ))?;
         let rows = statement.query_map([], read_run_row)?;
         let mut runs = Vec::new();
@@ -421,8 +426,9 @@ impl Store {
 
     /// Lists a job's runs, oldest first.
     pub fn runs_of_job(&self, id: &JobId) -> Result<Vec<Run>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY started_at, id"
+            "SELECT {RUN_COLUMNS} FROM project.runs WHERE job_id = ?1 ORDER BY started_at, id"
         ))?;
         let rows = statement.query_map([id.as_str()], read_run_row)?;
         let mut runs = Vec::new();
@@ -434,10 +440,13 @@ impl Store {
 
     /// Returns a job's most recent run, when it has one.
     pub fn last_run_of_job(&self, id: &JobId) -> Result<Option<Run>, StoreError> {
+        self.require_bound()?;
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {RUN_COLUMNS} FROM runs WHERE job_id = ?1 ORDER BY started_at DESC, id DESC LIMIT 1"),
+                &format!(
+                    "SELECT {RUN_COLUMNS} FROM project.runs WHERE job_id = ?1 ORDER BY started_at DESC, id DESC LIMIT 1"
+                ),
                 [id.as_str()],
                 read_run_row,
             )
@@ -447,8 +456,9 @@ impl Store {
 
     /// Inserts a gate result and returns its rowid; `result.id` is ignored.
     pub fn insert_gate_result(&self, result: &GateResult) -> Result<i64, StoreError> {
+        self.require_bound()?;
         self.conn.execute(
-            "INSERT INTO gate_results (
+            "INSERT INTO project.gate_results (
                 job_id, run_id, attempt, gate_index, gate_kind, gate_json, passed, evidence_json,
                 output_blob, duration_ms, ts
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -472,8 +482,9 @@ impl Store {
 
     /// Lists one attempt's gate results, ordered by gate index then row id.
     pub fn gate_results_for(&self, job: &JobId, attempt: u32) -> Result<Vec<GateResult>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {GATE_RESULT_COLUMNS} FROM gate_results
+            "SELECT {GATE_RESULT_COLUMNS} FROM project.gate_results
              WHERE job_id = ?1 AND attempt = ?2 ORDER BY gate_index, id"
         ))?;
         let rows = statement.query_map(params![job.as_str(), i64::from(attempt)], read_gate_result_row)?;
@@ -486,10 +497,11 @@ impl Store {
 
     /// Lists the newest attempt's gate results, ordered by gate index then row id.
     pub fn latest_gate_results(&self, job: &JobId) -> Result<Vec<GateResult>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {GATE_RESULT_COLUMNS} FROM gate_results
+            "SELECT {GATE_RESULT_COLUMNS} FROM project.gate_results
              WHERE job_id = ?1
-               AND attempt = (SELECT MAX(attempt) FROM gate_results WHERE job_id = ?1)
+               AND attempt = (SELECT MAX(attempt) FROM project.gate_results WHERE job_id = ?1)
              ORDER BY gate_index, id"
         ))?;
         let rows = statement.query_map([job.as_str()], read_gate_result_row)?;
@@ -502,8 +514,9 @@ impl Store {
 
     /// Inserts or updates one worker slot.
     pub fn upsert_worker(&self, worker: &Worker) -> Result<(), StoreError> {
+        self.require_bound()?;
         self.conn.execute(
-            "INSERT INTO workers (node, slot, kind, state, run_id, job_id, window, updated_at)
+            "INSERT INTO project.workers (node, slot, kind, state, run_id, job_id, window, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(node, kind, slot) DO UPDATE SET
                state = excluded.state,
@@ -527,8 +540,9 @@ impl Store {
 
     /// Lists one node's worker slots, ordered by kind then slot.
     pub fn list_workers(&self, node: &NodeName) -> Result<Vec<Worker>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {WORKER_COLUMNS} FROM workers WHERE node = ?1 ORDER BY kind, slot"
+            "SELECT {WORKER_COLUMNS} FROM project.workers WHERE node = ?1 ORDER BY kind, slot"
         ))?;
         let rows = statement.query_map([node.as_str()], read_worker_row)?;
         let mut workers = Vec::new();
@@ -542,16 +556,17 @@ impl Store {
     ///
     /// Busy and draining slots are never removed, even above the new bound.
     pub fn ensure_worker_slots(&self, node: &NodeName, kind: WorkerKind, count: u32) -> Result<(), StoreError> {
+        self.require_bound()?;
         self.transaction(|tx| {
             let kind_text = enum_to_text(&kind)?;
             tx.conn.execute(
-                "DELETE FROM workers WHERE node = ?1 AND kind = ?2 AND slot > ?3 AND state = 'idle'",
+                "DELETE FROM project.workers WHERE node = ?1 AND kind = ?2 AND slot > ?3 AND state = 'idle'",
                 params![node.as_str(), kind_text, i64::from(count)],
             )?;
             let now = ts_to_text(tx.clock().now());
             for slot in 1..=count {
                 tx.conn.execute(
-                    "INSERT OR IGNORE INTO workers (node, slot, kind, state, run_id, job_id, window, updated_at)
+                    "INSERT OR IGNORE INTO project.workers (node, slot, kind, state, run_id, job_id, window, updated_at)
                      VALUES (?1, ?2, ?3, 'idle', NULL, NULL, NULL, ?4)",
                     params![node.as_str(), i64::from(slot), kind_text, now],
                 )?;

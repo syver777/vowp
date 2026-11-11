@@ -1230,7 +1230,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vowp-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -1244,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cron",
  "globset",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "proptest",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "globset",
  "pretty_assertions",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "proptest",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "vowp-tmux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "tempfile",
  "thiserror",

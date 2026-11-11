@@ -85,6 +85,9 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, _args: &DoctorArgs) -> Resul
 
     check_home(root, &mut checks);
     check_db(&paths, &mut checks);
+    check_schema(&paths, &mut checks);
+    check_projects(&paths, &mut checks);
+    check_snapshot(&paths, &mut checks);
     check_version(
         runner.as_ref(),
         "git",
@@ -186,6 +189,161 @@ fn check_db(paths: &vowp_store::NodePaths, checks: &mut Checks) {
         },
         Err(error) => checks.push("db", CheckStatus::Fail, error.to_string()),
     }
+}
+
+/// Reports the global schema version and every registered project database's version.
+fn check_schema(paths: &vowp_store::NodePaths, checks: &mut Checks) {
+    if !paths.db_path().is_file() {
+        checks.push("schema", CheckStatus::Warn, "no database; run `vowp init`");
+        return;
+    }
+    let store = match Store::open_read_only(paths, None) {
+        Ok(store) => store,
+        Err(error) => {
+            checks.push("schema", CheckStatus::Fail, error.to_string());
+            return;
+        }
+    };
+    let global = match store.global_schema_version() {
+        Ok(version) => version,
+        Err(error) => {
+            checks.push("schema", CheckStatus::Fail, error.to_string());
+            return;
+        }
+    };
+    let projects = match store.list_projects() {
+        Ok(projects) => projects,
+        Err(error) => {
+            checks.push("schema", CheckStatus::Fail, error.to_string());
+            return;
+        }
+    };
+    let mut problems = Vec::new();
+    let mut count = 0_u32;
+    for project in projects
+        .iter()
+        .filter(|project| project.name.as_str() != vowp_store::RESERVED_NODE_PROJECT)
+    {
+        count += 1;
+        let path = paths.project_db_path(&project.name);
+        if !path.is_file() {
+            problems.push(format!("{}: missing project database", project.name));
+            continue;
+        }
+        match Store::open_read_only(paths, Some(&project.name))
+            .and_then(|project_store| project_store.project_schema_version())
+        {
+            Ok(1) => {}
+            Ok(version) => problems.push(format!("{}: project schema {version}", project.name)),
+            Err(error) => problems.push(format!("{}: {error}", project.name)),
+        }
+    }
+    if problems.is_empty() {
+        checks.push(
+            "schema",
+            CheckStatus::Ok,
+            format!("global {global}, {count} project database(s) at version 1"),
+        );
+    } else {
+        checks.push("schema", CheckStatus::Fail, problems.join("; "));
+    }
+}
+
+/// Reports whether every registered project has an openable database.
+fn check_projects(paths: &vowp_store::NodePaths, checks: &mut Checks) {
+    if !paths.db_path().is_file() {
+        checks.push("projects", CheckStatus::Warn, "no database; run `vowp init`");
+        return;
+    }
+    let store = match Store::open_read_only(paths, None) {
+        Ok(store) => store,
+        Err(error) => {
+            checks.push("projects", CheckStatus::Fail, error.to_string());
+            return;
+        }
+    };
+    let projects = match store.list_projects() {
+        Ok(projects) => projects,
+        Err(error) => {
+            checks.push("projects", CheckStatus::Fail, error.to_string());
+            return;
+        }
+    };
+    let real: Vec<_> = projects
+        .iter()
+        .filter(|project| project.name.as_str() != vowp_store::RESERVED_NODE_PROJECT)
+        .collect();
+    if real.is_empty() {
+        checks.push("projects", CheckStatus::Warn, "no projects registered");
+        return;
+    }
+    let mut problems = Vec::new();
+    for project in &real {
+        if !paths.project_db_path(&project.name).is_file() {
+            problems.push(format!("{}: missing project database", project.name));
+            continue;
+        }
+        if let Err(error) = Store::open_read_only(paths, Some(&project.name)) {
+            problems.push(format!("{}: {error}", project.name));
+        }
+    }
+    if problems.is_empty() {
+        checks.push(
+            "projects",
+            CheckStatus::Ok,
+            format!("{} project database(s) open", real.len()),
+        );
+    } else {
+        checks.push("projects", CheckStatus::Fail, problems.join("; "));
+    }
+}
+
+/// Reports whether the derived snapshot exists and parses, and whether `tmp/` is writable.
+///
+/// The snapshot writer stages `tmp/snapshot.json.tmp`, fsyncs it and renames it into place;
+/// a writable home root is not enough when `tmp/` is missing or read-only.
+fn check_snapshot(paths: &vowp_store::NodePaths, checks: &mut Checks) {
+    let tmp = paths.tmp_dir();
+    match probe_directory(&tmp) {
+        Ok(()) => {}
+        Err(detail) => {
+            checks.push("snapshot", CheckStatus::Fail, format!("{}: {detail}", tmp.display()));
+            return;
+        }
+    }
+    if !paths.root().join("snapshot.json").is_file() {
+        checks.push(
+            "snapshot",
+            CheckStatus::Warn,
+            "not written yet; the supervisor writes it every tick",
+        );
+        return;
+    }
+    match vowp_core::fleet::read_snapshot(paths) {
+        Ok(snapshot) => checks.push(
+            "snapshot",
+            CheckStatus::Ok,
+            format!(
+                "{} (schema {}, version {}, {} project(s))",
+                snapshot.generated_at.as_rfc3339(),
+                snapshot.schema,
+                snapshot.version,
+                snapshot.projects.len()
+            ),
+        ),
+        Err(error) => checks.push("snapshot", CheckStatus::Fail, error.to_string()),
+    }
+}
+
+/// Writes and removes one probe file in `dir`, reporting why it cannot.
+fn probe_directory(dir: &Path) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Err("missing or not a directory; run `vowp init`".to_owned());
+    }
+    let probe = dir.join(format!(".doctor-tmp-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"probe").map_err(|error| format!("not writable: {error}"))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Runs a `--version` style command and records its first line.

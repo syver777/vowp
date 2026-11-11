@@ -1,7 +1,7 @@
-# v0.2 — web / PWA window
+# v0.3 — web / PWA window
 
-Status: current for the commands shown; this note is design only. v0.1 has no browser UI and no
-listening socket.
+Status: moved from `docs/design/v0.2/` by the v0.2 spec; planned for v0.3, not v0.2. This note is
+design only. v0.1 has no browser UI and no listening socket.
 
 ## Goal
 

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use vowp_protocol::{
-    ActiveState, Clock, FakeClock, Loop, LoopBounds, LoopKind, MissedPolicy, Schedule, ScheduleAction, ScheduleId,
-    ScheduleSpecKind, Timestamp,
+    ActiveState, Clock, FakeClock, Loop, LoopBounds, LoopKind, MissedPolicy, Project, ProjectName, Schedule,
+    ScheduleAction, ScheduleId, ScheduleSpecKind, Timestamp,
 };
 use vowp_store::{NodePaths, Store};
 
@@ -28,6 +28,19 @@ impl Fixture {
         let store = Store::open(&paths)
             .expect("open store")
             .with_clock(Arc::new(clock.clone()));
+        let project = ProjectName::parse("proj").expect("project");
+        let now = clock.now();
+        store
+            .upsert_project(&Project {
+                name: project,
+                path: "/tmp/proj".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("insert project");
         Self {
             _tmp: tmp,
             store,

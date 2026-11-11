@@ -10,14 +10,19 @@ use std::io::{BufRead, BufReader, Cursor, IsTerminal, Write};
 
 use clap::Parser;
 
+pub mod chat;
 pub mod cli;
 pub mod cmd;
 pub mod ctx;
 pub mod errors;
 pub mod framework;
+pub mod mcp;
+pub mod node_ctx;
 pub mod output;
 pub mod remote;
+pub mod setup;
 pub mod signals;
+pub mod ssh_stream;
 
 pub use cli::{Cli, Command, Global};
 pub use ctx::Ctx;
@@ -188,6 +193,11 @@ fn execute(cli: Cli, original_args: &[String], io: &mut dyn IoStreams) -> Result
             vowp_store::Store::open(&paths)?;
         }
     }
+    // Refuse a command that still needs a v0.2 handler before the generic `--node` redirect,
+    // which would otherwise silently run the v0.1 chat loop.
+    if cmd::command_needs_v0_2_handler(&command) {
+        return Err(cmd::not_implemented());
+    }
     // Cross-node session export/import/switch stream a bundle instead of forwarding a local
     // id or path to the remote node (cli.md §7.5–§7.6).
     if let Some(code) = cmd::session::maybe_run_remote(&global, io, &command)? {
@@ -199,8 +209,31 @@ fn execute(cli: Cli, original_args: &[String], io: &mut dyn IoStreams) -> Result
     if let Command::Doctor(args) = &command {
         return cmd::doctor::run(&global, io, args);
     }
+    // Node-scoped commands run before `Ctx::build`: a v0.1 home cannot open its store
+    // until `vowp migrate` (or `vowp up`'s automatic migration) has split it, and the
+    // registry commands need no checkout at all.
+    if let Some(code) = execute_node_scoped(&global, &command, io)? {
+        return Ok(code);
+    }
     let ctx = Ctx::build(&global, io)?;
     cmd::dispatch(&ctx, io, command)
+}
+
+/// Dispatches `up`, `down`, `migrate` and `project` without a project context.
+///
+/// Returns `Ok(None)` for every other command. These four are node-scoped per
+/// `docs/design/v0.2/home-and-surfaces.md` §3.9, §4.5 and §4.6: they must work from
+/// `~/.vowp` itself (the unit's `WorkingDirectory`), on a v0.1 home and on a home with
+/// several projects. [`Ctx::build`] requires a project config and an openable v0.2
+/// database, so none of them may wait for it.
+fn execute_node_scoped(global: &Global, command: &Command, io: &mut dyn IoStreams) -> Result<Option<i32>, CliError> {
+    match command {
+        Command::Up(args) => cmd::up::run_node(global, io, &crate::cli::UpCommand::Up(args.clone())).map(Some),
+        Command::Down(args) => cmd::up::run_node(global, io, &crate::cli::UpCommand::Down(args.clone())).map(Some),
+        Command::Migrate(args) => cmd::migrate::run_node(global, io, args).map(Some),
+        Command::Project(args) => cmd::project::run_node(global, io, args).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Reads all of stdin as UTF-8 text.

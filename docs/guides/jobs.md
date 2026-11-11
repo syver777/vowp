@@ -4,8 +4,9 @@ A job is the unit of work in VOWP. It has a brief (the contract), owned paths (t
 (the checks), a report (the result) and a state in the graph. This guide covers creating a job, writing
 a brief that an agent can follow, choosing gates that prove the work, and reading the result.
 
-> **Status: current.** The `vowp job`, `vowp graph` and supervisor commands (`vowp up`, `vowp status`)
-> are implemented.
+> **Status: current.** The `vowp job`, `vowp graph` and supervisor commands (`vowp up`, `vowp status`,
+> `vowp fleet status`) are implemented. A job belongs to one project on the home; with several
+> projects, select the checkout or pass `--project <name>`.
 
 ## Create a job
 
@@ -263,8 +264,8 @@ requests need a running supervisor to be applied.
 | `owns_respected` fails | The worker edited a path outside `owns`. | Move the change into an owned path or split the job. |
 | The report gate says "missing report" | The worker stopped before writing it, or wrote it in the wrong worktree. | The L2 continue prompt names the exact path; check `.vowp/jobs/<id>/report.md` in the job worktree. |
 | The report gate says "commit not found" | The report lists a sha from before a rebase, or a fabricated sha. | Commit first, then write the report with the real shas. |
-| A job waits in `ready` | No free slot, an overlapping ownership lock, or a limited provider. | Check `vowp status`, `vowp job show`, and the limits section. Do not force a second worker. |
+| A job waits in `ready` | No free slot, a capacity brake, an overlapping ownership lock, or a limited provider. | `vowp fleet queue` shows the waiting reason; `vowp capacity show` shows the target and brake. Do not force a second worker. |
 | A verifier keeps failing | The findings are vague or the job is too large. | Make the verifier's findings concrete; split the job. |
-| A fix loop repeats | The same command fails without new evidence. | After three identical fingerprints the job is moved to `failed` with a no-progress note and a decision item is opened in the inbox. It does not create a `<id>-decision` job; only `on_exhausted = escalate` does that. Read the gate tails. |
+| A fix loop repeats | The same command fails without new evidence. | After three identical fingerprints the job is moved to `failed` with a no-progress note; VOWP creates a `<id>-decision` job and opens a decision item in the inbox. Read the gate tails. |
 
-Next: [operating a node](operating.md) to run the supervisor that executes these jobs.
+Next: [operating a home](operating.md) to run the supervisor that executes these jobs.

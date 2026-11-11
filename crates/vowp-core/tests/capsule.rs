@@ -4,25 +4,31 @@
 mod support;
 
 use std::collections::VecDeque;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use support::fake_adapter::FakeAdapter;
 use support::fake_git::FakeGit;
 use tempfile::{TempDir, tempdir};
+use vowp_core::lifecycle::compact_session;
+use vowp_core::session::bundle;
 use vowp_core::session::capsule::CapsuleWriter;
 use vowp_core::session::service::SessionService;
 use vowp_core::{AdapterRegistry, Deps};
 use vowp_protocol::{
-    Actor, Adapter, AdapterCapabilities, AdapterError, AdapterRun, AssistantMessage, Capsule, CapsuleId, CapsuleState,
-    CapsuleTrigger, Cost, EventBody, EventEnvelope, EventSource, Executor, ExecutorRef, FakeClock, HarnessEvent,
-    HarnessKind, LimitEvent, LimitKind, MemoryLog, NodeName, ProbeResult, RunOutcome, RunSummary, SessionCreated,
-    SessionId, SessionRole, StartInput, StopReason, Timestamp, ToolCall, ToolResult, TurnEnded,
+    Actor, Adapter, AdapterCapabilities, AdapterError, AdapterRun, AssistantMessage, BlobRef, Capsule, CapsuleId,
+    CapsuleState, CapsuleTrigger, Cost, EventBody, EventEnvelope, EventSource, Executor, ExecutorRef, FakeClock,
+    HarnessEvent, HarnessKind, LimitEvent, LimitKind, MemoryLog, NodeName, ProbeResult, RunOutcome, RunSummary,
+    SecretName, SessionCreated, SessionId, SessionRole, StartInput, StopReason, Timestamp, ToolCall, ToolResult,
+    TurnEnded,
 };
+use vowp_store::blobs::BlobStore;
 use vowp_store::session_files::list_capsule_files;
-use vowp_store::session_log::SessionLog;
+use vowp_store::session_log::{NewEvent, SessionLog, index_row};
 use vowp_store::{LedgerFilter, NodePaths, SessionFilter};
 use vowp_tmux::fake::FakeWindows;
 
@@ -502,6 +508,582 @@ fn capsule_debounce_120s_except_manual_switch_limit_export() {
         let capsule = writer.write(&session, trigger).expect("exempt trigger");
         assert_ne!(capsule.capsule_id, later.capsule_id, "{trigger:?} never debounces");
     }
+}
+
+#[test]
+fn compacted_session_export_and_resume_start_from_the_capsule() {
+    let tmp = tempdir().expect("tempdir");
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new(),
+        FakeClock::at(ts()),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+    let store = deps.open_store().expect("store");
+    {
+        let log = SessionLog::open(&deps.paths, &session, deps.clock.clone()).expect("log");
+        let appended = log
+            .append(NewEvent {
+                actor: Actor::User,
+                source: source(),
+                body: EventBody::UserMessage(vowp_protocol::UserMessage {
+                    text: "remember the frobnicator".to_owned(),
+                    attachments: Vec::new(),
+                    note: None,
+                }),
+                raw: None,
+                ts: None,
+            })
+            .expect("append");
+        store.index_event(&index_row(&appended)).expect("index");
+        log.sync().expect("sync");
+    }
+    store
+        .set_session_state(&session, vowp_protocol::SessionState::Closed, Some(&executor()))
+        .expect("close session");
+
+    let compacted = compact_session(&deps, &store, &session, ts()).expect("compact session");
+    assert!(!compacted.skipped);
+    let capsule = store.latest_capsule(&session).expect("capsule query").expect("capsule");
+    assert_eq!(compacted.capsule_id.as_ref(), Some(&capsule.capsule_id));
+    assert!(!deps.paths.log_path(&session).exists(), "compaction deletes the log");
+
+    let exported = bundle::export(&deps, &session, 20).expect("export compacted session");
+    assert_eq!(exported.capsule.capsule_id, capsule.capsule_id);
+    assert_eq!(exported.capsule.intent, capsule.intent);
+    assert!(exported.tail.is_empty(), "a compacted bundle has no event tail");
+    assert_eq!(exported.compacted_at, Some(ts()));
+    assert_eq!(exported.session.log_bytes, 0);
+
+    let child = bundle::import(&deps, &exported, None, None).expect("import compacted bundle");
+    let seed = bundle::imported_seed(&deps, &exported, &child, "continue the work");
+    assert!(
+        seed.contains(&capsule.intent),
+        "resume lost the capsule history: {seed}"
+    );
+    assert!(
+        seed.contains("(no earlier turns)"),
+        "a compacted bundle must not invent an event tail: {seed}"
+    );
+    assert!(seed.contains("continue the work"));
+}
+
+#[test]
+fn bundle_export_redacts_secret_from_capsule_file_row_and_json() {
+    let tmp = tempdir().expect("tempdir");
+    let secret = "bundle-\"quoted\"\\path\nsecond line";
+    let adapter = ScriptedAdapter::new(
+        HarnessKind::Opencode,
+        vec![good_draft(&format!("Continue with {secret}"))],
+    );
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", Arc::new(adapter)),
+        FakeClock::at(ts()),
+    );
+    let name = SecretName::parse("BUNDLE_KEY").expect("secret name");
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+
+    let exported = bundle::export(&deps, &session, 20).expect("export");
+    let marker = "[REDACTED:BUNDLE_KEY]";
+    assert_eq!(exported.capsule.intent, format!("Continue with {marker}"));
+    let json = bundle::to_json(&exported).expect("bundle json");
+    let escaped = serde_json::to_string(secret).expect("json-escape the secret");
+    let escaped = &escaped[1..escaped.len() - 1];
+    assert!(!json.contains(secret), "the raw secret is not exported");
+    assert!(!json.contains(escaped), "the JSON-escaped secret is not exported");
+    assert!(json.contains(marker), "the bundle records the redaction");
+
+    let store = deps.open_store().expect("store");
+    assert_eq!(
+        store
+            .latest_capsule(&session)
+            .expect("latest capsule")
+            .expect("capsule row")
+            .intent,
+        exported.capsule.intent,
+        "the cached capsule body is redacted too"
+    );
+    let files = list_capsule_files(&deps.paths, &session).expect("capsule files");
+    assert!(!files.is_empty(), "export wrote a capsule file");
+    for path in files {
+        let text = std::fs::read_to_string(path).expect("read capsule file");
+        assert!(!text.contains(secret), "the capsule file does not hold the raw secret");
+        assert!(
+            !text.contains(escaped),
+            "the capsule file does not hold the JSON-escaped secret"
+        );
+    }
+}
+
+#[test]
+fn bundle_import_redacts_secret_from_old_bundle_capsule_file_and_row() {
+    let tmp = tempdir().expect("tempdir");
+    let secret = "import-\"quoted\"\\path\nsecond line";
+    let adapter = ScriptedAdapter::new(
+        HarnessKind::Opencode,
+        vec![good_draft(&format!("Continue with {secret}"))],
+    );
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", Arc::new(adapter)),
+        FakeClock::at(ts()),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+
+    // This bundle is old/foreign: it was produced before the local home knew the secret,
+    // so its embedded capsule still carries the raw value.
+    let exported = bundle::export(&deps, &session, 20).expect("export");
+    assert!(
+        exported.capsule.intent.contains(secret),
+        "the source bundle carries the secret"
+    );
+
+    let name = SecretName::parse("IMPORT_KEY").expect("secret name");
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+    let marker = "[REDACTED:IMPORT_KEY]";
+
+    let child = bundle::import(&deps, &exported, None, None).expect("import");
+    let store = deps.open_store().expect("store");
+    let row = store
+        .latest_capsule(&child)
+        .expect("latest capsule")
+        .expect("imported capsule row");
+    assert_eq!(row.intent, format!("Continue with {marker}"));
+    assert!(!row.intent.contains(secret), "the row does not hold the raw secret");
+    let row_json = serde_json::to_string(&row).expect("capsule row json");
+    let escaped = serde_json::to_string(secret).expect("json-escape the secret");
+    let escaped = &escaped[1..escaped.len() - 1];
+    assert!(
+        !row_json.contains(escaped),
+        "the row does not hold the JSON-escaped secret"
+    );
+
+    let files = list_capsule_files(&deps.paths, &child).expect("capsule files");
+    assert!(!files.is_empty(), "import wrote a capsule file");
+    for path in files {
+        let text = std::fs::read_to_string(path).expect("read capsule file");
+        assert!(!text.contains(secret), "the capsule file does not hold the raw secret");
+        assert!(
+            !text.contains(escaped),
+            "the capsule file does not hold the JSON-escaped secret"
+        );
+        assert!(text.contains(marker), "the capsule file records the redaction");
+    }
+}
+
+#[test]
+fn bundle_import_sidecar_and_first_turn_seed_do_not_carry_secret() {
+    let tmp = tempdir().expect("tempdir");
+    let secret = "sidecar-\"quoted\"\\path\nsecond line";
+    let adapter = ScriptedAdapter::new(
+        HarnessKind::Opencode,
+        vec![good_draft(&format!("Continue with {secret}"))],
+    );
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", Arc::new(adapter)),
+        FakeClock::at(ts()),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+
+    // Build the bundle before this node knows the secret, like a bundle from a node
+    // that never had it: the embedded capsule still carries the raw value.
+    let exported = bundle::export(&deps, &session, 20).expect("export");
+    assert!(
+        exported.capsule.intent.contains(secret),
+        "the source bundle carries the secret"
+    );
+
+    let name = SecretName::parse("SIDECAR_KEY").expect("secret name");
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+    let marker = "[REDACTED:SIDECAR_KEY]";
+    let escaped = serde_json::to_string(secret).expect("json-escape the secret");
+    let escaped = &escaped[1..escaped.len() - 1];
+
+    let child = bundle::import(&deps, &exported, None, None).expect("import");
+
+    let sidecar_path = deps.paths.session_dir(&child).join("import.json");
+    let sidecar = std::fs::read_to_string(&sidecar_path).expect("import sidecar");
+    assert!(!sidecar.contains(secret), "import.json does not hold the raw secret");
+    assert!(
+        !sidecar.contains(escaped),
+        "import.json does not hold the JSON-escaped secret"
+    );
+    assert!(sidecar.contains(marker), "import.json records the redaction");
+    let stored = bundle::from_json(&sidecar).expect("the redacted sidecar still validates");
+    assert_eq!(stored.capsule.intent, format!("Continue with {marker}"));
+
+    // The public seed still gets a raw bundle from a caller that exported it earlier.
+    let seed = bundle::imported_seed(&deps, &exported, &child, "next step");
+    assert!(!seed.contains(secret), "the raw value does not reach the seed: {seed}");
+    assert!(
+        !seed.contains(escaped),
+        "the JSON-escaped value does not reach the seed"
+    );
+    assert!(seed.contains(marker), "the seed records the redaction: {seed}");
+    assert!(seed.ends_with("next step"));
+
+    let stored_seed = bundle::imported_seed(&deps, &stored, &child, "next step");
+    assert!(!stored_seed.contains(secret));
+    assert!(!stored_seed.contains(escaped));
+    assert!(stored_seed.contains(marker));
+
+    let store = deps.open_store().expect("store");
+    let row = store
+        .latest_capsule(&child)
+        .expect("latest capsule")
+        .expect("imported capsule row");
+    assert_eq!(row.intent, format!("Continue with {marker}"));
+    for path in list_capsule_files(&deps.paths, &child).expect("capsule files") {
+        let text = std::fs::read_to_string(path).expect("read capsule file");
+        assert!(!text.contains(secret), "the capsule file does not hold the raw secret");
+        assert!(
+            !text.contains(escaped),
+            "the capsule file does not hold the JSON-escaped secret"
+        );
+    }
+}
+
+#[test]
+fn bundle_import_redacts_inline_text_and_json_blob_secrets() {
+    let tmp = tempdir().expect("tempdir");
+    let adapter = ScriptedAdapter::new(HarnessKind::Opencode, vec![good_draft("Inline blob handoff")]);
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", Arc::new(adapter)),
+        FakeClock::at(ts()),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+    let secret = "blob-\"quoted\"\\path\nsecond line";
+    let name = SecretName::parse("BLOB_KEY").expect("secret name");
+    let marker = "[REDACTED:BLOB_KEY]";
+    let escaped = serde_json::to_string(secret).expect("json-escape the secret");
+    let escaped = &escaped[1..escaped.len() - 1];
+
+    // Hand-built inline blobs on an otherwise exported bundle: one JSON document and one
+    // plain-text document carry the secret, and one binary blob must pass through.
+    let json_blob = serde_json::json!({
+        "command": "printf",
+        "token": secret,
+        "filler": "x".repeat(9000),
+    })
+    .to_string();
+    let text_blob = format!("plain text before {secret} after");
+    let stable_blob = "unchanged text without any secret";
+    let binary = vec![0_u8, 0xff, 0x80, 0x01];
+    let json_ref = BlobRef {
+        sha256: sha256_hex(json_blob.as_bytes()),
+        bytes: json_blob.len() as u64,
+        preview: json_blob.chars().take(vowp_protocol::BLOB_PREVIEW_CHARS).collect(),
+    };
+    let text_ref = BlobRef {
+        sha256: sha256_hex(text_blob.as_bytes()),
+        bytes: text_blob.len() as u64,
+        preview: text_blob.chars().take(vowp_protocol::BLOB_PREVIEW_CHARS).collect(),
+    };
+    let stable_sha256 = sha256_hex(stable_blob.as_bytes());
+    let binary_sha256 = sha256_hex(&binary);
+
+    let mut exported = bundle::export(&deps, &session, 20).expect("export");
+    exported.blobs_inline.clear();
+    exported
+        .blobs_inline
+        .insert(json_ref.sha256.clone(), base64_encode(json_blob.as_bytes()));
+    exported
+        .blobs_inline
+        .insert(text_ref.sha256.clone(), base64_encode(text_blob.as_bytes()));
+    exported
+        .blobs_inline
+        .insert(stable_sha256.clone(), base64_encode(stable_blob.as_bytes()));
+    exported
+        .blobs_inline
+        .insert(binary_sha256.clone(), base64_encode(&binary));
+    exported.tail.push(envelope(
+        &session,
+        exported.session.last_seq + 1,
+        EventBody::ToolResult(ToolResult {
+            call_id: "inline-json".to_owned(),
+            ok: true,
+            output: None,
+            output_ref: Some(json_ref.clone()),
+            exit_code: Some(0),
+        }),
+    ));
+    exported.tail.push(envelope(
+        &session,
+        exported.session.last_seq + 2,
+        EventBody::UserMessage(vowp_protocol::UserMessage {
+            text: "see the attached notes".to_owned(),
+            attachments: vec![
+                text_ref.clone(),
+                BlobRef {
+                    sha256: stable_sha256.clone(),
+                    bytes: stable_blob.len() as u64,
+                    preview: stable_blob.to_owned(),
+                },
+            ],
+            note: None,
+        }),
+    ));
+    seal_bundle(&mut exported);
+    let source_json = bundle::to_json(&exported).expect("source bundle json");
+    assert!(
+        source_json.contains(escaped),
+        "the source bundle carries the secret in the text blob preview"
+    );
+    assert!(
+        source_json.contains(&json_ref.sha256) && source_json.contains(&text_ref.sha256),
+        "the source bundle references the raw blobs"
+    );
+
+    // The local node learns the secret only after the bundle was produced.
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+
+    let child = bundle::import(&deps, &exported, None, None).expect("import");
+
+    let sidecar_path = deps.paths.session_dir(&child).join("import.json");
+    let sidecar = std::fs::read_to_string(&sidecar_path).expect("import sidecar");
+    assert!(!sidecar.contains(secret), "import.json does not hold the raw secret");
+    assert!(
+        !sidecar.contains(escaped),
+        "import.json does not hold the JSON-escaped secret"
+    );
+    assert!(sidecar.contains(marker), "import.json records the redaction");
+    let stored = bundle::from_json(&sidecar).expect("the redacted sidecar still validates");
+    for old in [&json_ref.sha256, &text_ref.sha256] {
+        assert!(
+            !stored.blobs_inline.contains_key(old),
+            "the raw blob key {old} is gone from import.json"
+        );
+    }
+    assert!(
+        stored.blobs_inline.contains_key(&binary_sha256),
+        "the binary blob keeps its digest"
+    );
+    assert!(
+        stored.blobs_inline.contains_key(&stable_sha256),
+        "a text blob without a secret keeps its digest"
+    );
+
+    let blobs = BlobStore::new(deps.paths.blobs_dir(&child));
+    let mut saw_json = false;
+    let mut saw_text = false;
+    for (sha256, encoded) in &stored.blobs_inline {
+        let bytes = base64_decode(encoded);
+        assert_eq!(sha256_hex(&bytes), *sha256, "the sidecar key matches its content");
+        assert_eq!(
+            blobs.get(sha256).expect("sidecar blob is in the child store"),
+            bytes,
+            "the child store holds exactly the sidecar bytes"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains(secret), "blob {sha256} holds the raw secret");
+        assert!(!text.contains(escaped), "blob {sha256} holds the JSON-escaped secret");
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if value.get("token").is_some() {
+                assert_eq!(value["token"], marker);
+                assert_eq!(value["filler"].as_str().expect("filler").len(), 9000);
+                saw_json = true;
+            }
+        } else if text.contains(marker) {
+            assert_eq!(text.trim_end(), format!("plain text before {marker} after"));
+            saw_text = true;
+        }
+    }
+    assert!(saw_json, "the JSON blob is redacted through its string values");
+    assert!(saw_text, "the plain-text blob is redacted as text");
+    assert_eq!(blobs.get(&binary_sha256).expect("binary blob"), binary);
+    assert_eq!(
+        blobs.get(&stable_sha256).expect("stable blob"),
+        stable_blob.as_bytes().to_vec()
+    );
+    assert!(
+        !blobs.exists(&json_ref.sha256) && !blobs.exists(&text_ref.sha256),
+        "the raw blobs never enter the child store"
+    );
+
+    let seed = bundle::imported_seed(&deps, &exported, &child, "next step");
+    assert!(!seed.contains(secret), "the raw value does not reach the seed: {seed}");
+    assert!(
+        !seed.contains(escaped),
+        "the JSON-escaped value does not reach the seed"
+    );
+    let stored_seed = bundle::imported_seed(&deps, &stored, &child, "next step");
+    assert!(!stored_seed.contains(secret));
+    assert!(!stored_seed.contains(escaped));
+}
+
+#[test]
+fn bundle_import_redaction_error_leaves_no_raw_capsule_file_or_row() {
+    let tmp = tempdir().expect("tempdir");
+    let marker = "IMPORT-FAILURE-RAW-CAPSULE-9d2";
+    let adapter = ScriptedAdapter::new(
+        HarnessKind::Opencode,
+        vec![good_draft(&format!("Continue with {marker}"))],
+    );
+    let deps = deps_with_clock(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", Arc::new(adapter)),
+        FakeClock::at(ts()),
+    );
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp);
+    let exported = bundle::export(&deps, &session, 20).expect("export");
+    assert!(
+        exported.capsule.intent.contains(marker),
+        "the source bundle carries the marker"
+    );
+
+    // A secret file the vault refuses (mode 0644) makes Redactor::load fail, the same
+    // error path as an unreadable vault during import.
+    let secrets = deps.paths.root().join("secrets");
+    std::fs::create_dir_all(&secrets).expect("secrets dir");
+    let broken = secrets.join("BROKEN_IMPORT_KEY");
+    std::fs::write(&broken, "not a usable secret").expect("write broken secret");
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o644)).expect("break secret mode");
+
+    // The origin session and its export capsule already exist and legitimately carry the
+    // marker. The ordering guarantee is stronger than "no raw capsule survives": a failed
+    // redaction must do nothing at all. The old write-then-redact order created the child
+    // session row and log, then the raw capsule file/row, before it noticed the vault error.
+    let mut files_before = files_under(&deps.paths.sessions_dir());
+    files_before.sort();
+    let store = deps.open_store().expect("store");
+    let mut sessions_before: Vec<SessionId> = store
+        .list_sessions(&SessionFilter::default())
+        .expect("sessions before")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    sessions_before.sort();
+
+    let error = bundle::import(&deps, &exported, None, None).expect_err("the redaction must fail");
+    match &error {
+        vowp_core::CoreError::Invalid(message) => assert!(
+            message.contains("must be mode 0600"),
+            "unexpected redaction error: {message}"
+        ),
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let mut files_after = files_under(&deps.paths.sessions_dir());
+    files_after.sort();
+    assert_eq!(
+        files_after, files_before,
+        "a failed import must not leave a session directory, log, capsule file or sidecar"
+    );
+    let mut sessions_after: Vec<SessionId> = store
+        .list_sessions(&SessionFilter::default())
+        .expect("sessions after")
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    sessions_after.sort();
+    assert_eq!(
+        sessions_after, sessions_before,
+        "a failed import must not leave a child session row or capsule row"
+    );
+}
+
+/// Returns the lowercase hex SHA-256 of `bytes` for a hand-built bundle.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Encodes bytes as padded standard base64 for a hand-built bundle.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        out.push(ALPHABET[(b[0] >> 2) as usize] as char);
+        out.push(ALPHABET[(((b[0] & 0b11) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b[1] & 0b1111) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(b[2] & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Decodes the padded standard base64 stored in a bundle sidecar.
+fn base64_decode(text: &str) -> Vec<u8> {
+    fn value(byte: u8) -> u8 {
+        match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            other => panic!("invalid base64 character {:?}", other as char),
+        }
+    }
+    let mut out = Vec::new();
+    for chunk in text.as_bytes().chunks(4) {
+        let a = value(chunk[0]);
+        let b = value(chunk[1]);
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            let c = value(chunk[2]);
+            out.push(((b & 0b1111) << 4) | (c >> 2));
+            if chunk[3] != b'=' {
+                let d = value(chunk[3]);
+                out.push(((c & 0b11) << 6) | d);
+            }
+        }
+    }
+    out
+}
+
+/// Recomputes a hand-built bundle's canonical checksum, like `bundle::export` does.
+fn seal_bundle(bundle: &mut bundle::Bundle) {
+    let mut value = serde_json::to_value(&*bundle).expect("bundle value");
+    if let Some(map) = value.as_object_mut() {
+        map.remove("checksum");
+    }
+    let canonical = serde_json::to_vec(&value).expect("canonical bundle");
+    bundle.checksum = format!("sha256:{}", sha256_hex(&canonical));
+}
+
+/// Returns every regular file below `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    files
 }
 
 /// An adapter that returns the next scripted assistant message, reusing the last one.

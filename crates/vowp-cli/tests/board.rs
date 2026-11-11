@@ -2,8 +2,9 @@
 
 mod common;
 
-use vowp_protocol::{JobId, JobKind, JobState, Timestamp};
-use vowp_store::StateChange;
+use tempfile::TempDir;
+use vowp_protocol::{JobId, JobKind, JobState, NewJob, Project, ProjectName, Role, Timestamp, VowpConfig};
+use vowp_store::{NodePaths, StateChange, Store};
 
 #[test]
 fn board_once_golden() {
@@ -77,4 +78,109 @@ fn board_json_carries_counts_and_slots() {
     assert_eq!(value["running"], serde_json::json!([]));
     assert!(value["last_checkpoint"].is_null());
     assert_eq!(pending.state, JobState::Pending);
+}
+
+/// Registers and populates a second project in the same temporary home.
+fn add_project_with_job(env: &common::TestEnv, name: &str, job_id: &str) -> (TempDir, VowpConfig) {
+    let dir = tempfile::tempdir().expect("second project dir");
+    let mut config = env.config.clone();
+    config.project.name = ProjectName::parse(name).expect("project name");
+    config.project.path = Some(dir.path().display().to_string());
+    std::fs::write(
+        dir.path().join("vowp.toml"),
+        toml::to_string_pretty(&config).expect("config"),
+    )
+    .expect("write vowp.toml");
+    let paths = NodePaths::new(env.home_path());
+    let store = Store::open(&paths).expect("store");
+    let now = store.clock().now();
+    store
+        .upsert_project(&Project {
+            name: config.project.name.clone(),
+            path: dir.path().display().to_string(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            config: serde_json::to_value(&config).expect("config json"),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("project row");
+    let project_store = Store::open_with_project(&paths, &config.project.name).expect("project store");
+    project_store
+        .insert_job(
+            &config.project.name,
+            &NewJob {
+                id: JobId::parse(job_id).expect("job id"),
+                title: format!("job {job_id}"),
+                kind: JobKind::Build,
+                role: Role::Worker,
+                profile: None,
+                needs: Vec::new(),
+                owns: Vec::new(),
+                reads: Vec::new(),
+                gates: None,
+                priority: None,
+                loop_: None,
+                brief_text: None,
+            },
+            "test",
+        )
+        .expect("insert job");
+    (dir, config)
+}
+
+#[test]
+fn board_json_compat_with_one_project() {
+    let env = common::TestEnv::new();
+    env.insert_job("n01-alpha", "Alpha", JobKind::Build, &[]);
+
+    let (code, value, stderr) = env.run_json(&["board", "--once"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let keys: Vec<&str> = value
+        .as_object()
+        .expect("board object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    for key in [
+        "at",
+        "project",
+        "jobs",
+        "running",
+        "slots_busy",
+        "slots_total",
+        "planner",
+        "keeper",
+        "limits",
+        "cost_today_usd",
+        "inbox_open",
+        "last_checkpoint",
+    ] {
+        assert!(keys.contains(&key), "one-project board lost v0.1 key {key}: {value}");
+    }
+}
+
+#[test]
+fn board_shows_every_project() {
+    let env = common::TestEnv::new();
+    env.insert_job("n01-alpha", "Alpha", JobKind::Build, &[]);
+    let (dir, config) = add_project_with_job(&env, "beta", "b01-pending");
+
+    let (code, stdout, stderr) = env.run(&["board", "--once"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(stdout.contains("projects: 2"), "{stdout}");
+    assert!(stdout.contains("test"), "{stdout}");
+    assert!(stdout.contains("beta"), "{stdout}");
+    assert!(
+        stdout.contains("b01-pending"),
+        "the other project's queue is shown:\n{stdout}"
+    );
+
+    let (code, value, stderr) = env.run_json(&["board", "--once"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(value["home"], "local");
+    let projects = value["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 2, "{value}");
+    assert!(projects.iter().any(|project| project["name"] == "beta"));
+    drop((dir, config));
 }

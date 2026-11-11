@@ -440,7 +440,7 @@ Exported by `vowp schema Schedule` and generated from the protocol types in
       ]
     },
     "ProjectName": {
-      "description": "Project name slug, for example `vowp`.",
+      "description": "Project name slug, for example `vowp`.\n\n`_node` is the reserved project that owns project-less session runs.",
       "type": "string"
     },
     "PushedGate": {

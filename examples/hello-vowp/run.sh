@@ -129,7 +129,19 @@ git init -q --bare -b main "$ORIGIN"
     cd "$REPO"
     vowp_cli --home "$HOME_DIR" init --name hello-vowp --no-framework >/dev/null
 )
-cp "$ROOT/vowp.toml" "$REPO/vowp.toml"
+# `vowp up` schedules the node supervisor from the home-level config, not the project
+# config, so give the demo a one-second tick there too. The project config carries the
+# same value for project-scoped commands.
+cat > "$HOME_DIR/config.toml" <<'EOF'
+[node]
+tick_secs = 1
+EOF
+# The temporary checkout path is only known at run time. Materialise the absolute worktree
+# root inside the checkout; the absolute path also keeps the report path in the harness
+# prompt absolute, which the fake worker relies on. `.vowp/` is already ignored.
+worktree_root="$REPO/.vowp/worktrees"
+escaped_worktree_root=$(printf '%s' "$worktree_root" | sed -e 's/[\\&|]/\\&/g' -e 's/"/\\"/g')
+sed "s|@WORKTREE_ROOT@|$escaped_worktree_root|" "$ROOT/vowp.toml" > "$REPO/vowp.toml"
 mkdir -p "$REPO/.vowp/adapters"
 cp "$ROOT/mapping.toml" "$REPO/.vowp/adapters/fake-worker.toml"
 cp "$ROOT/fake-worker.sh" "$REPO/.vowp/adapters/fake-worker.sh"

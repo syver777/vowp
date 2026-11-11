@@ -19,8 +19,19 @@
 set -eu
 
 PROGRAM=install.sh
-SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
+# `$0` is the shell name when this script is piped from curl (`sh -s -- ...`),
+# so it has no directory. Do not `cd .` in that case: the caller's cwd may be a
+# login home the target user cannot search. A standalone install has no
+# checkout templates next to it.
+case $0 in
+    */*) SCRIPT_DIR=$(CDPATH='' cd -- "${0%/*}" && pwd) ;;
+    *) SCRIPT_DIR= ;;
+esac
+if [ -n "$SCRIPT_DIR" ]; then
+    REPO_ROOT=$(CDPATH='' cd -- "$SCRIPT_DIR/.." && pwd)
+else
+    REPO_ROOT=
+fi
 
 GITHUB_REPO=syver777/vowp
 DEFAULT_RELEASE_BASE_URL=https://github.com/syver777/vowp/releases/download
@@ -31,6 +42,7 @@ DRY_RUN=0
 DOWNLOAD=0
 WITH_SERVICE=1
 WITH_CRON=1
+WITH_WATCHDOG=1
 WITH_LINGER=0
 VERSION=${VOWP_VERSION:-}
 RELEASE_BASE_URL=${VOWP_RELEASE_BASE_URL:-$DEFAULT_RELEASE_BASE_URL}
@@ -60,6 +72,7 @@ Options:
   --dry-run          print every action without changing files, services or cron
   --no-service       do not enable or start the systemd user unit
   --no-cron          do not change the crontab
+  --no-watchdog      do not install the L8 watchdog script (implies --no-cron)
   --linger           run `loginctl enable-linger` for the current user
   -h, --help         show this help
 
@@ -120,6 +133,10 @@ while [ "$#" -gt 0 ]; do
             WITH_CRON=0
             shift
             ;;
+        --no-watchdog)
+            WITH_WATCHDOG=0
+            shift
+            ;;
         --linger)
             WITH_LINGER=1
             shift
@@ -141,6 +158,9 @@ done
 [ "$#" -eq 0 ] || die "unexpected argument: $1"
 [ -n "${HOME:-}" ] || die "HOME is not set"
 [ -z "$BIN_SOURCE" ] || [ "$DOWNLOAD" -eq 0 ] || die "--bin and --download are mutually exclusive"
+if [ "$WITH_WATCHDOG" -eq 0 ]; then
+    WITH_CRON=0
+fi
 if [ -n "$BIN_SOURCE" ] && [ -n "$VERSION" ]; then
     warn "ignoring --version $VERSION because --bin was given; use --download to fetch a release"
 fi
@@ -162,11 +182,11 @@ find_binary() {
         printf '%s\n' "$CARGO_TARGET_DIR/debug/vowp"
         return 0
     fi
-    if [ -x "$REPO_ROOT/target/release/vowp" ]; then
+    if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/target/release/vowp" ]; then
         printf '%s\n' "$REPO_ROOT/target/release/vowp"
         return 0
     fi
-    if [ -x "$REPO_ROOT/target/debug/vowp" ]; then
+    if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/target/debug/vowp" ]; then
         printf '%s\n' "$REPO_ROOT/target/debug/vowp"
         return 0
     fi
@@ -325,7 +345,9 @@ download_archive() {
     SOURCE_BIN="$DOWNLOAD_TMP/extract/vowp-${VERSION}-${TARGET}/vowp"
     [ -f "$SOURCE_BIN" ] || die "archive does not contain $ARCHIVE/vowp"
     chmod 0755 "$SOURCE_BIN"
-    DOWNLOADED_VERSION=$("$SOURCE_BIN" --version 2>&1) \
+    # Run the probe from the temp dir: the caller's cwd may be a login home the
+    # target user cannot search, and shells warn when getcwd() fails.
+    DOWNLOADED_VERSION=$(cd "$DOWNLOAD_TMP" && "$SOURCE_BIN" --version 2>&1) \
         || die "downloaded binary failed to run: $SOURCE_BIN --version"
     case "$DOWNLOADED_VERSION" in
         "vowp ${VERSION}"*) ;;
@@ -349,7 +371,7 @@ if [ -z "$SOURCE_BIN" ] && [ "$DRY_RUN" -eq 1 ] && [ "$DOWNLOAD" -eq 0 ]; then
 fi
 
 HAVE_TEMPLATES=0
-if [ -f "$SCRIPT_DIR/vowp-watchdog.sh" ] && [ -f "$SCRIPT_DIR/vowp.service" ]; then
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/vowp-watchdog.sh" ] && [ -f "$SCRIPT_DIR/vowp.service" ]; then
     HAVE_TEMPLATES=1
 fi
 
@@ -386,7 +408,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
         note "would install binary <not found> -> $VOWP_PATH"
     fi
     if [ "$USE_TEMPLATES" -eq 1 ]; then
-        note "would install watchdog $SCRIPT_DIR/vowp-watchdog.sh -> $WATCHDOG_PATH"
+        if [ "$WITH_WATCHDOG" -eq 1 ]; then
+            note "would install watchdog $SCRIPT_DIR/vowp-watchdog.sh -> $WATCHDOG_PATH"
+        else
+            note "would skip the watchdog script (--no-watchdog)"
+        fi
         note "would install unit $SCRIPT_DIR/vowp.service -> $UNIT_PATH"
     fi
     if [ "$WITH_SERVICE" -eq 1 ]; then
@@ -442,8 +468,12 @@ if [ -n "$DOWNLOAD_TMP" ]; then
 fi
 
 if [ "$USE_TEMPLATES" -eq 1 ]; then
-    install_file "$SCRIPT_DIR/vowp-watchdog.sh" "$WATCHDOG_PATH" 0755
-    note "installed $WATCHDOG_PATH"
+    if [ "$WITH_WATCHDOG" -eq 1 ]; then
+        install_file "$SCRIPT_DIR/vowp-watchdog.sh" "$WATCHDOG_PATH" 0755
+        note "installed $WATCHDOG_PATH"
+    else
+        note "skipped the watchdog script (--no-watchdog)"
+    fi
 
     install_file "$SCRIPT_DIR/vowp.service" "$UNIT_PATH" 0644
     note "installed $UNIT_PATH"

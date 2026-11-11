@@ -739,6 +739,10 @@ impl WindowManager for Tmux {
         self.run_checked(&args).map(|_| ())
     }
 
+    fn kill_session(&self, session: &str) -> Result<(), TmuxError> {
+        Tmux::kill_session(self, session)
+    }
+
     fn list_windows(&self, session: &str) -> Result<Vec<WindowInfo>, TmuxError> {
         require_vowp_session(session)?;
         let windows = self.list_windows_raw(session)?;

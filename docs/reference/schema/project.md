@@ -11,7 +11,7 @@ Exported by `vowp schema Project` and generated from the protocol types in
 {
   "$defs": {
     "ProjectName": {
-      "description": "Project name slug, for example `vowp`.",
+      "description": "Project name slug, for example `vowp`.\n\n`_node` is the reserved project that owns project-less session runs.",
       "type": "string"
     },
     "Timestamp": {

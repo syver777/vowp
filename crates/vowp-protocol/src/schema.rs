@@ -9,7 +9,12 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 
+use crate::capacity::{
+    BrakeState, CapacityAdvice, CapacityReport, CapacitySnapshot, CapacityTarget, HostSample, RunUsage,
+    RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
+};
 use crate::capsule::{Capsule, CapsuleDraft};
+use crate::catalog::{BackupFile, BackupReport, CatalogEntry, GcClassReport, GcReport};
 use crate::config::VowpConfig;
 use crate::cost::Cost;
 use crate::event::EventEnvelope;
@@ -19,10 +24,20 @@ use crate::inbox::InboxItem;
 use crate::job::{Edge, Job, JobPatch, NewJob};
 use crate::limit::Limit;
 use crate::loops::{Loop, Schedule};
+use crate::ops::{FleetQueueRow, FleetStatus, MigrationCount, MigrationReport, Tunnel};
 use crate::release::Release;
 use crate::report::{BriefFrontMatter, ReportFrontMatter};
 use crate::run::{Run, Worker};
 use crate::session::{LedgerEntry, Node, Project, Session, Switch};
+use crate::snapshot::{
+    BlockedJobCard, GateFailureCard, InboxSummary, MergeCard, ProjectEntry, ProjectSnapshot, QueueJobCard,
+    RunningJobCard, SessionSurfaceCard, Snapshot, SupervisorSnapshot,
+};
+use crate::surface::{
+    IngestAck, JoinInstructions, Lease, LeaseStatus, OrchestratorCard, RemoteEvent, RemoteLine, Surface, SurfaceRef,
+    TakeoverReport, TurnGrant,
+};
+use crate::vault::{SecretInfo, SecretRequest};
 
 /// Renders the schema for `T` as a JSON value.
 fn schema_value<T: JsonSchema>() -> serde_json::Value {
@@ -60,6 +75,52 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("Profile", schema_value::<Profile>());
     schemas.insert("Edge", schema_value::<Edge>());
     schemas.insert("LedgerEntry", schema_value::<LedgerEntry>());
+    // v0.2 capacity, surface, snapshot, catalog, ops and vault documents.
+    schemas.insert("HostSample", schema_value::<HostSample>());
+    schemas.insert("RunUsage", schema_value::<RunUsage>());
+    schemas.insert("UsageEstimate", schema_value::<UsageEstimate>());
+    schemas.insert("WaitReason", schema_value::<WaitReason>());
+    schemas.insert("BrakeState", schema_value::<BrakeState>());
+    schemas.insert("CapacityTarget", schema_value::<CapacityTarget>());
+    schemas.insert("CapacityAdvice", schema_value::<CapacityAdvice>());
+    schemas.insert("CapacityReport", schema_value::<CapacityReport>());
+    schemas.insert("RunningCapacity", schema_value::<RunningCapacity>());
+    schemas.insert("WaitingJob", schema_value::<WaitingJob>());
+    schemas.insert("CapacitySnapshot", schema_value::<CapacitySnapshot>());
+    schemas.insert("Surface", schema_value::<Surface>());
+    schemas.insert("Lease", schema_value::<Lease>());
+    schemas.insert("SurfaceRef", schema_value::<SurfaceRef>());
+    schemas.insert("LeaseStatus", schema_value::<LeaseStatus>());
+    schemas.insert("TakeoverReport", schema_value::<TakeoverReport>());
+    schemas.insert("RemoteEvent", schema_value::<RemoteEvent>());
+    schemas.insert("RemoteLine", schema_value::<RemoteLine>());
+    schemas.insert("IngestAck", schema_value::<IngestAck>());
+    schemas.insert("TurnGrant", schema_value::<TurnGrant>());
+    schemas.insert("OrchestratorCard", schema_value::<OrchestratorCard>());
+    schemas.insert("JoinInstructions", schema_value::<JoinInstructions>());
+    schemas.insert("Snapshot", schema_value::<Snapshot>());
+    schemas.insert("SupervisorSnapshot", schema_value::<SupervisorSnapshot>());
+    schemas.insert("ProjectEntry", schema_value::<ProjectEntry>());
+    schemas.insert("ProjectSnapshot", schema_value::<ProjectSnapshot>());
+    schemas.insert("RunningJobCard", schema_value::<RunningJobCard>());
+    schemas.insert("BlockedJobCard", schema_value::<BlockedJobCard>());
+    schemas.insert("QueueJobCard", schema_value::<QueueJobCard>());
+    schemas.insert("MergeCard", schema_value::<MergeCard>());
+    schemas.insert("GateFailureCard", schema_value::<GateFailureCard>());
+    schemas.insert("InboxSummary", schema_value::<InboxSummary>());
+    schemas.insert("SessionSurfaceCard", schema_value::<SessionSurfaceCard>());
+    schemas.insert("CatalogEntry", schema_value::<CatalogEntry>());
+    schemas.insert("GcReport", schema_value::<GcReport>());
+    schemas.insert("GcClassReport", schema_value::<GcClassReport>());
+    schemas.insert("BackupReport", schema_value::<BackupReport>());
+    schemas.insert("BackupFile", schema_value::<BackupFile>());
+    schemas.insert("SecretInfo", schema_value::<SecretInfo>());
+    schemas.insert("SecretRequest", schema_value::<SecretRequest>());
+    schemas.insert("FleetStatus", schema_value::<FleetStatus>());
+    schemas.insert("FleetQueueRow", schema_value::<FleetQueueRow>());
+    schemas.insert("Tunnel", schema_value::<Tunnel>());
+    schemas.insert("MigrationReport", schema_value::<MigrationReport>());
+    schemas.insert("MigrationCount", schema_value::<MigrationCount>());
     schemas
 }
 

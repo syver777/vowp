@@ -3,7 +3,7 @@
 mod common;
 
 use clap::{CommandFactory, Parser};
-use vowp_cli::cli::{Cli, Command, JobCommand, V0_1_COMMANDS};
+use vowp_cli::cli::{Cli, Command, JobCommand, ScheduleArgs, V0_1_COMMANDS, V0_2_COMMANDS};
 use vowp_cli::output::kind_name;
 use vowp_cli::{BufferIo, CliError, Ctx, Global, IoStreams};
 use vowp_protocol::ErrorKind;
@@ -134,12 +134,20 @@ fn help_lists_every_v0_1_command() {
         .filter(|name| name != "help")
         .collect();
     names.sort();
-    let mut expected: Vec<String> = V0_1_COMMANDS.iter().map(|name| (*name).to_owned()).collect();
+    let mut expected: Vec<String> = V0_1_COMMANDS
+        .iter()
+        .chain(V0_2_COMMANDS.iter())
+        .map(|name| (*name).to_owned())
+        .collect();
     expected.sort();
     assert_eq!(names, expected);
 
     let help = Cli::command().render_help().to_string();
-    for command in V0_1_COMMANDS.iter().filter(|name| **name != "__window") {
+    for command in V0_1_COMMANDS
+        .iter()
+        .chain(V0_2_COMMANDS.iter())
+        .filter(|name| !name.starts_with("__"))
+    {
         assert!(help.contains(command), "help does not mention {command}:\n{help}");
     }
 }
@@ -164,9 +172,10 @@ fn parse_schedule_add_examples_from_cli_md() {
     ])
     .expect("cli.md loop example parses");
     match cli.command {
-        Command::Schedule {
+        Command::Schedule(ScheduleArgs {
             command: ScheduleCommand::Add(args),
-        } => {
+            ..
+        }) => {
             assert_eq!(args.spec, "0 7 * * 1-5");
             match args.action {
                 ScheduleActionArg::Loop(loop_) => {
@@ -196,9 +205,10 @@ fn parse_schedule_add_examples_from_cli_md() {
     ])
     .expect("cli.md command example parses");
     match cli.command {
-        Command::Schedule {
+        Command::Schedule(ScheduleArgs {
             command: ScheduleCommand::Add(args),
-        } => match args.action {
+            ..
+        }) => match args.action {
             ScheduleActionArg::Command(command) => {
                 assert_eq!(command.common.name, "hb");
                 assert_eq!(command.argv, vec!["vowp", "status", "--check"])
@@ -221,9 +231,10 @@ fn parse_schedule_add_examples_from_cli_md() {
     ])
     .expect("cli.md job-template example parses");
     match cli.command {
-        Command::Schedule {
+        Command::Schedule(ScheduleArgs {
             command: ScheduleCommand::Add(args),
-        } => match args.action {
+            ..
+        }) => match args.action {
             ScheduleActionArg::JobTemplate(template) => {
                 assert_eq!(template.common.name, "dep-update");
                 assert_eq!(template.template_file, std::path::Path::new("deps.json"))
@@ -299,4 +310,34 @@ fn ctx_build_requires_init() {
         Err(other) => panic!("expected not found, got {other}"),
         Ok(_) => panic!("Ctx::build must fail before init"),
     }
+}
+
+#[test]
+fn chat_flags_are_no_longer_frozen() {
+    let env = common::TestEnv::new();
+    let cases: &[&[&str]] = &[
+        &["chat", "nope00", "--node", "laptop"],
+        &["chat", "nope00", "--follow"],
+        &["chat", "nope00", "--takeover"],
+        &["session", "chat", "nope00", "--follow"],
+    ];
+    for args in cases {
+        let (code, _stdout, stderr) = env.run(args);
+        assert_eq!(code, 3, "{args:?}: {stderr}");
+        assert!(stderr.contains("session nope00"), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("not implemented in this build"),
+            "{args:?} was still refused as not implemented: {stderr}"
+        );
+    }
+
+    // The legacy single-file form still works.
+    let legacy = env.home_path().join("legacy.db");
+    let legacy = legacy.to_str().expect("legacy path");
+    let (code, _stdout, stderr) = env.run(&["backup", "--to", legacy]);
+    assert_eq!(code, 0, "legacy .db backup failed: {stderr}");
+    assert!(
+        std::path::Path::new(legacy).is_file(),
+        "legacy .db backup was not written"
+    );
 }

@@ -1,6 +1,6 @@
 # vowp-adapters
 
-Harness adapters for [VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI coding agents.
+Harness adapters for [VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI coding agents.
 This crate is part of the VOWP workspace.
 
 ## What it provides
@@ -16,7 +16,7 @@ does not scrape a TUI, and does not read or forward harness login tokens.
 
 ## Status
 
-VOWP 0.1.0 is an early release. The adapter interfaces are used by the shipped `vowp` CLI, but they are not
+VOWP 0.2.0 is an early release. The adapter interfaces are used by the shipped `vowp` CLI, but they are not
 yet stable while VOWP is in 0.x.
 
 ## Links

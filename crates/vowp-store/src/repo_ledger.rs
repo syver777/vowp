@@ -1,14 +1,16 @@
-//! Repository methods for the append-only `ledger` table and its cost aggregation.
-//! Spec: `docs/design/crates/vowp-store.md` §3.4 and `docs/design/types.md` §10.
+//! Repository methods for the two append-only ledger tables and their cost aggregation.
+//! Spec: `docs/design/v0.2/home-and-surfaces.md` §3.4, §3.6 and §3.7.
 //!
-//! Rows are only ever inserted: schema triggers reject `UPDATE` and `DELETE`. Cost totals are
-//! computed directly from the ledger columns (role, provider, harness and model are copied onto
-//! cost rows), so no join to `runs` is needed.
+//! Project rows live in `project.ledger`; node-wide rows live in `main.node_ledger`. The
+//! tables are disjoint by name, and every statement names the file it touches. Rows are only
+//! ever inserted: schema triggers reject `UPDATE` and `DELETE`.
+
+use std::collections::BTreeMap;
 
 use rusqlite::types::ToSql;
 use rusqlite::{Row, params, params_from_iter};
 use vowp_protocol::{
-    Cost, CostSource, HarnessKind, JobId, LedgerEntry, LedgerKind, ProjectName, RunId, RunRole, SessionId, Tokens,
+    CostSource, HarnessKind, JobId, LedgerEntry, LedgerKind, ProjectName, RunId, RunRole, SessionId, Tokens,
 };
 
 use crate::convert::{
@@ -17,37 +19,37 @@ use crate::convert::{
 use crate::db::{CostGroup, CostQuery, CostRow, LedgerFilter, Store};
 use crate::error::StoreError;
 
-/// Column list shared by every `ledger` query.
+/// Column list shared by both ledger queries.
 const LEDGER_COLUMNS: &str = "id, ts, kind, project, job_id, run_id, session_id, role, provider, harness, model, \
      usd, tokens_in, tokens_out, tokens_reasoning, tokens_cache_read, tokens_cache_write, cost_source, summary, \
      detail_json";
 
-/// Raw values of one `ledger` row before protocol conversion.
-struct LedgerRow {
-    id: i64,
-    ts: String,
-    kind: String,
-    project: Option<String>,
-    job_id: Option<String>,
-    run_id: Option<String>,
-    session_id: Option<String>,
-    role: Option<String>,
-    provider: Option<String>,
-    harness: Option<String>,
-    model: Option<String>,
-    usd: Option<f64>,
-    tokens_in: i64,
-    tokens_out: i64,
-    tokens_reasoning: i64,
-    tokens_cache_read: i64,
-    tokens_cache_write: i64,
-    cost_source: Option<String>,
-    summary: String,
-    detail_json: String,
+/// Raw values of one ledger row before protocol conversion.
+pub(crate) struct LedgerRow {
+    pub(crate) id: i64,
+    pub(crate) ts: String,
+    pub(crate) kind: String,
+    pub(crate) project: Option<String>,
+    pub(crate) job_id: Option<String>,
+    pub(crate) run_id: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) role: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) harness: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) usd: Option<f64>,
+    pub(crate) tokens_in: i64,
+    pub(crate) tokens_out: i64,
+    pub(crate) tokens_reasoning: i64,
+    pub(crate) tokens_cache_read: i64,
+    pub(crate) tokens_cache_write: i64,
+    pub(crate) cost_source: Option<String>,
+    pub(crate) summary: String,
+    pub(crate) detail_json: String,
 }
 
-/// Reads the textual columns of a `ledger` row.
-fn read_ledger_row(row: &Row<'_>) -> rusqlite::Result<LedgerRow> {
+/// Reads the textual columns of a ledger row.
+pub(crate) fn read_ledger_row(row: &Row<'_>) -> rusqlite::Result<LedgerRow> {
     Ok(LedgerRow {
         id: row.get(0)?,
         ts: row.get(1)?,
@@ -72,8 +74,8 @@ fn read_ledger_row(row: &Row<'_>) -> rusqlite::Result<LedgerRow> {
     })
 }
 
-/// Converts a raw `ledger` row into a protocol [`LedgerEntry`].
-fn ledger_from_row(raw: LedgerRow) -> Result<LedgerEntry, StoreError> {
+/// Converts a raw ledger row into a protocol [`LedgerEntry`].
+pub(crate) fn ledger_from_row(raw: LedgerRow) -> Result<LedgerEntry, StoreError> {
     let tokens = Tokens {
         input: u64_from_i64(raw.tokens_in, "ledger.tokens_in")?,
         output: u64_from_i64(raw.tokens_out, "ledger.tokens_out")?,
@@ -82,7 +84,7 @@ fn ledger_from_row(raw: LedgerRow) -> Result<LedgerEntry, StoreError> {
         cache_write: u64_from_i64(raw.tokens_cache_write, "ledger.tokens_cache_write")?,
     };
     let cost = match raw.cost_source {
-        Some(source) => Some(Cost {
+        Some(source) => Some(vowp_protocol::Cost {
             usd: raw.usd,
             tokens,
             source: enum_from_text::<CostSource>(&source, "ledger.cost_source")?,
@@ -118,22 +120,31 @@ fn ledger_from_row(raw: LedgerRow) -> Result<LedgerEntry, StoreError> {
 impl Store {
     /// Appends one ledger row and returns its autoincrement id.
     ///
-    /// Cost columns come from `entry.cost`; an absent or unknown cost stores `usd` as `NULL`
-    /// and `cost_source` as `unknown` (or `NULL` when the entry has no cost at all).
+    /// `entry.project = None` writes `node_ledger`; `Some(p)` writes the bound project's
+    /// `ledger` and returns [`StoreError::WrongProject`] when `p` is not the bound project.
     pub fn append_ledger(&self, entry: &LedgerEntry) -> Result<i64, StoreError> {
+        let table = match &entry.project {
+            Some(project) => {
+                self.check_bound(project)?;
+                "project.ledger"
+            }
+            None => "main.node_ledger",
+        };
         let tokens = entry.cost.as_ref().map(|cost| cost.tokens).unwrap_or_default();
         let (usd, cost_source) = match &entry.cost {
             Some(cost) => (cost.usd, Some(enum_to_text(&cost.source)?)),
             None => (None, None),
         };
         self.conn.execute(
-            "INSERT INTO ledger (
-                ts, kind, project, job_id, run_id, session_id, role, provider, harness, model, usd,
-                tokens_in, tokens_out, tokens_reasoning, tokens_cache_read, tokens_cache_write,
-                cost_source, summary, detail_json
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-             )",
+            &format!(
+                "INSERT INTO {table} (
+                    ts, kind, project, job_id, run_id, session_id, role, provider, harness, model, usd,
+                    tokens_in, tokens_out, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+                    cost_source, summary, detail_json
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                 )"
+            ),
             params![
                 ts_to_text(entry.ts),
                 enum_to_text(&entry.kind)?,
@@ -159,131 +170,159 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Lists ledger rows matching `filter`, ascending by id.
+    /// Lists ledger rows matching `filter`, ascending by timestamp then id.
+    ///
+    /// The bound project's rows and node-wide rows (whose `project` is `NULL` or names the
+    /// bound project) are merged.
     pub fn ledger_since(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError> {
-        let mut query = format!("SELECT {LEDGER_COLUMNS} FROM ledger WHERE 1 = 1");
-        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-        if let Some(kind) = &filter.kind {
-            query.push_str(" AND kind = ?");
-            values.push(Box::new(enum_to_text(kind)?));
-        }
-        if let Some(job_id) = &filter.job_id {
-            query.push_str(" AND job_id = ?");
-            values.push(Box::new(job_id.as_str().to_owned()));
-        }
-        if let Some(since) = filter.since {
-            query.push_str(" AND ts >= ?");
-            values.push(Box::new(ts_to_text(since)));
-        }
-        query.push_str(" ORDER BY id");
-        if let Some(limit) = filter.limit {
-            query.push_str(" LIMIT ?");
-            values.push(Box::new(i64::from(limit)));
-        }
-
-        let mut statement = self.conn.prepare(&query)?;
-        let rows = statement.query_map(params_from_iter(values), read_ledger_row)?;
+        let bound = self.bound_project().cloned();
         let mut entries = Vec::new();
-        for row in rows {
-            entries.push(ledger_from_row(row?)?);
+        if bound.is_some() {
+            let (project_sql, project_values) = ledger_filter_sql("project.ledger", filter, None, true)?;
+            entries.extend(collect_ledger_entries(&self.conn, &project_sql, project_values)?);
+        }
+        let (node_sql, node_values) = ledger_filter_sql("main.node_ledger", filter, bound.as_ref(), true)?;
+        entries.extend(collect_ledger_entries(&self.conn, &node_sql, node_values)?);
+        entries.sort_by(|left, right| {
+            left.ts
+                .cmp(&right.ts)
+                .then_with(|| left.id.unwrap_or_default().cmp(&right.id.unwrap_or_default()))
+        });
+        if let Some(limit) = filter.limit {
+            entries.truncate(limit as usize);
         }
         Ok(entries)
     }
 
-    /// Sums `kind = 'cost'` rows grouped by one dimension.
+    /// Sums `kind = 'cost'` rows grouped by one dimension across both files.
     ///
     /// Rows whose key column is `NULL` fall into the key `"(none)"`; `Day` groups by the UTC
     /// date (`YYYY-MM-DD`) of `ts`. Ordering is known USD descending, then key ascending.
     pub fn cost_totals(&self, query: &CostQuery, group: CostGroup) -> Result<Vec<CostRow>, StoreError> {
-        let key_expr = match group {
-            CostGroup::Job => "COALESCE(job_id, '(none)')",
-            CostGroup::Role => "COALESCE(role, '(none)')",
-            CostGroup::Provider => "COALESCE(provider, '(none)')",
-            CostGroup::Model => "COALESCE(model, '(none)')",
-            CostGroup::Day => "substr(ts, 1, 10)",
+        let bound = match &query.project {
+            Some(project) => Some(self.check_bound(project)?),
+            None => self.bound_project().cloned(),
         };
-        let mut sql = format!(
-            "SELECT {key_expr} AS group_key,
-                COALESCE(SUM(usd), 0.0) AS group_usd,
-                SUM(CASE WHEN cost_source = 'receipt' THEN 1 ELSE 0 END) AS receipt_entries,
-                SUM(CASE WHEN cost_source = 'price-table' THEN 1 ELSE 0 END) AS price_table_entries,
-                SUM(CASE WHEN usd IS NULL THEN 1 ELSE 0 END) AS unknown_entries,
-                COALESCE(SUM(tokens_in), 0) AS tokens_in,
-                COALESCE(SUM(tokens_out), 0) AS tokens_out,
-                COALESCE(SUM(tokens_reasoning), 0) AS tokens_reasoning,
-                COALESCE(SUM(tokens_cache_read), 0) AS tokens_cache_read,
-                COALESCE(SUM(tokens_cache_write), 0) AS tokens_cache_write,
-                COUNT(*) AS entries
-             FROM ledger WHERE kind = 'cost'"
-        );
-        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
-        if let Some(since) = query.since {
-            sql.push_str(" AND ts >= ?");
-            values.push(Box::new(ts_to_text(since)));
+        let filter = LedgerFilter {
+            kind: Some(LedgerKind::Cost),
+            job_id: query.job_id.clone(),
+            since: query.since,
+            limit: None,
+        };
+        let mut entries = Vec::new();
+        if bound.is_some() {
+            let (project_sql, project_values) = ledger_filter_sql("project.ledger", &filter, None, true)?;
+            entries.extend(collect_ledger_entries(&self.conn, &project_sql, project_values)?);
         }
-        if let Some(until) = query.until {
-            sql.push_str(" AND ts <= ?");
-            values.push(Box::new(ts_to_text(until)));
-        }
-        if let Some(project) = &query.project {
-            sql.push_str(" AND project = ?");
-            values.push(Box::new(project.as_str().to_owned()));
-        }
-        if let Some(job_id) = &query.job_id {
-            sql.push_str(" AND job_id = ?");
-            values.push(Box::new(job_id.as_str().to_owned()));
-        }
-        sql.push_str(&format!(" GROUP BY {key_expr} ORDER BY group_usd DESC, group_key ASC"));
+        let (node_sql, node_values) = ledger_filter_sql("main.node_ledger", &filter, bound.as_ref(), false)?;
+        entries.extend(collect_ledger_entries(&self.conn, &node_sql, node_values)?);
+        entries.retain(|entry| {
+            if let Some(until) = query.until {
+                entry.ts <= until
+            } else {
+                true
+            }
+        });
 
-        let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_map(params_from_iter(values), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, i64>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, i64>(9)?,
-                row.get::<_, i64>(10)?,
-            ))
-        })?;
-        let mut totals = Vec::new();
-        for row in rows {
-            let (
+        let mut totals: BTreeMap<String, CostRow> = BTreeMap::new();
+        for entry in entries {
+            let key = match group {
+                CostGroup::Job => entry.job_id.as_ref().map(JobId::as_str).unwrap_or("(none)").to_owned(),
+                CostGroup::Role => entry
+                    .role
+                    .as_ref()
+                    .map(|role| enum_to_text(role).unwrap_or_else(|_| "(none)".to_owned()))
+                    .unwrap_or_else(|| "(none)".to_owned()),
+                CostGroup::Provider => entry.provider.clone().unwrap_or_else(|| "(none)".to_owned()),
+                CostGroup::Model => entry.model.clone().unwrap_or_else(|| "(none)".to_owned()),
+                CostGroup::Day => entry.ts.as_rfc3339()[..10].to_owned(),
+            };
+            let row = totals.entry(key.clone()).or_insert_with(|| CostRow {
                 key,
-                usd,
-                receipt_entries,
-                price_table_entries,
-                unknown_entries,
-                tokens_in,
-                tokens_out,
-                tokens_reasoning,
-                tokens_cache_read,
-                tokens_cache_write,
-                entries,
-            ) = row?;
-            totals.push(CostRow {
-                key,
-                usd,
-                receipt_entries: u64_from_i64(receipt_entries, "ledger.receipt_entries")?,
-                price_table_entries: u64_from_i64(price_table_entries, "ledger.price_table_entries")?,
-                unknown_entries: u64_from_i64(unknown_entries, "ledger.unknown_entries")?,
-                tokens: Tokens {
-                    input: u64_from_i64(tokens_in, "ledger.tokens_in")?,
-                    output: u64_from_i64(tokens_out, "ledger.tokens_out")?,
-                    reasoning: u64_from_i64(tokens_reasoning, "ledger.tokens_reasoning")?,
-                    cache_read: u64_from_i64(tokens_cache_read, "ledger.tokens_cache_read")?,
-                    cache_write: u64_from_i64(tokens_cache_write, "ledger.tokens_cache_write")?,
-                },
-                entries: u64_from_i64(entries, "ledger.entries")?,
+                usd: 0.0,
+                receipt_entries: 0,
+                price_table_entries: 0,
+                unknown_entries: 0,
+                tokens: Tokens::default(),
+                entries: 0,
             });
+            if let Some(cost) = &entry.cost {
+                if let Some(usd) = cost.usd {
+                    row.usd += usd;
+                }
+                match cost.source {
+                    CostSource::Receipt => row.receipt_entries += 1,
+                    CostSource::PriceTable => row.price_table_entries += 1,
+                    CostSource::Unknown => row.unknown_entries += 1,
+                }
+                row.tokens.input += cost.tokens.input;
+                row.tokens.output += cost.tokens.output;
+                row.tokens.reasoning += cost.tokens.reasoning;
+                row.tokens.cache_read += cost.tokens.cache_read;
+                row.tokens.cache_write += cost.tokens.cache_write;
+            } else {
+                row.unknown_entries += 1;
+            }
+            row.entries += 1;
         }
-        Ok(totals)
+        let mut rows: Vec<CostRow> = totals.into_values().collect();
+        rows.sort_by(|left, right| {
+            right
+                .usd
+                .partial_cmp(&left.usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        Ok(rows)
     }
+}
+
+/// Builds one filtered ledger query and its bound values.
+fn ledger_filter_sql(
+    table: &str,
+    filter: &LedgerFilter,
+    node_project: Option<&ProjectName>,
+    include_null_node: bool,
+) -> Result<(String, Vec<Box<dyn ToSql>>), StoreError> {
+    let mut query = format!("SELECT {LEDGER_COLUMNS} FROM {table} WHERE 1 = 1");
+    let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+    if let Some(kind) = &filter.kind {
+        query.push_str(" AND kind = ?");
+        values.push(Box::new(enum_to_text(kind)?));
+    }
+    if let Some(job_id) = &filter.job_id {
+        query.push_str(" AND job_id = ?");
+        values.push(Box::new(job_id.as_str().to_owned()));
+    }
+    if let Some(since) = filter.since {
+        query.push_str(" AND ts >= ?");
+        values.push(Box::new(ts_to_text(since)));
+    }
+    if let Some(project) = node_project {
+        if include_null_node {
+            query.push_str(" AND (project IS NULL OR project = ?)");
+        } else {
+            query.push_str(" AND project = ?");
+        }
+        values.push(Box::new(project.as_str().to_owned()));
+    }
+    query.push_str(" ORDER BY ts, id");
+    Ok((query, values))
+}
+
+/// Runs one ledger query and converts its rows.
+fn collect_ledger_entries(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    values: Vec<Box<dyn ToSql>>,
+) -> Result<Vec<LedgerEntry>, StoreError> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map(params_from_iter(values), read_ledger_row)?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(ledger_from_row(row?)?);
+    }
+    Ok(entries)
 }
 
 /// Converts one token count into SQLite's signed integer form.

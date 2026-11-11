@@ -1,6 +1,6 @@
 # vowp-protocol
 
-Shared data types and traits for [VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI
+Shared data types and traits for [VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI
 coding agents. This crate is part of the VOWP workspace and is the foundation the other `vowp-*` crates are
 built on.
 
@@ -17,7 +17,7 @@ adapters, core and CLI use.
 
 ## Status
 
-VOWP 0.1.0 is an early release. The types in this crate back the shipped `vowp` CLI, but the API is not yet
+VOWP 0.2.0 is an early release. The types in this crate back the shipped `vowp` CLI, but the API is not yet
 stable and may change in a minor release while VOWP is in 0.x.
 
 ## Links

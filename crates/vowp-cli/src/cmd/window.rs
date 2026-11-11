@@ -44,6 +44,18 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &WindowArgs) -> Result<i32, 
         "planner" => tail_role(ctx, io, SessionRole::Planner)?,
         "keeper" => tail_role(ctx, io, SessionRole::Keeper)?,
         "inbox" => list_inbox(ctx, io)?,
+        "capacity" => {
+            // On a TTY the capacity window redraws; without one a single frame is printed
+            // so scripts and tests terminate, matching the board window.
+            if io.is_tty() {
+                loop {
+                    write!(io.out(), "\x1b[2J\x1b[H")?;
+                    crate::cmd::capacity::show(ctx, io)?;
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+            crate::cmd::capacity::show(ctx, io)?;
+        }
         "job" => {
             let id = args
                 .id
@@ -56,7 +68,7 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &WindowArgs) -> Result<i32, 
         }
         other => {
             return Err(CliError::Invalid(format!(
-                "unknown window {other:?}; expected board, supervisor, planner, keeper, inbox or job"
+                "unknown window {other:?}; expected board, supervisor, planner, keeper, inbox, capacity or job"
             )));
         }
     }

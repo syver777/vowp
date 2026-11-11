@@ -59,7 +59,7 @@ body:
     attributes:
       label: "`vowp --version` output"
       description: Paste the complete line. If you built from source, also give the commit.
-      placeholder: "vowp 0.1.0"
+      placeholder: "vowp 0.2.0"
     validations:
       required: true
   - type: dropdown

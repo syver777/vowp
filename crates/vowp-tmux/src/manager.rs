@@ -55,6 +55,13 @@ pub trait WindowManager: Send + Sync {
     /// Kill a window, but only if it carries the `@vowp=1` tag.
     fn kill_window(&self, session: &str, name: &str) -> Result<(), TmuxError>;
 
+    /// Kill a whole session, but only when every window in it is tagged.
+    ///
+    /// A missing session is a no-op. `project archive`/`project rm` use this to remove
+    /// the project's session explicitly instead of relying on tmux dropping a session
+    /// after its last window dies.
+    fn kill_session(&self, session: &str) -> Result<(), TmuxError>;
+
     /// List windows in creation/index order; a missing session yields an empty
     /// vector.
     fn list_windows(&self, session: &str) -> Result<Vec<WindowInfo>, TmuxError>;

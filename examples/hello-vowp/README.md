@@ -43,6 +43,11 @@ FAKE=1 examples/hello-vowp/run.sh
 5. polls until `hello-greeting`, `hello-farewell` and `hello-message` are all `done`;
 6. runs `vowp down` and checks the merged files in the checkout and on `origin/main`.
 
+Job worktrees live under `<project>/.vowp/worktrees`: `run.sh` fills the
+`worktree_root` placeholder in `vowp.toml` with that absolute path, inside the
+checkout, so the default cwd allow-list admits them without a `[node].cwd_allow`
+entry.
+
 It exits 0 only when all three jobs reached `done` and the merged content is correct. It
 never touches `~/.vowp`, the real tmux server, or a real `claude`/`opencode` binary. A
 temporary directory created by the script is removed on success.

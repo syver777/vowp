@@ -143,8 +143,16 @@ fn schedule_from_row(raw: ScheduleRow) -> Result<Schedule, StoreError> {
 impl Store {
     /// Inserts or updates one loop row, keyed by name.
     pub fn upsert_loop(&self, loop_: &Loop) -> Result<(), StoreError> {
+        match &loop_.project {
+            Some(project) => {
+                self.check_bound(project)?;
+            }
+            None => {
+                self.require_bound()?;
+            }
+        }
         self.conn.execute(
-            "INSERT INTO loops (
+            "INSERT INTO project.loops (
                 name, kind, project, interval_secs, state, bounds_json, last_run_at, next_run_at,
                 last_status, fail_streak, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -179,10 +187,11 @@ impl Store {
 
     /// Returns the loop called `name`, when it exists.
     pub fn loop_(&self, name: &str) -> Result<Option<Loop>, StoreError> {
+        self.require_bound()?;
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {LOOP_COLUMNS} FROM loops WHERE name = ?1"),
+                &format!("SELECT {LOOP_COLUMNS} FROM project.loops WHERE name = ?1"),
                 [name],
                 read_loop_row,
             )
@@ -192,9 +201,10 @@ impl Store {
 
     /// Lists every loop, ordered by name.
     pub fn list_loops(&self) -> Result<Vec<Loop>, StoreError> {
+        self.require_bound()?;
         let mut statement = self
             .conn
-            .prepare(&format!("SELECT {LOOP_COLUMNS} FROM loops ORDER BY name"))?;
+            .prepare(&format!("SELECT {LOOP_COLUMNS} FROM project.loops ORDER BY name"))?;
         let rows = statement.query_map([], read_loop_row)?;
         let mut loops = Vec::new();
         for row in rows {
@@ -205,8 +215,9 @@ impl Store {
 
     /// Sets one loop's active state, stamping `updated_at` from the clock.
     pub fn set_loop_state(&self, name: &str, state: ActiveState) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE loops SET state = ?1, updated_at = ?2 WHERE name = ?3",
+            "UPDATE project.loops SET state = ?1, updated_at = ?2 WHERE name = ?3",
             params![enum_to_text(&state)?, ts_to_text(self.clock().now()), name],
         )?;
         if changed == 0 {
@@ -224,8 +235,9 @@ impl Store {
         status: &str,
         ok: bool,
     ) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE loops SET last_run_at = ?1, next_run_at = ?2, last_status = ?3,
+            "UPDATE project.loops SET last_run_at = ?1, next_run_at = ?2, last_status = ?3,
                 fail_streak = CASE WHEN ?4 THEN 0 ELSE fail_streak + 1 END, updated_at = ?5
              WHERE name = ?6",
             params![
@@ -245,8 +257,16 @@ impl Store {
 
     /// Inserts one schedule row; a duplicate id or name is a [`StoreError::Conflict`].
     pub fn insert_schedule(&self, schedule: &Schedule) -> Result<(), StoreError> {
+        match &schedule.project {
+            Some(project) => {
+                self.check_bound(project)?;
+            }
+            None => {
+                self.require_bound()?;
+            }
+        }
         self.conn.execute(
-            "INSERT INTO schedules (
+            "INSERT INTO project.schedules (
                 id, project, name, spec_kind, spec, tz, action_kind, action_json, missed_policy,
                 state, last_run_at, next_run_at, last_status, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -272,11 +292,12 @@ impl Store {
 
     /// Returns a schedule by id or name, when it exists.
     pub fn schedule(&self, id_or_name: &str) -> Result<Option<Schedule>, StoreError> {
+        self.require_bound()?;
         let raw = self
             .conn
             .query_row(
                 &format!(
-                    "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1 OR name = ?1
+                    "SELECT {SCHEDULE_COLUMNS} FROM project.schedules WHERE id = ?1 OR name = ?1
                      ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1"
                 ),
                 [id_or_name],
@@ -288,9 +309,10 @@ impl Store {
 
     /// Lists every schedule, ordered by name.
     pub fn list_schedules(&self) -> Result<Vec<Schedule>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare(&format!("SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY name"))?;
+        self.require_bound()?;
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM project.schedules ORDER BY name"
+        ))?;
         let rows = statement.query_map([], read_schedule_row)?;
         let mut schedules = Vec::new();
         for row in rows {
@@ -301,8 +323,9 @@ impl Store {
 
     /// Lists active schedules whose `next_run_at` has passed, oldest first.
     pub fn due_schedules(&self, now: Timestamp) -> Result<Vec<Schedule>, StoreError> {
+        self.require_bound()?;
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {SCHEDULE_COLUMNS} FROM schedules
+            "SELECT {SCHEDULE_COLUMNS} FROM project.schedules
              WHERE state = 'active' AND next_run_at IS NOT NULL AND next_run_at <= ?1
              ORDER BY next_run_at, id"
         ))?;
@@ -322,8 +345,9 @@ impl Store {
         next_run: Option<Timestamp>,
         status: &str,
     ) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE schedules SET last_run_at = ?1, next_run_at = ?2, last_status = ?3 WHERE id = ?4",
+            "UPDATE project.schedules SET last_run_at = ?1, next_run_at = ?2, last_status = ?3 WHERE id = ?4",
             params![ts_to_text(last_run), opt_ts_to_text(next_run), status, id.as_str()],
         )?;
         if changed == 0 {
@@ -334,8 +358,9 @@ impl Store {
 
     /// Sets one schedule's active state.
     pub fn set_schedule_state(&self, id: &ScheduleId, state: ActiveState) -> Result<(), StoreError> {
+        self.require_bound()?;
         let changed = self.conn.execute(
-            "UPDATE schedules SET state = ?1 WHERE id = ?2",
+            "UPDATE project.schedules SET state = ?1 WHERE id = ?2",
             params![enum_to_text(&state)?, id.as_str()],
         )?;
         if changed == 0 {
@@ -346,9 +371,10 @@ impl Store {
 
     /// Removes a schedule by id or name, returning whether a row was deleted.
     pub fn remove_schedule(&self, id_or_name: &str) -> Result<bool, StoreError> {
+        self.require_bound()?;
         let changed = self
             .conn
-            .execute("DELETE FROM schedules WHERE id = ?1 OR name = ?1", [id_or_name])?;
+            .execute("DELETE FROM project.schedules WHERE id = ?1 OR name = ?1", [id_or_name])?;
         Ok(changed > 0)
     }
 }

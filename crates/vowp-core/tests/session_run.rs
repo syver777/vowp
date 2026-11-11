@@ -485,6 +485,36 @@ fn run_turn_cwd_outside_allow_list_refused() {
 }
 
 #[test]
+fn run_turn_from_orchestrator_cwd_is_allowed() {
+    let tmp = tempdir().expect("tempdir");
+    let fake = Arc::new(FakeAdapter::new(HarnessKind::Opencode, Vec::new()));
+    let deps = deps(
+        &tmp,
+        config_for(tmp.path()),
+        AdapterRegistry::new().with("opencode", fake.clone()),
+    );
+    let cwd = deps.paths.root().join("orchestrators").join("night");
+    std::fs::create_dir_all(&cwd).expect("orchestrator dir");
+    let service = SessionService::new(deps.clone());
+    let session = service
+        .create_session(vowp_protocol::NewSession {
+            project: None,
+            job_id: None,
+            role: SessionRole::Worker,
+            title: "orchestrator".to_owned(),
+            cwd,
+            parent: None,
+            executor: Some(opencode()),
+        })
+        .expect("create session");
+
+    service
+        .run_turn(turn(&session, opencode(), "work"), &CancelToken::default())
+        .expect("the VOWP orchestrator directory is inside the allow-list");
+    assert_eq!(fake.starts().len(), 1);
+}
+
+#[test]
 fn run_turn_cancel_interrupts_adapter() {
     let tmp = tempdir().expect("tempdir");
     let (started_tx, started_rx) = channel();
@@ -697,7 +727,8 @@ fn session_switch_writes_capsule_and_lineage() {
 fn run_turn_cancel_interrupts_streaming_adapter() {
     let tmp = tempdir().expect("tempdir");
     let (started_tx, started_rx) = channel();
-    let streaming = StreamingAdapter::new(started_tx);
+    let (first_event_tx, first_event_rx) = channel();
+    let streaming = StreamingAdapter::new(started_tx, first_event_tx);
     let interrupts = streaming.interrupts.clone();
     let deps = deps(
         &tmp,
@@ -709,11 +740,18 @@ fn run_turn_cancel_interrupts_streaming_adapter() {
     let cancel = CancelToken::default();
     let canceller = cancel.clone();
     let handle = std::thread::spawn(move || {
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("adapter started");
-        std::thread::sleep(Duration::from_millis(30));
+        // Cancel only after the adapter has queued its first assistant message. A fixed
+        // startup delay races thread scheduling: under load the producer may not run
+        // before the cancellation arrives, leaving the log without the event the test
+        // means to interrupt. Always cancel on timeout so a broken adapter fails the
+        // assertion below instead of hanging the run.
+        if started_rx.recv_timeout(Duration::from_secs(30)).is_err() {
+            canceller.cancel();
+            panic!("adapter started");
+        }
+        let first_event = first_event_rx.recv_timeout(Duration::from_secs(30));
         canceller.cancel();
+        first_event.expect("the adapter emitted an event before cancellation");
     });
 
     let (done_tx, done_rx) = channel();
@@ -727,7 +765,7 @@ fn run_turn_cancel_interrupts_streaming_adapter() {
         })
     };
     let result = done_rx
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(30))
         .expect("a streaming run must return after cancellation")
         .expect("interrupted turn returns a summary");
     worker.join().expect("worker");
@@ -1095,13 +1133,15 @@ impl AdapterRun for WaitErrorRun {
 struct StreamingAdapter {
     interrupts: Arc<AtomicBool>,
     started: Arc<Mutex<Option<Sender<()>>>>,
+    first_event: Arc<Mutex<Option<Sender<()>>>>,
 }
 
 impl StreamingAdapter {
-    fn new(started: Sender<()>) -> Self {
+    fn new(started: Sender<()>, first_event: Sender<()>) -> Self {
         Self {
             interrupts: Arc::new(AtomicBool::new(false)),
             started: Arc::new(Mutex::new(Some(started))),
+            first_event: Arc::new(Mutex::new(Some(first_event))),
         }
     }
 }
@@ -1132,7 +1172,9 @@ impl Adapter for StreamingAdapter {
         let running = Arc::new(AtomicBool::new(true));
         let producer_sender = sender.clone();
         let producer_running = Arc::clone(&running);
+        let producer_first_event = Arc::clone(&self.first_event);
         std::thread::spawn(move || {
+            let mut first_event = producer_first_event.lock().expect("first event sender").take();
             while producer_running.load(Ordering::SeqCst) {
                 if producer_sender
                     .send(HarnessEvent {
@@ -1146,6 +1188,9 @@ impl Adapter for StreamingAdapter {
                     .is_err()
                 {
                     break;
+                }
+                if let Some(signal) = first_event.take() {
+                    let _ = signal.send(());
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }

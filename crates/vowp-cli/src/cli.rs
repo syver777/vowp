@@ -1,14 +1,26 @@
-//! clap definitions for every v0.1 command.
+//! clap definitions for every v0.1 and v0.2 command.
 //!
-//! Spec: `docs/design/cli.md`. The structs are shared by the command handlers; their
-//! argument names are stable.
-//!
-//! `Command` contains every command the v0.1 binary exposes, including commands whose
-//! handlers are still explicit [`crate::CliError::NotImplemented`] stubs.
+//! Spec: `docs/design/cli.md` and `docs/design/v0.2/home-and-surfaces.md` §12–§13.5.
+//! This file fixes every v0.2 top-level command, subcommand and flag; each command's
+//! handler and its `Args` struct live in `cmd/<name>.rs`.
 
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+
+use crate::cmd::capacity::CapacityArgs;
+use crate::cmd::control::ControlArgs;
+use crate::cmd::exec::ExecArgs;
+use crate::cmd::fleet::FleetArgs;
+use crate::cmd::gc::GcArgs;
+use crate::cmd::lease::{LeaseArgs, TakeoverArgs};
+use crate::cmd::mcp::McpArgs;
+use crate::cmd::migrate::MigrateArgs;
+use crate::cmd::orchestrator::OrchestratorArgs;
+use crate::cmd::project::ProjectArgs;
+use crate::cmd::secret::{SecretArgs, VaultAdminArgs, VaultExecArgs};
+use crate::cmd::setup::SetupArgs;
+use crate::cmd::tunnel::TunnelArgs;
 
 /// Every top-level command the v0.1 CLI exposes, in `cli.md` order.
 pub const V0_1_COMMANDS: &[&str] = &[
@@ -17,12 +29,33 @@ pub const V0_1_COMMANDS: &[&str] = &[
     "__window",
 ];
 
+/// Every top-level command v0.2 adds, including the hidden implementation interfaces.
+///
+/// `Cli::command().get_subcommands()` enumerates hidden subcommands too, which is why they
+/// are part of the help-test expectation.
+pub const V0_2_COMMANDS: &[&str] = &[
+    "project",
+    "fleet",
+    "capacity",
+    "secret",
+    "gc",
+    "tunnel",
+    "setup",
+    "control",
+    "orchestrator",
+    "migrate",
+    "mcp",
+    "__exec",
+    "__vault-exec",
+    "__vault-admin",
+];
+
 /// The parsed command line.
 #[derive(Debug, Parser)]
 #[command(
     name = "vowp",
     version,
-    about = "VOWP: VPS-first supervisor for AI coding agents",
+    about = "VOWP: local-first supervisor for AI coding agents",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -112,11 +145,7 @@ pub enum Command {
     /// List or pause supervisor loops.
     Loops(LoopsArgs),
     /// Manage scheduled actions.
-    Schedule {
-        /// The schedule subcommand.
-        #[command(subcommand)]
-        command: ScheduleCommand,
-    },
+    Schedule(ScheduleArgs),
     /// Promote a change to an environment.
     Promote(PromoteArgs),
     /// Roll a release back.
@@ -129,11 +158,42 @@ pub enum Command {
     Backup(BackupArgs),
     /// Print one exported JSON Schema.
     Schema(SchemaArgs),
+    /// Register, list, pause or archive projects.
+    Project(ProjectArgs),
+    /// Read the node snapshot, queue and inbox.
+    Fleet(FleetArgs),
+    /// Show or change measured capacity.
+    Capacity(CapacityArgs),
+    /// Set, list, remove or request secrets.
+    Secret(SecretArgs),
+    /// List lifecycle classes and collect garbage.
+    Gc(GcArgs),
+    /// Open, list or close control-machine SSH tunnels.
+    Tunnel(TunnelArgs),
+    /// Plan or apply the AI-first setup.
+    Setup(SetupArgs),
+    /// Configure this machine as the control machine.
+    Control(ControlArgs),
+    /// Create and manage orchestrator sessions.
+    Orchestrator(OrchestratorArgs),
+    /// Migrate a v0.1 home to the v0.2 layout.
+    Migrate(MigrateArgs),
+    /// Run the stdio MCP server.
+    Mcp(McpArgs),
     /// Print the binary version.
     Version,
     /// Hidden: what the tmux windows run.
     #[command(name = "__window", hide = true)]
     Window(WindowArgs),
+    /// Hidden: remote executor client.
+    #[command(name = "__exec", hide = true)]
+    Exec(ExecArgs),
+    /// Hidden: vault read/inject helper.
+    #[command(name = "__vault-exec", hide = true)]
+    VaultExec(VaultExecArgs),
+    /// Hidden: vault write helper.
+    #[command(name = "__vault-admin", hide = true)]
+    VaultAdmin(VaultAdminArgs),
 }
 
 /// Arguments for `vowp init`.
@@ -166,6 +226,9 @@ pub struct UpArgs {
     /// Do not create the tmux windows.
     #[arg(long)]
     pub no_tmux: bool,
+    /// Do not migrate the home before starting the supervisor.
+    #[arg(long)]
+    pub no_migrate: bool,
     /// Run exactly one supervisor tick and exit.
     #[arg(long)]
     pub once: bool,
@@ -429,6 +492,18 @@ pub enum SessionCommand {
     Watch(SessionWatchArgs),
     /// Print a session's event log.
     Tail(SessionTailArgs),
+    /// Hidden: begin a remote turn and print its grant.
+    #[command(name = "turn-begin", hide = true)]
+    TurnBegin(TurnBeginArgs),
+    /// Hidden: ingest remote events for one run.
+    #[command(name = "ingest", hide = true)]
+    Ingest(IngestArgs),
+    /// Hidden: show or acquire a session lease.
+    #[command(name = "lease", hide = true)]
+    Lease(LeaseArgs),
+    /// Hidden: take a session over from another surface.
+    #[command(name = "takeover", hide = true)]
+    Takeover(TakeoverArgs),
 }
 
 /// Arguments for `vowp session ls`.
@@ -489,6 +564,15 @@ pub struct ChatArgs {
     /// Switch to this executor before the first turn.
     #[arg(long, value_name = "EXECUTOR")]
     pub executor: Option<String>,
+    /// Node that runs the turn; defaults to this surface's machine.
+    #[arg(long, value_name = "NAME")]
+    pub node: Option<String>,
+    /// Follow the log read-only, without taking the lease.
+    #[arg(long)]
+    pub follow: bool,
+    /// Take the lease from a live surface before the first turn.
+    #[arg(long)]
+    pub takeover: bool,
 }
 
 /// Arguments for `vowp session switch`.
@@ -574,6 +658,38 @@ pub struct SessionTailArgs {
     /// Start after this sequence number.
     #[arg(long, value_name = "N")]
     pub from: Option<u64>,
+}
+
+/// Arguments for the hidden `vowp session turn-begin`.
+#[derive(Debug, Clone, Args)]
+pub struct TurnBeginArgs {
+    /// Session id or unique prefix.
+    pub id: String,
+    /// Executor to run on the surface's machine.
+    #[arg(long, value_name = "EXECUTOR")]
+    pub executor: String,
+    /// Purpose of the run (`start`, `continue`, `fix`, ...).
+    #[arg(long, value_name = "PURPOSE")]
+    pub purpose: String,
+    /// Node that will execute the run.
+    #[arg(long, value_name = "NAME")]
+    pub node: String,
+    /// Request document file, or `-` for stdin.
+    #[arg(long, value_name = "FILE|-")]
+    pub request: String,
+}
+
+/// Arguments for the hidden `vowp session ingest`.
+#[derive(Debug, Clone, Args)]
+pub struct IngestArgs {
+    /// Session id or unique prefix.
+    pub id: String,
+    /// Run id to ingest.
+    #[arg(long, value_name = "ID")]
+    pub run: String,
+    /// Hint that the client is replaying its spool.
+    #[arg(long)]
+    pub replay: bool,
 }
 
 /// `vowp inbox` subcommands.
@@ -700,6 +816,9 @@ pub struct LoopsArgs {
     /// Optional pause/resume action.
     #[command(subcommand)]
     pub command: Option<LoopsCommand>,
+    /// List every project's loop rows.
+    #[arg(long)]
+    pub all: bool,
 }
 
 /// `vowp loops` actions.
@@ -716,6 +835,25 @@ pub enum LoopsCommand {
 pub struct LoopNameArgs {
     /// Loop name, for example `l4-planner`.
     pub loop_name: String,
+}
+
+/// `vowp schedule` arguments.
+#[derive(Debug, Clone, Args)]
+pub struct ScheduleArgs {
+    /// The schedule subcommand.
+    #[command(subcommand)]
+    pub command: ScheduleCommand,
+    /// Show every project's schedules.
+    #[arg(long)]
+    pub all: bool,
+}
+
+impl std::ops::Deref for ScheduleArgs {
+    type Target = ScheduleCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.command
+    }
 }
 
 /// `vowp schedule` subcommands.
@@ -853,11 +991,26 @@ pub struct ReindexArgs {
 }
 
 /// Arguments for `vowp backup`.
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 pub struct BackupArgs {
-    /// Destination file.
-    #[arg(long, value_name = "FILE")]
+    /// Destination file/directory or offsite target; a `.db` path is a global-only copy.
+    #[arg(long, value_name = "PATH|TARGET")]
     pub to: Option<PathBuf>,
+    /// Offsite rsync or git target.
+    #[arg(long, value_name = "TARGET")]
+    pub offsite: Option<String>,
+    /// Encrypt with `age` to this recipient.
+    #[arg(long, value_name = "RECIPIENT")]
+    pub encrypt: Option<String>,
+    /// Restore this backup directory into `--to-home`.
+    #[arg(long, value_name = "DIR")]
+    pub restore: Option<PathBuf>,
+    /// Fresh home directory to restore into.
+    #[arg(long, value_name = "DIR")]
+    pub to_home: Option<PathBuf>,
+    /// Overwrite an existing restore target.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `vowp schema`.
@@ -870,7 +1023,7 @@ pub struct SchemaArgs {
 /// Arguments for the hidden `vowp __window`.
 #[derive(Debug, Clone, Args)]
 pub struct WindowArgs {
-    /// Window kind (`board`, `supervisor`, `planner`, `keeper`, `inbox`, `job`).
+    /// Window kind (`board`, `supervisor`, `planner`, `keeper`, `inbox`, `capacity`, `job`).
     pub kind: String,
     /// Job id for `job`.
     pub id: Option<String>,

@@ -34,7 +34,7 @@ Exported by `vowp schema Release` and generated from the protocol types in
       "type": "object"
     },
     "ProjectName": {
-      "description": "Project name slug, for example `vowp`.",
+      "description": "Project name slug, for example `vowp`.\n\n`_node` is the reserved project that owns project-less session runs.",
       "type": "string"
     },
     "ReleaseId": {

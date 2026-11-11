@@ -36,7 +36,7 @@ decoration, not the source of truth.
   receipt.
 - `vowp-cli::cmd::cost` — the exact JSON shape and the `receipt`/`price-table`/`unknown`/`mixed`
   source derivation.
-- [`http-api.md`](http-api.md) — the transport.
+- [`http-api.md`](../v0.3/http-api.md) — the transport.
 
 ## Shape
 

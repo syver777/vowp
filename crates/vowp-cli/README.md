@@ -1,6 +1,6 @@
 # vowp-cli
 
-The command-line interface for [VOWP](https://github.com/syver777/vowp), a VPS-first supervisor for AI
+The command-line interface for [VOWP](https://github.com/syver777/vowp), a local-first supervisor for AI
 coding agents. This crate is part of the VOWP workspace.
 
 The crate is named `vowp-cli`; the binary it builds and installs is named `vowp`. There is no separate
@@ -8,7 +8,7 @@ The crate is named `vowp-cli`; the binary it builds and installs is named `vowp`
 
 ## Install
 
-Once version 0.1.0 is on crates.io:
+Once version 0.2.0 is on crates.io:
 
 ```sh
 cargo install vowp-cli
@@ -32,7 +32,7 @@ vowp --version
 
 ## Status
 
-VOWP 0.1.0 is an early release. The `vowp` command tree is implemented, but some supervisor loops and
+VOWP 0.2.0 is an early release. The `vowp` command tree is implemented, but some supervisor loops and
 optional features have known gaps; the release notes list them.
 
 ## Links

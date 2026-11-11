@@ -167,6 +167,12 @@ macro_rules! ulid_id {
 /// Declares a slug-backed id type.
 macro_rules! slug_id {
     ($(#[$meta:meta])* $name:ident) => {
+        slug_id!(@define $(#[$meta])* $name, false);
+    };
+    ($(#[$meta:meta])* $name:ident, reserved_node) => {
+        slug_id!(@define $(#[$meta])* $name, true);
+    };
+    (@define $(#[$meta:meta])* $name:ident, $allow_node:expr) => {
         $(#[$meta])*
         #[derive(
             Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -177,8 +183,10 @@ macro_rules! slug_id {
 
         impl $name {
             /// Parses a slug: lowercase letters and digits, `-` inside, at most 64 characters.
+            ///
+            /// Project names additionally accept the reserved literal `_node`.
             pub fn parse(s: &str) -> Result<Self, ProtocolError> {
-                if is_slug(s) {
+                if is_slug(s) || ($allow_node && s == "_node") {
                     Ok(Self(s.to_owned()))
                 } else {
                     Err(ProtocolError::InvalidId {
@@ -264,5 +272,8 @@ slug_id!(
 );
 slug_id!(
     /// Project name slug, for example `vowp`.
-    ProjectName
+    ///
+    /// `_node` is the reserved project that owns project-less session runs.
+    ProjectName,
+    reserved_node
 );

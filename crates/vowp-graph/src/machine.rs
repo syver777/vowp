@@ -21,7 +21,7 @@ pub const MAX_HANG_RESTARTS: u32 = 3;
 pub enum JobEvent {
     /// Every `needs` target is done (T1; emitted by the tick's readiness check).
     NeedsSatisfied,
-    /// A worker slot and executor were assigned (T2).
+    /// A worker slot and executor were assigned.
     Dispatched,
     /// The worker wrote a valid report (T3).
     ReportReady,
@@ -196,11 +196,11 @@ pub fn transition_with(job: &Job, ev: &JobEvent, bounds: &TransitionBounds) -> R
         // T1
         (JobState::Pending, JobEvent::NeedsSatisfied) => done(JobState::Ready, Vec::new()),
 
-        // T2
+        // Ready -> Running: hand the job to a worker.
         (JobState::Ready, JobEvent::Dispatched) => {
-            // T2's "already has a session / prior run" fact is not part of the pure-function
-            // inputs listed in crates/vowp-graph.md §3 rule 1; only `continues` is observable
-            // here, so a caller resuming a prior run overrides the purpose itself.
+            // Whether the job already has a session or a prior run is not part of the
+            // pure-function inputs listed in crates/vowp-graph.md §3 rule 1; only `continues`
+            // is observable here, so a caller resuming a prior run overrides the purpose itself.
             let purpose = if matches!(job.kind, JobKind::Fix | JobKind::Merge) {
                 RunPurpose::Fix
             } else if job.continues > 0 {

@@ -4,9 +4,10 @@
 //! Every step is wrapped: one failing step is logged, bumps the L1 fail streak and the tick
 //! continues with the later steps.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,11 +17,12 @@ use vowp_graph::{
     StallThresholds, StallVerdict, TransitionBounds, plan_dispatch,
 };
 use vowp_protocol::{
-    ActiveState, CancelToken, GateResult, InboxKind, Job, JobId, JobKind, JobState, Level, LimitRowKind, LoopBounds,
-    NewSession, ParkedReason, Profile, Run, RunId, RunPurpose, SessionId, SessionRole, Timestamp, Worker, WorkerKind,
+    ActiveState, CancelToken, GateResult, InboxId, InboxItem, InboxKind, InboxState, Job, JobId, JobKind, JobState,
+    Level, LimitRowKind, LoopBounds, NewSession, Node, NodeFile, ParkedReason, Profile, ProjectEntry, ProjectName,
+    ProjectState, Run, RunId, RunPurpose, SessionId, SessionRole, Timestamp, VowpConfig, Worker, WorkerKind,
     WorkerState,
 };
-use vowp_store::{JobFilter, Store};
+use vowp_store::{CrossDbReconcile, JobFilter, MigrationReport, Store};
 
 use crate::CoreError;
 use crate::deps::Deps;
@@ -28,6 +30,7 @@ use crate::gates::{GateCtx, GateRunner};
 use crate::ledger::{BoardSnapshot, Ledger};
 use crate::schedules::ScheduleEngine;
 use crate::session::service::SessionService;
+use crate::surface::orchestrator::Orchestrator;
 
 use super::l2_worker::ReportOutcome;
 use super::l4_planner::{self, SessionChoice};
@@ -75,6 +78,15 @@ pub struct TickReport {
     pub transitions: Vec<(JobId, JobState, JobState)>,
     /// Jobs merged this tick.
     pub merged: Vec<JobId>,
+}
+
+/// Which project steps one node-supervisor pass runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectTickMode {
+    /// A normal tick: every step, including dispatch and schedules.
+    Active,
+    /// A paused project's maintenance tick: finish running work, start nothing new.
+    Maintenance,
 }
 
 /// Result of one background gate run.
@@ -194,37 +206,89 @@ impl Supervisor {
     }
 
     /// One full L1 tick, steps 0–13 of loops.md §1.1.
+    ///
+    /// The node-level hooks (capacity sampling, lease sweep, lifecycle tick and the
+    /// snapshot) belong to [`NodeSupervisor`] and are not run here. This method keeps the
+    /// v0.1 project-local board and heartbeat so single-project supervisors and their
+    /// tests behave exactly as before.
     pub fn tick(&mut self) -> Result<TickReport, CoreError> {
         let now = self.deps.clock.now();
+        let mut report = self.tick_steps(ProjectTickMode::Active, now)?;
+        report.steps.push(self.step("board", |this| this.step_board(now)));
+        report
+            .steps
+            .push(self.step("heartbeat", |this| this.step_heartbeat(now)));
+        if let Err(error) = self.update_loop_rows(now, &report.steps) {
+            self.deps
+                .log
+                .log(Level::Error, "l1", &format!("cannot update loop rows: {error}"));
+        }
+        self.record_tick(&report, now);
+        Ok(report)
+    }
+
+    /// Runs the project steps for one node-supervisor pass.
+    ///
+    /// `Active` runs the full L1 order. `Maintenance` keeps requests, reconcile, harvest,
+    /// stalls, states, gates, verify and merge, and skips the steps that create work
+    /// (dispatch, triggers and schedules). Board and heartbeat are node-level and are
+    /// written once by [`NodeSupervisor`].
+    pub(crate) fn tick_project(&mut self, mode: ProjectTickMode, now: Timestamp) -> Result<TickReport, CoreError> {
+        let report = self.tick_steps(mode, now)?;
+        // L2–L7 and L9 come from this project's steps. L8 is node-wide: the node
+        // supervisor records it from the node heartbeat after every project has ticked.
+        if let Err(error) = self.update_loop_rows(now, &report.steps) {
+            self.deps
+                .log
+                .log(Level::Error, "l1", &format!("cannot update loop rows: {error}"));
+        }
+        self.record_tick(&report, now);
+        Ok(report)
+    }
+
+    /// Runs the ordered project steps without recording the L1 loop row.
+    fn tick_steps(&mut self, mode: ProjectTickMode, now: Timestamp) -> Result<TickReport, CoreError> {
         self.transitions.clear();
         self.dispatched.clear();
         self.merged.clear();
         self.repeat_tripped = None;
-        let paused = self.store.kv_get("paused")?.as_deref() == Some("1");
+        let node_paused = self.store.kv_get("paused")?.as_deref() == Some("1");
         let mut steps = Vec::new();
 
         steps.push(self.step("requests", Self::step_requests));
         steps.push(self.step("reconcile", |this| this.step_reconcile(now)));
-        if !paused {
+        if !node_paused {
             steps.push(self.step("harvest", |this| this.step_harvest(now)));
             steps.push(self.step("stalls", |this| this.step_stalls(now)));
             steps.push(self.step("states", |this| this.step_states(now)));
             steps.push(self.step("gates", |this| this.step_gates(now)));
             steps.push(self.step("verify", |this| this.step_verify(now)));
             steps.push(self.step("merge", |this| this.step_merge(now)));
-            steps.push(self.step("dispatch", |this| this.step_dispatch(now)));
-            steps.push(self.step("triggers", |this| this.step_triggers(now)));
-            steps.push(self.step("probes", |this| this.step_probes(now)));
-            steps.push(self.step("schedules", |this| this.step_schedules(now)));
+            if mode == ProjectTickMode::Active {
+                steps.push(self.step("dispatch", |this| this.step_dispatch(now)));
+                steps.push(self.step("triggers", |this| this.step_triggers(now)));
+                steps.push(self.step("probes", |this| this.step_probes(now)));
+                steps.push(self.step("schedules", |this| this.step_schedules(now)));
+            }
         }
-        steps.push(self.step("board", |this| this.step_board(now)));
-        steps.push(self.step("heartbeat", |this| this.step_heartbeat(now)));
-        if let Err(error) = self.update_loop_rows(now, &steps) {
-            self.deps
-                .log
-                .log(Level::Error, "l1", &format!("cannot update loop rows: {error}"));
+        // §4.2: board/checkpoint is in the maintenance subset. A paused project keeps its
+        // own checkpoint fresh; the node-level board.json stays the single-project
+        // compatibility copy written by [`NodeSupervisor`].
+        if mode == ProjectTickMode::Maintenance {
+            steps.push(self.step("board", |this| this.step_checkpoint(now)));
         }
+        Ok(TickReport {
+            at: now,
+            steps,
+            dispatched: std::mem::take(&mut self.dispatched),
+            transitions: std::mem::take(&mut self.transitions),
+            merged: std::mem::take(&mut self.merged),
+        })
+    }
 
+    /// Records the L1 loop row for one project pass.
+    fn record_tick(&self, report: &TickReport, now: Timestamp) {
+        let steps = &report.steps;
         let ok = steps.iter().all(|step| step.ok) && self.repeat_tripped.is_none();
         let failed: Vec<&str> = steps.iter().filter(|step| !step.ok).map(|step| step.name).collect();
         let status = match (&self.repeat_tripped, failed.is_empty()) {
@@ -241,35 +305,22 @@ impl Supervisor {
                 .log
                 .log(Level::Error, "l1", &format!("cannot record loop row: {error}"));
         }
-
-        Ok(TickReport {
-            at: now,
-            steps,
-            dispatched: std::mem::take(&mut self.dispatched),
-            transitions: std::mem::take(&mut self.transitions),
-            merged: std::mem::take(&mut self.merged),
-        })
     }
 
-    /// Startup then tick every `[node].tick_secs` or on wake, until `cancel`.
-    pub fn run(&mut self, cancel: &CancelToken) -> Result<(), CoreError> {
-        self.startup()?;
-        let tick = Duration::from_secs(self.deps.config.node.tick_secs.max(1));
-        while !cancel.is_cancelled() {
-            self.tick()?;
-            if !wait_for_next_tick(self.wake_rx.as_ref(), tick, &self.store, cancel)? {
-                break;
-            }
-        }
+    /// Writes the project board and checkpoint outside a full tick.
+    pub(crate) fn write_board(&mut self, now: Timestamp) -> Result<String, CoreError> {
+        self.step_board(now)
+    }
+
+    /// Stops project runner threads and marks their open runs as stalled.
+    pub(crate) fn shutdown(&mut self) -> Result<(), CoreError> {
         self.runners.cancel_all();
         self.session_runners.cancel_all();
-        // Mark run rows whose threads were interrupted as stalled, as the crate doc requires.
-        let store = self.deps.open_store()?;
-        for run in store.open_runs()? {
+        for run in self.store.open_runs()? {
             if run.node != self.deps.node {
                 continue;
             }
-            let _ = store.finish_run(
+            let _ = self.store.finish_run(
                 &run.id,
                 &vowp_store::RunFinish {
                     outcome: vowp_protocol::RunOutcome::Stalled,
@@ -282,6 +333,20 @@ impl Supervisor {
             );
         }
         Ok(())
+    }
+
+    /// Startup then tick every `[node].tick_secs` or on wake, until `cancel`.
+    pub fn run(&mut self, cancel: &CancelToken) -> Result<(), CoreError> {
+        self.startup()?;
+        let tick = Duration::from_secs(self.deps.config.node.tick_secs.max(1));
+        while !cancel.is_cancelled() {
+            self.tick()?;
+            if !wait_for_next_tick(self.wake_rx.as_ref(), tick, &self.store, cancel)? {
+                break;
+            }
+        }
+        // Mark run rows whose threads were interrupted as stalled, as the crate doc requires.
+        self.shutdown()
     }
 
     /// Returns a cloneable handle that ends the idle wait early.
@@ -1263,6 +1328,10 @@ impl Supervisor {
         let mut dispatched = 0;
         for choice in choices {
             let job = self.store.require_job(&choice.job_id)?;
+            // Ask capacity admission before dispatch; a job that must wait stays queued.
+            if !dispatch::admit(&self.deps, &self.store, &job)? {
+                continue;
+            }
             self.dispatched.push(job.id.clone());
             let resume = dispatch::purpose_for_dispatch(&self.store, &job)?;
             self.start_purpose_override = Some(resume);
@@ -1584,6 +1653,23 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Records this project's L8 row from the node-level heartbeat result.
+    ///
+    /// The heartbeat file is written once per node, after every project has ticked; a
+    /// project pass therefore has no `heartbeat` step of its own. The node supervisor
+    /// calls this for each project so `l8-watchdog` still shows the real run time.
+    pub(crate) fn record_heartbeat(&self, now: Timestamp, ok: bool, detail: &str) -> Result<(), CoreError> {
+        let Some(loop_) = self.store.loop_("l8-watchdog")? else {
+            return Ok(());
+        };
+        if loop_.state == ActiveState::Paused {
+            return Ok(());
+        }
+        self.store
+            .record_loop_run("l8-watchdog", now, loop_.next_run_at, detail, ok)?;
+        Ok(())
+    }
+
     /// Step 11: fire due schedules.
     fn step_schedules(&mut self, now: Timestamp) -> Result<String, CoreError> {
         if !self.loop_active("l9-schedules") {
@@ -1609,31 +1695,46 @@ impl Supervisor {
 
     /// Step 12: board snapshot and checkpoint.
     fn step_board(&mut self, now: Timestamp) -> Result<String, CoreError> {
+        self.write_board_snapshot(now)?;
+        self.step_checkpoint(now)?;
+        Ok("board written".to_owned())
+    }
+
+    /// Writes the board snapshot copy without touching the checkpoint.
+    fn write_board_snapshot(&self, now: Timestamp) -> Result<(), CoreError> {
         let snapshot = BoardSnapshot::collect(&self.store, &self.deps.config, now)?;
         let json = board_json(&snapshot)?;
-        self.atomic_write("board.json", &json)?;
+        self.atomic_write("board.json", &json)
+    }
 
+    /// Writes the project checkpoint when one is due.
+    ///
+    /// This is the maintenance subset's board step for a paused project: the node-level
+    /// `board.json` belongs to the single-project compatibility path, while the
+    /// checkpoint file is per project and can be written by every paused tick.
+    fn step_checkpoint(&mut self, now: Timestamp) -> Result<String, CoreError> {
         let checkpoint_minutes = self.bounds().checkpoint_minutes.unwrap_or(120) as u64;
         let due = match self.last_checkpoint {
             None => checkpoint_minutes > 0,
             Some(last) => now.since(last) >= Duration::from_secs(checkpoint_minutes.saturating_mul(60)),
         };
-        if due && checkpoint_minutes > 0 {
-            let text = crate::ledger::report::checkpoint(&self.store, &self.deps.config, now)?;
-            let project = super::main_repo(&self.deps, &self.store, &self.project)?;
-            let dir = project.join(".vowp/checkpoints");
-            std::fs::create_dir_all(&dir).map_err(|source| CoreError::Io {
-                path: dir.display().to_string(),
-                source,
-            })?;
-            let path = dir.join(format!("{}.md", now.unix_secs()));
-            std::fs::write(&path, text).map_err(|source| CoreError::Io {
-                path: path.display().to_string(),
-                source,
-            })?;
-            self.last_checkpoint = Some(now);
+        if !due || checkpoint_minutes == 0 {
+            return Ok("checkpoint not due".to_owned());
         }
-        Ok("board written".to_owned())
+        let text = crate::ledger::report::checkpoint(&self.store, &self.deps.config, now)?;
+        let project = super::main_repo(&self.deps, &self.store, &self.project)?;
+        let dir = project.join(".vowp/checkpoints");
+        std::fs::create_dir_all(&dir).map_err(|source| CoreError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let path = dir.join(format!("{}.md", now.unix_secs()));
+        std::fs::write(&path, text).map_err(|source| CoreError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        self.last_checkpoint = Some(now);
+        Ok("checkpoint written".to_owned())
     }
 
     /// Step 13: heartbeat file and supervisor pid.
@@ -2254,6 +2355,842 @@ impl Supervisor {
         let job = self.store.require_job(job)?;
         Ok(self.store.gate_results_for(&job.id, job.attempts)?)
     }
+}
+
+/// One project's supervisor inside the node supervisor.
+pub struct ProjectSupervisor {
+    deps: Deps,
+    project: ProjectName,
+    inner: Supervisor,
+    started: bool,
+}
+
+impl ProjectSupervisor {
+    /// Returns the project this supervisor runs.
+    pub fn name(&self) -> &ProjectName {
+        &self.project
+    }
+
+    /// Returns the per-project dependencies (its own `vowp.toml` plus node defaults).
+    pub fn deps(&self) -> &Deps {
+        &self.deps
+    }
+
+    /// Returns the project store handle.
+    pub fn store(&self) -> &Store {
+        &self.inner.store
+    }
+}
+
+/// What one node pass reconciled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeReconcileReport {
+    /// Projects with a loaded supervisor.
+    pub projects: u32,
+    /// Cross-database repairs summed over every project.
+    pub cross_db: CrossDbReconcile,
+    /// Migration performed by this startup, when the CLI asked for one.
+    pub migration: Option<MigrationReport>,
+    /// Running orchestrators whose app hosts were resumed.
+    pub orchestrators_resumed: u32,
+    /// Per-project startup counters.
+    pub per_project: BTreeMap<ProjectName, ReconcileReport>,
+}
+
+/// Everything one node tick did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeTickReport {
+    /// Instant the tick started.
+    pub at: Timestamp,
+    /// Node-level steps, in order.
+    pub steps: Vec<StepReport>,
+    /// One report per project that was ticked.
+    pub projects: BTreeMap<ProjectName, TickReport>,
+    /// Projects that were not ticked, with the reason.
+    pub skipped: Vec<(ProjectName, String)>,
+}
+
+/// One supervisor for every active project on the node.
+///
+/// The node lock and the node-level hooks live here. Each project keeps its own `Deps`,
+/// its own attached database and its own [`Supervisor`], so a broken project can only
+/// park itself.
+pub struct NodeSupervisor {
+    deps: Deps,
+    orchestrators: Orchestrator,
+    global: Store,
+    projects: BTreeMap<ProjectName, ProjectSupervisor>,
+    order: Vec<ProjectName>,
+    next: usize,
+    started_at: Timestamp,
+    wake: WakeHandle,
+    wake_rx: Option<Receiver<()>>,
+    last_failure: BTreeMap<ProjectName, String>,
+    pending_migration: Option<MigrationReport>,
+}
+
+impl NodeSupervisor {
+    /// Opens the node registry and loads every active or paused project.
+    pub fn new(deps: Deps) -> Result<Self, CoreError> {
+        let orchestrators = Orchestrator::new(deps.clone());
+        Self::with_orchestrator(deps, orchestrators)
+    }
+
+    /// Creates a node supervisor with explicit orchestrator app hosts.
+    ///
+    /// Production uses [`NodeSupervisor::new`], which builds the real opencode and
+    /// Claude Code hosts. Tests pass fake hosts so a startup resume never launches an
+    /// app.
+    pub fn with_orchestrator(deps: Deps, orchestrators: Orchestrator) -> Result<Self, CoreError> {
+        let global = Store::open_global(&deps.paths)?.with_clock(deps.clock.clone());
+        ensure_node_project(&deps, &global)?;
+        let (wake, wake_rx) = WakeHandle::channel();
+        let mut supervisor = Self {
+            started_at: deps.clock.now(),
+            deps,
+            orchestrators,
+            global,
+            projects: BTreeMap::new(),
+            order: Vec::new(),
+            next: 0,
+            wake,
+            wake_rx: Some(wake_rx),
+            last_failure: BTreeMap::new(),
+            pending_migration: None,
+        };
+        supervisor.reload_projects()?;
+        Ok(supervisor)
+    }
+
+    /// Records the migration `vowp up` performed before building this supervisor.
+    ///
+    /// The CLI migrates a v0.1 home before [`NodeSupervisor::new`] can open it, so the
+    /// result would otherwise be lost. [`NodeSupervisor::startup`] returns it in
+    /// [`NodeReconcileReport::migration`].
+    pub fn record_migration(&mut self, report: MigrationReport) {
+        self.pending_migration = Some(report);
+    }
+
+    /// Startup reconciliation for every project.
+    pub fn startup(&mut self) -> Result<NodeReconcileReport, CoreError> {
+        self.reload_projects()?;
+        let mut report = NodeReconcileReport {
+            migration: self.pending_migration.take(),
+            ..NodeReconcileReport::default()
+        };
+        match self.orchestrators.resume_all() {
+            Ok(resumed) => {
+                report.orchestrators_resumed = u32::try_from(resumed.len()).unwrap_or(u32::MAX);
+            }
+            Err(error) => self
+                .deps
+                .log
+                .log(Level::Warn, "node", &format!("orchestrator resume: {error}")),
+        }
+        let names: Vec<ProjectName> = self.projects.keys().cloned().collect();
+        for name in names {
+            let Some(project) = self.projects.get_mut(&name) else {
+                continue;
+            };
+            if project.started {
+                continue;
+            }
+            match project.inner.startup() {
+                Ok(project_report) => {
+                    project.started = true;
+                    report.projects += 1;
+                    report.per_project.insert(name.clone(), project_report);
+                    match project.inner.store.reconcile_cross_db() {
+                        Ok(cross) => add_cross_db(&mut report.cross_db, cross),
+                        Err(error) => {
+                            self.deps
+                                .log
+                                .log(Level::Warn, "node", &format!("cross-db reconcile for {name}: {error}"))
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.deps
+                        .log
+                        .log(Level::Error, "node", &format!("startup for {name} failed: {error}"));
+                    self.park_broken(&name, &format!("startup failed: {error}"))?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// One node pass: node hooks, then every project in round-robin order.
+    pub fn tick(&mut self) -> Result<NodeTickReport, CoreError> {
+        let now = self.deps.clock.now();
+        self.reload_projects()?;
+        let mut steps = Vec::new();
+        steps.push(self.node_step("sample", |this| {
+            crate::capacity::CapacityManager::new(this.deps.clone())
+                .sample(&this.global, now)
+                .map(|sample| {
+                    if sample.is_some() {
+                        "host sampled".to_owned()
+                    } else {
+                        "no sampler".to_owned()
+                    }
+                })
+        }));
+        steps.push(self.node_step("advice", |this| {
+            crate::capacity::advisor::advise_tick(&this.deps, &this.global, now).map(|advice| {
+                advice.map_or_else(
+                    || "no advice due".to_owned(),
+                    |advice| format!("advice {} ({} workers)", advice.id, advice.proposed_target),
+                )
+            })
+        }));
+        steps.push(self.node_step("leases", |this| {
+            crate::surface::sweep_leases(&this.deps, &this.global, now).map(|count| format!("{count} lease(s) swept"))
+        }));
+        steps.push(self.node_step("lifecycle", |this| {
+            crate::lifecycle::tick(&this.deps, &this.global, now).map(|()| "lifecycle ticked".to_owned())
+        }));
+        // §4.2 step 1: the node drains node-scoped requests itself. A project's
+        // `step_requests` also accepts node keys, but whichever project ticked first would
+        // then apply a request for another project's job to the wrong database.
+        steps.push(self.node_step("global", |this| this.step_global_requests()));
+
+        let rotation = self.rotation();
+        let mut projects = BTreeMap::new();
+        let mut skipped = Vec::new();
+        let mut ticked = Vec::new();
+        for name in &rotation {
+            let Some(entry) = super::registry::project_entry(&self.global, name)? else {
+                skipped.push((name.clone(), "not registered".to_owned()));
+                continue;
+            };
+            let mode = match entry.state {
+                ProjectState::Active => ProjectTickMode::Active,
+                ProjectState::Paused if entry.paused_reason.starts_with("broken:") => {
+                    skipped.push((name.clone(), entry.paused_reason.clone()));
+                    continue;
+                }
+                ProjectState::Paused => ProjectTickMode::Maintenance,
+                ProjectState::Archived => {
+                    skipped.push((name.clone(), "archived".to_owned()));
+                    continue;
+                }
+            };
+            let Some(project) = self.projects.get_mut(name) else {
+                skipped.push((name.clone(), "not loaded".to_owned()));
+                continue;
+            };
+            if !project.started {
+                match project.inner.startup() {
+                    Ok(_) => {
+                        project.started = true;
+                        // §3.8: a project added after `NodeSupervisor::startup` must
+                        // reconcile its cross-file rows before its first L1 tick too.
+                        if let Err(error) = project.inner.store.reconcile_cross_db() {
+                            self.deps
+                                .log
+                                .log(Level::Warn, "node", &format!("cross-db reconcile for {name}: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        self.last_failure.insert(name.clone(), error.to_string());
+                        skipped.push((name.clone(), error.to_string()));
+                        self.deps
+                            .log
+                            .log(Level::Error, "node", &format!("startup for {name} failed: {error}"));
+                        self.park_broken(name, &format!("startup failed: {error}"))?;
+                        continue;
+                    }
+                }
+            }
+            match project.inner.tick_project(mode, now) {
+                Ok(report) => {
+                    if report.steps.iter().any(|step| !step.ok) {
+                        let failed: Vec<String> = report
+                            .steps
+                            .iter()
+                            .filter(|step| !step.ok)
+                            .map(|step| format!("{}: {}", step.name, step.detail))
+                            .collect();
+                        self.last_failure.insert(name.clone(), failed.join("; "));
+                    } else {
+                        self.last_failure.remove(name);
+                    }
+                    projects.insert(name.clone(), report);
+                    ticked.push(name.as_str().to_owned());
+                }
+                Err(error) => {
+                    self.last_failure.insert(name.clone(), error.to_string());
+                    skipped.push((name.clone(), error.to_string()));
+                    self.deps
+                        .log
+                        .log(Level::Error, "node", &format!("project {name} tick failed: {error}"));
+                }
+            }
+            self.refresh_fail_streak(name)?;
+        }
+        self.advance_rotation();
+        // Registry entries that never got a supervisor (archived, parked broken at load)
+        // are still reported, so the node tick explains why a project is missing.
+        for entry in super::registry::project_entries(&self.global)? {
+            if entry.name.as_str() == vowp_store::RESERVED_NODE_PROJECT
+                || self.projects.contains_key(&entry.name)
+                || skipped.iter().any(|(name, _)| name == &entry.name)
+            {
+                continue;
+            }
+            let reason = match entry.state {
+                ProjectState::Archived => "archived".to_owned(),
+                ProjectState::Paused if !entry.paused_reason.is_empty() => entry.paused_reason.clone(),
+                ProjectState::Paused => "paused".to_owned(),
+                ProjectState::Active => "not loaded".to_owned(),
+            };
+            skipped.push((entry.name, reason));
+        }
+        steps.push(StepReport {
+            name: "projects",
+            ok: true,
+            detail: format!("{} project(s) ticked: {}", ticked.len(), ticked.join(", ")),
+        });
+
+        steps.push(self.node_step("snapshot", |this| {
+            crate::fleet::write_snapshot(&this.deps, &this.global, now).map(|()| "snapshot written".to_owned())
+        }));
+
+        // §4.2 step 4: the v0.1 compatibility board is written only when one non-reserved
+        // project needs a tick. An active project owns the copy when there is exactly one.
+        // With no active project, a single paused project still writes it: its maintenance
+        // subset includes board/checkpoint, and a home whose only project is paused must not
+        // leave board.json stale. A broken project is parked and not ticked, so it cannot
+        // write the board.
+        let entries = super::registry::project_entries(&self.global)?;
+        let active: Vec<ProjectName> = entries
+            .iter()
+            .filter(|entry| {
+                entry.state == ProjectState::Active && entry.name.as_str() != vowp_store::RESERVED_NODE_PROJECT
+            })
+            .map(|entry| entry.name.clone())
+            .collect();
+        let paused: Vec<ProjectName> = entries
+            .iter()
+            .filter(|entry| {
+                entry.state == ProjectState::Paused
+                    && !entry.paused_reason.starts_with("broken:")
+                    && entry.name.as_str() != vowp_store::RESERVED_NODE_PROJECT
+            })
+            .map(|entry| entry.name.clone())
+            .collect();
+        let board_project = match active.as_slice() {
+            [only] => Some(only.clone()),
+            [] if paused.len() == 1 => paused.first().cloned(),
+            _ => None,
+        };
+        if let Some(only) = board_project {
+            let result = match self.projects.get_mut(&only) {
+                Some(project) => project.inner.write_board(now),
+                None => Ok("project not loaded".to_owned()),
+            };
+            steps.push(match result {
+                Ok(detail) => StepReport {
+                    name: "board",
+                    ok: true,
+                    detail,
+                },
+                Err(error) => {
+                    self.deps
+                        .log
+                        .log(Level::Error, "node", &format!("board failed: {error}"));
+                    StepReport {
+                        name: "board",
+                        ok: false,
+                        detail: error.to_string(),
+                    }
+                }
+            });
+        } else {
+            steps.push(StepReport {
+                name: "board",
+                ok: true,
+                detail: format!(
+                    "node board deferred: {} active and {} paused project(s)",
+                    active.len(),
+                    paused.len()
+                ),
+            });
+        }
+
+        let heartbeat = self.node_step("heartbeat", |this| {
+            l8_watchdog::write_heartbeat(&this.deps)?;
+            this.global.kv_set("supervisor_pid", &std::process::id().to_string())?;
+            Ok("heartbeat written".to_owned())
+        });
+        // The heartbeat is one node-wide step, but every project has an `l8-watchdog`
+        // row. Record the node result in each project DB after the file is written, so
+        // `vowp loops --all` shows the same run time as `l1-supervisor`.
+        for project in self.projects.values() {
+            if let Err(error) = project.inner.record_heartbeat(now, heartbeat.ok, &heartbeat.detail) {
+                self.deps.log.log(
+                    Level::Error,
+                    "node",
+                    &format!("cannot record the L8 row for {}: {error}", project.project),
+                );
+            }
+        }
+        steps.push(heartbeat);
+
+        Ok(NodeTickReport {
+            at: now,
+            steps,
+            projects,
+            skipped,
+        })
+    }
+
+    /// §4.2 step 1: drains `req:node:*` and applies each request once on the node.
+    ///
+    /// A request that names a job or an inbox item is routed to the project database that
+    /// owns it. A node-scoped loop request applies to every loaded project, and `Wake`
+    /// has no project effect. A request that matches no project is dropped with a warning,
+    /// exactly like a project step's undecodable request.
+    fn step_global_requests(&mut self) -> Result<String, CoreError> {
+        let requests = crate::requests::drain(&self.global)?;
+        let total = requests.len();
+        let mut applied = 0;
+        let mut dropped = 0;
+        for (id, request) in requests {
+            match self.apply_node_request(&request) {
+                Ok(true) => applied += 1,
+                Ok(false) => {
+                    dropped += 1;
+                    self.deps.log.log(
+                        Level::Warn,
+                        "requests",
+                        &format!(
+                            "dropped node request {} {}: no loaded project owns it",
+                            id.0,
+                            request_name(&request)
+                        ),
+                    );
+                }
+                Err(error) => {
+                    dropped += 1;
+                    self.deps.log.log(
+                        Level::Warn,
+                        "requests",
+                        &format!("dropped node request {} {}: {error}", id.0, request_name(&request)),
+                    );
+                }
+            }
+        }
+        Ok(format!(
+            "{applied} node request(s) applied, {dropped} dropped ({total} drained)"
+        ))
+    }
+
+    /// Applies one node-scoped request to the project that owns it.
+    ///
+    /// Returns `Ok(false)` when no loaded project owns it. `Wake` is node-wide and needs
+    /// no project; an unbound loop request applies to every loaded project.
+    fn apply_node_request(&mut self, request: &crate::requests::Request) -> Result<bool, CoreError> {
+        use crate::requests::Request;
+        match request {
+            Request::Wake => Ok(true),
+            Request::PauseLoop { .. } | Request::ResumeLoop { .. } | Request::RunLoop { .. } => {
+                if self.projects.is_empty() {
+                    return Ok(false);
+                }
+                for project in self.projects.values_mut() {
+                    project.inner.apply_request(request)?;
+                }
+                Ok(true)
+            }
+            Request::AnswerInbox { id } => {
+                for project in self.projects.values_mut() {
+                    if project.inner.store.inbox_item(id)?.is_some() {
+                        project.inner.apply_request(request)?;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Request::ResolveJob { job, .. }
+            | Request::RetryJob { job, .. }
+            | Request::ParkJob { job, .. }
+            | Request::CancelJob { job, .. }
+            | Request::NudgeJob { job, .. }
+            | Request::RestartJob { job, .. }
+            | Request::ReplanJob { job, .. }
+            | Request::FailJob { job, .. } => {
+                for project in self.projects.values_mut() {
+                    if project.inner.store.job(job)?.is_some() {
+                        project.inner.apply_request(request)?;
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Startup then tick every `[node].tick_secs` or on wake, until `cancel`.
+    pub fn run(&mut self, cancel: &CancelToken) -> Result<(), CoreError> {
+        self.startup()?;
+        let tick = Duration::from_secs(self.deps.config.node.tick_secs.max(1));
+        while !cancel.is_cancelled() {
+            self.tick()?;
+            if !wait_for_next_tick(self.wake_rx.as_ref(), tick, &self.global, cancel)? {
+                break;
+            }
+        }
+        for project in self.projects.values_mut() {
+            if let Err(error) = project.inner.shutdown() {
+                self.deps.log.log(
+                    Level::Error,
+                    "node",
+                    &format!("shutdown for {}: {error}", project.project),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns a cloneable handle that ends the idle wait early.
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.wake.clone()
+    }
+
+    /// Returns when this supervisor was constructed.
+    pub fn started_at(&self) -> Timestamp {
+        self.started_at
+    }
+
+    /// Returns the registered project names in the order the next pass will tick them.
+    pub fn order(&self) -> Vec<ProjectName> {
+        self.rotation()
+    }
+
+    /// Returns the loaded project names.
+    pub fn projects(&self) -> impl Iterator<Item = &ProjectName> {
+        self.projects.keys()
+    }
+
+    /// Returns one loaded project's supervisor.
+    pub fn project(&self, name: &ProjectName) -> Option<&ProjectSupervisor> {
+        self.projects.get(name)
+    }
+
+    /// Reloads registry entries and builds supervisors for new projects.
+    ///
+    /// Archived or removed projects lose their supervisor and their runner threads are
+    /// stopped. A project whose config or database cannot be opened is parked alone with
+    /// a node-inbox notice; the other projects keep ticking.
+    fn reload_projects(&mut self) -> Result<(), CoreError> {
+        let entries = super::registry::project_entries(&self.global)?;
+        let mut keep = BTreeSet::new();
+        for entry in &entries {
+            if entry.name.as_str() == vowp_store::RESERVED_NODE_PROJECT {
+                continue;
+            }
+            if entry.state == ProjectState::Archived
+                || (entry.state == ProjectState::Paused && entry.paused_reason.starts_with("broken:"))
+            {
+                continue;
+            }
+            keep.insert(entry.name.clone());
+            if self.projects.contains_key(&entry.name) {
+                continue;
+            }
+            match project_supervisor(&self.deps, entry) {
+                Ok(project) => {
+                    self.projects.insert(entry.name.clone(), project);
+                }
+                Err(error) => {
+                    self.deps.log.log(
+                        Level::Error,
+                        "node",
+                        &format!("cannot load project {}: {error}", entry.name),
+                    );
+                    self.park_broken(&entry.name, &format!("cannot load project: {error}"))?;
+                }
+            }
+        }
+
+        let stale: Vec<ProjectName> = self
+            .projects
+            .keys()
+            .filter(|name| !keep.contains(*name))
+            .cloned()
+            .collect();
+        for name in stale {
+            if let Some(mut project) = self.projects.remove(&name) {
+                let _ = project.inner.shutdown();
+            }
+            self.last_failure.remove(&name);
+        }
+        self.order = self.projects.keys().cloned().collect();
+        if self.order.is_empty() {
+            self.next = 0;
+        } else {
+            self.next %= self.order.len();
+        }
+        Ok(())
+    }
+
+    /// Returns the tick order: fairness weight first, then the last admitted project.
+    ///
+    /// `capacity::fair::order` sorts by weight and moves the last admitted project to the
+    /// back of its weight group. Groups with no recorded last admission keep the old
+    /// per-tick start offset so equal projects still round-robin instead of one staying first.
+    fn rotation(&self) -> Vec<ProjectName> {
+        if self.order.is_empty() {
+            return Vec::new();
+        }
+        let Ok(entries) = super::registry::project_entries(&self.global) else {
+            return self.name_rotation();
+        };
+        let mut entries: Vec<ProjectEntry> = entries
+            .into_iter()
+            .filter(|entry| self.projects.contains_key(&entry.name))
+            .collect();
+        if entries.is_empty() {
+            return self.name_rotation();
+        }
+        let last = crate::capacity::admit::last_project(&self.global).ok().flatten();
+        crate::capacity::fair::order(&mut entries, last.as_ref());
+        self.rotate_weight_groups(&mut entries, last.as_ref());
+        entries.into_iter().map(|entry| entry.name).collect()
+    }
+
+    /// Advances equal-weight groups that `capacity:last_project` does not pin.
+    fn rotate_weight_groups(&self, entries: &mut [ProjectEntry], last: Option<&ProjectName>) {
+        let mut start = 0;
+        while start < entries.len() {
+            let weight = entries[start].weight;
+            let mut end = start + 1;
+            while end < entries.len() && entries[end].weight == weight {
+                end += 1;
+            }
+            let pinned = last.is_some_and(|last| entries[start..end].iter().any(|project| &project.name == last));
+            if !pinned && end - start > 1 {
+                let offset = self.next % (end - start);
+                entries[start..end].rotate_left(offset);
+            }
+            start = end;
+        }
+    }
+
+    /// Returns the old name-order rotation, used only when the registry cannot be read.
+    fn name_rotation(&self) -> Vec<ProjectName> {
+        let start = self.next % self.order.len();
+        let mut order = Vec::with_capacity(self.order.len());
+        order.extend(self.order[start..].iter().cloned());
+        order.extend(self.order[..start].iter().cloned());
+        order
+    }
+
+    /// Advances the round-robin start offset after one pass.
+    fn advance_rotation(&mut self) {
+        if !self.order.is_empty() {
+            self.next = (self.next + 1) % self.order.len();
+        }
+    }
+
+    /// Copies the durable L1 fail streak for `name` and parks it at three.
+    fn refresh_fail_streak(&mut self, name: &ProjectName) -> Result<(), CoreError> {
+        let Some(project) = self.projects.get(name) else {
+            return Ok(());
+        };
+        let streak = project
+            .inner
+            .store
+            .loop_("l1-supervisor")?
+            .map(|loop_| loop_.fail_streak)
+            .unwrap_or(0);
+        if streak >= 3 {
+            let reason = self
+                .last_failure
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| "unknown failure".to_owned());
+            self.park_broken(name, &format!("3 failed ticks: {reason}"))?;
+        }
+        Ok(())
+    }
+
+    /// Parks one project with a `broken:` reason and opens one node-inbox notice.
+    fn park_broken(&mut self, name: &ProjectName, reason: &str) -> Result<(), CoreError> {
+        let entry = super::registry::project_entry(&self.global, name)?;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if entry.state == ProjectState::Archived {
+            return Ok(());
+        }
+        if entry.state == ProjectState::Paused && entry.paused_reason.starts_with("broken:") {
+            return Ok(());
+        }
+        let detail = if let Some(failures) = reason.strip_prefix("3 failed ticks: ") {
+            format!("project {name} paused after 3 failed ticks: {failures}")
+        } else {
+            format!("project {name} paused: {reason}")
+        };
+        super::registry::set_project_state(&self.global, name, ProjectState::Paused, &format!("broken: {reason}"))?;
+        let title = format!("project {name} paused");
+        let already_open = self
+            .global
+            .list_inbox(Some(InboxState::Open))?
+            .iter()
+            .any(|item| item.project.as_ref() == Some(name) && item.title == title);
+        if !already_open {
+            let now = self.deps.clock.now();
+            self.global.insert_node_inbox(&InboxItem {
+                id: InboxId::new(),
+                project: Some(name.clone()),
+                job_id: None,
+                kind: InboxKind::Notice,
+                title,
+                body: detail.clone(),
+                options: Vec::new(),
+                state: InboxState::Open,
+                answer: None,
+                answered_by: None,
+                created_at: now,
+                answered_at: None,
+            })?;
+        }
+        self.deps.log.log(Level::Warn, "node", &detail);
+        Ok(())
+    }
+
+    /// Runs one node-level step under `catch_unwind`.
+    fn node_step<F>(&mut self, name: &'static str, f: F) -> StepReport
+    where
+        F: FnOnce(&mut Self) -> Result<String, CoreError>,
+    {
+        match catch_unwind(AssertUnwindSafe(|| f(self))) {
+            Ok(Ok(detail)) => StepReport { name, ok: true, detail },
+            Ok(Err(error)) => {
+                self.deps
+                    .log
+                    .log(Level::Error, "node", &format!("step {name} failed: {error}"));
+                StepReport {
+                    name,
+                    ok: false,
+                    detail: error.to_string(),
+                }
+            }
+            Err(payload) => {
+                let detail = panic_text(payload);
+                self.deps
+                    .log
+                    .log(Level::Error, "node", &format!("step {name} panicked: {detail}"));
+                StepReport {
+                    name,
+                    ok: false,
+                    detail: format!("panic: {detail}"),
+                }
+            }
+        }
+    }
+}
+
+/// Ensures the reserved `_node` registry row and its database exist.
+fn ensure_node_project(deps: &Deps, global: &Store) -> Result<(), CoreError> {
+    if global.local_node()?.is_none() {
+        global.upsert_node(&Node {
+            name: deps.node.clone(),
+            ssh_target: None,
+            is_local: true,
+            capabilities: serde_json::json!({ "vowp": env!("CARGO_PKG_VERSION") }),
+            last_seen_at: Some(deps.clock.now()),
+            created_at: deps.clock.now(),
+        })?;
+    }
+    let node = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT)?;
+    if global.project(&node)?.is_none() {
+        global.upsert_project(&vowp_protocol::Project {
+            name: node.clone(),
+            path: deps.paths.root().display().to_string(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            config: serde_json::json!({}),
+            created_at: deps.clock.now(),
+            updated_at: deps.clock.now(),
+        })?;
+    } else {
+        Store::create_project_db(&deps.paths, &node)?;
+    }
+    Ok(())
+}
+
+/// Builds one project's supervisor from its registry row and `vowp.toml`.
+fn project_supervisor(base: &Deps, entry: &ProjectEntry) -> Result<ProjectSupervisor, CoreError> {
+    let deps = project_deps(base, entry)?;
+    let inner = Supervisor::new(deps.clone(), entry.name.clone())?;
+    Ok(ProjectSupervisor {
+        deps,
+        project: entry.name.clone(),
+        inner,
+        started: false,
+    })
+}
+
+/// Resolves the project-scoped [`Deps`] described by the spec (§3.8).
+fn project_deps(base: &Deps, entry: &ProjectEntry) -> Result<Deps, CoreError> {
+    let config_path = Path::new(&entry.path).join("vowp.toml");
+    let loaded_from_project = config_path.is_file();
+    let mut config = if loaded_from_project {
+        let text = std::fs::read_to_string(&config_path).map_err(|source| CoreError::Io {
+            path: config_path.display().to_string(),
+            source,
+        })?;
+        let mut config = VowpConfig::from_toml(&text)?;
+        let node_path = base.paths.root().join("config.toml");
+        if node_path.is_file() {
+            let node_text = std::fs::read_to_string(&node_path).map_err(|source| CoreError::Io {
+                path: node_path.display().to_string(),
+                source,
+            })?;
+            let node_file = NodeFile::from_toml(&node_text)?;
+            config = config.with_node_defaults(&node_file);
+        }
+        config.validate()?;
+        config
+    } else {
+        (*base.config).clone()
+    };
+    if config.project.name != entry.name {
+        return Err(CoreError::Invalid(format!(
+            "{} names project {} but the registry entry is {}",
+            config_path.display(),
+            config.project.name,
+            entry.name
+        )));
+    }
+    if config.project.path.is_none() {
+        config.project.path = Some(entry.path.clone());
+    }
+    // A project without a `vowp.toml` keeps the caller's registry: that is the v0.1
+    // single-project seam and the hermetic test seam where fake adapters are injected.
+    let adapters = if loaded_from_project {
+        Arc::new(crate::deps::AdapterRegistry::from_config(&config)?)
+    } else {
+        base.adapters.clone()
+    };
+    let mut deps = base.clone();
+    deps.config = Arc::new(config);
+    deps.adapters = adapters;
+    Ok(deps)
+}
+
+/// Adds one cross-database reconcile result into an aggregate.
+fn add_cross_db(total: &mut CrossDbReconcile, one: CrossDbReconcile) {
+    total.runs_closed += one.runs_closed;
+    total.runs_missing_session += one.runs_missing_session;
+    total.sessions_repaired += one.sessions_repaired;
+    total.terminal_events_repaired += one.terminal_events_repaired;
+    total.ledgers_repaired += one.ledgers_repaired;
+    total.leases_dropped += one.leases_dropped;
 }
 
 /// Renders the board snapshot as the JSON convenience copy written to `<node>/board.json`.

@@ -6,7 +6,8 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use tempfile::TempDir;
 use vowp_protocol::{
-    Cost, CostSource, FakeClock, HarnessKind, JobId, LedgerEntry, LedgerKind, ProjectName, RunRole, Timestamp, Tokens,
+    Clock, Cost, CostSource, FakeClock, HarnessKind, JobId, LedgerEntry, LedgerKind, ProjectName, RunRole, Timestamp,
+    Tokens,
 };
 use vowp_store::{CostGroup, CostQuery, CostRow, LedgerFilter, NodePaths, Store};
 
@@ -23,10 +24,29 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_project("proj")
+    }
+
+    fn with_project(name: &str) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = NodePaths::new(tmp.path());
         let clock = FakeClock::at(Timestamp::parse(EPOCH).expect("epoch"));
-        let store = Store::open(&paths).expect("open store").with_clock(Arc::new(clock));
+        let store = Store::open(&paths)
+            .expect("open store")
+            .with_clock(Arc::new(clock.clone()));
+        let project = ProjectName::parse(name).expect("project");
+        let now = clock.now();
+        store
+            .upsert_project(&vowp_protocol::Project {
+                name: project,
+                path: format!("/tmp/{name}"),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("insert project");
         Self {
             _tmp: tmp,
             paths,
@@ -171,7 +191,8 @@ fn ledger_is_append_only() {
     assert_eq!(limited.len(), 1);
     assert_eq!(limited[0].id, Some(first_id));
 
-    let connection = Connection::open(fixture.paths.db_path()).expect("raw connection");
+    let project = ProjectName::parse("proj").expect("project");
+    let connection = Connection::open(fixture.paths.project_db_path(&project)).expect("raw connection");
     let error = connection
         .execute("UPDATE ledger SET summary = 'tampered' WHERE id = ?1", [first_id])
         .expect_err("UPDATE must be rejected");
@@ -320,8 +341,9 @@ fn cost_totals_group_by_each_dimension() {
 
 #[test]
 fn cost_totals_respects_filters() {
-    let fixture = Fixture::new();
-    let entries = [
+    let alpha = Fixture::with_project("alpha");
+    let beta = Fixture::with_project("beta");
+    let alpha_entries = [
         cost_entry(
             DAY_ONE,
             "alpha",
@@ -340,6 +362,8 @@ fn cost_totals_respects_filters() {
             "m1",
             Cost::receipt(2.0, tokens(20, 2)),
         ),
+    ];
+    let beta_entries = [
         cost_entry(
             DAY_ONE,
             "beta",
@@ -359,12 +383,15 @@ fn cost_totals_respects_filters() {
             priced(8.0, tokens(80, 8)),
         ),
     ];
-    for entry in &entries {
-        fixture.store.append_ledger(entry).expect("append cost");
+    for entry in &alpha_entries {
+        alpha.store.append_ledger(entry).expect("append alpha cost");
+    }
+    for entry in &beta_entries {
+        beta.store.append_ledger(entry).expect("append beta cost");
     }
 
     let since = Timestamp::parse(DAY_TWO).expect("day two");
-    let totals = fixture
+    let totals = alpha
         .store
         .cost_totals(
             &CostQuery {
@@ -374,10 +401,10 @@ fn cost_totals_respects_filters() {
             CostGroup::Job,
         )
         .expect("since totals");
-    assert_eq!(totals, vec![expected("job-b", 10.0, 1, 1, 0, tokens(100, 10), 2)]);
+    assert_eq!(totals, vec![expected("job-b", 2.0, 1, 0, 0, tokens(20, 2), 1)]);
 
     let until = Timestamp::parse("2026-01-01T23:59:59.999Z").expect("end of day one");
-    let totals = fixture
+    let totals = alpha
         .store
         .cost_totals(
             &CostQuery {
@@ -387,14 +414,14 @@ fn cost_totals_respects_filters() {
             CostGroup::Job,
         )
         .expect("until totals");
-    assert_eq!(totals, vec![expected("job-a", 5.0, 2, 0, 0, tokens(50, 5), 2)]);
+    assert_eq!(totals, vec![expected("job-a", 1.0, 1, 0, 0, tokens(10, 1), 1)]);
 
-    let alpha = ProjectName::parse("alpha").expect("project");
-    let totals = fixture
+    let alpha_name = ProjectName::parse("alpha").expect("project");
+    let totals = alpha
         .store
         .cost_totals(
             &CostQuery {
-                project: Some(alpha.clone()),
+                project: Some(alpha_name.clone()),
                 ..CostQuery::default()
             },
             CostGroup::Job,
@@ -407,9 +434,23 @@ fn cost_totals_respects_filters() {
             expected("job-a", 1.0, 1, 0, 0, tokens(10, 1), 1),
         ]
     );
+    let wrong = alpha
+        .store
+        .cost_totals(
+            &CostQuery {
+                project: Some(ProjectName::parse("beta").expect("project")),
+                ..CostQuery::default()
+            },
+            CostGroup::Job,
+        )
+        .expect_err("wrong project");
+    assert!(
+        matches!(wrong, vowp_store::StoreError::WrongProject { .. }),
+        "got {wrong:?}"
+    );
 
     let job_a = JobId::parse("job-a").expect("job");
-    let totals = fixture
+    let totals = alpha
         .store
         .cost_totals(
             &CostQuery {
@@ -419,9 +460,9 @@ fn cost_totals_respects_filters() {
             CostGroup::Job,
         )
         .expect("job totals");
-    assert_eq!(totals, vec![expected("job-a", 5.0, 2, 0, 0, tokens(50, 5), 2)]);
+    assert_eq!(totals, vec![expected("job-a", 1.0, 1, 0, 0, tokens(10, 1), 1)]);
 
-    let totals = fixture
+    let totals = beta
         .store
         .cost_totals(
             &CostQuery {
@@ -434,11 +475,11 @@ fn cost_totals_respects_filters() {
         .expect("combined totals");
     assert_eq!(totals, vec![expected("job-b", 8.0, 0, 1, 0, tokens(80, 8), 1)]);
 
-    let totals = fixture
+    let totals = alpha
         .store
         .cost_totals(
             &CostQuery {
-                project: Some(alpha),
+                project: Some(alpha_name),
                 ..CostQuery::default()
             },
             CostGroup::Day,

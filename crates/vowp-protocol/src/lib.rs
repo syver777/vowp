@@ -10,7 +10,9 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+pub mod capacity;
 pub mod capsule;
+pub mod catalog;
 pub mod config;
 pub mod cost;
 pub mod error;
@@ -23,19 +25,27 @@ pub mod job;
 pub mod limit;
 pub mod log;
 pub mod loops;
+pub mod ops;
 pub mod release;
 pub mod report;
 pub mod run;
 pub mod schema;
 pub mod services;
 pub mod session;
+pub mod snapshot;
+pub mod surface;
 pub mod time;
+pub mod vault;
 
 // Re-exports so every public type is available at the crate root.
 #[allow(unused_imports)]
 pub use adapter::*;
 #[allow(unused_imports)]
+pub use capacity::*;
+#[allow(unused_imports)]
 pub use capsule::*;
+#[allow(unused_imports)]
+pub use catalog::*;
 #[allow(unused_imports)]
 pub use config::*;
 pub use cost::*;
@@ -55,6 +65,8 @@ pub use log::*;
 #[allow(unused_imports)]
 pub use loops::*;
 #[allow(unused_imports)]
+pub use ops::*;
+#[allow(unused_imports)]
 pub use release::*;
 #[allow(unused_imports)]
 pub use report::*;
@@ -66,7 +78,13 @@ pub use schema::*;
 pub use services::*;
 #[allow(unused_imports)]
 pub use session::*;
+#[allow(unused_imports)]
+pub use snapshot::*;
+#[allow(unused_imports)]
+pub use surface::*;
 pub use time::*;
+#[allow(unused_imports)]
+pub use vault::*;
 
 /// Tool output strictly larger than this many bytes is spilled to a blob.
 pub const BLOB_SPILL_BYTES: usize = 8192;

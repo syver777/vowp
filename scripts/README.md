@@ -6,7 +6,7 @@ only the product scripts that ship in the public tree.
 | File | Purpose |
 |---|---|
 | `install.sh` | Copies the binary and templates into place, enables the systemd user unit and adds the five-minute cron check. Supports `--dry-run`. |
-| `vowp.service` | systemd **user** unit run by `systemctl --user`; `Restart=always`. |
+| `vowp.service` | systemd **user** unit run by `systemctl --user`; `Restart=on-failure`. |
 | `vowp-watchdog.sh` | Cron check for `~/.vowp/heartbeat`; restarts the unit when the heartbeat is missing or older than 180 s, falling back to `vowp up --detach`. |
 | `vowp-watchdog.cron` | Standalone crontab template for the same five-minute check. |
 | `uninstall.sh` | Stops and removes the unit, cron entry and binaries; keeps `~/.vowp` state. Supports `--dry-run` and `--keep-binary`. |

@@ -47,6 +47,31 @@ impl NodePaths {
         self.root.join("vowp.db")
     }
 
+    /// Returns `<root>/projects`.
+    pub fn projects_dir(&self) -> PathBuf {
+        self.root.join("projects")
+    }
+
+    /// Returns `<root>/projects/<name>`.
+    pub fn project_dir(&self, name: &vowp_protocol::ProjectName) -> PathBuf {
+        self.projects_dir().join(name.as_str())
+    }
+
+    /// Returns `<root>/projects/<name>/project.db`.
+    pub fn project_db_path(&self, name: &vowp_protocol::ProjectName) -> PathBuf {
+        self.project_dir(name).join("project.db")
+    }
+
+    /// Returns `<root>/migration.json`, the restart manifest of the v0.1→v0.2 split.
+    pub fn migration_manifest_path(&self) -> PathBuf {
+        self.root.join("migration.json")
+    }
+
+    /// Returns `<root>/supervisor.lock`.
+    pub fn supervisor_lock_path(&self) -> PathBuf {
+        self.root.join("supervisor.lock")
+    }
+
     /// Returns `<root>/sessions`.
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")

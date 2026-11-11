@@ -1,191 +1,198 @@
 # Install
 
-VOWP is a single Rust binary. The simplest install is the prebuilt release for your machine; the
-same binary can also be installed with `cargo install vowp-cli` or the npm wrapper. The repository also
-ships a per-user [install script](../../scripts/README.md) that installs the binary, the systemd user
-unit and the cron watchdog. For a server deployment, see [Running VOWP on a VPS](vps.md).
+VOWP 0.2 has two roles:
 
-> **Status: current.** The prebuilt installer, the build commands, `vowp init`, `vowp doctor` and the
-> install script work today; every command referenced on this page is implemented.
+| Role | What it is | What it owns |
+|---|---|---|
+| **home** | One Linux VPS. | The global database, every project database, all session logs and the one node supervisor. |
+| **control machine** | A laptop, desktop or phone that talks to the home. | A snapshot cache, SSH tunnels and the local app configuration. It holds no truth. |
 
-## One-line install (macOS and Linux)
+Most people set up the home first, then make the computer they already use the control machine. The
+phone needs no install at all: an SSH app and the owner's key are enough (see
+[Using your phone](phone.md)).
 
-This downloads the release archive for your OS/architecture from the latest GitHub release, verifies
-its SHA256, and installs `vowp` into `~/.local/bin`. It does not need Rust, Node or root:
+> **Status: current.** `vowp setup plan`, `setup home`, `setup control`, `vowp init`,
+> `vowp project`, `vowp control` and the install script are implemented.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/syver777/vowp/main/scripts/install.sh | sh -s -- --download
-```
+## The recommended path: let an agent run the setup
 
-If the installer reports that `~/.local/bin` is not on your `PATH`, add it in your shell profile.
-Then check:
-
-```sh
-vowp --version
-```
-
-The [`scripts/install.sh`](../../scripts/install.sh) script also supports `--version`, `--prefix`,
-`--dry-run`, and a source checkout can install the systemd unit and watchdog as well.
-
-### Alternative installs
-
-Use one of these instead of the curl installer; they all install the same `vowp` binary.
+The setup contract is designed around one copyable prompt. It names a release tag and sends the
+agent to [the setup contract](../setup/agent-setup.md), which asks the owner five questions once,
+shows the whole plan once and runs it after one approval. The `vowp setup` commands do the work, so
+the result does not depend on which harness runs the prompt. If the README you are reading has the
+prompt, paste it into any harness; if not, run the same commands yourself.
 
 ```sh
-# From crates.io (needs Rust)
-cargo install vowp-cli --version 0.1.0
-
-# From npm (needs Node; npm 12 blocks install scripts by default)
-npm install -g @syver_august/vowp --allow-scripts=@syver_august/vowp
+vowp setup plan --target <home-ssh-target> \
+  --repository <path-on-the-home> \
+  --harness <harness> \
+  --provider <provider>
 ```
 
-The [GitHub release](https://github.com/syver777/vowp/releases/tag/v0.1.0) also carries the four
-prebuilt archives and their checksums. A Homebrew tap is not published.
+`--target` is the home's SSH destination (`<user>@<host>` or an SSH config alias), not the `--home`
+directory. `--repository`, `--harness`, `--provider` and `--secret` are repeatable and carry names
+only; never put a key in an argument. The plan prints every phase, command and file, and changes
+nothing. It needs key-only SSH:
+
+```sh
+ssh -o BatchMode=yes -o ConnectTimeout=10 <home-ssh-target> true
+```
+
+Then apply the home plan:
+
+```sh
+vowp setup home --target <home-ssh-target> --apply --yes \
+  --repository <path-on-the-home> \
+  --harness <harness> \
+  --provider <provider>
+```
+
+`--yes` is the single approval for the plan that was just shown. `setup home` is idempotent and stops
+cleanly at a hand-off instead of guessing:
+
+| Phase | What it does |
+|---|---|
+| `preflight` | Checks SSH, OS/architecture, disk, `git`, `tmux` and `curl`; reads no secret. |
+| `user` | Creates a non-root `vowp` user when sudo allows it; otherwise records no-sudo mode. |
+| `install` | Installs the pinned binary and verifies the version. |
+| `home` | Creates the home, the global database and the node registry, then runs `vowp doctor`. |
+| `service` | Installs the user unit `vowp.service`, enables linger and starts it. |
+| `vault` | Creates the vault user when sudo allows it, otherwise uses basic secret mode. It never stores a value. |
+| `projects` | Registers the repositories the owner named. A repository must already have `vowp.toml`; `vowp init` is offered, not forced. |
+| `tunnels` | Nothing by default. Tunnels are opened from the control machine when needed. |
+
+A hand-off exits 5 with a `handoff` object: a sudo command the owner runs, a harness login, a secret
+value entered with `vowp secret set NAME` or `vowp secret request NAME`, or an owner answer. Relay the
+question, wait for the owner, then run the same command again. Never ask for a secret in chat.
+
+When the home phase succeeds, make this computer the control machine:
+
+```sh
+vowp setup control --apply
+vowp control status
+vowp fleet status
+```
+
+`setup control` reuses the target from the home run (or takes `--target`) and writes
+`~/.vowp-control/`; it installs no supervisor. `fleet status` fetches the home's snapshot and caches
+it with an `as of` time, so the answer is still useful when SSH is down.
 
 ## Prerequisites
 
-| Requirement | Why |
-|---|---|
-| Linux (x86_64/arm64) or macOS (arm64/x86_64) | The v0.1 platforms. |
-| Rust from [`rust-toolchain.toml`](../../rust-toolchain.toml) | Only needed for source builds and `cargo install`; the prebuilt installer does not need it. The workspace pins a stable toolchain and edition 2024. |
-| `git` | Worktrees, branches, the merge queue and release checks. |
-| `tmux` | Job and board windows. `--no-tmux` skips the initial supervisor layout, but a dispatched job still needs a window, so install tmux before running jobs. |
-| A harness such as [Claude Code](https://code.claude.com/docs/en/overview) or [opencode](https://opencode.ai/docs/) | The agent that actually does the work. Install and sign in with the harness's own tooling. |
+For a home:
 
-Check the basics:
+- Linux on `x86_64` or `arm64`.
+- `git`, `tmux`, `curl` and a C toolchain for the bundled SQLite build. Debian/Ubuntu:
+  `sudo apt-get install -y build-essential curl git pkg-config tmux`; Fedora/RHEL:
+  `sudo dnf install -y curl gcc git make pkgconf-pkg-config tmux`.
+- A non-root account with key-only SSH. The setup can create a dedicated `vowp` user when sudo is
+  available; without sudo it runs as the SSH user and records basic secret mode.
+- At least one harness installed and signed in **on the home**, with its own login flow. VOWP drives
+  the harness's documented headless interface and never reads its login.
+- One or more git repositories the home can fetch and push. The merge queue needs a remote.
+
+For a control machine:
+
+- Linux or macOS, `ssh`, and key-only access to the home.
+- The same `vowp` binary for the control commands. It can be installed per user; no service is needed.
+- Optional: the opencode desktop app or a Claude app for the app surfaces. `vowp chat` works in any
+  terminal and needs nothing extra.
+
+Check the basics on a machine you build on:
 
 ```sh
 git --version
 tmux -V
 cargo --version
 rustc --version
+ssh -V
 ```
 
-VOWP does not need a provider key of its own and never reads a harness login. If a harness needs an
-environment variable (for example a provider key), set it in your shell exactly as you already do for
-that harness. `vowp doctor` reports only whether the **name** is present; it never prints the value and
-never calls the network. See the [security model](../security.md).
+## Build and install by hand
 
-## Build from source
-
-From the repository root:
-
-```sh
-cargo build --workspace
-cargo run -p vowp-cli --bin vowp -- --version
-```
-
-The last command prints the binary version:
-
-```
-vowp 0.1.0
-```
-
-For a release build:
+From the repository root, with Rust from [`rust-toolchain.toml`](../../rust-toolchain.toml):
 
 ```sh
 cargo build --release --workspace
-```
-
-## Put `vowp` on your `PATH`
-
-The binary package is `vowp-cli`; the executable is `vowp`. Run this from the repository root:
-
-```sh
-cargo install --path .
+./scripts/install.sh --bin target/release/vowp
 vowp --version
 ```
 
-`cargo install` writes under `$CARGO_HOME/bin` (usually `~/.cargo/bin`) by default. If that directory is
-not on your `PATH`, add it in your shell profile, or pass `--root <dir>` and add `<dir>/bin` instead.
-
-## Install the systemd unit and watchdog
-
-The repository ships a per-user installer for the binary, the systemd user unit and the five-minute
-cron watchdog. It never needs root and supports a dry run:
+The install script puts the binary in `~/.local/bin` and, unless told otherwise, installs the user
+unit and the five-minute watchdog. Preview it first if you like:
 
 ```sh
 ./scripts/install.sh --dry-run
-./scripts/install.sh
+./scripts/install.sh --no-service --no-watchdog   # control machine: no enabled service, no watchdog
 ```
 
-Use `--no-service` or `--no-cron` to skip either part, and `--linger` to keep the supervisor running
-after logout. The installed paths and the uninstall command are documented in
-[`scripts/README.md`](../../scripts/README.md).
+Use `--linger` to keep the user service available after logout. On a control machine,
+`--no-service --no-watchdog` is the normal choice; the home runs the supervisor, not the laptop.
+`--no-service` leaves the unit installed but does not enable or start it; `--no-watchdog` skips the
+watchdog script and its crontab entry (it implies `--no-cron`). The unit is `vowp.service`, one
+service for the whole home, and its `ExecStart` is `vowp up --foreground`.
 
-## Prepare a project repository
+If you build with `cargo install` instead, the binary lands in `$CARGO_HOME/bin` (usually
+`~/.cargo/bin`); add that directory to `PATH` or pass `--root <dir>`.
 
-VOWP manages an existing git repository; it does not create one for you. The project must have a
-default branch and, for the merge queue, a remote it can fetch and push to. If you only want to try the
-supervisor on a local repository, an `origin` remote is still required by the merge path.
+## Create the home without the setup command
 
-The first project command is:
-
-```sh
-vowp init --name my-project
-```
-
-On a fresh repository it prints `initialised project my-project at /path (11 files written, 0 skipped)`.
-It writes `vowp.toml` with `schedules = []`; `[node] name = "local"`, `max_workers = 4`,
-`max_verifiers = 2`, `tick_secs = 60`, `cwd_allow = []` and `tz_offset_minutes` set to the machine's
-current UTC offset; `[project] remote = "origin"`, `default_branch = "main"`,
-`lock_files = ["Cargo.lock"]`, `always_allowed = ["Cargo.lock"]` and `push = true`; the four profiles
-(the planner starts with a Claude Code rung then an opencode rung; `keeper`, `worker` and `verifier`
-start with the opencode rung; all use `on_quota = "next_then_probe_back"`); `[capsule]
-min_interval_secs = 120`, `max_input_chars = 200000` and `tail_turns = 2`; and `[merge] rebase = true`,
-`check_cmds = []`, `timeout_secs = 2700` and `secret_scan = true`. The list here is a key subset: the
-generated file also contains empty `[providers]`, `[harnesses]`, `[env]`, `[gates]` and `[loops]` tables,
-and `[project].check_cmds = []`.
-
-It also installs the embedded framework files from [`framework/`](../../framework/README.md)
-(`AGENTS.md`, `CLAUDE.md`, four `.claude/skills/vowp-*/SKILL.md` files, `opencode.jsonc`, and the
-brief/report templates), creates `.vowp/jobs`, `.vowp/checkpoints` and `.vowp/templates`, appends
-`.vowp/tmp/` to `.gitignore`, creates the node home (`vowp.db`, `sessions/`, `logs/`, `runs/`,
-`backups/`, `tmp/`), registers node `local` and the project, and seeds nine **active** loop rows:
-`l1-supervisor` 60 s, `l2-worker`, `l3-verify`, `l4-planner` 1800 s, `l5-keeper` 1200 s,
-`l6-failover`, `l7-inbox`, `l8-watchdog` 300 s and `l9-schedules` 60 s (0 means event-driven).
-
-On a fresh repository, `--no-framework` writes only `vowp.toml` and `.gitignore` (2 files). Existing
-framework files are skipped and listed, with one exception: an existing `CLAUDE.md` keeps its content and
-gains `@AGENTS.md` when that line is missing (the file counts as written); if it already contains the
-line it is skipped. A second `init` exits 4 with `project already initialised ...; use --force`, and
-`--force` overwrites the generated files. `vowp up` also ensures the loop rows on
-startup, so an existing project picks up the current defaults.
-
-## Verify the node
+The setup command is only a wrapper around the same local commands. On the home, as the runtime user:
 
 ```sh
+cd /path/to/<your-first-repo>
+vowp init --name <your-project>
 vowp doctor
 ```
 
-`doctor` checks, with `ok`, `warn` or `fail` per item:
+`vowp init` writes `vowp.toml`, the framework files, `.vowp/jobs` and `.vowp/checkpoints`, creates the
+home if it does not exist, registers the project and its database, and seeds the default loops. Commit
+the generated files before the first run. For each further repository that already has a `vowp.toml`:
 
-- `home`: the VOWP home is writable;
-- `db`: the database opens, passes `integrity_check` and has a supported schema;
-- `git` and `tmux`: the versions (`tmux` is a warning when absent);
-- `config`: `vowp.toml` parses and validates;
-- `schedules`: every `[[schedules]]` cron, interval and timezone parses;
-- `harness:claude-code` and `harness:opencode`: adapter probes;
-- `profiles`: every profile ladder resolves to an installed harness;
-- `providers`: provider environment variable **names** are `present` or `absent` (never values, never a
-  network call);
-- `systemd` and `watchdog`: the user unit and cron watchdog are installed (warn only);
-- `supervisor`: a supervisor is running (warn only);
-- `disk`: at least 1 GB of free disk space.
+```sh
+vowp project add /path/to/<your-project>
+vowp project ls
+```
 
-Exit code 0 means no `fail`. A missing harness is a `fail`; a missing tmux is a `warn`.
+The install script does not run `vowp init` for you. Run it once per checkout, or let `setup home
+--repository <path>` register a checkout that is already initialised.
 
 ## Where things go
 
 | Path | Contents |
 |---|---|
-| `~/.vowp/` | Node state: database, session logs, blobs, runs, logs, releases.log, backups, inbox copies. |
+| `~/.vowp/vowp.db` | The global database: nodes, the project registry, sessions, surfaces, leases, capacity, limits and the catalog. The fleet snapshot is a separate file. |
+| `~/.vowp/projects/<name>/project.db` | One database per project: jobs, edges, runs, gates, workers, loops, schedules, inbox, ledger and releases. |
+| `~/.vowp/sessions/<id>/log.jsonl` | Authoritative conversation content. Append-only; never edited by hand. |
+| `~/.vowp/snapshot.json` | Last fleet snapshot, written every tick. |
+| `~/.vowp/orchestrators/<name>/` | Project-local app config, instructions, lease token and host state for an orchestrator. |
+| `~/.vowp/secrets/` | Basic-mode secret files (mode 0600); vault mode keeps them under the vault user. |
+| `~/.vowp/backups/` | Backup directories and the pre-migration backup. Secrets are never included. |
+| `~/.vowp-control/` | Control-machine config, snapshot cache, spool, surface state and tunnel records. |
 | `<repo>/vowp.toml` | Project configuration, committed. |
-| `<repo>/AGENTS.md`, `CLAUDE.md`, `opencode.jsonc` | Framework files installed by `vowp init`, committed. |
-| `<repo>/.vowp/` | Job briefs and reports, checkpoints and optional graph snapshot. |
-| `<repo>/../<repo>-wt/<job-id>` | Job worktrees on branch `job/<job-id>`. |
+| `<repo>/.vowp/` | Job briefs and reports, checkpoints and runtime files. Never the database. |
 
-Treat `~/.vowp` as sensitive: session logs can contain prompts, tool output and file contents. Back it
-up like any other work data, and never commit it.
+Treat `~/.vowp` and `~/.vowp-control` as sensitive: they can contain prompts, tool output and file
+contents. The [security model](../security.md) describes the limits, and
+[Operating a home](operating.md) covers backup and lifecycle.
 
-Next: [quickstart](quickstart.md), or [Running VOWP on a VPS](vps.md) for a server deployment.
+## Verify the home
+
+```sh
+vowp doctor
+vowp fleet status
+vowp setup verify
+```
+
+`doctor` exits 0 only when no check failed. On a control machine, `vowp fleet status` proves that the
+SSH route and the snapshot cache work; `vowp control status` shows the cached `as of` time. If a
+harness or provider check fails, fix it on the home, not on the laptop.
+
+`setup verify` is the end-to-end fixture check: a gc dry run, a fixture project through one fake
+harness turn and the real merge queue, a fresh snapshot, and one orchestrator chat turn. It creates
+the fixture under the home's `setup-verify/` area and removes it on every exit path; it does not touch
+your repositories. On a control machine it runs the home checks over SSH and refreshes the local
+snapshot cache. It prints `ok`, `warn` or `fail` per check and exits 1 when a check fails.
+
+Next: [Getting started](quickstart.md) for the first project and the first conversation, or
+[Running a home on a VPS](vps.md) for the server details.

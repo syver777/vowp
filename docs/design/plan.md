@@ -368,7 +368,7 @@ Shipped under `framework/` (`templates/`, `skills/`, `opencode/`) and installed 
 - **`AGENTS.md`** (harness-neutral). Covers working autonomously until the report exists, owned paths only, never committing secrets (names only), reporting costs, verifying against real artifacts, and staging any refused action rather than working around it.
 - **`CLAUDE.md`** that just imports `AGENTS.md` (`@AGENTS.md`), so both harnesses read the same rules.
 - **`brief.md` and `report.md` templates** with the front-matter above.
-- **Skills** in `.agents/skills/`, loaded by both harnesses: `vowp-worker` (the job contract), `vowp-planner` (how to shape the graph, split ownership and write briefs), `vowp-verifier` (how to judge evidence).
+- **Skills** in `.claude/skills/`, loaded by both harnesses: `vowp-worker` (the job contract), `vowp-planner` (how to shape the graph, split ownership and write briefs), `vowp-verifier` (how to judge evidence).
 - **`opencode.jsonc` agent definitions** for planner, keeper, worker and verifier, with permission presets so no dialog ever needs a keystroke.
 
 ---

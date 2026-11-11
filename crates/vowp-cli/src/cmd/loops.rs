@@ -3,7 +3,8 @@
 //! Spec: `docs/design/cli.md` §5 and `docs/design/loops.md` §1. L1 itself cannot be paused;
 //! stopping the supervisor is `vowp down`.
 
-use vowp_protocol::{ActiveState, LoopKind};
+use vowp_protocol::{ActiveState, Loop, LoopKind};
+use vowp_store::Store;
 
 use crate::cli::{LoopNameArgs, LoopsArgs, LoopsCommand};
 use crate::output::{Table, local_time_at, print_json};
@@ -12,24 +13,45 @@ use crate::{CliError, Ctx, IoStreams};
 /// Lists loops or pauses/resumes one.
 pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &LoopsArgs) -> Result<i32, CliError> {
     match &args.command {
-        None => list(ctx, io),
+        None => list(ctx, io, args.all),
+        Some(_) if args.all => Err(CliError::Invalid(
+            "--all lists every project; pause or resume one project at a time".to_owned(),
+        )),
         Some(LoopsCommand::Pause(args)) => set_state(ctx, io, args, ActiveState::Paused),
         Some(LoopsCommand::Resume(args)) => set_state(ctx, io, args, ActiveState::Active),
     }
 }
 
-/// Lists every loop row.
-fn list(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
-    let store = ctx.store()?;
-    let loops = store.list_loops()?;
+/// Lists every loop row, from every registered project when `all` is set.
+fn list(ctx: &Ctx, io: &mut dyn IoStreams, all: bool) -> Result<i32, CliError> {
+    let loops = if all {
+        all_loops(ctx)?
+    } else {
+        crate::node_ctx::selected_store(ctx)?.list_loops()?
+    };
     if ctx.json() {
         print_json(io, &loops)?;
         return Ok(0);
     }
     let now = ctx.clock().now();
-    let mut table = Table::new(&["NAME", "KIND", "STATE", "INTERVAL", "LAST", "NEXT", "STATUS", "FAILS"]);
+    let mut headers = Vec::new();
+    if all {
+        headers.push("PROJECT");
+    }
+    headers.extend(["NAME", "KIND", "STATE", "INTERVAL", "LAST", "NEXT", "STATUS", "FAILS"]);
+    let mut table = Table::new(&headers);
     for loop_ in &loops {
-        table.row(vec![
+        let mut row = Vec::new();
+        if all {
+            row.push(
+                loop_
+                    .project
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "-".to_owned()),
+            );
+        }
+        row.extend([
             loop_.name.clone(),
             loop_kind(loop_.kind).to_owned(),
             active_state(loop_.state).to_owned(),
@@ -49,14 +71,40 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
             },
             loop_.fail_streak.to_string(),
         ]);
+        table.row(row);
     }
     writeln!(io.out(), "{}", table.render(ctx.color()))?;
     Ok(0)
 }
 
+/// Collects loop rows from every registered project, sorted by project then name.
+fn all_loops(ctx: &Ctx) -> Result<Vec<Loop>, CliError> {
+    let global = Store::open_global(ctx.paths())?;
+    let mut loops = Vec::new();
+    for entry in vowp_core::loops::registry::project_entries(&global)? {
+        if entry.name.as_str() == vowp_store::RESERVED_NODE_PROJECT {
+            continue;
+        }
+        let store = match Store::open_with_project(ctx.paths(), &entry.name) {
+            Ok(store) => store,
+            Err(vowp_store::StoreError::NotFound { .. }) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        loops.extend(store.list_loops()?);
+    }
+    loops.sort_by(|left, right| {
+        left.project
+            .as_ref()
+            .map(ToString::to_string)
+            .cmp(&right.project.as_ref().map(ToString::to_string))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(loops)
+}
+
 /// Pauses or resumes one loop.
 fn set_state(ctx: &Ctx, io: &mut dyn IoStreams, args: &LoopNameArgs, state: ActiveState) -> Result<i32, CliError> {
-    let store = ctx.store()?;
+    let store = crate::node_ctx::selected_store(ctx)?;
     if args.loop_name == "l1-supervisor" {
         return Err(CliError::Invalid(
             "the l1-supervisor loop cannot be paused; use `vowp down`".to_owned(),

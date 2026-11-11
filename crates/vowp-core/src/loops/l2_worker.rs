@@ -23,7 +23,7 @@ pub enum ReportOutcome {
 
 /// Returns the run purpose for a fresh dispatch of `job`.
 ///
-/// T2 only sees `job.continues`; the store-aware Start-vs-Resume decision is made by
+/// The dispatch loop only sees `job.continues`; the store-aware Start-vs-Resume decision is made by
 /// `dispatch::purpose_for_dispatch`, which also looks for a prior session/run.
 pub fn purpose_for(job: &Job) -> RunPurpose {
     if matches!(job.kind, JobKind::Fix | JobKind::Merge) {

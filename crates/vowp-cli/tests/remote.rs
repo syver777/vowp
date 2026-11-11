@@ -1,11 +1,25 @@
 //! `--node` tests: pure ssh argv construction and the exit-7 remote failure path.
+//!
+//! The control-machine tests live in the separate `control` test target.
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use vowp_cli::remote::build_ssh_argv;
+use vowp_cli::remote::{build_ssh_argv, strip_home_flag};
 use vowp_protocol::{Node, NodeName};
 use vowp_store::{NodePaths, Store};
+
+#[test]
+fn strip_home_flag_removes_both_forms() {
+    let args = vec![
+        "--home".to_owned(),
+        "/tmp/local".to_owned(),
+        "--json".to_owned(),
+        "--home=/tmp/other".to_owned(),
+        "status".to_owned(),
+    ];
+    assert_eq!(strip_home_flag(&args), vec!["--json".to_owned(), "status".to_owned()]);
+}
 
 #[test]
 fn node_ssh_argv_quoting() {
@@ -236,8 +250,8 @@ fn node_flag_returns_remote_exit_code_and_ignores_local_node() {
         .expect("run vowp");
     assert_eq!(output.status.code(), Some(42));
 
-    // A local node is not redirected: the command runs locally and fails for lack of a
-    // project, not by spawning ssh (the fake exits 42).
+    // A local node is not redirected: the fleet read model runs locally against the empty
+    // home, so the fake ssh (which exits 42) is never spawned.
     let output = Command::new(env!("CARGO_BIN_EXE_vowp"))
         .current_dir(bin.path())
         .env("TMUX_TMPDIR", home.path().join("tmux"))
@@ -248,5 +262,10 @@ fn node_flag_returns_remote_exit_code_and_ignores_local_node() {
         .args(["--node", "here", "status"])
         .output()
         .expect("run vowp");
-    assert_eq!(output.status.code(), Some(2), "no project is invalid input");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a local status must run locally, not spawn ssh; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

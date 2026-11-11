@@ -236,7 +236,7 @@ impl Store {
     /// The creation timestamp of an existing row is kept; every other column is replaced.
     pub fn upsert_session(&self, session: &Session) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO sessions (
+            "INSERT INTO main.sessions (
                 id, project, job_id, role, title, parent_session_id, node, cwd, state, executor,
                 last_seq, last_capsule_id, log_bytes, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
@@ -280,7 +280,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                &format!("SELECT {SESSION_COLUMNS} FROM main.sessions WHERE id = ?1"),
                 [id.as_str()],
                 read_session_row,
             )
@@ -294,9 +294,46 @@ impl Store {
             .ok_or_else(|| StoreError::not_found("session", id.as_str()))
     }
 
+    /// Lists running sessions reconciled by the handle bound to `project`.
+    ///
+    /// A `_node` handle also owns project-less sessions: their `sessions.project` is `NULL`
+    /// while their runs live in the `_node` database (§3.8).
+    pub(crate) fn sessions_for_reconcile(
+        &self,
+        project: &ProjectName,
+        state: SessionState,
+    ) -> Result<Vec<Session>, StoreError> {
+        let (sql, values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            if project.as_str() == crate::RESERVED_NODE_PROJECT {
+                (
+                    format!(
+                        "SELECT {SESSION_COLUMNS} FROM main.sessions
+                         WHERE state = ? AND (project = ? OR project IS NULL)
+                         ORDER BY updated_at DESC, id DESC"
+                    ),
+                    vec![Box::new(enum_to_text(&state)?), Box::new(project.as_str().to_owned())],
+                )
+            } else {
+                (
+                    format!(
+                        "SELECT {SESSION_COLUMNS} FROM main.sessions
+                         WHERE state = ? AND project = ? ORDER BY updated_at DESC, id DESC"
+                    ),
+                    vec![Box::new(enum_to_text(&state)?), Box::new(project.as_str().to_owned())],
+                )
+            };
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values), read_session_row)?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(session_from_row(row?)?);
+        }
+        Ok(sessions)
+    }
+
     /// Lists sessions matching `filter`, most recently updated first.
     pub fn list_sessions(&self, filter: &SessionFilter) -> Result<Vec<Session>, StoreError> {
-        let mut query = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE 1 = 1");
+        let mut query = format!("SELECT {SESSION_COLUMNS} FROM main.sessions WHERE 1 = 1");
         let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(project) = &filter.project {
             query.push_str(" AND project = ?");
@@ -335,7 +372,7 @@ impl Store {
         executor: Option<&Executor>,
     ) -> Result<(), StoreError> {
         let changed = self.conn.execute(
-            "UPDATE sessions SET state = ?1, executor = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE main.sessions SET state = ?1, executor = ?2, updated_at = ?3 WHERE id = ?4",
             params![
                 enum_to_text(&state)?,
                 executor.map(ToString::to_string),
@@ -357,7 +394,7 @@ impl Store {
                 return Err(StoreError::not_found("session", row.session_id.as_str()));
             }
             tx.conn.execute(
-                "INSERT INTO session_events (
+                "INSERT INTO main.session_events (
                     session_id, seq, id, ts, type, actor, harness, model, byte_offset, byte_len, summary
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
@@ -379,7 +416,7 @@ impl Store {
             let end = row.byte_offset.saturating_add(row.byte_len);
             let ts = ts_to_text(row.ts);
             tx.conn.execute(
-                "UPDATE sessions SET
+                "UPDATE main.sessions SET
                     last_seq = MAX(last_seq, ?1),
                     log_bytes = MAX(log_bytes, ?2),
                     updated_at = CASE WHEN updated_at < ?3 THEN ?3 ELSE updated_at END
@@ -398,7 +435,7 @@ impl Store {
     /// Lists indexed events after `after_seq`, oldest first, at most `limit` rows.
     pub fn event_rows(&self, id: &SessionId, after_seq: u64, limit: u32) -> Result<Vec<EventIndexRow>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {EVENT_COLUMNS} FROM session_events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
+            "SELECT {EVENT_COLUMNS} FROM main.session_events WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
         ))?;
         let rows = statement.query_map(
             params![
@@ -420,7 +457,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {EVENT_COLUMNS} FROM session_events WHERE id = ?1"),
+                &format!("SELECT {EVENT_COLUMNS} FROM main.session_events WHERE id = ?1"),
                 [id.as_str()],
                 read_event_row,
             )
@@ -439,7 +476,7 @@ impl Store {
         first_seq: u64,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
+            "INSERT INTO main.session_natives (session_id, harness, native_session_id, node, first_seq, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id, harness, native_session_id) DO NOTHING",
             params![
@@ -457,7 +494,7 @@ impl Store {
     /// Lists every native session id recorded for `session`, oldest first.
     pub fn natives_of(&self, session: &SessionId) -> Result<Vec<SessionNative>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {NATIVE_COLUMNS} FROM session_natives WHERE session_id = ?1
+            "SELECT {NATIVE_COLUMNS} FROM main.session_natives WHERE session_id = ?1
              ORDER BY created_at, first_seq, native_session_id"
         ))?;
         let rows = statement.query_map([session.as_str()], |row| {
@@ -490,7 +527,7 @@ impl Store {
         let native = self
             .conn
             .query_row(
-                "SELECT native_session_id FROM session_natives
+                "SELECT native_session_id FROM main.session_natives
                  WHERE session_id = ?1 AND harness = ?2
                  ORDER BY created_at DESC, first_seq DESC, native_session_id DESC LIMIT 1",
                 params![session.as_str(), enum_to_text(&harness)?],
@@ -507,7 +544,7 @@ impl Store {
                 return Err(StoreError::not_found("session", capsule.session_id.as_str()));
             }
             tx.conn.execute(
-                "INSERT INTO capsules (id, session_id, at_seq, version, trigger, author, path, body_json, created_at)
+                "INSERT INTO main.capsules (id, session_id, at_seq, version, trigger, author, path, body_json, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     capsule.capsule_id.as_str(),
@@ -522,7 +559,7 @@ impl Store {
                 ],
             )?;
             let changed = tx.conn.execute(
-                "UPDATE sessions SET last_capsule_id = ?1 WHERE id = ?2",
+                "UPDATE main.sessions SET last_capsule_id = ?1 WHERE id = ?2",
                 params![capsule.capsule_id.as_str(), capsule.session_id.as_str()],
             )?;
             if changed == 0 {
@@ -537,7 +574,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                "SELECT body_json FROM capsules WHERE id = ?1",
+                "SELECT body_json FROM main.capsules WHERE id = ?1",
                 [id.as_str()],
                 read_capsule_row,
             )
@@ -553,7 +590,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                "SELECT body_json FROM capsules WHERE session_id = ?1
+                "SELECT body_json FROM main.capsules WHERE session_id = ?1
                  ORDER BY at_seq DESC, created_at DESC LIMIT 1",
                 [session.as_str()],
                 read_capsule_row,
@@ -567,9 +604,9 @@ impl Store {
 
     /// Lists a session's capsules, newest first.
     pub fn list_capsules(&self, session: &SessionId) -> Result<Vec<Capsule>, StoreError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT body_json FROM capsules WHERE session_id = ?1 ORDER BY at_seq DESC, created_at DESC")?;
+        let mut statement = self.conn.prepare(
+            "SELECT body_json FROM main.capsules WHERE session_id = ?1 ORDER BY at_seq DESC, created_at DESC",
+        )?;
         let rows = statement.query_map([session.as_str()], read_capsule_row)?;
         let mut capsules = Vec::new();
         for row in rows {
@@ -582,7 +619,7 @@ impl Store {
     /// Inserts one executor-switch row.
     pub fn insert_switch(&self, switch: &Switch) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO switches (
+            "INSERT INTO main.switches (
                 id, session_id, from_executor, to_executor, from_node, to_node, capsule_id, reason,
                 state, error, started_at, ended_at, at_seq
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
@@ -623,7 +660,7 @@ impl Store {
             ));
         }
         let changed = self.conn.execute(
-            "UPDATE switches SET state = ?1, error = ?2, ended_at = ?3,
+            "UPDATE main.switches SET state = ?1, error = ?2, ended_at = ?3,
                 capsule_id = COALESCE(?4, capsule_id)
               WHERE id = ?5",
             params![
@@ -645,7 +682,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {SWITCH_COLUMNS} FROM switches WHERE id = ?1"),
+                &format!("SELECT {SWITCH_COLUMNS} FROM main.switches WHERE id = ?1"),
                 [id.as_str()],
                 read_switch_row,
             )
@@ -656,7 +693,7 @@ impl Store {
     /// Lists a session's switches, oldest first.
     pub fn list_switches(&self, session: &SessionId) -> Result<Vec<Switch>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {SWITCH_COLUMNS} FROM switches WHERE session_id = ?1 ORDER BY started_at, id"
+            "SELECT {SWITCH_COLUMNS} FROM main.switches WHERE session_id = ?1 ORDER BY started_at, id"
         ))?;
         let rows = statement.query_map([session.as_str()], read_switch_row)?;
         let mut switches = Vec::new();
@@ -669,7 +706,7 @@ impl Store {
     /// Lists every switch still in `started` state, oldest first, for crash recovery.
     pub fn open_switches(&self) -> Result<Vec<Switch>, StoreError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT {SWITCH_COLUMNS} FROM switches WHERE state = 'started' ORDER BY started_at, id"
+            "SELECT {SWITCH_COLUMNS} FROM main.switches WHERE state = 'started' ORDER BY started_at, id"
         ))?;
         let rows = statement.query_map([], read_switch_row)?;
         let mut switches = Vec::new();
@@ -677,5 +714,71 @@ impl Store {
             switches.push(switch_from_row(row?)?);
         }
         Ok(switches)
+    }
+
+    /// Replaces a capsule's cached body, for redaction after the file was written.
+    pub fn update_capsule_body(&self, capsule: &Capsule) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE main.capsules SET body_json = ?1 WHERE id = ?2",
+            params![json_to_text(capsule)?, capsule.capsule_id.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::not_found("capsule", capsule.capsule_id.as_str()));
+        }
+        Ok(())
+    }
+
+    /// Records one app-transcript id mapping; returns false when it was already known.
+    pub fn insert_native_event(
+        &self,
+        session: &SessionId,
+        harness: HarnessKind,
+        native_id: &str,
+        event_id: &EventId,
+        at: Timestamp,
+    ) -> Result<bool, StoreError> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO main.native_events (session_id, harness, native_id, event_id, at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                session.as_str(),
+                enum_to_text(&harness)?,
+                native_id,
+                event_id.as_str(),
+                ts_to_text(at),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Returns the VOWP event id already written for an app-transcript entry.
+    pub fn native_event(
+        &self,
+        session: &SessionId,
+        harness: HarnessKind,
+        native_id: &str,
+    ) -> Result<Option<EventId>, StoreError> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT event_id FROM main.native_events
+                 WHERE session_id = ?1 AND harness = ?2 AND native_id = ?3",
+                params![session.as_str(), enum_to_text(&harness)?, native_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value.as_deref().map(EventId::parse).transpose()?)
+    }
+
+    /// Marks a session as compacted at `at`.
+    pub fn set_session_compacted(&self, session: &SessionId, at: Timestamp) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE main.sessions SET compacted_at = ?1, updated_at = ?2 WHERE id = ?3",
+            params![ts_to_text(at), ts_to_text(at), session.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::not_found("session", session.as_str()));
+        }
+        Ok(())
     }
 }

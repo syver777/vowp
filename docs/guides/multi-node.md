@@ -1,159 +1,208 @@
-# Multiple nodes
+# Control machines and extra nodes
 
-A VOWP project is homed on one node. That node runs the supervisor, owns the database and the job
-worktrees, and decides job state. In v0.1 one VOWP home runs one project's supervisor; to host several
-projects on one machine, give each project its own `VOWP_HOME`. Other nodes are reachable over SSH; in
-v0.1 there is no cross-node sync, replication or shared database.
+VOWP 0.2 has one **home** that owns the truth. Every other machine is either a **control machine**
+that talks to it or an **executor node** that runs work the home schedules. No control machine opens
+a database; no second machine is authoritative.
 
-The recommended production layout is **VPS project home + local control**. The VPS owns the repository,
-database, worktrees and workers; your computer runs the orchestrator/communicator session and the
-`vowp --node vps ...` CLI. Several projects can be homed on one VPS, each in its own home and with its
-own supervisor and slot budget; the VPS's CPU/RAM plus provider limits are the shared ceiling. v0.1 has
-no global cross-project scheduler, so size each project's `max_workers`/`max_verifiers` to fit the
-total.
+> **Status: current.** `vowp control`, `vowp tunnel`, `vowp fleet`, `vowp node`, the `--node` redirect
+> and cross-node session export/import/switch are implemented. Remote execution uses the home's
+> session service; the same session is never written by two machines.
 
-> **Status: current.** `vowp init`, `vowp doctor`, the `--node` flag, node registration
-> (`vowp node add/ls/rm`) and cross-node session commands are implemented.
+## What each machine is
 
-## What a node is
+| Machine | Role | Holds |
+|---|---|---|
+| **home** | The VPS. Runs the one node supervisor, owns the global and project databases, session logs, leases and snapshot. | All truth. |
+| **control machine** | A laptop or desktop. Reads the snapshot, opens tunnels, runs the app or `vowp chat`, sends writes to the home. | `~/.vowp-control/`: config, snapshot cache, spool, surface state and tunnel records. |
+| **executor node** | A registered machine that can run a turn. It can also be surface-only (`node add <name> -`) because it dials the home; the home never dials it. | Its own working copy and harness login. |
 
-| Node | Role |
-|---|---|
-| `local` | Your laptop. Can run the CLI and, if a project is homed here, the supervisor. |
-| `vps` | A server. Runs the same `vowp` binary; can host a project or be a switch target for a profile. |
-| any named node | A row in `nodes` with an SSH target and capabilities. |
+The phone is a control surface with no installation: an SSH app plus the owner's key, running
+`vowp chat` on the home. See [Using your phone](phone.md).
 
-The supervisor and the project graph live on one node. The database lives in that node's VOWP home
-(`$VOWP_HOME/vowp.db`, default `~/.vowp/vowp.db`), not in the project checkout. Each home has its own
-supervisor lock and tmux server, so separate homes do not collide. The `--node <name>` flag runs a
-command on that node and forwards stdout, stderr and the exit code. It is SSH, not an API: no port is
-opened and no token is sent.
+## Prepare SSH
 
-## Prepare the remote node
-
-1. Install the same VOWP binary on the remote and make sure `vowp` is on `PATH` for a non-interactive
-   shell.
-2. Make SSH key authentication work in batch mode:
-   `ssh -o BatchMode=yes <target> vowp --version` must print a version without a prompt.
-3. Install `git` and, if the remote will run jobs with windows, `tmux`.
-4. Install and sign in the harnesses there exactly as on the local node. VOWP stores no credentials and
-   does not copy a login between nodes.
-
-The remote user needs access to the project checkout and worktree root. A version mismatch is not
-blocked, but commands and schema versions are only guaranteed within the same release; upgrade both
-sides together.
-
-Remote commands run in the remote's own VOWP home and SSH working directory. For project-scoped
-commands such as `status`, `job` and `session`, the remote needs its own initialised project
-(`vowp init` in a checkout, or `--project` pointing at one); the laptop's database only supplies the
-SSH target.
-
-## Register a node
+Every route is plain SSH with key authentication and no password prompt:
 
 ```sh
-vowp node add vps vps.example.com
+ssh -o BatchMode=yes -o ConnectTimeout=10 <home-ssh-target> true
+ssh -o BatchMode=yes -o ConnectTimeout=10 <executor-ssh-target> vowp --version
+```
+
+Keep the host keys in `known_hosts`. If a key is missing, fix the key; do not disable batch mode or
+put a password in a script. The home needs outbound access to the git remote and to the harness's
+provider; a control machine only needs SSH to the home.
+
+## Make a computer the control machine
+
+On the laptop or desktop:
+
+```sh
+vowp control init --name home <home-ssh-target>
+vowp control status
+vowp fleet status
+```
+
+`control init` probes the home, writes `~/.vowp-control/control.json` (0600), creates the spool, the
+surface state and the tunnel table, and records the home in `nodes.json`. It refuses to overwrite an
+existing configuration without `--force`; a failed probe is a warning unless `--strict` is passed.
+The setup path does the same thing:
+
+```sh
+vowp setup control --apply
+```
+
+`setup control` reuses the target from `vowp setup home` (or takes `--target`) and installs no
+supervisor. It is the recommended path because it also records the setup state and fetches the first
+snapshot.
+
+On a control machine:
+
+- project, fleet, capacity, job, inbox, secret and session commands default to the home; the CLI
+  sends them over SSH and returns the home's exit code;
+- `vowp status` and `vowp fleet status` try the home over SSH first; only when SSH fails do they print
+  the cached snapshot with an `as of` time. A successful `fleet status` refreshes that cache;
+- `fleet status --refresh` requires SSH; `fleet status --cached` never opens SSH;
+- writes (`project add/pause`, `inbox answer`, `job add/pause/retry`, `capacity set`, ...) always go
+  to the home; they never succeed against the cache;
+- `vowp up`, `vowp down` and `vowp board` refuse with exit 5 because they need local truth;
+- a path given to `project add` is a path **on the home**, not on the laptop.
+
+`vowp control status` prints the config and the cache metadata without SSH. The cache is disposable;
+the home remains the only source.
+
+## Open a tunnel
+
+The opencode app host and the one-time secret page bind loopback on the home. A control machine
+reaches them through a managed SSH forward. Claude Remote Control does not use a tunnel: it connects
+outbound to claude.ai from the home and opens no local port.
+
+```sh
+vowp tunnel open opencode --remote-port <port>
+vowp tunnel open web --remote-port <port> --local-port <port>
+vowp tunnel ls
+vowp tunnel close opencode
+```
+
+`tunnel open` starts `ssh -N ... -L 127.0.0.1:<local>:<host>:<remote>` in its own process group,
+records the pid in `~/.vowp-control/tunnels.json` (0600) and prints the local port when it chose one.
+Ports below 1024 need `--allow-privileged`. A duplicate name is a conflict (exit 4). `tunnel ls`
+removes records whose process died. There is no `close --all`: close what you opened.
+
+A tunnel is opened from the machine that will use it. On the home, `vowp tunnel` exits 5. Ports and
+pids are local to the control machine and never written to the snapshot or the session log.
+
+## Register executor nodes
+
+The home's registry is the `nodes` table. On the home:
+
+```sh
+vowp node add <node-name> <executor-ssh-target>
+vowp node add laptop -            # surface-only: the laptop dials the home
 vowp node ls
-vowp node rm vps
+vowp node rm <node-name>
 ```
 
-`node add` records the name and SSH target, then tests
-`ssh -o BatchMode=yes <target> vowp --version`. The result is stored in `capabilities`; a failure is a
-warning unless you pass `--strict`, in which case the command fails. `node ls` prints
-`NAME TARGET LOCAL LAST_SEEN VERSION`.
+`node add` probes `ssh -o BatchMode=yes <target> vowp --version` and stores the result in the node's
+capabilities. A failed probe is a warning unless `--strict` is passed; a surface-only node is
+registered without a probe because the home will never dial it. `node rm` refuses the local node.
 
-The local node is registered by `vowp init`; you normally do not add it by hand.
+On a control machine, `node add/ls/rm` edit the control machine's `nodes.json` mirror rather than a
+home database. Add the home once with `control init` or `setup control`; add other nodes only when
+you need to address them from the laptop.
 
-## Run a command remotely
+## Use `--node`
+
+`--node` is the v0.1 remote-command flag and still works. It re-executes the command over SSH on the
+target node:
 
 ```sh
-# --node is current; these run on the registered vps
-vowp --node vps job ls
-vowp --node vps status
-vowp --node vps session ls
-vowp --node vps session tail <id> --follow
+vowp --node <node-name> status
+vowp --node <node-name> job ls
+vowp --node <node-name> session tail <id> --follow
+vowp --node <node-name> doctor
 ```
 
-`--node` is global: it may appear before or after the subcommand, and it is removed from the arguments
-sent to the remote. The CLI builds one safely quoted remote command and runs:
+The target needs its own `vowp` binary and its own VOWP installation for project-scoped commands; a
+version mismatch is not blocked, but upgrade both sides together. Interactive commands
+(`attach`, `chat`, `session chat`, `board` without `--once`) get a TTY. SSH exit 255 becomes exit 7
+(`remote`). Arguments are single-quote escaped into one remote command; a shell alias or wrapper on
+the remote that rewrites arguments is a bug, not something to work around.
 
-```
-ssh -o BatchMode=yes -o ConnectTimeout=10 [-t] <target> vowp <args…>
-```
+On a control machine, `--node home` addresses the configured home directly; other names come from
+`nodes.json`. `--node` is not a second database and does not make the remote authoritative: the home
+still owns the session logs and the supervisor.
 
-`-t` is added only for interactive commands (`attach`, `session chat`, `board` without `--once`). Exit
-255 from SSH becomes exit 7 (`remote`), including a missing remote `vowp`. If the target is the local
-node, the flag is ignored and the command runs in-process.
+## Move a session between nodes
 
-The cross-node session commands keep the bundle as the unit of movement:
-
-- `vowp session import <file> --node vps` streams the bundle over SSH stdin; the remote never needs the
-  file path.
-- `vowp session export <id> --node vps` writes the bundle locally from the remote's stdout.
-- A cross-node `session switch --to … --node vps` exports locally, imports on the target, runs the switch
-  there, and records `from_node`/`to_node` on both sides.
-
-## Run sessions on another node
-
-A profile may set `node = "vps"`, which makes that role's sessions run on the VPS while the supervisor
-stays on the project's home node. The project checkout must be available on that node; v0.1 does not sync
-files between nodes, so provision the checkout yourself. This is how a laptop can plan on Claude Code
-locally and run workers on a server.
-
-For a one-off move, prefer a session switch or export/import rather than moving a running job: a job does
-not change node during failover in v0.1.
-
-## Example: laptop and VPS
-
-Replace `vps.example.com` with the SSH target you prepared above. `vowp node add` records the target
-and probes it, so a successful probe is the quickest sign that the `--node vps` commands will work.
+The same session normally stays on the home while you change the surface. If you need a copy on a
+different machine, the v0.1 bundle path still works:
 
 ```sh
-# on the laptop, where the project is homed
-vowp init --name my-project
-vowp doctor
+vowp session export <id> --out planner.vowp-bundle.json
+vowp session import planner.vowp-bundle.json --node <node-name>
+vowp session switch <id> --to <executor> --node <node-name>
+```
 
-vowp node add vps vps.example.com
-vowp node ls
+`export` writes a `vowp-bundle-v1` file with a capsule, the last events and a checksum. `import`
+validates it and creates a **child** session; the origin is never modified. A cross-node switch
+exports, imports and switches on the target, recording the node transition. In v0.2 this is for
+copying or archiving; the normal multi-device path is one home with several surfaces.
+
+## Remote execution and SSH drops
+
+A session has one writer: the home. A surface sends turns through the home's session service, and the
+home appends events with a gapless `seq`. If the SSH connection drops during a turn, the surface keeps
+its unacknowledged events in a local spool and replays them into the home log when it reconnects.
+Ingest is idempotent by event id, so a replay cannot duplicate an event. This is what lets a laptop or
+phone lose connectivity without losing the conversation.
+
+The practical rules:
+
+- The home stays up; do not run a second supervisor to "keep the session alive".
+- On reconnect, the surface replays its spool into the home log and continues from the last
+  acknowledged sequence. The chat view prints only events after the current turn's `grant.tail_seq`;
+  use `vowp session show` or `vowp session tail` to read the replayed events from the home log.
+- Do not hand-edit `log.jsonl`, a capsule or a spool file to repair a gap; report the session id and
+  the first missing sequence instead.
+- A surface that does not hold the lease can read in follow mode but every write is refused with the
+  takeover notice.
+
+## Example: laptop and home
+
+```sh
+# once, on the laptop
+vowp control init --name home <home-ssh-target>
+vowp setup control --apply
+
+# every day
+vowp fleet status
+vowp fleet queue
+vowp chat <session-id>          # routed to the home over SSH
+```
+
+```sh
+# once, on the home
+vowp project add /srv/projects/alpha
 vowp up
-
-# watch the local project and run a command on the VPS
-vowp status
-vowp attach
-vowp --node vps job ls
 ```
 
-`vowp --node vps job ls` reads the VPS's own VOWP home and project checkout, not the laptop's graph;
-the VPS needs the initialised checkout described above (or pass `--project` with its path there).
-
-If `node add` warns that the probe failed, fix SSH or the remote `PATH` first. Without `--strict`, the
-warning is non-fatal and the node row is still written, but `--node` will fail until SSH to that target
-works. With `--strict`, the command fails before writing the row.
-
-If the project itself is homed on the VPS, run `vowp up` there and use `vowp --node vps status` from the
-laptop. The laptop still needs its own initialized VOWP home with the `vps` node registered — for example
-`vowp init` in a small local project and then `vowp node add vps vps.example.com` — because `--node`
-looks the node up in the local database before it opens SSH. It does not need the VPS project's database
-or session store.
-
-## Security notes
-
-- Remote access is SSH with the keys you already use. VOWP does not open a port, run a daemon or store a
-  token in v0.1.
-- `BatchMode=yes` means a missing key fails instead of prompting. Fix the key; do not disable the check
-  to "make it work".
-- Arguments are single-quote escaped as one remote command string; no argument is interpolated
-  unquoted. A command with spaces, quotes or `$` is passed literally.
-- A remote node sees the same project checkout and can run harnesses; treat its account and disk with
-  the same care as the local one.
+The laptop has no supervisor, no project database and no worktrees. If it is lost, the home is
+unchanged.
 
 ## Troubleshooting a remote command
 
 | Symptom | Check |
 |---|---|
 | Exit 7, `remote` | `ssh -o BatchMode=yes <target> vowp --version` from the same user and shell. |
-| `vowp: command not found` | The remote non-interactive `PATH`; install to a standard location or set it in the SSH environment. |
-| Version mismatch | Upgrade both binaries. A newer database is refused rather than guessed at. |
-| Interactive command hangs | `-t` is only added for interactive commands; a non-TTY `chat` reads until EOF by design. |
-| Host key prompt | Add the host key to `known_hosts` first; batch mode must not prompt. |
+| `vowp: command not found` remotely | The remote non-interactive `PATH`; install to `~/.local/bin` or use the absolute path. |
+| `this is a control machine` | The command needs local truth (`up`, `down`, `board`) or an app host. Run it on the home. |
+| `no control configuration` | Run `vowp control init --name home <home-ssh-target>` on this machine. |
+| `fleet status` says `stale` | The home is unreachable. Check SSH; the cached answer is still labelled `as of`. |
+| A write says it went to the cache | It did not. Writes always route to the home; fix SSH or the control config. |
+| Host key prompt | Add the host key to `known_hosts`; batch mode must not prompt. |
+| Version mismatch | Upgrade both binaries; a newer database is refused rather than guessed at. |
+| Tunnel dies immediately | The remote port is not listening on the home, or `ExitOnForwardFailure` refused it. Check the app host and the port. |
+| An argument was mangled | VOWP single-quote escapes the whole remote command; check for a remote shell wrapper. |
 
-Next: [troubleshooting](../troubleshooting.md) covers the local and remote failure modes together.
+Next: [Sessions and surfaces](sessions.md) for leases and takeover, or
+[Operating a home](operating.md) for capacity, backups and migration.

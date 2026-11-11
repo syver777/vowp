@@ -92,7 +92,7 @@ impl Store {
     /// Inserts or updates one node row, keyed by name.
     pub fn upsert_node(&self, node: &Node) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at)
+            "INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(name) DO UPDATE SET
                ssh_target = excluded.ssh_target,
@@ -116,7 +116,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes WHERE name = ?1"),
+                &format!("SELECT {NODE_COLUMNS} FROM main.nodes WHERE name = ?1"),
                 [name.as_str()],
                 read_node_row,
             )
@@ -135,7 +135,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {NODE_COLUMNS} FROM nodes WHERE is_local = 1"),
+                &format!("SELECT {NODE_COLUMNS} FROM main.nodes WHERE is_local = 1"),
                 [],
                 read_node_row,
             )
@@ -147,7 +147,7 @@ impl Store {
     pub fn list_nodes(&self) -> Result<Vec<Node>, StoreError> {
         let mut statement = self
             .conn
-            .prepare(&format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY name"))?;
+            .prepare(&format!("SELECT {NODE_COLUMNS} FROM main.nodes ORDER BY name"))?;
         let rows = statement.query_map([], read_node_row)?;
         let mut nodes = Vec::new();
         for row in rows {
@@ -159,7 +159,7 @@ impl Store {
     /// Records that `name` was seen at `at`.
     pub fn touch_node_seen(&self, name: &NodeName, at: Timestamp) -> Result<(), StoreError> {
         let changed = self.conn.execute(
-            "UPDATE nodes SET last_seen_at = ?1 WHERE name = ?2",
+            "UPDATE main.nodes SET last_seen_at = ?1 WHERE name = ?2",
             params![ts_to_text(at), name.as_str()],
         )?;
         if changed == 0 {
@@ -175,15 +175,24 @@ impl Store {
             return Err(StoreError::Conflict("cannot remove the local node".to_owned()));
         }
         self.conn
-            .execute("DELETE FROM nodes WHERE name = ?1", [name.as_str()])?;
+            .execute("DELETE FROM main.nodes WHERE name = ?1", [name.as_str()])?;
         Ok(())
     }
 
     /// Inserts or updates one project row, keyed by name.
+    ///
+    /// A newly inserted row also gets its project database, created idempotently. Binding
+    /// follows the spec's rules: an unbound handle binds the first non-reserved project (or
+    /// `_node` when no real project exists), and a `_node`-bound handle re-binds once to the
+    /// first real project. A handle bound to a real project never re-binds.
     pub fn upsert_project(&self, project: &Project) -> Result<(), StoreError> {
+        let existed = self.project_row_exists(&project.name)?;
+        let real_before = self.count_real_projects_excluding(Some(&project.name))?;
         self.conn.execute(
-            "INSERT INTO projects (name, path, remote_url, default_branch, config_json, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO main.projects (
+                name, path, remote_url, default_branch, config_json, state, weight, paused_reason,
+                archived_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', 1, '', NULL, ?6, ?7)
              ON CONFLICT(name) DO UPDATE SET
                path = excluded.path,
                remote_url = excluded.remote_url,
@@ -200,7 +209,60 @@ impl Store {
                 ts_to_text(project.updated_at),
             ],
         )?;
+
+        if !existed {
+            if let Some(paths) = &self.paths {
+                Store::create_project_db(paths, &project.name)?;
+            }
+        }
+
+        let bound_name = self.bound_project().cloned();
+        let is_node = project.name.as_str() == crate::RESERVED_NODE_PROJECT;
+        let should_bind = self.auto_bind
+            && !existed
+            && if is_node {
+                bound_name.is_none() && real_before == 0
+            } else {
+                real_before == 0
+                    && bound_name
+                        .as_ref()
+                        .is_none_or(|bound| bound.as_str() == crate::RESERVED_NODE_PROJECT)
+            };
+        if should_bind {
+            match &self.paths {
+                Some(paths) => self.attach_file(paths, &project.name)?,
+                None => self.attach_memory(&project.name)?,
+            }
+        }
         Ok(())
+    }
+
+    /// Returns whether a project registry row with this name exists.
+    pub(crate) fn project_row_exists(&self, name: &ProjectName) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM main.projects WHERE name = ?1", [name.as_str()], |_| {
+                Ok(())
+            })
+            .optional()?
+            .is_some())
+    }
+
+    /// Counts non-reserved project rows, optionally ignoring one name.
+    fn count_real_projects_excluding(&self, except: Option<&ProjectName>) -> Result<u64, StoreError> {
+        let count: i64 = match except {
+            Some(name) => self.conn.query_row(
+                "SELECT COUNT(*) FROM main.projects WHERE name <> ?1 AND name <> ?2",
+                params![name.as_str(), crate::RESERVED_NODE_PROJECT],
+                |row| row.get(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM main.projects WHERE name <> ?1",
+                [crate::RESERVED_NODE_PROJECT],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(count as u64)
     }
 
     /// Returns the project called `name`, when it exists.
@@ -208,7 +270,7 @@ impl Store {
         let raw = self
             .conn
             .query_row(
-                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE name = ?1"),
+                &format!("SELECT {PROJECT_COLUMNS} FROM main.projects WHERE name = ?1"),
                 [name.as_str()],
                 read_project_row,
             )
@@ -226,7 +288,7 @@ impl Store {
     pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
         let mut statement = self
             .conn
-            .prepare(&format!("SELECT {PROJECT_COLUMNS} FROM projects ORDER BY name"))?;
+            .prepare(&format!("SELECT {PROJECT_COLUMNS} FROM main.projects ORDER BY name"))?;
         let rows = statement.query_map([], read_project_row)?;
         let mut projects = Vec::new();
         for row in rows {

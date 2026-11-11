@@ -5,8 +5,8 @@ executors. The first rung whose provider is available runs the work; when a prov
 either moves to the next rung with a capsule or parks the affected jobs and asks the owner. It never
 silently moves work to a paid provider that the profile does not list.
 
-> **Status: current.** Adapters, provider classification and the `vowp status`, `vowp session`,
-> `vowp inbox` and `vowp cost` commands are implemented.
+> **Status: current.** Adapters, provider classification, the global limit rows and the `vowp status`,
+> `vowp session`, `vowp inbox` and `vowp cost` commands are implemented on `main`.
 
 ## Profiles and ladders
 
@@ -36,6 +36,22 @@ configuration are merged. A job's `profile` field selects its ladder; by default
 | `next_then_probe_back` | Move to the next unlisted-by-limit rung now; probe the limited provider after its reset and switch back when it succeeds. Default. |
 | `next` | Move to the next rung and stay there. No probe-back. |
 | `park` | Park the affected jobs and open an inbox item. |
+
+### One home, shared limit rows
+
+The global database holds one `limits` row per provider, so every project sees the same limit state and
+dispatch skips a limited provider. The follow-up action is **project-local** in this build:
+
+- `credits` and `auth` parking runs in the project whose supervisor handles the event and parks only
+  that project's jobs; the global `park:<provider>` request is consumed by one project tick, so another
+  project's jobs may not be parked automatically;
+- a `rate` limit updates the shared row, but the effective concurrency count is computed from one
+  project's open runs;
+- a `quota` limit moves the session that hit it, and dispatch in every project skips that provider
+  until the reset.
+
+Node-wide parking and a shared concurrency cap are code follow-ups. Job cost stays attached to its
+project and run; the limit row is the shared fact.
 
 ### Executor grammar
 
@@ -74,8 +90,8 @@ provider with no limit classification mark that provider `unavailable` for 15 mi
 2. L1 records the limit row with `resets_at = reported + 2 min` (no known time: now + 60 min).
 3. The session is switched to the next rung whose provider is not limited, using the normal
    [switch protocol](sessions-and-switching.md#switching): freeze, drain, capsule, detach, start, record.
-4. A job run that was interrupted continues on the new rung with `StartRun{Continue}`. The job never
-   changes node during failover in v0.1.
+4. A job run that was interrupted continues on the new rung with `StartRun{Continue}`. The switch
+   records the target node, probes it over SSH when it is remote, and only then detaches the source.
 5. When the reset arrives, a probe runs a tiny prompt (`Reply with the single word: ok`) on the limited
    provider in a scratch directory, with a 60-second timeout. Its cost is recorded like any other run.
 6. A successful probe deletes the limit row. Planner and keeper sessions switch back to rung 0 with a
@@ -93,7 +109,7 @@ Credits exhausted and expired auth mean "a human must act". VOWP records the lim
 whose **current** rung uses that provider, and opens exactly one inbox item per provider and kind. A job
 whose ladder happens to contain another provider is still parked — the owner decides after topping up or
 logging in. `vowp inbox answer <id> resolved` removes the limit row and returns the parked jobs to
-`ready`. The only v0.1 credits policy is `on_credits_exhausted = "park"`.
+`ready`. The only credits policy is `on_credits_exhausted = "park"`.
 
 ## Provider concurrency and spend
 
@@ -106,9 +122,19 @@ on_credits_exhausted = "park"
 max_concurrent = 1                             # keep a subscription-backed provider at one run
 ```
 
-Use your own provider keys as the table names. `max_concurrent` caps concurrent runs per provider. A
-rate limit lowers the effective cap until its reset, then restores it. Slots are separate:
-`[node].max_workers` and `max_verifiers` bound how many runs a node starts at once.
+Use your own provider keys as the table names. In this build `max_concurrent` caps concurrent runs per
+provider **within one project**; the limit rows are global, but the count is project-local. A rate limit
+lowers the effective cap until its reset, then restores it.
+
+**Capacity and providers are separate controls.** Capacity admission asks whether the machine can start
+another run, and it includes the provider's active limit and smallest `max_concurrent` in its target.
+It does not choose a provider or a model. Failover is what moves a session to another rung. Cost is not
+an admission input: VOWP reports it but does not enforce a spending budget. See [capacity](capacity.md)
+for the measured target, brakes and waiting reasons.
+
+`[node].max_workers` is a per-project preference, not a hard cap: it seeds the advised target and the
+worker-slot bookkeeping, while admission uses the capacity target. `max_verifiers` still bounds the
+verifier share of the slots.
 
 If a harness reports usage but no cost receipt, add a price table under the provider:
 `[providers.<provider>.prices."<model>"]` with `input_per_m` and `output_per_m`, plus
@@ -127,15 +153,17 @@ Every run produces a `Cost`:
 
 `vowp cost` groups totals by job, role, provider, model or day, shows the source for each row and counts
 unknown costs separately. Totals are also written to the ledger and to planner checkpoints. There are no
-invented budgets; bounds are on retries and no-progress loops instead.
+invented budgets; bounds are on retries, no-progress loops and measured capacity instead.
 
 ## What VOWP never does
 
 - It never stores a provider key or a harness login. Keys are environment variables the user already
-  has; `env_pass` in `[harnesses.<name>]` contains **names**, never values.
+  has, or secrets injected by name; `env_pass` in `[harnesses.<name>]` contains **names**, never values.
 - It never switches to a paid provider that the profile does not list.
 - It never retries credits/auth failures in a loop.
 - It never mid-run flips a job to another provider just because a probe succeeded.
+- It never lets capacity overrule a provider limit, or a provider choice overrule the measured target.
+- It never changes the capacity target from a model's advice; only the owner applies a target.
 
-Next: [Work → Production](work-to-production.md), or the [operating guide](../guides/operating.md) for
-`vowp status` and `vowp cost`.
+Next: [capacity](capacity.md), [Work → Production](work-to-production.md), or the
+[operating guide](../guides/operating.md) for `vowp status` and `vowp cost`.

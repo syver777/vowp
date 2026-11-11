@@ -76,8 +76,9 @@ fn drill_failover_and_probe_back() {
     assert!(
         wait_until(Duration::from_secs(10), || {
             completed_switch_reasons(&node, vowp_protocol::SessionRole::Planner).contains(&SwitchReason::Limit)
+                && switch_ledger_reason_recorded(&node, "limit")
         }),
-        "the planner session switches on the limit"
+        "the planner session switches on the limit and records it in the ledger"
     );
     node.wait_runs();
 
@@ -127,13 +128,17 @@ fn drill_failover_and_probe_back() {
         supervisor.tick().expect("probe tick");
         if store.limit_for("claude").expect("limit").is_none()
             && completed_switch_reasons(&node, vowp_protocol::SessionRole::Planner).contains(&SwitchReason::ProbeBack)
+            && switch_ledger_reason_recorded(&node, "probe_back")
         {
             probed = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(probed, "the probe clears the quota row");
+    assert!(
+        probed,
+        "the probe clears the quota row and records the probe_back switch in the ledger"
+    );
     let probes = claude
         .starts()
         .into_iter()
@@ -225,13 +230,18 @@ fn drill_credits_park() {
         .expect("pause keeper");
     let first = node.insert_job("credits-one", JobKind::Build, Role::Worker, Some(vec![]));
     let second = node.insert_job("credits-two", JobKind::Build, Role::Worker, Some(vec![]));
+    // L6 writes the `park:<provider>` request after the run row ends but before its
+    // durable `l6:<run>` marker. Answering while that request is still queued lets the
+    // answer tick resolve the jobs at step 0 and then re-park them when harvest drains
+    // the stale request, so wait for both runs' L6 policy before answering.
+    let settled = [first.id.clone(), second.id.clone()];
     node.tick_until(&mut supervisor, 30, |store| {
         [&first, &second].iter().all(|job| {
             store
                 .require_job(&job.id)
                 .map(|job| job.state == JobState::Parked)
                 .unwrap_or(false)
-        })
+        }) && l6_policy_settled(&node, &settled)
     });
     for job in [&first, &second] {
         let job = store.require_job(&job.id).expect("job");

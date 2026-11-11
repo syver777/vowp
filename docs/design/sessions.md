@@ -1,7 +1,15 @@
-# sessions.md — universal sessions: log, capsule, switch, export/import
+# sessions.md — universal sessions: log, capsule, switch, surfaces, export/import
 
-File- and protocol-level rules. Consumed by `vowp-store` (files, `SessionLog`, reindex: `crates/vowp-store.md`), `vowp-core::session`
-(capsule writer, switch, export/import, `SessionOps` impl) and `vowp-cli` (`session` commands: `cli.md`). Types are in `types.md` (§5 events, §6 capsule, §9 sessions).
+Status: current for v0.2. File- and protocol-level rules. Consumed by `vowp-store` (files,
+`SessionLog`, reindex: `crates/vowp-store.md`), `vowp-core::session` (capsule writer, switch,
+remote execution, export/import, `SessionOps` impl), `vowp-core::surface` (leases, takeover, app
+hosts, mirror), `vowp-cli` (`session`, `chat`, `mcp`: `cli.md`). Types are in `types.md` (§5 events,
+§6 capsule, §9 sessions) and §16 (v0.2 surface types). The normative v0.2 behaviour is
+[`v0.2/home-and-surfaces.md`](v0.2/home-and-surfaces.md) §7.
+
+The v0.1 model is unchanged: one append-only log with one `seq`, capsules, the switch protocol and
+bundles. v0.2 adds a transport (remote execution), a lease (one writing surface) and app-host
+integration. It does not add a second session type or a second transcript store.
 
 ## 1. Canonical event log
 
@@ -9,20 +17,30 @@ File- and protocol-level rules. Consumed by `vowp-store` (files, `SessionLog`, r
 
 ```
 ~/.vowp/
-  vowp.db                          index + decisions (schema.sql)
+  vowp.db                          global index + surfaces/leases + capsules (schema/global.sql)
+  projects/<name>/project.db       project rows, including that project's runs (schema/project.sql)
   sessions/<sessionId>/
     log.jsonl                      AUTHORITATIVE content, append-only, one EventEnvelope per line
     .lock                          single-writer lock (pid)
     blobs/<sha256>                 spilled tool output, diffs, attachments (content addressed)
     capsules/<at_seq:010>-<ulid>.json   authoritative capsule files
     adapters.json                  {"natives":[{harness,native_session_id,node,first_seq,created_at}]} append-only
-  runs/<runId>.jsonl               raw harness stdout mirror (debug only, rotated by `vowp backup`)
+  orchestrators/<name>/            orchestrator.json (0600), app config, lease token, mirror.json
+  runs/<runId>.jsonl               raw harness stdout mirror on the home (debug only, compressed/rotated)
   logs/supervisor.log  backups/  tmp/
 project/.vowp/jobs/<job>/{brief.md,report.md}
 ```
 
-2. **Append rules.** Only `SessionLog::append` writes `log.jsonl`. `seq` starts at 1, increments by exactly 1; a gap or duplicate is rejected
-   (`StoreError::SeqGap`). Events are immutable; corrections are new events. `ts` = harness-reported time when the adapter provides one, else the node clock.
+A remote executor writes its raw harness mirror in its own worktree on the executor machine and
+redacts it there; the home keeps the canonical session log. The home is the only writer of
+`log.jsonl`; `vowp session ingest` is the one additional append path and it runs on the home.
+
+2. **Append rules.** Only `SessionLog::append` on the home writes `log.jsonl`; the session service
+   and `vowp session ingest` are its two callers. `seq` starts at 1, increments by exactly 1; a gap or
+   duplicate is rejected (`StoreError::SeqGap`). Ingest is idempotent by event id: a duplicate id is
+   acknowledged without a second append; the same id with different content is a conflict. Events are
+   immutable; corrections are new events. `ts` = harness-reported time when the adapter provides one,
+   else the node clock.
 3. **fsync.** The log is flushed per append and fsynced by `sync()` which the session layer calls at: `turn.ended`, `session.executor` (detach), `switch`, `capsule`, `session.created`, and fatal `error`. A crash therefore
    loses at most the in-flight turn's tail; a torn last line is truncated on the next open (vowp-store.md §4.1 rule 5).
 4. **Blobs.** `tool.result.output` strictly larger than **8192 bytes** is written to `blobs/<sha256>` and replaced by `output_ref{sha256,bytes,preview(512 chars)}`. `file.change.diff_ref` and attachments always use blobs. Blob content is raw bytes, sha256 lowercase hex.
@@ -118,7 +136,7 @@ The seed is appended to the log as a `user.message` with `note: "handoff"` (disp
 
 ## 5. Switch protocol
 
-`SessionOps::switch(SwitchRequest{session_id, to, reason, drain_secs=5})`. Triggers: user (`vowp session switch`), `limit` (L6), `crash` (only if configured), `context`, `failover`, `probe_back`.
+`SessionOps::switch(SwitchRequest{session_id, to, reason, drain_secs=5})`. Triggers: user (`vowp session switch`), `limit` (L6), `crash` (only if configured), `context`, `failover`, `probe_back`, and `takeover` when another surface takes the lease and the session already has an executor (§9).
 Each step lists the log events and DB rows it changes. `S` = the source executor, `T` = the target.
 
 | # | Step | Log events | DB rows |
@@ -197,11 +215,131 @@ Records an interactive Claude Code session into the canonical store without runn
 
 1. Locate transcripts: `~/.claude/projects/<mangled-cwd>/<claude-session-uuid>.jsonl` (read from `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; the path is a flag/config input, never assumed in tests). `vowp session watch [--claude-dir <dir>] [--once]` (the flag names the transcripts root, default `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; cli.md §4).
 2. Map each Claude transcript line to events (`harness=claude-code`, `native_session_id` = uuid): user text → `user.message`; assistant text blocks → `assistant.message`; `thinking` blocks → `assistant.reasoning` (`replayable=false`); `tool_use` → `tool.call`; `tool_result` → `tool.result` (spill > 8192 bytes); usage → `cost` (`source: unknown`, tokens only — subscription sessions have no receipt); unknown line types are skipped and counted.
-3. Incremental: the importer stores the last processed **byte offset** and last transcript line uuid in `adapters.json`-sibling file `watch.json` (`{"claude_file": "...", "offset": N}`); each poll (every 2 s, plain thread) reads from `offset`, only whole lines (`\n`-terminated), appends events, `sync()`s every 20 events and at EOF-idle.
-4. One canonical session per Claude uuid (created on first sight, `role=user`, title = first user message ≤ 60 chars). A truncated/rewritten file (size < offset) restarts from 0 and skips events already imported by matching the `tool_use_id`/message uuid recorded in `raw`.
-5. Tests (optional): `watch_imports_fixture_transcript` (recorded sanitized transcript → expected event types/count), `watch_is_incremental` (append lines, only new events appended), `watch_never_writes_claude_files` (read-only open flags; directory unchanged).
+3. Incremental by **line count** in this build: the importer stores the processed line count
+   under `watch:<native session id>` in the node database. A later `--once` run reads the whole
+   transcript, imports only lines after the stored count, and skips a transcript that is shorter or
+   unchanged. `--follow` is not available: without `--once`, a TTY run exits 2 with a message to use
+   `--once` (non-TTY input does one pass).
+4. Each pass with new lines creates a **new canonical session** (`role=user`, title = first user
+   message ≤ 60 chars) even for the same Claude uuid. The uuid is recorded as the event source's
+   `native_session_id`, but the importer does not look it up to reuse a session. Two `--once` runs
+   therefore produce two VOWP sessions for one Claude transcript, the second holding only the lines
+   appended since the first. The importer opens Claude's files read-only and never writes them.
+5. The optional importer has no dedicated test yet; the follow-up in `../roadmap.md` (good first
+   issue 4) adds byte-offset incremental reads, one session per native uuid, `--follow` and the
+   missing coverage. Until then, `--once` is the supported form and a TTY `--follow` exits 2.
 
-## 8. Named tests (consumers)
+## 8. Surfaces, leases and takeover
+
+A **surface** is where a person talks to a session: `vowp chat`, an opencode app, a Claude app, or
+the `vowp mcp` server such an app calls. A **lease** is the right of one surface to write. The
+global DB holds `surfaces` and `leases`; rows are live state and are not rebuilt from the logs.
+
+- One lease row per session (`leases.session_id` is the key). It carries `surface_id`,
+  `surface_kind`, `node`, `holder`, a random `token`, `acquired_at` and `heartbeat_at`.
+- A surface registers once and heartbeats every 5 s. A lease without a heartbeat for 60 s is stale
+  and another surface may take it; the node tick sweeps stale leases.
+- A surface without the current token reads in **follow mode** and cannot write. A clean exit
+  releases the lease.
+- Taking over replaces the lease row atomically, pushes `IngestAck::LeaseRevoked` on the old
+  surface's ingest stream (measured 99.6–265 ms over live SSH, bound < 2 s), drains a running turn
+  for up to `drain_secs` (5 s) then interrupts it, writes a capsule, records a switch with reason
+  `takeover` when the session already has an executor, appends a `note` after the switch releases
+  the log lock, and leaves the old surface in follow mode. A pre-attach session gets the note only.
+- The old surface prints:
+  `Taken over by phone at 14:05. This surface is now read-only (follow mode).`
+- `vowp session takeover <session> --kind <kind> --holder <h> --node <n>` performs the same path;
+  `vowp session lease` shows the status, and only an acquire prints the token.
+- A surface cannot close another vendor's window. The cut-off is enforced in every write path: the
+  chat loop, the MCP write tools and `session ingest`.
+
+Types: `Surface`, `Lease`, `SurfaceRef`, `LeaseStatus`, `TakeoverReport` (types.md §16.2).
+
+## 9. Remote execution (`turn-begin`, `__exec`, `ingest`, spool)
+
+A turn may run on the surface's own machine (for example a laptop) while the session stays on the
+home and the home remains the only writer.
+
+1. The surface calls the hidden
+   `vowp session turn-begin <session> --executor <exec> --purpose <p> --node <n> --request <file|->`.
+   The request document carries the lease token, prompt, executor, purpose and node; it is read from
+   stdin/file, never argv. The home validates the lease, writes
+   `session.executor{attach}`, `turn.started`, `user.message` (seeded from the capsule when the
+   native session is absent), inserts the project `runs` row with `node=<executor-node>`, and prints
+   a `TurnGrant { run_id, session_id, executor, purpose, node, cwd, prompt, resume_native,
+   native_hint, env_names, lease_token, tail_seq }`.
+2. The client writes the grant to a mode-0600 file and runs `vowp __exec --grant <file>` on the
+   executor machine. `__exec` starts the adapter with the same `StartInput`, resolves `env_names`
+   from the executor's own environment/vault (a missing name is a clear error, never an empty
+   value), and appends every adapter event to `<spool>/<session>/<run>/events.jsonl` with fsync
+   **before** sending it. The executor owns its harness binary and any injected value; the home
+   never receives a secret value over the wire.
+3. `__exec` prints `RemoteLine` JSON objects on stdout; the first is `RemoteLine::Hello`, which
+   carries the lease token. The client pipes them over SSH into
+   `vowp session ingest <session> --run <run-id>`. The token is never in argv or `ps`.
+4. `ingest` validates the token, assigns `seq`, appends with the supplied event id and timestamp,
+   updates the index, heartbeats the lease, and prints `IngestAck { event_id, seq }`. It keeps a
+   bounded in-flight window (64 events) so a WAN round trip is not paid per event.
+5. Acks are written to `acked.json` by event id. On reconnect, `ingest --replay` resends from the
+   first unacked event; a duplicate id is acknowledged, not appended; the same id with different
+   content is `duplicate-conflict`. A killed client, not only a dead SSH, resumes from the spool. A
+   torn final line is truncated; corruption before the last complete line is an error.
+6. `RemoteLine::Summary` carries the harness summary and usage. `ingest` writes `cost`, `limit` or
+   `error`, `turn.ended`, `session.executor{detach}`, finishes the `runs` row, writes ledger rows
+   and `run_usage` (a default row with `source='default'` when the executor could not measure), and
+   acks `{run_id, done:true}`.
+7. A laptop that dials the home is registered once with `vowp node add <name> -`; the home never
+   dials it. `control_master` multiplexing is an optimisation for reconnects, never a correctness
+   requirement.
+
+Wire types: `RemoteEvent`, `RemoteLine`, `IngestAck`, `TurnGrant` (types.md §16.2). The
+`vowp-adapters` `proc` scope and `run_usage` measurement are in `capacity`/`types.md` §16.1.
+
+## 10. App hosts, transcript mirror and resume
+
+The primary surfaces are the apps people already use. VOWP hosts the session and gives the app a
+project-local configuration.
+
+- **opencode host**: runs `opencode serve` for an orchestrator on the home with a private
+  `XDG_STATE_HOME`/`XDG_DATA_HOME` under `~/.vowp/orchestrators/<name>/`, binds `127.0.0.1` only,
+  and prints join instructions for the desktop (`ssh -L` + `opencode pair`, a one-time link that
+  expires after five minutes) and the phone (SSH + `opencode --server …`).
+- **Claude Remote Control**: starts only when a claude.ai login already exists on the home. VOWP
+  reads only `claude auth status` (`loggedIn`/`authMethod`), never login or credential files. The
+  project-local `.mcp.json` needs one owner approval; without a login the orchestrator is recorded
+  `degraded` and the command exits non-zero.
+- **mirror**: each app transcript is mirrored into the canonical log when the orchestrator is
+  created, resumed, or resumed by the supervisor at startup. A pass reads entries after the cursor,
+  appends each at most once (the native-id map skips duplicates), and writes
+  `~/.vowp/orchestrators/<name>/mirror.json` with the last mirrored app id and update time. This is
+  not a continuous watcher; the next create/resume/startup pass catches up. A read or cursor failure
+  is logged and does not stop the host.
+- **resume**: `session_resume` (MCP) builds the capsule and the last turns for a new app from the
+  log; `surface::resume_context` is implemented and tested in core. The new app continues the same
+  session id and log.
+
+## 11. MCP tools and what a surface may write
+
+`vowp mcp --session <id> --surface <id> --token-file <path>` is a stdio MCP server using plain
+threads. Read tools: `fleet_status`, `fleet_queue`, `inbox_list`, `capacity_report`,
+`session_tail`. Write tools: `inbox_answer`, `job_add`, `job_pause`, `job_retry`, `capacity_set`,
+`tunnel_open`, `tunnel_close`, `secret_request`, `session_handoff`, `session_resume`.
+
+Every write reads the token file on each call, checks the lease and records the actor
+`session:<id>/surface:<surface-id>`. Read tools work in follow mode; write tools refuse after a
+takeover. `tunnel_open`/`tunnel_close` exist only on a control-machine surface and refuse on the
+home.
+
+| Surface | Read | Write | Lease |
+|---|---|---|---|
+| `vowp chat` | yes | turn input and slash commands | required |
+| opencode app via MCP | yes | MCP write tools only | required; checked on every call |
+| Claude app via MCP | yes | MCP write tools only | same |
+| fleet/status/capacity/project CLI | yes | writes go to the home | no session lease |
+| `vowp session ingest` | yes | event append for one run | token in the grant |
+| `vowp session tail --follow` | yes | no | not required |
+
+## 12. Named tests (consumers)
 
 The tests live in `crates/vowp-store.md` §6 (log, blob, reindex) and `crates/vowp-core.md` §3 (session module); those files are the **only** place test names are defined. The table maps each requirement of this document to the exact test name that must prove it:
 
@@ -219,3 +357,15 @@ The tests live in `crates/vowp-store.md` §6 (log, blob, reindex) and `crates/vo
 | §6 tampered bundle / unknown format rejected, nothing created | `bundle_checksum_mismatch_rejected`, `bundle_unknown_format_rejected` | core |
 | §6 only blobs ≤ 64 KiB inlined (60 KB yes, 70 KB no) | `bundle_inlines_small_blobs_only` | core |
 | §1 log, blob and reindex rules | the `log_*`, `blob_*`, `reindex_*` tests of vowp-store.md §6 | store |
+| §8 lease acquire, heartbeat, stale sweep, exact holder | `lease_acquire_is_one_holder`, `heartbeat_keeps_lease_live`, `stale_lease_free_after_sixty_seconds` | core |
+| §8 takeover cuts off the old surface within 2 s | `takeover_cuts_old_surface_within_two_seconds`, `lease_revoked_is_pushed_within_2s` | core |
+| §8 takeover drains, writes a capsule and leaves follow mode | `takeover_drains_and_writes_capsule`, `follow_mode_prints_new_events_and_refuses_writes` | core |
+| §8 a pre-attach session gets the note only; a wrong token is rejected | `takeover_before_first_executor_writes_note_only`, `lease_check_rejects_wrong_token` | core |
+| §9 framing, seq assignment and idempotent ingest | `turn_begin_writes_framing_events_and_returns_grant`, `remote_exec_streams_events_and_home_assigns_seq`, `remote_ingest_is_idempotent_by_event_id` | core |
+| §9 spool before send; replay after SSH drop or killed client | `exec_spools_and_fsyncs_before_send`, `ssh_drop_spools_and_replays_without_gap_or_duplicate`, `client_crash_resumes_from_spool` | core |
+| §9 bad lease, summary and usage | `remote_ingest_rejects_bad_lease`, `remote_summary_finishes_run_and_terminal_events`, `remote_summary_writes_run_usage` | core |
+| §9 token never in argv or logs; remote probe before a switch | `lease_token_never_in_argv_or_logs`, `remote_probe_uses_remote_node_and_switch` | core |
+| §10 opencode host and transcript mirror | `opencode_host_starts_and_stops_with_fake_server`, `mirror_is_incremental_and_idempotent`, `orchestrator_state_survives_supervisor_restart` | core |
+| §10 Claude Remote Control refuses without a login; resume context | `claude_remote_refuses_without_login`, `resume_context_builds_capsule_and_tail` | core |
+| §11 MCP write checks the lease and records the actor | `mcp_write_tool_checks_lease_and_records_actor`, `mcp_old_app_write_gets_read_only_notice` | cli |
+| §8/§9 chat fallback lease rules | `chat_takes_over_and_prints_notice`, `chat_follow_mode_is_read_only` | cli |

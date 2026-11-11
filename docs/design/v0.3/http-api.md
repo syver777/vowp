@@ -1,7 +1,8 @@
-# v0.2 — daemon HTTP + SSE API
+# v0.3 — daemon HTTP + SSE API
 
-Status: current for the commands shown; this note is design only. Nothing here is implemented in
-v0.1; the supervisor opens no socket and there is no HTTP API to call.
+Status: moved from `docs/design/v0.2/` by the v0.2 spec. This note is design only and is **not** part
+of v0.2; v0.2 uses the opencode/Claude apps and `vowp chat` as its surfaces, and the supervisor opens
+no socket. Nothing here is implemented in v0.1.
 
 ## Goal
 
@@ -39,9 +40,9 @@ event. A browser action must never apply a state transition directly.
 
 ## Wire contract
 
-`EventEnvelope` is already frozen for v0.1 (`docs/design/architecture.md` §8): v0.2 may add optional
+`EventEnvelope` is already frozen for v0.1 (`docs/design/architecture.md` §8): v0.3 may add optional
 fields and new event types, but readers ignore unknown **fields**; unknown event **types** are a hard
-error in v0.1 and should be tolerated as opaque in v0.2. The API sends the envelope as-is rather than
+error in v0.1 and should be tolerated as opaque in v0.3. The API sends the envelope as-is rather than
 wrapping the payload, so a stored log line and an SSE `data:` value are the same object.
 
 `Job`, `Session`, `Run`, `GateResult`, `Switch`, `Capsule`, `Limit`, `Cost` and `LedgerEntry` are

@@ -1,12 +1,12 @@
 # Security policy
 
-VOWP is an early release (0.1.0). It runs AI coding agents that can edit files and execute commands, so
+VOWP is an early release (0.2.0). It runs AI coding agents that can edit files and execute commands, so
 the security model is deliberately narrow: no credentials, stock harness binaries, private tmux servers
 and loopback-only local state.
 
 ## Supported versions
 
-Security fixes land on `main` and in the latest `0.1.x` release. Pre-0.1 builds and older pre-release
+Security fixes land on `main` and in the latest `0.2.x` release. Pre-0.2 builds and older pre-release
 builds are not supported. There is no security team and no response-time guarantee; reports are handled
 on a best-effort basis by the repository owner.
 
@@ -31,8 +31,9 @@ not available yet, wait until the repository is public and use the same link.
 3. **Private tmux sockets.** Every VOWP tmux server uses a socket derived from the node home, plus a
    private `TMUX_TMPDIR`; a missing or `default` socket is refused before tmux is spawned. VOWP never
    drives the user's default server.
-4. **Loopback-only.** In v0.1 the supervisor opens no listening sockets and has no HTTP API. The planned
-   v0.2 API binds `127.0.0.1` only; remote access is expected through SSH or a tunnel, never a public port.
+4. **Loopback-only.** In v0.2 the supervisor opens no public HTTP, SSE or API port. The opencode app host
+   and the one-time secret paste page bind `127.0.0.1` only; remote access is expected through SSH or a
+   tunnel, never a public port.
 5. **Local user trust.** VOWP runs as the invoking user and stores state under the node home (usually
    `~/.vowp`) with that user's permissions. It is not a multi-tenant sandbox; protect the account and
    the filesystem.
