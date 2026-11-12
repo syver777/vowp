@@ -5,10 +5,12 @@
 mod support;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tempfile::TempDir;
 use vowp_core::promote::{PromoteOpts, Promoter};
-use vowp_protocol::{Approval, InboxKind, InboxState, LedgerKind, ReleaseState};
+use vowp_core::vault;
+use vowp_protocol::{Approval, InboxKind, InboxState, LedgerKind, MemoryLog, ReleaseState, SecretName};
 use vowp_store::LedgerFilter;
 
 use support::*;
@@ -321,6 +323,250 @@ fn policy_approval_with_yes_deploys() {
     assert_eq!(release.approved_by.as_deref(), Some("ops"));
     assert!(store.list_inbox(None).unwrap().is_empty());
     assert_eq!(order(root), vec!["bank", "deploy", "probe"]);
+}
+
+#[test]
+fn env_pass_injects_stored_secret_into_bank_deploy_probe_and_rollback() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let node = root.join("node");
+    let (repo, checkout, candidate) = candidate_fixture(root);
+
+    let token = "deploy-token-value-9f3a7c";
+    let other_value = "unconfigured-value-1b7c4d";
+    let bank_token = root.join("bank-token.env");
+    let bank_other = root.join("bank-other.env");
+    let deploy_token = root.join("deploy-token.env");
+    let deploy_other = root.join("deploy-other.env");
+    let probe_token = root.join("probe-token.env");
+    let rollback_token = root.join("rollback-token.env");
+
+    let guard = root.join("guard.sh");
+    script(&guard, "echo guard-pass");
+    let bank = root.join("bank.sh");
+    script(
+        &bank,
+        &format!(
+            "printf '%s' \"$DEPLOY_TOKEN\" > {}\nprintf '%s' \"${{VOWP_TEST_UNCONFIGURED_SECRET_7F1A-UNSET}}\" > {}\necho snapshot > \"$VOWP_BANK_PATH\"",
+            bank_token.display(),
+            bank_other.display()
+        ),
+    );
+    let deploy = root.join("deploy.sh");
+    script(
+        &deploy,
+        &format!(
+            "printf '%s' \"$DEPLOY_TOKEN\" > {}\nprintf '%s' \"${{VOWP_TEST_UNCONFIGURED_SECRET_7F1A-UNSET}}\" > {}",
+            deploy_token.display(),
+            deploy_other.display()
+        ),
+    );
+    let probe = root.join("probe.sh");
+    script(
+        &probe,
+        &format!("printf '%s' \"$DEPLOY_TOKEN\" > {}", probe_token.display()),
+    );
+    let rollback = root.join("rollback.sh");
+    script(
+        &rollback,
+        &format!("printf '%s' \"$DEPLOY_TOKEN\" > {}", rollback_token.display()),
+    );
+
+    let mut config = config_for(&repo);
+    let mut env = env_config(&checkout);
+    env.env_pass = vec!["DEPLOY_TOKEN".to_owned()];
+    env.guards = vec![format!("ok:{}", guard.display())];
+    env.serving_bank = Some(format!("{} {{target}}", bank.display()));
+    env.deploy = vec![deploy.display().to_string()];
+    env.probe = Some(probe.display().to_string());
+    env.approval = Approval::Policy;
+    env.rollback = Some(rollback.display().to_string());
+    config.env.insert("prod".to_owned(), env);
+
+    let log = Arc::new(MemoryLog::new());
+    let store = test_store(&node);
+    let project = insert_project(&store);
+    let deps = test_deps_with_log(&node, config, Arc::clone(&log));
+    let token_name = SecretName::parse("DEPLOY_TOKEN").unwrap();
+    let other_name = SecretName::parse("VOWP_TEST_UNCONFIGURED_SECRET_7F1A").unwrap();
+    vault::write_secret(&deps, &token_name, token).unwrap();
+    vault::write_secret(&deps, &other_name, other_value).unwrap();
+    let promoter = Promoter::new(deps.clone());
+
+    let release = promoter
+        .promote(
+            &store,
+            &project,
+            "prod",
+            &candidate,
+            PromoteOpts {
+                yes: true,
+                ..PromoteOpts::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(release.state, ReleaseState::Live);
+
+    assert_eq!(read(&bank_token), token, "the serving bank sees the secret");
+    assert_eq!(read(&deploy_token), token, "the deploy sees the secret");
+    assert_eq!(read(&probe_token), token, "the probe sees the secret");
+    assert_eq!(
+        read(&bank_other),
+        "UNSET",
+        "an unconfigured secret is absent from the bank command"
+    );
+    assert_eq!(
+        read(&deploy_other),
+        "UNSET",
+        "an unconfigured secret is absent from the deploy command"
+    );
+
+    let release_json = serde_json::to_string(&release).expect("release serialises");
+    assert!(!release_json.contains(token), "the release record leaked the value");
+    assert!(
+        !serde_json::to_string(&release.guards)
+            .expect("guards serialise")
+            .contains(token),
+        "the gate evidence leaked the value"
+    );
+
+    let rolled_back = promoter
+        .rollback(&store, &release.id, PromoteOpts::default())
+        .expect("rollback");
+    assert_eq!(rolled_back.state, ReleaseState::RolledBack);
+    assert_eq!(read(&rollback_token), token, "the rollback sees the secret");
+    assert!(
+        !serde_json::to_string(&rolled_back)
+            .expect("rollback release serialises")
+            .contains(token),
+        "the rollback record leaked the value"
+    );
+
+    let releases_log = read(&node.join("releases.log"));
+    assert!(!releases_log.contains(token), "releases.log leaked the value");
+    let ledger = store.ledger_since(&LedgerFilter::default()).unwrap();
+    assert!(!ledger.is_empty());
+    assert!(
+        !serde_json::to_string(&ledger).unwrap().contains(token),
+        "the ledger summary or detail leaked the value"
+    );
+    assert!(!log.contains(token), "the supervisor log leaked the value");
+}
+
+#[test]
+fn missing_env_pass_secret_fails_before_banking_or_deploying() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let node = root.join("node");
+    let (repo, checkout, candidate) = candidate_fixture(root);
+    let scripts = scripts(root);
+
+    let mut config = config_for(&repo);
+    let mut env = env_config(&checkout);
+    env.env_pass = vec!["MISSING_DEPLOY_TOKEN".to_owned()];
+    env.serving_bank = Some(format!("{} {{target}}", scripts.bank.display()));
+    env.deploy = vec![scripts.deploy.display().to_string()];
+    env.probe = Some(scripts.probe.display().to_string());
+    env.approval = Approval::Policy;
+    env.rollback = Some(scripts.rollback.display().to_string());
+    config.env.insert("prod".to_owned(), env);
+
+    let store = test_store(&node);
+    let project = insert_project(&store);
+    let promoter = Promoter::new(test_deps(&node, config));
+    let error = promoter
+        .promote(
+            &store,
+            &project,
+            "prod",
+            &candidate,
+            PromoteOpts {
+                yes: true,
+                ..PromoteOpts::default()
+            },
+        )
+        .expect_err("a configured but missing secret must fail the promotion");
+
+    assert!(
+        error.to_string().contains("MISSING_DEPLOY_TOKEN"),
+        "the error names the variable: {error}"
+    );
+    assert!(order(root).is_empty(), "no guard, bank or deploy command ran");
+    assert!(
+        store.list_releases(&project, None).unwrap().is_empty(),
+        "the promotion did not record a release"
+    );
+}
+
+#[test]
+fn rollback_with_missing_env_pass_secret_does_not_run_the_command() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let node = root.join("node");
+    let (repo, checkout, candidate) = candidate_fixture(root);
+    let scripts = scripts(root);
+    let rollback_marker = root.join("rollback-ran");
+    let rollback = root.join("rollback.sh");
+    script(
+        &rollback,
+        &format!(
+            ": > {}\necho \"rollback $1\" >> {}",
+            rollback_marker.display(),
+            scripts.log.display()
+        ),
+    );
+
+    let mut config = config_for(&repo);
+    let mut env = env_config(&checkout);
+    env.env_pass = vec!["ROLLBACK_TOKEN".to_owned()];
+    env.serving_bank = Some(format!("{} {{target}}", scripts.bank.display()));
+    env.deploy = vec![scripts.deploy.display().to_string()];
+    env.probe = Some(scripts.probe.display().to_string());
+    env.approval = Approval::Policy;
+    env.rollback = Some(rollback.display().to_string());
+    config.env.insert("prod".to_owned(), env);
+
+    let store = test_store(&node);
+    let project = insert_project(&store);
+    let deps = test_deps(&node, config);
+    let name = SecretName::parse("ROLLBACK_TOKEN").unwrap();
+    vault::write_secret(&deps, &name, "rollback-token-value-4e2b").unwrap();
+    let promoter = Promoter::new(deps.clone());
+
+    let release = promoter
+        .promote(
+            &store,
+            &project,
+            "prod",
+            &candidate,
+            PromoteOpts {
+                yes: true,
+                ..PromoteOpts::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(release.state, ReleaseState::Live);
+
+    vault::remove_secret(&deps, &name).unwrap();
+    let error = promoter
+        .rollback(&store, &release.id, PromoteOpts::default())
+        .expect_err("a configured but missing secret must fail the rollback");
+
+    assert!(
+        error.to_string().contains("ROLLBACK_TOKEN"),
+        "the error names the variable: {error}"
+    );
+    assert!(!rollback_marker.exists(), "the rollback command did not run");
+    assert_eq!(
+        store.release(&release.id).unwrap().unwrap().state,
+        ReleaseState::Live,
+        "the original release is unchanged"
+    );
+    assert_eq!(
+        promoter.releases(&store, &project, Some("prod"), 10).unwrap().len(),
+        1,
+        "the failed rollback recorded no release"
+    );
 }
 
 #[test]

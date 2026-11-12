@@ -4,11 +4,151 @@ All notable changes to VOWP are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/).
 
-Release notes are in [`docs/release/0.2.0.md`](docs/release/0.2.0.md) and
+Release notes are in [`docs/release/0.3.0.md`](docs/release/0.3.0.md),
+[`docs/release/0.2.0.md`](docs/release/0.2.0.md) and
 [`docs/release/0.1.0.md`](docs/release/0.1.0.md). The product scope and the
-features deliberately left out of v0.2 are in [`docs/roadmap.md`](docs/roadmap.md).
+features deliberately left out of v0.3 are in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## [Unreleased]
+
+## [0.3.0] - 2026-11-12
+
+The v0.3 feature set: a loopback HTTP/SSE API and `vowp-daemon`, a web/PWA
+window and phone board served from the home, the ACP adapter, and session pull
+with same-id, full-directory and divergence reporting. This is an early
+release; the interfaces may still change. The upgrade path and the known limits
+are in [`docs/release/0.3.0.md`](docs/release/0.3.0.md).
+
+### Added
+
+**Loopback HTTP and SSE API**
+
+- `vowp-daemon`, a library and binary that opens an existing home read-only
+  for reads (writable but non-creating for the two writes), serves one project
+  and binds `127.0.0.1` only. It resolves the home from `--home`, `VOWP_HOME`
+  or `$HOME/.vowp` and selects the checkout project or the only registered one.
+- Read endpoints: `GET /api/v1/health`, `/board`, `/board/stream`, `/jobs`,
+  `/sessions`, `/sessions/{id}`, `/sessions/{id}/capsules/{capsuleId}`,
+  `/sessions/{id}/events`, `/sessions/{id}/events/stream`, `/nodes`, `/inbox`
+  and `/cost`. The JSON documents are the same objects the CLI prints.
+- Per-session SSE with one `session` frame per stored event, a periodic
+  `heartbeat`, a single `resync` frame after a compacted or truncated log, and
+  bounded batches with HTTP backpressure. The board stream sends the exact
+  board document when it changes plus heartbeats; it has no cursor.
+- Two token-gated writes: `POST /api/v1/inbox/{id}/answer` queues the same
+  `answer_inbox` request as the CLI, and `POST /api/v1/sessions/{id}/switch`
+  runs the same `SessionService` switch as `vowp session switch` with the CLI
+  guards and a five-second drain. Both require `Authorization: Bearer
+  <VOWP_API_TOKEN>`; missing or empty disables writes with `503`, a missing or
+  wrong token is `401`, and reads stay token-free. The token is compared in
+  constant time and never logged, echoed or put in a URL.
+- API wire documents and their JSON Schemas: `Health`, `Board`, `BoardRun`,
+  `BoardLimit`, `Page`, `JobPage`, `SessionPage`, `NodePage`, `SessionDetail`,
+  `EventPage`, `InboxPage`, `InboxAnswerRequest`, `SessionSwitchRequest`,
+  `CostReport`, `CostRow`, `CostTotal`, `ApiError` and `ApiErrorBody`.
+
+**Web/PWA window**
+
+- `vowp up` starts `vowp-daemon` as a separate child process, prints
+  `web window: http://127.0.0.1:<port>/` and the exact
+  `vowp tunnel open window --remote-port <port>` control-machine hint, writes
+  the address to `<home>/web-window` for a detached run, and stops the child on
+  `vowp down`, SIGINT/SIGTERM or shutdown. A missing daemon warns and the
+  supervisor keeps running.
+- Embedded static pages for the board, session list, session detail with an
+  event timeline, capsule view, cost, inbox and nodes, with no Node or
+  TypeScript build step. The board and session timelines use SSE with
+  `after_seq` resume and a five-second polling fallback; the cost, inbox and
+  nodes pages poll.
+- The session detail page includes the executor switcher (target, reason and
+  force) and the inbox page includes the answer form. Both share a token
+  unlock panel that keeps `VOWP_API_TOKEN` in `sessionStorage`, never in the
+  URL, clears it on `401` and shows the disabled line on `503`.
+- The cost page renders grouped ledger rows, totals and an accessible inline
+  bar chart of known USD rows; unknown costs stay `?` and are never drawn as
+  zero.
+- PWA shell: `/manifest.webmanifest`, `/icon.svg` and `/sw.js` with the service
+  worker scoped to `/`. The worker caches only the static shell; `/api/` and
+  stream requests always go to the network and are never served from the cache
+  as authoritative data.
+
+**Phone board**
+
+- `GET /board` serves the same PWA shell at a 360 px card layout: job counts
+  with state labels, running-job cards with age and last-event age, slots,
+  planner and keeper, active limits with resets, today's cost, the open-inbox
+  badge, the last checkpoint and a visible last-updated time. A phone reaches
+  it through the same loopback SSH tunnel as the window; no public port is
+  opened.
+
+**ACP adapter**
+
+- The `acp` harness kind and `acp:<model>` executor string drive an Agent
+  Client Protocol (revision 1) JSON-RPC 2.0 server over stdin/stdout. One
+  prompt turn maps streamed updates to `tool.call`, `tool.result`,
+  `file.change`, `plan`, one accumulated `assistant.message`, token-only
+  `cost` with an unknown source, and `turn.ended`; VOWP keeps writing the
+  session framing.
+- A permission request is never auto-approved: it becomes a `note` plus a
+  non-retryable `error`, the adapter answers `cancelled`, and the turn ends.
+  There is no keystroke path and no inbox-approval round trip in this slice.
+- `vowp doctor` probes `acp` only when `[harnesses.acp]` or an ACP profile
+  rung is configured.
+
+**Session pull and divergence**
+
+- `vowp session pull <node> <session>` exports a bundle from another node over
+  the existing SSH transport, verifies its format, protocol version and
+  checksum in a private staging directory, and imports a child session with
+  the source as its parent.
+- `--same-id` keeps the origin session id when it is absent locally, with no
+  parent and the same tail and capsule rules as `session import --same-id`. A
+  present id is exit 4, a duplicate event id is a conflict, and neither form
+  overwrites or merges.
+- `--full` copies the whole `sessions/<id>/` directory (full log, blobs,
+  capsules and `adapters.json`) as a `vowp-session-dir-v1` manifest plus raw
+  bytes. Every size and sha256 is checked in private staging before the
+  directory is renamed into place and reindexed; the cap is 1 GiB. A present
+  id, corrupt snapshot, over-cap source or compacted source is refused and
+  leaves no local session.
+- Both id-preserving pulls report divergence instead of a bare already-exists
+  error. They print the local and remote heads and exit 4, and `--json`
+  returns a stable `session_divergence` conflict with `local`, `remote`,
+  `node` and `source_session` fields. The pull writes nothing; the operator
+  deletes or exports one side and pulls again. There is no force flag and no
+  merge.
+- `vowp session watch` keeps a byte cursor, imports only newly completed lines
+  and maps one Claude native uuid to one canonical VOWP session.
+  `session watch --follow` polls every two seconds until Ctrl-C; `--once`
+  makes one incremental pass and a non-TTY run without `--follow` does not
+  hang.
+
+**Other features**
+
+- `vowp graph --json` prints `{"jobs":[...],"edges":[...]}` for the normal read
+  path. `--mermaid` and `--export`/`--import` keep their precedence and
+  behaviour.
+- `vowp job show --gates` lists every gate configured on the job in order and
+  marks one with no recorded result as `not run`; recorded results replace only
+  their own entry.
+- `[env.<name>].build` names the commands the build guard runs in that
+  environment's checkout; when empty, the merge and project check commands
+  remain the fallback.
+- Promotion and rollback commands receive the secret values named by
+  `[env.<name>].env_pass` in their child environment only. A missing or
+  invalid name fails the operation by name before anything is banked or
+  deployed.
+
+### Changed
+
+- `vowp up` starts the web-window daemon and prints its address and tunnel
+  hint; `up --once` starts no daemon, and a missing or ambiguous project
+  leaves the window off with a warning.
+- Interval schedules keep the phase of their creation time instead of
+  aligning to the Unix epoch, including after a restart and in catch-up.
+- `vowp session watch` reuses the canonical session for a Claude native uuid
+  and imports incrementally instead of creating a session on each pass.
+- The graph Mermaid renderer emits state `classDef`s for node classes.
 
 ## [0.2.0] - 2026-11-11
 
@@ -208,6 +348,7 @@ generated CLI and JSON Schema reference (`docs/reference/`), the design spec
 (`docs/design/`), a docs command/link checker (`docs/tests/`) and the runnable
 `examples/hello-vowp` fake-adapter demo.
 
-[Unreleased]: https://github.com/syver777/vowp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/syver777/vowp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/syver777/vowp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/syver777/vowp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/syver777/vowp/releases/tag/v0.1.0

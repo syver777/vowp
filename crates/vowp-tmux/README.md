@@ -17,7 +17,7 @@ The crate refuses to kill windows it did not create. It is the only crate in the
 
 ## Status
 
-VOWP 0.2.0 is an early release. The window-manager API is used by the shipped `vowp` CLI, but it is not yet
+VOWP 0.3.0 is an early release. The window-manager API is used by the shipped `vowp` CLI, but it is not yet
 stable while VOWP is in 0.x.
 
 ## Links

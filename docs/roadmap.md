@@ -6,8 +6,9 @@ This page records what the current tree ships, what is deliberately **not** in v
 order for v0.3 and later. It promises no dates. The authoritative proof for every claim is the
 linked document or the code itself.
 
-The v0.1 public release is **v0.1.0**. The v0.2 feature set is merged on `main`; this tree identifies
-itself as `0.2.0`, and the release job owns the tag, published artifacts and release notes. This page
+The v0.1 public release is **v0.1.0** and v0.2 is **v0.2.0**. The v0.3 feature set is merged on
+`main`; this tree identifies itself as `0.3.0`, and the release job owns the tag, published artifacts
+and release notes. This page
 does not duplicate those instructions.
 
 The product rationale is [`docs/design/plan.md`](design/plan.md); the v0.1 implementation spec is
@@ -57,8 +58,6 @@ server joined through an SSH tunnel and the one-time secret paste page.
   between those calls the app owns its transcript.
 - **No promise that every app exposes MCP tools.** opencode 2.0.28 can load the server and report it
   `connected` without exposing its tools to the model; `vowp chat` is the tool-free fallback.
-- **Secret injection only reaches harness `env_pass`.** Promotion/deploy commands run with an empty
-  environment in this build; they cannot name secrets yet (good first issue 11).
 - **`session watch` starts a new VOWP session on each pass with new lines.** It does not reuse the
   session already mapped to the Claude uuid (good first issue 4).
 
@@ -223,20 +222,13 @@ secret-scan gate as the separate backstop.
 **Accept:** a fake command that prints an injected value leaves only `[REDACTED:<NAME>]` in
 `gate_results` and `ledger`; an uninjected value is unchanged.
 
-### 11. Inject secrets into promotion/deploy commands by name
+### 11. Inject secrets into promotion/deploy commands by name — closed
 
-**Files:** `crates/vowp-protocol/src/config.rs`, `crates/vowp-core/src/promote/promoter.rs`,
-`crates/vowp-core/src/vault/mod.rs`, `crates/vowp-protocol/tests/config.rs`,
-`crates/vowp-core/tests/promote_pipeline.rs`.
-**Problem:** `EnvConfig` has no names-only environment list and the promoter runs deploy commands with
-`env: Vec::new()`, so a deploy cannot receive a secret that `vowp secret set` stored. Only harness
-`env_pass` is resolved by `vault::env_for` today.
-**Do:** add an optional names-only list to `EnvConfig` (for example `env_pass = ["DEPLOY_TOKEN"]`),
-resolve it through the vault helper when the promote/rollback command starts, and keep the value out
-of argv, logs, gate evidence and the release record. A missing name is a clear error, never an empty
-value.
-**Accept:** a deploy command sees its configured secret in the child environment; an unconfigured
-value is absent; the stored value never appears in the release, ledger or logs.
+Closed because `[env.<name>].env_pass` now lists secret **names**. `Promoter::promote` and
+`Promoter::rollback` resolve the list through the vault once before anything is banked or deployed,
+pass the values only in the child environment of the serving-bank, deploy, probe and rollback
+commands, and fail with the variable's name when a configured secret is missing. Harness `env_pass`
+keeps its warn-and-skip behaviour.
 
 ### 12. Setup verify fixture under load — closed
 

@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use vowp_protocol::{
     Actor, AttachAction, CancelToken, Capsule, CapsuleEvent, CapsuleTrigger, CostEvent, ErrorEvent, ErrorKind,
-    EventBody, EventEnvelope, EventSource, Executor, HarnessKind, Limit, LimitEvent, LimitRowKind, NewSession,
-    NodeName, Run, RunOutcome, ServiceError, Session, SessionExecutor, SessionId, SessionOps, SessionState, Switch,
-    SwitchRequest, Timestamp, TurnEnded, TurnRequest, TurnResult, TurnStarted, UserMessage,
+    EventBody, EventEnvelope, EventSource, EventType, Executor, HarnessKind, Limit, LimitEvent, LimitRowKind,
+    NewSession, NodeName, Run, RunOutcome, ServiceError, Session, SessionExecutor, SessionId, SessionOps, SessionState,
+    Switch, SwitchRequest, Timestamp, TurnEnded, TurnRequest, TurnResult, TurnStarted, UserMessage,
 };
 use vowp_store::session_files::{AdapterMapping, add_adapter_mapping, write_capsule_file};
 use vowp_store::session_log::{AppendedEvent, NewEvent, SessionLog, index_row};
@@ -45,6 +45,77 @@ pub struct RecoveryReport {
     pub sessions_unlocked: u32,
 }
 
+/// The last log position and index metadata for one side of a divergence report.
+///
+/// A pull that finds the same session id on both nodes reports these two heads instead of
+/// overwriting, silently refusing or merging. Log fields come from `log.jsonl`; state,
+/// executor and `updated_at` come from the index row when it exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHead {
+    /// Session id whose log this head describes.
+    pub session_id: SessionId,
+    /// Node that owns the log.
+    pub node: NodeName,
+    /// Last log sequence number, or the row's `last_seq` when no log remains.
+    pub last_seq: u64,
+    /// Type of the last log event, when the log has one.
+    pub last_event: Option<EventType>,
+    /// Timestamp of the last log event, when the log has one.
+    pub last_event_at: Option<Timestamp>,
+    /// Session state from the index row, when the row exists.
+    pub state: Option<SessionState>,
+    /// Current executor from the index row, when the row exists.
+    pub executor: Option<Executor>,
+    /// Row `updated_at`, when the row exists.
+    pub updated_at: Option<Timestamp>,
+}
+
+impl SessionHead {
+    /// Builds a head from an index row and the last event of its log.
+    pub fn from_session(session: &Session, last_event: Option<&EventEnvelope>) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            node: session.node.clone(),
+            last_seq: session.last_seq,
+            last_event: last_event.map(|event| event.event_type),
+            last_event_at: last_event.map(|event| event.ts),
+            state: Some(session.state),
+            executor: session.executor.clone(),
+            updated_at: Some(session.updated_at),
+        }
+    }
+}
+
+/// Reads one local session's head without changing the row, log or index.
+///
+/// A missing row is allowed: a copied `sessions/<id>/` can be inspected before
+/// `vowp reindex` registers it. A missing log (a compacted session) keeps the row's
+/// `last_seq` and reports no last event.
+pub fn local_head(deps: &Deps, id: &SessionId) -> Result<SessionHead, CoreError> {
+    let store = deps.open_store()?;
+    let row = store.session(id)?;
+    let mut head = match &row {
+        Some(session) => SessionHead::from_session(session, None),
+        None => SessionHead {
+            session_id: id.clone(),
+            node: deps.node.clone(),
+            last_seq: 0,
+            last_event: None,
+            last_event_at: None,
+            state: None,
+            executor: None,
+            updated_at: None,
+        },
+    };
+    if deps.paths.log_path(id).is_file() {
+        let log = SessionLog::open_read(&deps.paths, id)?.head()?;
+        head.last_seq = log.last_seq;
+        head.last_event = log.event_type;
+        head.last_event_at = log.ts;
+    }
+    Ok(head)
+}
+
 /// The session service. Cloning shares the injected [`Deps`].
 #[derive(Clone)]
 pub struct SessionService {
@@ -64,9 +135,29 @@ impl SessionService {
 
     /// Creates a session: index row, log directory and the `session.created` event.
     pub fn create_session(&self, req: NewSession) -> Result<SessionId, CoreError> {
-        let store = self.deps.open_store()?;
-        let id = SessionId::new();
         let now = self.deps.clock.now();
+        self.create_session_with_id(SessionId::new(), req, now)
+    }
+
+    /// Creates a session with a caller-supplied id and creation time, for a same-id bundle import.
+    ///
+    /// The id is used only when neither an index row nor a log file exists for it, so an
+    /// import can never overwrite an existing session. `SessionLog::create` opens
+    /// `log.jsonl` with `create_new`, which is the race-safe gate; the row is written only
+    /// after the log exists.
+    pub fn create_session_with_id(
+        &self,
+        id: SessionId,
+        req: NewSession,
+        created_at: Timestamp,
+    ) -> Result<SessionId, CoreError> {
+        let store = self.deps.open_store()?;
+        if store.session(&id)?.is_some() || self.deps.paths.log_path(&id).is_file() {
+            return Err(CoreError::Store(StoreError::Conflict(format!(
+                "session {id} already exists; refusing to overwrite"
+            ))));
+        }
+        let log = SessionLog::create(&self.deps.paths, &id, self.deps.clock.clone())?;
         let session = Session {
             id: id.clone(),
             project: req.project.clone(),
@@ -81,12 +172,11 @@ impl SessionService {
             last_seq: 0,
             last_capsule_id: None,
             log_bytes: 0,
-            created_at: now,
-            updated_at: now,
+            created_at,
+            updated_at: created_at,
         };
         store.upsert_session(&session)?;
 
-        let log = SessionLog::create(&self.deps.paths, &id, self.deps.clock.clone())?;
         let body = EventBody::SessionCreated(vowp_protocol::SessionCreated {
             title: req.title,
             cwd: session.cwd.clone(),
@@ -95,7 +185,7 @@ impl SessionService {
             role: Some(req.role),
             parent_session_id: req.parent,
         });
-        self.append(&store, &log, HarnessKind::Vowp, body, None, None)?;
+        self.append_event(&store, &log, HarnessKind::Vowp, body, Some(created_at), None, None)?;
         log.sync()?;
         Ok(id)
     }
@@ -472,9 +562,19 @@ impl SessionService {
     /// Switches a session to another executor (a pure switch: the seed is delivered next turn).
     ///
     /// The protocol lives in [`crate::session::switch`]; this method is the service boundary
-    /// used by `SessionOps` and the CLI.
+    /// used by `SessionOps` and the CLI. It opens the store through [`Deps::open_store`].
     pub fn switch(&self, req: &SwitchRequest) -> Result<Switch, CoreError> {
         switch::run_switch(&self.deps, req, &CancelToken::default())
+    }
+
+    /// Switches a session over an already-open, writable store.
+    ///
+    /// The daemon uses this after opening the existing home with
+    /// [`vowp_store::Store::open_writable`], so a web switch has the same protocol and rows
+    /// as the CLI but cannot create or migrate the home. The store must belong to the same
+    /// home and project as [`Deps::paths`](crate::deps::Deps::paths).
+    pub fn switch_with_store(&self, store: &Store, req: &SwitchRequest) -> Result<Switch, CoreError> {
+        switch::run_switch_with_store(&self.deps, store, req, &CancelToken::default())
     }
 
     /// Checks session `cwd` against the shared allow-list.
@@ -487,6 +587,7 @@ impl SessionService {
         let key = match executor.harness {
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Opencode => "opencode",
+            HarnessKind::Acp => "acp",
             HarnessKind::Cli => executor.model.as_str(),
             HarnessKind::Vowp => return None,
         };
@@ -744,8 +845,11 @@ impl SessionService {
 
 /// Checks `cwd` against the shared session allow-list.
 ///
-/// The allowed roots are the project path, the worktree root, `[node].cwd_allow` and the
-/// VOWP-owned orchestrator root `<VOWP_HOME>/orchestrators`. Orchestrator sessions run in
+/// The allowed roots are the project path, the effective worktree root, `[node].cwd_allow`
+/// and the VOWP-owned orchestrator root `<VOWP_HOME>/orchestrators`. The effective worktree
+/// root is `[project].worktree_root` when set, or the default sibling
+/// `<repo>/../<repo-name>-wt` when it is unset; [`crate::loops::worktree_root`] is the single
+/// source of that rule. Orchestrator sessions run in
 /// `<VOWP_HOME>/orchestrators/<name>/`, so a takeover or repair must accept that directory
 /// even though it is outside the project checkout.
 ///
@@ -755,9 +859,11 @@ pub(crate) fn check_cwd(deps: &Deps, cwd: &str) -> Result<(), CoreError> {
     let path = Path::new(cwd);
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(project) = &deps.config.project.path {
-        roots.push(PathBuf::from(project));
-    }
-    if let Some(root) = &deps.config.project.worktree_root {
+        let project = PathBuf::from(project);
+        // Share dispatch's configured-or-default rule so the allow-list cannot drift.
+        roots.push(crate::loops::worktree_root(deps, &project));
+        roots.push(project);
+    } else if let Some(root) = &deps.config.project.worktree_root {
         roots.push(PathBuf::from(root));
     }
     roots.extend(deps.config.node.cwd_allow.iter().map(PathBuf::from));

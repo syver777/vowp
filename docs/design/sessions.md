@@ -25,6 +25,7 @@ integration. It does not add a second session type or a second transcript store.
     blobs/<sha256>                 spilled tool output, diffs, attachments (content addressed)
     capsules/<at_seq:010>-<ulid>.json   authoritative capsule files
     adapters.json                  {"natives":[{harness,native_session_id,node,first_seq,created_at}]} append-only
+    manifest.json                  optional; written by `session pull --full`, informational only
   orchestrators/<name>/            orchestrator.json (0600), app config, lease token, mirror.json
   runs/<runId>.jsonl               raw harness stdout mirror on the home (debug only, compressed/rotated)
   logs/supervisor.log  backups/  tmp/
@@ -164,6 +165,15 @@ Failure handling:
 
 The log is never rewritten; a switch only appends events. Lineage = `switches` rows + `switch` events + `parent_session_id` across nodes.
 
+The daemon's `POST /api/v1/sessions/{id}/switch` runs this same protocol through
+`SessionService::switch_with_store` and `switch::run_switch_with_store`, over a store the
+daemon opened with `Store::open_writable` (never `Store::open`). The HTTP handler applies the
+CLI's `switch_to` guards before the service call: an unknown session is `404`, a running
+session without `force` is `409`, a `switching` or `closed` session is `409`, and an active
+limit on the target provider is `409`; an invalid body or executor is `400`. The switch is
+local-node only, uses `drain_secs: 5`, and returns the completed `Switch`; a failed switch is
+an error and leaves the previous executor attached under the abort rules above.
+
 ## 6. Export / import (cross-node, v0.1)
 
 `vowp session export <id> [--tail N] [--out file | -o file]` writes a **single JSON file** (no archive dependency): `vowp-bundle-v1`.
@@ -209,25 +219,175 @@ Rust (in `vowp-core::session::bundle`): `pub struct Bundle { format: String, pro
 5. The first `run_turn` on `S'` uses `seed_prompt(capsule, tail_from_bundle, tail_turns, next_input)` (§4).
 6. Importing the same bundle twice creates two independent children (no dedupe); the origin session is never modified.
 
-## 7. `vowp session watch` importer (v0.1 optional / nice-to-have)
+### 6.4 Pull from another node (v0.3 first slice)
+
+`vowp session pull <node> <session>` runs on the local machine. It looks up `node` in the local
+registry and runs `vowp session export <session> --out -` on that node with the same `--project`
+argument as the other remote session commands. The stdout bundle is staged in a private temporary
+directory, parsed and verified by `bundle::from_json` (format, protocol version and sha256
+checksum), and then imported through the same path as `session import`: a fresh child whose
+`parent_session_id` is the source id. The command prints the source and child ids; `--json` prints
+`{"node", "source_session", "child_session"}`. The staged file and its directory are removed on
+every path.
+
+A failed remote export returns the remote exit code and output. A malformed, truncated or
+checksum-mismatched bundle returns a local invalid-input error. In both cases nothing is imported.
+The source must be a remote node; a local node is refused with a hint to use export/import. This
+slice deliberately has no same-id import (see §6.5) or directory copy (see §6.6); push,
+bidirectional sync/merge, lease interaction and daemon/offline transport remain out of scope.
+
+### 6.5 Same-id import (v0.3 second slice)
+
+`vowp session import <file> --same-id` and `vowp session pull <node> <session> --same-id` keep the
+origin session id instead of creating a child. The default import and pull paths are unchanged.
+
+1. Verify the bundle exactly as in §6.3 step 1 before looking at local state. A checksum, format,
+   protocol-version or event-body failure creates nothing.
+2. Refuse with exit 4 when the origin id already exists locally as a `sessions` row or a
+   `sessions/<id>/` directory. The existing row, log and index are not touched. Never overwrite and
+   never merge.
+3. Check every event id in the bundle tail: an id repeated inside the bundle or already present in
+   `session_events` is a conflict. This check runs before the log is created, so a duplicate id
+   leaves no session directory.
+4. Create the session with the origin id, no parent, the bundle's title, role, project/job (when
+   those rows exist locally) and the same cwd rule as §6.3 step 2. The log is created with
+   `create_new`, so two racing imports cannot both succeed.
+5. Append a fresh `session.created` (parent `NULL`) followed by every other replayable event in the
+   bundle tail. Event ids and timestamps are preserved; `seq` is reassigned contiguously from 1
+   because the bundle carries only a tail, not the full origin log. A bundle that includes its own
+   `session.created` contributes its metadata, not a second created event.
+6. Write the bundle capsule with its original capsule id under the origin session id, set its
+   `at_seq` to the last copied tail seq, append the `capsule` event, write inline blobs with digest
+   verification and run `reindex(Some(id))` in one transaction. A `reindex` collision (duplicate
+   event id) is a conflict, never a warning.
+7. Do not write the child `import.json` sidecar: the tail events are already in the log, and the
+   first turn uses the normal capsule + complete-turn seed. A compacted bundle keeps its capsule,
+   empty tail and `compacted_at`.
+8. The output keeps the default shape in child mode. Same-id human output is
+   `pulled session <source> from <node> with same id <id>`; JSON is
+   `{"node","source_session","same_id_session"}`.
+
+Out of scope for this slice: directory copy of `sessions/<id>/` (see §6.6), divergence reporting
+(two heads, see §6.7), merge, bidirectional sync, `session push`, lease interaction and an offline
+retry queue.
+
+### 6.6 Full directory pull (v0.3 third slice)
+
+`vowp session pull <node> <session> --full` copies the raw `sessions/<id>/` directory instead of a
+bundle. It always keeps the origin id and has no `--same-id` combination; the default bundle pull
+and its child session are unchanged.
+
+1. The local side runs the source's hidden `session dir-export <session>` over the existing SSH
+   argv path. Its stdout is one JSON manifest line followed by the file bytes in manifest order.
+   The command is read-only: it takes no session lock, writes nothing and moves no lease.
+2. The manifest is `vowp-session-dir-v1`:
+   `{"format":"vowp-session-dir-v1","origin":"<id>","files":[{"path":"log.jsonl","bytes":N,
+   "sha256":"<64 lowercase hex>"}]}`. Paths are relative, `/`-separated and limited to `log.jsonl`,
+   `adapters.json`, `blobs/<sha256>` and `capsules/<name>.json`; traversal, duplicates,
+   `.lock`, `import.json` and `manifest.json` are refused.
+3. The cap is 1 GiB (`SESSION_DIR_MAX_BYTES` = 1 073 741 824 bytes). The source checks the total
+   from file sizes before hashing and the local side checks it again from the manifest before
+   staging; an over-cap pull fails with the limit named and copies nothing. A missing or oversized
+   blob is never replaced by a placeholder in this slice: the pull refuses instead.
+4. The origin id must be absent locally as a `sessions` row and as `sessions/<id>/`. A present id
+   is exit 4 and the existing row, log, index and directory are untouched. There is no child, no
+   parent and no bundle rewrite.
+5. Files are written into a private staging directory under `<home>/tmp` containing
+   `sessions/<id>/`. Every size and sha256 is checked, the staged log must verify cleanly, and
+   `adapters.json` and every capsule file must parse and belong to the id. A failure removes the
+   staging directory and leaves no final `sessions/<id>/`.
+6. Only after verification is the manifest written into the staged directory as `manifest.json`
+   and the directory renamed to `sessions/<id>/`. The pull then runs `reindex(Some(id))`. A reindex
+   failure removes the new directory and fails; expected warnings (for example an absent local
+   project or job row) leave the session indexed with a null foreign key and are printed on stderr.
+7. A compacted source has no `log.jsonl` and is refused with a hint to use the bundle pull, which
+   carries its capsule. A torn or corrupt source log is also refused rather than copied.
+8. The source lease must be released or quiescent: this is a one-way snapshot, not a lease move,
+   and no live lease is migrated or cut off. Both nodes must run a build that has the hidden
+   export command.
+9. Human output is `pulled session <id> from <node> as a full directory snapshot (<n> files,
+   <bytes> bytes)`; JSON is
+   `{"node","source_session","full_session","files","bytes"}`.
+
+Named tests: `session_pull_full_imports_the_origin_id_with_the_full_log`,
+`session_pull_full_reports_divergence_without_mutating_it`,
+`session_pull_full_refuses_a_corrupt_snapshot_without_leaving_a_directory`,
+`session_pull_full_refuses_an_over_cap_snapshot_before_copying`,
+`session_pull_full_reports_a_failed_remote_export_and_imports_nothing` and the store tests
+`session_dir_manifest_verifies_and_detects_corruption`,
+`session_dir_manifest_refuses_a_directory_over_the_size_cap` and
+`session_dir_manifest_rejects_traversal_and_reserved_paths`.
+
+Still out of scope: divergence reporting (two heads, see §6.7), merge, bidirectional sync,
+`session push`, live lease migration, a daemon transport, offline queueing, a progress display,
+blob deduplication and a CLI size-limit flag.
+
+### 6.7 Divergence report (v0.3 fourth slice)
+
+`vowp session pull --same-id` and `vowp session pull --full` report a divergence when the origin
+id is present locally instead of overwriting, silently refusing or merging. The default child pull
+and the empty-local same-id/full success paths are unchanged.
+
+1. The check runs after the bundle or directory manifest has been verified but before any local
+   session file, row or index entry is written. The full path aborts the snapshot stream at that
+   point; it does not stage, copy, rename or reindex anything.
+2. The report names both heads. The local head is read from the local index row and `log.jsonl`:
+   last seq, last event type and timestamp, state and executor when the row exists. A compacted
+   local session reports the row's `last_seq` with no last event. The remote head comes from the
+   bundle tail (seq, event type, timestamp) or, for a full pull, from the source's read-only
+   `session show --json --events 1` because a `vowp-session-dir-v1` manifest carries no log
+   position. `vowp-store::session_log::SessionLogReader::head` supplies the local log position.
+3. Human output writes a `local:` and a `remote:` line plus the note
+   `choose which side advances; no merge performed`, and exits 4 (conflict). `--json` writes one
+   stable document: `{"error":{"kind":"conflict","code":"session_divergence","message","hint",
+   "node","source_session","local","remote","note"}}`, where each head carries `session`, `node`,
+   `last_seq`, `last_event`, `last_event_at`, `state`, `executor` and `updated_at` (nullable).
+   Neither form prints a token, cwd or home path.
+4. The explicit choice is manual and outside this slice: delete or export one side, then pull
+   again. There is no force/overwrite flag and no merge. A bundle export still writes its usual
+   export capsule on the source; the directory export and the head read take no lock and write
+   nothing.
+
+Tests: `session_pull_same_id_reports_divergence_without_mutating_it` and
+`session_pull_full_reports_divergence_without_mutating_it` (both sides advanced, both heads,
+human and JSON shape, unchanged local log/manifest/row, clean temp directory),
+`session_pull_full_prefix_of_an_existing_session_keeps_the_local_conflict`, plus the existing
+empty-local success tests `session_pull_same_id_imports_the_origin_id_without_a_parent`,
+`session_pull_full_imports_the_origin_id_with_the_full_log` and the default child test
+`session_pull_imports_a_child_and_prints_both_ids`. Store tests are
+`session_log_head_reports_the_last_complete_event` and
+`session_log_head_is_empty_for_an_empty_log`; the core test is
+`bundle_head_names_the_source_row_and_last_tail_event` (and its compacted-bundle case).
+
+Still out of scope: automatic merge, a force/overwrite flag, bidirectional sync, `session push`,
+live lease migration, a daemon transport, offline queueing, a progress display and a configurable
+size limit.
+
+## 7. `vowp session watch` importer
 
 Records an interactive Claude Code session into the canonical store without running it. **Read-only** on Claude's files.
 
-1. Locate transcripts: `~/.claude/projects/<mangled-cwd>/<claude-session-uuid>.jsonl` (read from `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; the path is a flag/config input, never assumed in tests). `vowp session watch [--claude-dir <dir>] [--once]` (the flag names the transcripts root, default `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; cli.md §4).
+1. Locate transcripts: `~/.claude/projects/<mangled-cwd>/<claude-session-uuid>.jsonl` (read from `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; the path is a flag/config input, never assumed in tests). `vowp session watch [--claude-dir <dir>] [--once] [--follow]` (the flag names the transcripts root, default `$CLAUDE_CONFIG_DIR` or `$HOME/.claude`; cli.md §4).
 2. Map each Claude transcript line to events (`harness=claude-code`, `native_session_id` = uuid): user text → `user.message`; assistant text blocks → `assistant.message`; `thinking` blocks → `assistant.reasoning` (`replayable=false`); `tool_use` → `tool.call`; `tool_result` → `tool.result` (spill > 8192 bytes); usage → `cost` (`source: unknown`, tokens only — subscription sessions have no receipt); unknown line types are skipped and counted.
-3. Incremental by **line count** in this build: the importer stores the processed line count
-   under `watch:<native session id>` in the node database. A later `--once` run reads the whole
-   transcript, imports only lines after the stored count, and skips a transcript that is shorter or
-   unchanged. `--follow` is not available: without `--once`, a TTY run exits 2 with a message to use
-   `--once` (non-TTY input does one pass).
-4. Each pass with new lines creates a **new canonical session** (`role=user`, title = first user
-   message ≤ 60 chars) even for the same Claude uuid. The uuid is recorded as the event source's
-   `native_session_id`, but the importer does not look it up to reuse a session. Two `--once` runs
-   therefore produce two VOWP sessions for one Claude transcript, the second holding only the lines
-   appended since the first. The importer opens Claude's files read-only and never writes them.
-5. The optional importer has no dedicated test yet; the follow-up in `../roadmap.md` (good first
-   issue 4) adds byte-offset incremental reads, one session per native uuid, `--follow` and the
-   missing coverage. Until then, `--once` is the supported form and a TTY `--follow` exits 2.
+3. **Incremental by byte offset.** The importer keeps an `ImportCursor { offset, last_uuid }`
+   in the node database under `watch:<native session id>`, as JSON. A pass opens the transcript
+   read-only, seeks to `offset` and consumes complete lines only: a final line without its `\n`
+   stays unread until the newline arrives. `last_uuid` names the last complete line that carried an
+   app-side id. A file that shrank below the cursor restarts at offset 0. The old v0.1 marker was a
+   bare processed-line count; it is converted to the byte offset after that many complete lines, so
+   upgrading does not re-import the prefix. Each imported entry also records its app-side id in
+   `native_events`, which makes a re-read after a crash idempotent.
+4. **One canonical session per Claude uuid.** The first pass with new lines looks up the canonical
+   session mapped to `(claude-code, uuid)` in `session_natives`, creates it when missing
+   (`role=user`, title = first user message ≤ 60 chars) and records the mapping; later passes append
+   only the new events to that same session. `--follow` follows: it polls every two seconds,
+   imports newly completed lines, and exits cleanly on Ctrl-C. A plain TTY run without `--once` or
+   `--follow` follows the same way. `--once`, and a non-TTY run without `--follow`, make one
+   incremental pass so scripts and tests do not hang. The importer never writes to Claude's
+   transcript tree.
+5. Coverage lives in `crates/vowp-cli/tests/session.rs` (growing fixture, partial final line,
+   follow loop, legacy marker and one-session rule) and `crates/vowp-core/src/session/importer.rs`
+   (complete-line and truncation cursor behaviour).
 
 ## 8. Surfaces, leases and takeover
 
@@ -356,6 +516,16 @@ The tests live in `crates/vowp-store.md` §6 (log, blob, reindex) and `crates/vo
 | §6 export → import round trip (child session, 4 setup events, seed text) | `bundle_export_import_roundtrip_child_session` | core |
 | §6 tampered bundle / unknown format rejected, nothing created | `bundle_checksum_mismatch_rejected`, `bundle_unknown_format_rejected` | core |
 | §6 only blobs ≤ 64 KiB inlined (60 KB yes, 70 KB no) | `bundle_inlines_small_blobs_only` | core |
+| §6.5 same-id absent → origin id, no parent, log/index read back | `same_id_import_keeps_the_origin_id_without_a_parent` | core |
+| §6.5 same-id present → conflict, existing row/log unchanged | `same_id_import_refuses_an_existing_session_and_changes_nothing` | core |
+| §6.5 duplicate event id → conflict before any write | `same_id_import_rejects_a_duplicate_event_id_before_writing` | core |
+| §6.5 default import still creates a child with the parent | `child_import_still_creates_a_child_with_the_parent` | core |
+| §6.5 fake-ssh pull in both modes | `session_pull_same_id_imports_the_origin_id_without_a_parent`, `session_pull_imports_a_child_and_prints_both_ids` | cli |
+| §6.5 corrupted bundle fails before any write | `same_id_import_rejects_a_corrupt_bundle_before_writing`, `session_pull_same_id_refuses_a_corrupt_bundle_before_importing` | core, cli |
+| §6.6 full pull keeps the origin id and the full log, with manifest checksums | `session_pull_full_imports_the_origin_id_with_the_full_log` | cli |
+| §6.6 full pull refuses a present id without touching it | `session_pull_full_reports_divergence_without_mutating_it` | cli |
+| §6.6 corrupt or over-cap full pull leaves no final directory | `session_pull_full_refuses_a_corrupt_snapshot_without_leaving_a_directory`, `session_pull_full_refuses_an_over_cap_snapshot_before_copying` | cli |
+| §6.6 manifest validation, size cap and digest verification | `session_dir_manifest_verifies_and_detects_corruption`, `session_dir_manifest_refuses_a_directory_over_the_size_cap`, `session_dir_manifest_rejects_traversal_and_reserved_paths` | store |
 | §1 log, blob and reindex rules | the `log_*`, `blob_*`, `reindex_*` tests of vowp-store.md §6 | store |
 | §8 lease acquire, heartbeat, stale sweep, exact holder | `lease_acquire_is_one_holder`, `heartbeat_keeps_lease_live`, `stale_lease_free_after_sixty_seconds` | core |
 | §8 takeover cuts off the old surface within 2 s | `takeover_cuts_old_surface_within_two_seconds`, `lease_revoked_is_pushed_within_2s` | core |

@@ -18,7 +18,7 @@ those rules live in `vowp-graph`, `vowp-core` and `vowp-adapters`.
 
 ## Status
 
-VOWP 0.2.0 is an early release. The schema is versioned and migrated forward, but the Rust API is not yet
+VOWP 0.3.0 is an early release. The schema is versioned and migrated forward, but the Rust API is not yet
 stable while VOWP is in 0.x.
 
 ## Links

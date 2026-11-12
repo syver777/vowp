@@ -5,7 +5,7 @@ Behaviour of each adapter is specified in `adapters.md`; this file is the **API,
 
 ## 1. Modules
 
-The shared modules (`classify`, `proc`, `stream`, `testing`) are the foundation for the three adapter modules.
+The shared modules (`classify`, `proc`, `stream`, `testing`) are the foundation for the four adapter modules.
 
 ```
 crates/vowp-adapters/
@@ -18,17 +18,20 @@ crates/vowp-adapters/
   src/opencode/mod.rs             (+ submodules src/opencode/*.rs)
   src/claude_code/mod.rs          (+ src/claude_code/*.rs)
   src/cli/mod.rs                  (+ src/cli/*.rs)
+  src/acp/mod.rs                  ACP adapter, config and run (+ mapping.rs, run.rs)  (adapters.md §10)
   tests/fixtures/claude_*.jsonl           tests/fixtures/opencode_*.jsonl         tests/fixtures/cli_*
-  tests/fakes/fake-*.sh           all three, written once from adapters.md §9
-  tests/*.rs                      claude_code.rs, opencode.rs, cli.rs, classify.rs, proc.rs
+  tests/fakes/fake-*.sh           claude/opencode/cli, written once from adapters.md §9
+  tests/fakes/fake_acp.py         ACP JSON-RPC fake                                  (adapters.md §10.6)
+  tests/*.rs                      claude_code.rs, opencode.rs, cli.rs, acp.rs, classify.rs, proc.rs
 ```
 
 Final `src/lib.rs`:
 
 ```rust
-//! Harness adapters: claude-code, opencode, generic cli. Spec: docs/design/adapters.md
+//! Harness adapters: claude-code, opencode, generic cli and ACP. Spec: docs/design/adapters.md
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+pub mod acp;
 pub mod classify;
 pub mod proc;
 pub mod stream;
@@ -37,6 +40,7 @@ pub mod opencode;
 pub mod cli;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub use acp::{ACP_PROTOCOL_VERSION, AcpAdapter, AcpConfig};
 pub use claude_code::{ClaudeCodeAdapter, ClaudeConfig};
 pub use opencode::{OpencodeAdapter, OpencodeConfig};
 pub use cli::{CliAdapter, Mapping};
@@ -246,6 +250,29 @@ pub fn pointer_get<'a>(v: &'a serde_json::Value, ptr: &str) -> Option<&'a serde_
 
 `AdapterRegistry` (name → `Arc<dyn Adapter>` from `VowpConfig`) is **not** here: it lives in `vowp-core::deps`, which constructs adapters from `[harnesses.*]`.
 
+### 4.4 ACP
+
+```rust
+/// ACP protocol revision 1, sent in `initialize`.
+pub const ACP_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default)]
+pub struct AcpConfig {
+    pub binary: Option<String>,     // default resolve_binary("claude-code-acp")
+    pub extra_args: Vec<String>,
+    pub tz_offset_minutes: i32,
+}
+pub struct AcpAdapter { /* config */ }
+impl AcpAdapter { pub fn new(cfg: AcpConfig) -> Self; }
+impl vowp_protocol::Adapter for AcpAdapter {}
+```
+
+ACP is JSON-RPC 2.0 on the child's stdin/stdout, so the adapter owns a small driver rather than a
+`StreamParser`: `src/acp/run.rs` performs `initialize`, `session/new` and `session/prompt`, keeps the
+process-group, stop/interrupt/timeout and 4 MiB/4 KiB reader rules of `proc::RunHandle`, and
+`src/acp/mapping.rs` is the pure event mapper. The pinned subset, permission rule and capabilities
+are in adapters.md §10.
+
 ## 5. Optional importer
 
 `pub fn import_transcript(path: &Path, tz_offset_minutes: i32) -> Result<Vec<HarnessEvent>, AdapterError>` is re-exported as `claude_code::import_transcript` (implementation in `claude_code::import`). It reads a `~/.claude/projects/…/<uuid>.jsonl`
@@ -352,6 +379,21 @@ All hermetic: temp dirs, the fake scripts, recorded fixtures. Names are exact.
 | `cli_end_to_end_with_fake_script` | start/wait with `fake-cli.sh` |
 | `cli_pointer_get_cases` | `/a/0/b`, `""`, missing, escaped `~0 ~1` |
 
+### acp (`tests/acp.rs`)
+
+| Test | Proves |
+|---|---|
+| `acp_probe_reports_the_binary_without_a_version_call` | found executable → `ok`, `version == None`; missing configured path → `ok == false` |
+| `acp_capabilities_are_honest` | resume/live-input/reasoning/receipts are all false |
+| `acp_clean_turn_emits_events_in_order` | `tool.call`, `tool.result`, `tool.call`, `tool.result`, `file.change`, `plan`, one accumulated `assistant.message`, tokens-only `cost`, one `turn.ended`; requests are `initialize`/`session/new`/`session/prompt` with version 1, cwd and prompt text |
+| `acp_permission_request_is_never_approved` | `note` + `Error{Refused}`, the JSON-RPC answer is `cancelled` with no option id, outcome `Error` |
+| `acp_server_exiting_without_a_result_fails_cleanly` | one `Error`, stop reason `Crash`, no hang |
+| `acp_malformed_json_fails_cleanly` | one `Error` naming malformed JSON |
+| `acp_unknown_method_fails_cleanly_and_answers_the_request` | one `Error`, the agent request gets JSON-RPC `-32601` |
+| `acp_rpc_error_classifies_a_quota_limit` | `LimitEvent{Quota, resets_at 1794164400}`, outcome `Limit`, stop reason `Limit` |
+| `acp_stop_kills_the_process_group` | `stop()` returns, the spawned child is dead, one `Interrupted` terminal event |
+| `acp_extra_args_follow_the_binary` | configured `extra_args` reach argv |
+
 ### Cross-adapter (in `vowp-core` tests, listed here so the contract is covered)
 
-`adapters_emit_terminal_turn_ended_on_every_exit_path` (claude, opencode, cli × {ok, error exit, killed, spawn fail after start}) — a parametrised test in `crates/vowp-core/tests/adapter_contract.rs`.
+`adapters_emit_terminal_turn_ended_on_every_exit_path` (claude, opencode, cli and acp × {ok, error exit, killed, spawn fail after start}) — a parametrised test in `crates/vowp-core/tests/adapter_contract.rs`; the ACP fake selects its scenario through `FAKE_ACP_MODE`.

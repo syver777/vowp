@@ -5,9 +5,11 @@
 //! events and the switch lineage, inlines small blobs and signs the result with a
 //! sha256 checksum. [`import`] verifies that document before touching any state and
 //! creates a *child* session whose log carries exactly four setup events; the origin
-//! session is never modified and tail events are not copied.
+//! session is never modified and tail events are not copied. [`import_with_mode`] adds
+//! [`ImportMode::SameId`], which keeps the origin id when it is absent locally, copies
+//! the bundle tail into the log and refuses a duplicate instead of overwriting.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -21,13 +23,13 @@ use vowp_store::blobs::BlobStore;
 use vowp_store::reindex::reindex;
 use vowp_store::session_files::{list_capsule_files, read_capsule_file, write_capsule_file};
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
-use vowp_store::{NodePaths, Store};
+use vowp_store::{NodePaths, Store, StoreError};
 
 use crate::deps::Deps;
 use crate::error::CoreError;
 use crate::session::capsule::CapsuleWriter;
 use crate::session::seed::seed_prompt;
-use crate::session::service::SessionService;
+use crate::session::service::{SessionHead, SessionService};
 
 /// The only bundle format this build reads and writes.
 pub const BUNDLE_FORMAT: &str = "vowp-bundle-v1";
@@ -220,6 +222,29 @@ pub fn from_json(text: &str) -> Result<Bundle, CoreError> {
     Ok(bundle)
 }
 
+/// Returns the source head a bundle reports for a divergence decision.
+///
+/// The head's sequence number, event type and timestamp come from the last replayable tail
+/// event; state and executor come from the exported row. A compacted bundle has an empty
+/// tail, so its row still supplies `last_seq` and `updated_at` and there is no last event.
+pub fn head(bundle: &Bundle) -> SessionHead {
+    let mut head = SessionHead::from_session(&bundle.session, bundle.tail.last());
+    head.node = bundle.source_node.clone();
+    if let Some(last) = bundle.tail.last() {
+        head.last_seq = last.seq;
+    }
+    head
+}
+
+/// How an import chooses the target id and parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    /// Create a fresh child session whose parent is the origin (the default).
+    Child,
+    /// Keep the origin session id, with no parent; refuse when it exists locally.
+    SameId,
+}
+
 /// Imports a bundle as a new child session on this node and returns its id.
 ///
 /// The child log contains exactly `session.created` (with `parent_session_id`),
@@ -231,9 +256,26 @@ pub fn import(
     executor: Option<ExecutorRef>,
     cwd: Option<&Path>,
 ) -> Result<SessionId, CoreError> {
+    import_with_mode(deps, bundle, executor, cwd, ImportMode::Child)
+}
+
+/// Imports a bundle with an explicit [`ImportMode`].
+///
+/// [`ImportMode::SameId`] preserves the origin id only when neither a session row nor a
+/// session directory exists locally; a duplicate is a conflict and writes nothing. It
+/// writes a fresh `session.created` with no parent, then every other replayable tail
+/// event and the capsule, with fresh contiguous sequence numbers and the original event
+/// ids and timestamps. A duplicate event id is a conflict, not a warning.
+pub fn import_with_mode(
+    deps: &Deps,
+    bundle: &Bundle,
+    executor: Option<ExecutorRef>,
+    cwd: Option<&Path>,
+    mode: ImportMode,
+) -> Result<SessionId, CoreError> {
     bundle.validate()?;
     // Decode and verify the origin blobs before redaction re-keys them. The redacted
-    // bytes returned by `redact_bundle` are what the child store receives.
+    // bytes returned by `redact_bundle` are what the imported store receives.
     let origin_blobs = decode_blobs(bundle)?;
     // Redact before anything is persisted. A bundle may predate the local vault (or come
     // from a node that never knew these secrets); if the redactor cannot be loaded the
@@ -243,6 +285,11 @@ pub fn import(
     let target = target_executor(deps, &bundle, executor);
     let cwd = resolve_cwd(deps, &bundle, cwd);
     let origin = bundle.session.id.clone();
+
+    if mode == ImportMode::SameId {
+        return import_same_id(deps, &store, &bundle, &target, cwd, inline);
+    }
+
     // The origin row may name a project/job this node has never seen. The session
     // index has foreign keys to both tables, so an absent row becomes NULL exactly as
     // reindex does instead of failing the import with a foreign-key error.
@@ -342,6 +389,143 @@ pub fn import(
     store.set_session_state(&child, SessionState::Idle, Some(&target.executor))?;
     write_import_sidecar(deps, &child, &bundle)?;
     Ok(child)
+}
+
+/// Imports with the origin id, no parent and the bundle's replayable tail.
+///
+/// Every check that can fail without touching files runs first: the local-absence check,
+/// the event-body parse, the duplicate id check and the duplicate event id lookup. The
+/// log itself is created with `create_new`, so a second import of the same id conflicts
+/// even if two processes race.
+fn import_same_id(
+    deps: &Deps,
+    store: &Store,
+    bundle: &Bundle,
+    target: &ExecutorRef,
+    cwd: PathBuf,
+    inline: Vec<DecodedBlob>,
+) -> Result<SessionId, CoreError> {
+    let origin = bundle.session.id.clone();
+    if store.session(&origin)?.is_some() || deps.paths.session_dir(&origin).exists() {
+        return Err(CoreError::Store(StoreError::Conflict(format!(
+            "session {origin} already exists locally; --same-id refuses to overwrite"
+        ))));
+    }
+    check_same_id_events(store, &origin, &bundle.tail)?;
+
+    // The origin row may name a project/job this node has never seen; an absent row
+    // becomes NULL exactly as the child path and reindex do.
+    let project = match &bundle.session.project {
+        Some(name) if store.project(name)?.is_some() => Some(name.clone()),
+        _ => None,
+    };
+    let job_id = match &bundle.session.job_id {
+        Some(id) if store.job(id)?.is_some() => Some(id.clone()),
+        _ => None,
+    };
+    let id = SessionService::new(deps.clone()).create_session_with_id(
+        origin.clone(),
+        NewSession {
+            project,
+            job_id,
+            role: bundle.session.role.unwrap_or(vowp_protocol::SessionRole::User),
+            title: bundle.session.title.clone(),
+            cwd,
+            parent: None,
+            executor: Some(target.executor.clone()),
+        },
+        bundle.session.created_at,
+    )?;
+    // `create_session_with_id` refuses a present id, so it returned the origin unchanged.
+    debug_assert_eq!(id, origin);
+
+    let log = SessionLog::open(&deps.paths, &id, deps.clock.clone())?;
+    for event in &bundle.tail {
+        // The importer writes its own `session.created` with no parent; the origin's
+        // created event is history, not a second setup event.
+        if matches!(event.body(), Ok(EventBody::SessionCreated(_))) {
+            continue;
+        }
+        let mut event = event.clone();
+        event.session_id = id.clone();
+        event.seq = log.last_seq() + 1;
+        log.append_envelope(&event)?;
+    }
+
+    let mut capsule = bundle.capsule.clone();
+    capsule.session_id = id.clone();
+    capsule.at_seq = log.last_seq().max(1);
+    let path = write_capsule_file(&deps.paths, &capsule)?;
+    store.insert_capsule(&capsule, &path.to_string_lossy())?;
+    log.append(NewEvent {
+        actor: Actor::System,
+        source: vowp_source(deps),
+        body: EventBody::Capsule(CapsuleEvent {
+            capsule_id: capsule.capsule_id.clone(),
+            version: capsule.version,
+            trigger: capsule.trigger,
+            at_seq: capsule.at_seq,
+        }),
+        raw: None,
+        ts: Some(capsule.created_at),
+    })?;
+    log.sync()?;
+    drop(log);
+
+    let blobs = BlobStore::new(deps.paths.blobs_dir(&id));
+    for (sha256, bytes) in inline {
+        let stored = blobs.put(&bytes)?;
+        if stored.sha256 != sha256 {
+            return Err(CoreError::Invalid(format!(
+                "blob {sha256} hashes to {} on import",
+                stored.sha256
+            )));
+        }
+    }
+
+    let report = reindex(store, &deps.paths, Some(&id))?;
+    if !report.problems.is_empty() {
+        return Err(CoreError::Store(StoreError::Conflict(format!(
+            "same-id import of {id} was not indexed cleanly: {}",
+            report.problems.join("; ")
+        ))));
+    }
+    store.set_session_state(&id, SessionState::Idle, Some(&target.executor))?;
+    if let Some(at) = bundle.compacted_at {
+        store.set_session_compacted(&id, at)?;
+    }
+    Ok(id)
+}
+
+/// Rejects a same-id bundle whose tail is invalid or whose event ids are already indexed.
+///
+/// The body parse and the duplicate checks happen before `SessionLog::create`, so a
+/// rejected import leaves no session row, log or directory behind. Event ids are unique
+/// across the whole index (`session_events_id`); a collision with any session is a
+/// conflict rather than something `reindex` later reports as a warning.
+fn check_same_id_events(store: &Store, origin: &SessionId, tail: &[EventEnvelope]) -> Result<(), CoreError> {
+    let mut seen = HashSet::new();
+    for event in tail {
+        event.body().map_err(|error| {
+            CoreError::Invalid(format!(
+                "bundle event {} for session {origin} is invalid: {error}",
+                event.id
+            ))
+        })?;
+        if !seen.insert(event.id.clone()) {
+            return Err(CoreError::Store(StoreError::Conflict(format!(
+                "bundle for session {origin} carries duplicate event id {}",
+                event.id
+            ))));
+        }
+        if let Some(existing) = store.event_row_by_id(&event.id)? {
+            return Err(CoreError::Store(StoreError::Conflict(format!(
+                "event {} is already indexed for session {}; refusing to import session {origin}",
+                event.id, existing.session_id
+            ))));
+        }
+    }
+    Ok(())
 }
 
 /// Returns the prefix for a seed on the imported session.
@@ -831,7 +1015,154 @@ fn b64_value(byte: u8) -> Result<u8, CoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tempfile::tempdir;
+    use vowp_protocol::{AssistantMessage, Executor, FakeClock, MemoryLog, SessionCreated, SessionRole, UserMessage};
+    use vowp_tmux::fake::FakeWindows;
+
     use super::*;
+    use crate::deps::{AdapterRegistry, Deps, FixedRng, SystemGit, SystemRunner};
+
+    fn ts() -> Timestamp {
+        Timestamp::parse("2026-11-08T18:00:00Z").expect("timestamp")
+    }
+
+    fn executor() -> Executor {
+        Executor::parse("opencode:deepseek/deepseek-flash#max").expect("executor")
+    }
+
+    fn test_deps(root: &Path) -> Deps {
+        let paths = NodePaths::new(root.join("node"));
+        paths.ensure().expect("node paths");
+        let mut config = vowp_protocol::VowpConfig::with_defaults_for_tests();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        config.project.path = Some(project.display().to_string());
+        Deps {
+            paths,
+            config: Arc::new(config),
+            node: NodeName::parse("local").expect("node"),
+            clock: Arc::new(FakeClock::at(ts())),
+            log: Arc::new(MemoryLog::new()),
+            adapters: Arc::new(AdapterRegistry::new()),
+            windows: Arc::new(FakeWindows::new()),
+            git: Arc::new(SystemGit::new(Arc::new(SystemRunner))),
+            cmd: Arc::new(SystemRunner),
+            rng: Arc::new(FixedRng(0)),
+        }
+    }
+
+    fn new_request(title: &str) -> NewSession {
+        NewSession {
+            project: None,
+            job_id: None,
+            role: SessionRole::Worker,
+            title: title.to_owned(),
+            cwd: PathBuf::from("/tmp/project"),
+            parent: None,
+            executor: Some(executor()),
+        }
+    }
+
+    fn event_source() -> EventSource {
+        EventSource {
+            harness: HarnessKind::Opencode,
+            model: Some("deepseek/deepseek-flash".to_owned()),
+            node: Some(NodeName::parse("source").expect("node")),
+            native_session_id: None,
+        }
+    }
+
+    fn made_event(session: &SessionId, seq: u64, body: EventBody) -> EventEnvelope {
+        EventEnvelope::new(session.clone(), seq, ts(), Actor::User, event_source(), &body)
+    }
+
+    /// One bundle whose origin row has a parent (the import must not keep it) and three
+    /// replayable tail events: created, user message and assistant message.
+    fn test_bundle(source: &SessionId) -> (Bundle, EventEnvelope) {
+        let created = made_event(
+            source,
+            1,
+            EventBody::SessionCreated(SessionCreated {
+                title: "same-id source".to_owned(),
+                cwd: "/tmp/source".to_owned(),
+                project: None,
+                job_id: None,
+                role: Some(SessionRole::Worker),
+                parent_session_id: Some(SessionId::new()),
+            }),
+        );
+        let user = made_event(
+            source,
+            2,
+            EventBody::UserMessage(UserMessage {
+                text: "copy this event".to_owned(),
+                attachments: Vec::new(),
+                note: None,
+            }),
+        );
+        let assistant = made_event(
+            source,
+            3,
+            EventBody::AssistantMessage(AssistantMessage {
+                text: "copied".to_owned(),
+            }),
+        );
+        let tail = vec![created, user.clone(), assistant];
+        let capsule = Capsule {
+            version: vowp_protocol::CAPSULE_VERSION,
+            capsule_id: CapsuleId::new(),
+            session_id: source.clone(),
+            created_at: ts(),
+            at_seq: 3,
+            trigger: CapsuleTrigger::Export,
+            from: ExecutorRef {
+                executor: executor(),
+                node: Some(NodeName::parse("source").expect("node")),
+            },
+            intent: "Continue the same session".to_owned(),
+            constraints: Vec::new(),
+            decisions: Vec::new(),
+            state: Default::default(),
+            files: Vec::new(),
+            gotchas: Vec::new(),
+            open_questions: Vec::new(),
+            telemetry: Default::default(),
+        };
+        let session = Session {
+            id: source.clone(),
+            project: None,
+            job_id: None,
+            role: Some(SessionRole::Worker),
+            title: "same-id source".to_owned(),
+            parent_session_id: Some(SessionId::new()),
+            node: NodeName::parse("source").expect("node"),
+            cwd: "/tmp/source".to_owned(),
+            state: SessionState::Idle,
+            executor: Some(executor()),
+            last_seq: 3,
+            last_capsule_id: Some(capsule.capsule_id.clone()),
+            log_bytes: 0,
+            created_at: ts(),
+            updated_at: ts(),
+        };
+        let mut bundle = Bundle {
+            format: BUNDLE_FORMAT.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            exported_at: ts(),
+            source_node: NodeName::parse("source").expect("node"),
+            session,
+            capsule,
+            tail,
+            lineage: Vec::new(),
+            blobs_inline: BTreeMap::new(),
+            compacted_at: None,
+            checksum: String::new(),
+        };
+        bundle.checksum = checksum(&bundle).expect("checksum");
+        (bundle, user)
+    }
 
     #[test]
     fn base64_roundtrip() {
@@ -842,5 +1173,234 @@ mod tests {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert!(base64_decode("a").is_err());
         assert!(base64_decode("****").is_err());
+    }
+
+    #[test]
+    fn bundle_head_names_the_source_row_and_last_tail_event() {
+        let source = SessionId::new();
+        let (bundle, _user) = test_bundle(&source);
+
+        let head = head(&bundle);
+        assert_eq!(head.session_id, source);
+        assert_eq!(head.node, bundle.source_node);
+        assert_eq!(head.last_seq, 3);
+        assert_eq!(head.last_event, Some(EventType::AssistantMessage));
+        assert_eq!(head.last_event_at, Some(ts()));
+        assert_eq!(head.state, Some(SessionState::Idle));
+        assert_eq!(head.executor, Some(executor()));
+        assert_eq!(head.updated_at, Some(ts()));
+    }
+
+    #[test]
+    fn bundle_head_of_a_compacted_bundle_has_no_tail_event() {
+        let source = SessionId::new();
+        let (mut bundle, _user) = test_bundle(&source);
+        bundle.tail.clear();
+        bundle.compacted_at = Some(ts());
+        bundle.checksum = checksum(&bundle).expect("checksum");
+
+        let head = head(&bundle);
+        assert_eq!(head.last_seq, 3, "the exported row still names the last seq");
+        assert_eq!(head.last_event, None);
+        assert_eq!(head.last_event_at, None);
+        assert_eq!(head.updated_at, Some(ts()));
+    }
+
+    #[test]
+    fn same_id_import_keeps_the_origin_id_without_a_parent() {
+        let dest_dir = tempdir().expect("dest");
+        let source = SessionId::new();
+        let (bundle, user) = test_bundle(&source);
+        let capsule_id = bundle.capsule.capsule_id.clone();
+        let dest = test_deps(dest_dir.path());
+
+        let imported = import_with_mode(&dest, &bundle, None, None, ImportMode::SameId).expect("same-id import");
+        assert_eq!(imported, source);
+
+        let store = dest.open_store().expect("store");
+        let row = store.require_session(&source).expect("session row");
+        assert!(row.parent_session_id.is_none(), "a same-id import has no parent");
+        assert_eq!(row.title, "same-id source");
+        assert_eq!(row.executor, Some(executor()));
+        assert_eq!(
+            row.created_at, bundle.session.created_at,
+            "the origin creation time is kept"
+        );
+
+        let events = SessionLog::open_read(&dest.paths, &source)
+            .expect("log")
+            .read_all()
+            .expect("events");
+        assert_eq!(
+            events.first().map(|event| event.event_type),
+            Some(EventType::SessionCreated)
+        );
+        assert!(matches!(
+            events[0].body().expect("created body"),
+            EventBody::SessionCreated(payload) if payload.parent_session_id.is_none()
+        ));
+        let copied = events
+            .iter()
+            .find(|event| event.id == user.id)
+            .expect("the bundle tail is copied into the log");
+        assert_eq!(copied.payload, user.payload);
+        assert_eq!(copied.ts, user.ts);
+        assert_eq!(events.last().map(|event| event.event_type), Some(EventType::Capsule));
+
+        let indexed = store.event_rows(&source, 0, 100).expect("index rows");
+        assert_eq!(
+            indexed.len(),
+            events.len(),
+            "the index mirrors the copied log: {indexed:?} vs {events:?}"
+        );
+        let capsule = store
+            .latest_capsule(&source)
+            .expect("capsule query")
+            .expect("capsule row");
+        assert_eq!(capsule.capsule_id, capsule_id);
+        assert_eq!(capsule.session_id, source);
+        assert_eq!(
+            capsule.at_seq,
+            events[events.len() - 2].seq,
+            "the capsule covers the copied tail, not its own event"
+        );
+        assert!(
+            !dest.paths.session_dir(&source).join("import.json").exists(),
+            "a same-id import copies the tail instead of writing a seed sidecar"
+        );
+    }
+
+    #[test]
+    fn same_id_import_refuses_an_existing_session_and_changes_nothing() {
+        let dest_dir = tempdir().expect("dest");
+        let source = SessionId::new();
+        let (bundle, _) = test_bundle(&source);
+        let dest = test_deps(dest_dir.path());
+        import_with_mode(&dest, &bundle, None, None, ImportMode::SameId).expect("first import");
+
+        let log_path = dest.paths.log_path(&source);
+        let before_log = std::fs::read(&log_path).expect("log bytes");
+        let store = dest.open_store().expect("store");
+        let before_row = store.require_session(&source).expect("row");
+        drop(store);
+
+        let error =
+            import_with_mode(&dest, &bundle, None, None, ImportMode::SameId).expect_err("a duplicate id must conflict");
+        match error {
+            CoreError::Store(StoreError::Conflict(message)) => {
+                assert!(message.contains("already exists"), "{message}");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+
+        assert_eq!(std::fs::read(&log_path).expect("log bytes"), before_log);
+        let store = dest.open_store().expect("store");
+        let after_row = store.require_session(&source).expect("row");
+        assert_eq!(after_row.last_seq, before_row.last_seq);
+        assert_eq!(after_row.updated_at, before_row.updated_at);
+        assert_eq!(after_row.title, before_row.title);
+        assert_eq!(
+            store
+                .list_sessions(&vowp_store::SessionFilter::default())
+                .expect("sessions")
+                .len(),
+            1,
+            "the refused import created no second session"
+        );
+    }
+
+    #[test]
+    fn same_id_import_rejects_a_duplicate_event_id_before_writing() {
+        let dest_dir = tempdir().expect("dest");
+        let dest = test_deps(dest_dir.path());
+        let other = SessionService::new(dest.clone())
+            .create_session(new_request("already indexed"))
+            .expect("other session");
+        let other_events = SessionLog::open_read(&dest.paths, &other)
+            .expect("log")
+            .read_all()
+            .expect("events");
+        let existing_id = other_events[0].id.clone();
+
+        let source = SessionId::new();
+        let mut duplicated = made_event(
+            &source,
+            2,
+            EventBody::UserMessage(UserMessage {
+                text: "collides with another session".to_owned(),
+                attachments: Vec::new(),
+                note: None,
+            }),
+        );
+        duplicated.id = existing_id;
+        let mut bundle = test_bundle(&source).0;
+        bundle.tail = vec![duplicated];
+        bundle.checksum = checksum(&bundle).expect("checksum");
+
+        let error = import_with_mode(&dest, &bundle, None, None, ImportMode::SameId)
+            .expect_err("a duplicate event id must conflict");
+        match error {
+            CoreError::Store(StoreError::Conflict(message)) => {
+                assert!(message.contains("already indexed"), "{message}");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        let store = dest.open_store().expect("store");
+        assert!(
+            store.session(&source).expect("lookup").is_none(),
+            "the refused import created no session row"
+        );
+        assert!(
+            !dest.paths.session_dir(&source).exists(),
+            "the duplicate check runs before the session directory"
+        );
+    }
+
+    #[test]
+    fn same_id_import_rejects_a_corrupt_bundle_before_writing() {
+        let dest_dir = tempdir().expect("dest");
+        let source = SessionId::new();
+        let (mut bundle, _) = test_bundle(&source);
+        bundle.session.title = "tampered".to_owned();
+        let dest = test_deps(dest_dir.path());
+
+        let error =
+            import_with_mode(&dest, &bundle, None, None, ImportMode::SameId).expect_err("a tampered bundle must fail");
+        assert!(
+            matches!(&error, CoreError::Invalid(message) if message.contains("checksum mismatch")),
+            "{error:?}"
+        );
+        let store = dest.open_store().expect("store");
+        assert!(store.session(&source).expect("lookup").is_none());
+        assert!(!dest.paths.session_dir(&source).exists());
+    }
+
+    #[test]
+    fn child_import_still_creates_a_child_with_the_parent() {
+        let dest_dir = tempdir().expect("dest");
+        let source = SessionId::new();
+        let (bundle, _) = test_bundle(&source);
+        let dest = test_deps(dest_dir.path());
+
+        let child = import(&dest, &bundle, None, None).expect("child import");
+        assert_ne!(child, source);
+        let store = dest.open_store().expect("store");
+        let row = store.require_session(&child).expect("child row");
+        assert_eq!(row.parent_session_id.as_ref(), Some(&source));
+        assert_eq!(row.title, "same-id source (imported)");
+        let events = SessionLog::open_read(&dest.paths, &child)
+            .expect("log")
+            .read_all()
+            .expect("events");
+        assert_eq!(
+            events.iter().map(|event| event.event_type).collect::<Vec<_>>(),
+            vec![
+                EventType::SessionCreated,
+                EventType::Note,
+                EventType::Switch,
+                EventType::Capsule
+            ],
+            "the default child log keeps its four setup events"
+        );
     }
 }

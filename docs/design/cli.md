@@ -56,7 +56,7 @@ Human: `initialised project vowp at /path (8 files written, 2 skipped)`. JSON: `
 
 ### `vowp doctor`
 Checks (each `ok|warn|fail` with detail): `home` writable; `db` opens + `integrity_check` + schema version; `schema` matches the binary; `projects` each have an openable project DB; `snapshot` is writable; `git` version; `tmux` version (warn if absent); harness probes via adapters
-(`claude`, `opencode`, each `Adapter::probe`); `vowp.toml` parses + validates and every `[[schedules]]` cron/interval/timezone parses with `ScheduleSpec::parse` (an invalid entry fails the `schedules` check with the schedule name and error); profile ladders resolve to installed harnesses; providers reachable **only by env-var-name presence** (`PROVIDER_API_KEY` set? — never prints the value, never calls the network);
+(`claude`, `opencode`, each `Adapter::probe`; `acp` only when `[harnesses.acp]` or an ACP profile rung is configured); `vowp.toml` parses + validates and every `[[schedules]]` cron/interval/timezone parses with `ScheduleSpec::parse` (an invalid entry fails the `schedules` check with the schedule name and error); profile ladders resolve to installed harnesses; providers reachable **only by env-var-name presence** (`PROVIDER_API_KEY` set? — never prints the value, never calls the network);
 `systemd --user` unit and cron watchdog installed (warn only); supervisor running; disk space ≥ 1 GB.
 Exit 0 if no `fail`, else 1. JSON: `{"ok":true,"checks":[{"name":"tmux","status":"ok","detail":"tmux 3.4"}]}`.
 
@@ -92,8 +92,8 @@ Starts a planner turn (session role `planner`, executor = first available rung o
 | `job nudge <id>` · `job restart <id>` · `job replan <id>` · `job fail <id> --reason t` | keeper commands (loops.md §7): enqueue a request row applying the corresponding `JobEvent` (`KeeperNudge|KeeperRestart|KeeperReplan|KeeperFail`); exit 4 if the job's state does not allow it. |
 | `job cancel <id>` | any non-terminal → `cancelled`; stops the run, releases the ownership lock (worktree and branch are kept on disk for inspection). Dependents stay `pending`; `vowp job ls` flags them `blocked-by-cancelled`. |
 
-### `vowp graph [--mermaid] [--export <file.yaml>] [--import <file.yaml>] [--all]`
-Default: ASCII, exactly `render_ascii` of `vowp-graph` (one line per job ordered by layer: `L1 graph-engine [running] graph engine  <- protocol`). `--mermaid`: exactly `render_mermaid` (`graph TD`, one node per job, edges per kind; no `classDef`). `--export`: YAML (jobs + edges) to the file (stdout if `-`). `--import`: validates then inserts missing jobs/edges (never overwrites; conflicts listed, exit 4). Formats: `crates/vowp-graph.md`.
+### `vowp graph [--mermaid] [--export <file.yaml>] [--import <file.yaml>] [--all] [--json]`
+Default: ASCII, exactly `render_ascii` of `vowp-graph` (one line per job ordered by layer: `L1 graph-engine [running] graph engine  <- protocol`). `--json`: one document `{"jobs": [Job,…], "edges": [Edge,…]}` for the normal read path (jobs ordered by id, edges in store/graph order; `--all` keeps the same project selection as ASCII). `--mermaid`: exactly `render_mermaid` (`graph TD`, one node per job, edges per kind; no `classDef`) and takes precedence over `--json`, so `vowp graph --json --mermaid` prints only Mermaid. `--export`: YAML (jobs + edges) to the file (stdout if `-`). `--import`: validates then inserts missing jobs/edges (never overwrites; conflicts listed, exit 4). Formats: `crates/vowp-graph.md`.
 
 ### `vowp attach [<job>] [--node <n>]`
 `tmux attach -t vowp-<project>:job-<id>` (or the session's `board` window with no job). Exec's tmux (inherits the TTY). If tmux is absent or the window is gone: falls back to `vowp session tail --follow` of the job's latest session. Exit 3 if the job has no session.
@@ -111,8 +111,9 @@ All `session` subcommands accept a session id prefix; `vowp chat <id>` is the v0
 | `session switch <id> --to <executor> [--node <n>] [--reason user\|limit\|…] [--force]` | runs the switch protocol (`sessions.md` §5): prints the capsule path and the new executor; exit 6 if the target provider is limited, 4 if the session is running a turn and `--force` is not given. A remote target is probed with `vowp doctor` first. |
 | `session capsule <id> [--print]` | writes a capsule now (`trigger=manual`), prints its id (or the markdown with `--print`) |
 | `session export <id> [--out <file>\|-o <file>] [--tail <n>]` | writes a `vowp-bundle-v1` JSON bundle (default `./<id>.vowp-bundle.json`, tail 20 events) |
-| `session import <file> [--node n] [--executor <exec>] [--cwd <dir>]` | validates checksum/version, creates a **child** session (`parent_session_id`), prints the new id; the seed capsule is attached |
-| `session watch [--claude-dir <dir>] [--once]` | records interactive Claude Code transcripts (read-only importer) into canonical sessions; prints `watching N transcripts`; without `--once`, a TTY run exits 2 because continuous following is not available (non-TTY input does one pass); exit 1 if the dir is unreadable |
+| `session import <file> [--node n] [--executor <exec>] [--cwd <dir>] [--same-id]` | validates checksum/version, creates a **child** session (`parent_session_id`), prints the new id; the seed capsule is attached. `--same-id` keeps the bundle id only when no local row or session directory exists, writes no parent and copies the bundle tail into the log; a present id is exit 4 and nothing is changed. |
+| `session pull <node> <session> [--same-id \| --full]` | runs on the local machine: exports the bundle from `node` over ssh, stages it in a private temporary directory, verifies format/protocol/checksum, imports a **child** (`parent_session_id` = source id) and prints both ids. JSON `{"node","source_session","child_session"}`. With `--same-id` it imports under the source id with no parent and JSON `{"node","source_session","same_id_session"}`. With `--full` it streams the whole `sessions/<id>/` directory (full log, blobs, capsules, `adapters.json`) as a `vowp-session-dir-v1` manifest plus file bytes, verifies every digest and size (1 GiB cap) before the final rename, reindexes, and prints JSON `{"node","source_session","full_session","files","bytes"}`; it never creates a child or rewrites a bundle. When `--same-id` or `--full` finds the source id present locally, the pull exits 4 with a divergence report naming both heads (last seq, last event type/time, state and executor where available) and the note `choose which side advances; no merge performed`; `--json` returns `{"error":{"kind":"conflict","code":"session_divergence","message","hint","node","source_session","local","remote","note"}}`. Nothing is overwritten, forced or merged. A failed remote run, malformed/truncated/corrupt snapshot, over-cap directory or checksum mismatch imports nothing and leaves no `sessions/<id>/`. |
+| `session watch [--claude-dir <dir>] [--once] [--follow]` | records interactive Claude Code transcripts (read-only, byte-offset importer) into one canonical session per Claude uuid; prints `watching N transcripts`; `--follow` polls every two seconds until Ctrl-C, and a TTY run without `--once` or `--follow` follows the same way; `--once`, and a non-TTY run without `--follow`, make one incremental pass; exit 1 if the dir is unreadable |
 | `session tail <id> [--follow] [--pretty] [--from <seq>]` | prints events (JSONL, or `--pretty` one line per event); `--follow` polls the file (200 ms) and does not take the lease. This is what job windows run (`vowp __window job <id>`). |
 
 Pretty line format: `HH:MM:SS #seq type  summary` e.g. `19:30:12 #6 tool.call  shell: cargo test`.
@@ -128,10 +129,10 @@ events. See `sessions.md` §8–§11.
 ### Hidden session interfaces
 
 These are implementation interfaces, not help-listed user commands. `vowp session turn-begin`,
-`vowp session ingest`, `vowp session lease` and `vowp session takeover` are hidden subcommands of
-`vowp session`; `vowp __exec`, `vowp __vault-exec` and `vowp __vault-admin` are hidden top-level
-commands. They still accept `--json` where a document is printed; the streaming ones print one JSON
-object per line.
+`vowp session ingest`, `vowp session lease`, `vowp session takeover` and `vowp session dir-export`
+are hidden subcommands of `vowp session`; `vowp __exec`, `vowp __vault-exec` and
+`vowp __vault-admin` are hidden top-level commands. They still accept `--json` where a document is
+printed; the streaming ones print one JSON object per line.
 
 ```
 vowp session turn-begin <session> --executor <exec> --purpose <p> --node <n> --request <file|->
@@ -139,7 +140,11 @@ vowp __exec --grant <file> [--spool-dir <dir>]
 vowp session ingest <session> --run <run-id> [--replay] [--json]
 vowp session lease <session> [--acquire <kind> --holder <h> --node <n>] [--json]
 vowp session takeover <session> --kind <kind> --holder <h> --node <n> [--json]
+vowp session dir-export <session> [--max-bytes <n>]
 ```
+
+`dir-export` is the source half of `session pull --full`: it prints one `vowp-session-dir-v1`
+manifest line and then the listed file bytes on stdout. It is read-only and takes no session lock.
 
 `turn-begin` reads a request document (lease token, prompt, executor, purpose, node) and prints a
 `TurnGrant`; `__exec` runs the adapter on the executor machine, spools every event before sending
@@ -356,8 +361,8 @@ reads still work in follow mode. `tunnel_open`/`tunnel_close` refuse on the home
 | `vowp reindex [--session <id>]` | rebuilds `sessions`, `session_events`, `session_natives`, `capsules` rows from `sessions/*/log.jsonl`; prints counts. Safe while the supervisor runs. |
 | `vowp backup …` | see §6.8. |
 | `vowp schema [<type>]` | with no arg lists the JSON-Schema type names; with a name prints that schema (types.md §14). `snapshot` is the v0.2 snapshot schema. Still needs an initialised home in this build. |
-| `vowp --version` | prints `vowp 0.2.0` (the binary version only). |
-| `vowp version` | prints `vowp 0.2.0 (<git sha>) schema 1`. |
+| `vowp --version` | prints `vowp 0.3.0` (the binary version only). |
+| `vowp version` | prints `vowp 0.3.0 (<git sha>) schema 1`. |
 | `vowp __window <board\|capacity\|supervisor\|planner\|keeper\|inbox\|job> [<id>]` | hidden; what tmux windows run (renders the board or capacity screen, tails `supervisor.log`, tails the planner/keeper session, lists the inbox, tails a job session). Read-only. |
 | `vowp __exec --grant <file> [--spool-dir <dir>]` | hidden remote-executor client (sessions.md §9). |
 | `vowp __vault-exec --env <NAME> -- <cmd…>` · `vowp __vault-admin probe` · `vowp __vault-admin set\|rm <NAME>` | hidden vault-user helper; `probe` takes no name and checks the helper context and vault directory, `set` reads the value from stdin, never argv. In basic mode `__vault-exec` is a plain exec. |
@@ -370,7 +375,7 @@ reads still work in follow mode. `tunnel_open`/`tunnel_close` refuse on the home
 2. Build argv: the original args with `--node <name>` removed. If the command is interactive (`attach`, `session chat`, `chat`, `board` without `--once`) add `-t`.
 3. Execute `ssh -o BatchMode=yes -o ConnectTimeout=10 [-t] <ssh_target> vowp <argv…>` with stdin/stdout/stderr inherited; the remote exit code is returned unchanged; ssh failure (exit 255) ⇒ exit 7 with `{"error":{"kind":"remote",…}}` under `--json`.
 4. Arguments are passed as a single remote command string built with POSIX single-quote escaping (`shell_quote`, shared with `vowp-tmux`); no argument is ever interpolated unquoted.
-5. `session import` with `--node n`: the bundle file is streamed over ssh stdin (`vowp session import - …`); `session export --node n` writes the bundle locally from the remote's stdout.
+5. `session import` with `--node n`: the bundle file is streamed over ssh stdin (`vowp session import - …`); `session export --node n` writes the bundle locally from the remote's stdout. `session pull <node> <session>` uses that remote export, verifies the bundle locally and imports the child here; the pull never runs on the remote node. `--same-id` on either command is forwarded to the importer and preserves the source id only when it is absent locally. `session pull --full` instead calls the remote hidden `session dir-export` and streams the manifest plus raw directory files; it stages, verifies and reindexes locally under the source id only when absent. If `--same-id` or `--full` finds the id already local, the pull prints the two heads and exits 4 without touching the local row or log; the full path aborts the snapshot stream and asks the source's read-only `session show --json --events 1` for its head because the directory manifest carries no log position. No pull takes a source log lock; a bundle export writes its usual export capsule on the source, while the directory export is read-only.
 6. Cross-node `session switch --to … --node server`: the target's adapter is probed with `vowp --node server doctor --json` before the source is touched. v0.1's bundle move remains available as explicit export/import; v0.2 remote execution keeps the session on the home and moves only the executor (`sessions.md` §9).
 7. On a control machine, commands without `--node` are sent to the configured home target; the rules are in §1 and `v0.2/home-and-surfaces.md` §8.
 
@@ -398,4 +403,19 @@ v0.2 adds the CLI-facing subset of the spec's named tests:
 `setup_verify_fixture_job_merges`, `orchestrator_new_writes_only_project_local_config`,
 `mcp_write_tool_checks_lease_and_records_actor`, `chat_follow_mode_is_read_only`,
 `remote_ingest_is_idempotent_by_event_id`. The full per-feature list is in
-`v0.2/home-and-surfaces.md` §15.
+`v0.2/home-and-surfaces.md` §15. The v0.3 pull slice adds
+`session_pull_imports_a_child_and_prints_both_ids`,
+`session_pull_refuses_a_corrupt_bundle_before_importing` and
+`session_pull_reports_a_failed_remote_export_and_imports_nothing`. The same-id slice adds
+`session_pull_same_id_imports_the_origin_id_without_a_parent`,
+`session_pull_same_id_reports_divergence_without_mutating_it`,
+`session_pull_same_id_refuses_a_corrupt_bundle_before_importing` and
+`session_import_same_id_keeps_the_bundle_id_and_refuses_a_second_import`. The full-directory slice
+adds `session_pull_full_imports_the_origin_id_with_the_full_log`,
+`session_pull_full_reports_divergence_without_mutating_it`,
+`session_pull_full_prefix_of_an_existing_session_keeps_the_local_conflict`,
+`session_pull_full_refuses_a_corrupt_snapshot_without_leaving_a_directory`,
+`session_pull_full_refuses_a_log_with_a_missing_blob`,
+`session_pull_full_refuses_an_over_cap_snapshot_before_copying` and
+`session_pull_full_reports_a_failed_remote_export_and_imports_nothing`; the default child path
+remains `session_pull_imports_a_child_and_prints_both_ids`.

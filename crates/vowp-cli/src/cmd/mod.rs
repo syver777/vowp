@@ -80,7 +80,7 @@ pub fn dispatch(ctx: &Ctx, io: &mut dyn IoStreams, command: Command) -> Result<i
         Command::Releases(args) => promote::run(ctx, io, &PromoteCommand::Releases(args)),
         Command::Reindex(args) => maint::run(ctx, io, &MaintCommand::Reindex(args)),
         Command::Backup(args) => maint::run(ctx, io, &MaintCommand::Backup(args)),
-        Command::Schema(args) => schema::run(ctx, io, &args),
+        Command::Schema(args) => schema::run(ctx.json(), io, &args),
         Command::Project(args) => project::run(ctx, io, &args),
         Command::Fleet(args) => fleet::run(ctx, io, &args),
         Command::Capacity(args) => capacity::run(ctx, io, &args),

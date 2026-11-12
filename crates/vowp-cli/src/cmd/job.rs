@@ -5,13 +5,15 @@
 //! same graph event directly. Keeper commands (`nudge`, `restart`, `replan`, `fail`) only
 //! enqueue, as `loops.md` §7 requires.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use vowp_core::requests::{self, Request};
 use vowp_graph::{Graph, JobEvent, transition};
-use vowp_protocol::{EdgeKind, Gate, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Role, default_gates};
+use vowp_protocol::{
+    EdgeKind, Gate, GateResult, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Role, default_gates,
+};
 use vowp_store::{JobFilter, Store};
 
 use crate::cli::{JobAddArgs, JobCommand, JobLsArgs, JobShowArgs, JobUpdateArgs};
@@ -281,6 +283,10 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobLsArgs) -> Result<i32, CliE
 }
 
 /// Shows one job and optionally its runs or gate evidence.
+///
+/// The `--gates` section lists every configured gate in order, marking one `not run` until
+/// a recorded result for its gate index replaces it. The job's contract is therefore visible
+/// before the first run.
 fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, CliError> {
     let store = ctx.store()?;
     let id = JobId::parse(&args.id)?;
@@ -379,24 +385,36 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, Cl
 
     if args.gates {
         writeln!(io.out(), "gates:")?;
-        for result in store.latest_gate_results(&job.id)? {
-            let evidence = serde_json::to_string(&result.evidence).unwrap_or_default();
-            let evidence: String = evidence
-                .chars()
-                .rev()
-                .take(200)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            writeln!(
-                io.out(),
-                "  {}  {}  {}ms  {}",
-                gate_kind_str(result.gate.kind()),
-                if result.passed { "pass" } else { "fail" },
-                result.duration_ms,
-                evidence
-            )?;
+        let results = store.latest_gate_results(&job.id)?;
+        // Merge-queue results have gate_index -1 and are not part of the job's contract.
+        let latest: BTreeMap<i32, &GateResult> = results
+            .iter()
+            .filter(|result| result.gate_index >= 0)
+            .map(|result| (result.gate_index, result))
+            .collect();
+        for (index, gate) in job.gates.iter().enumerate() {
+            match i32::try_from(index).ok().and_then(|index| latest.get(&index)) {
+                Some(result) => {
+                    let evidence = serde_json::to_string(&result.evidence).unwrap_or_default();
+                    let evidence: String = evidence
+                        .chars()
+                        .rev()
+                        .take(200)
+                        .collect::<String>()
+                        .chars()
+                        .rev()
+                        .collect();
+                    writeln!(
+                        io.out(),
+                        "  {}  {}  {}ms  {}",
+                        gate_kind_str(result.gate.kind()),
+                        if result.passed { "pass" } else { "fail" },
+                        result.duration_ms,
+                        evidence
+                    )?;
+                }
+                None => writeln!(io.out(), "  {}  not run", gate.short())?,
+            }
         }
     }
     Ok(0)

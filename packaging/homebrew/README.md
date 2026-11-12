@@ -15,7 +15,7 @@ were not run here.
 Fill the formula for the release first, from a VOWP checkout:
 
 ```sh
-packaging/homebrew/update.sh 0.2.0
+packaging/homebrew/update.sh 0.3.0
 ```
 
 Then, in a local clone of the empty tap repository, copy the **filled**
@@ -25,7 +25,7 @@ formula:
 mkdir -p Formula
 cp /path/to/vowp/packaging/homebrew/vowp.rb Formula/vowp.rb
 git add Formula/vowp.rb
-git commit -m "vowp 0.2.0"
+git commit -m "vowp 0.3.0"
 git push origin main
 ```
 
@@ -49,15 +49,15 @@ Publish the GitHub release first (the formula URLs point at release assets, and
 assets of a draft release are not public). From this repository:
 
 ```sh
-packaging/homebrew/update.sh 0.2.0
+packaging/homebrew/update.sh 0.3.0
 ```
 
 With no second argument the script downloads
-`https://github.com/syver777/vowp/releases/download/v0.2.0/SHA256SUMS`. To use a
+`https://github.com/syver777/vowp/releases/download/v0.3.0/SHA256SUMS`. To use a
 local file, or to write a copy of the formula instead of editing `vowp.rb`:
 
 ```sh
-packaging/homebrew/update.sh 0.2.0 /path/to/SHA256SUMS /tmp/vowp.rb
+packaging/homebrew/update.sh 0.3.0 /path/to/SHA256SUMS /tmp/vowp.rb
 ```
 
 The script rewrites the version line and the four platform `sha256` lines in

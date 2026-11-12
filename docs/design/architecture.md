@@ -199,7 +199,7 @@ refuse with exit 5 because the control machine has no local truth. A path accept
 | | `on_credits_exhausted` | `"park"` | `park` | the only v0.1 option |
 | `[providers.<p>.prices."<model>"]` | `input_per_m`, `output_per_m`, `cache_read_per_m`, `cache_write_per_m` | float USD per 1M tokens | — | price table for `cost.source = "price-table"` |
 | `[harnesses.<name>]` | `binary`, `extra_args`, `env_pass`, `permission_mode`, `mapping` | | PATH lookup | per-harness overrides; `mapping` = generic cli adapter file |
-| `[env.<name>]` | `checkout`, `deploy`, `guards`, `approval`, `serving_bank`, `probe`, `rollback` | | | Work→Production (`promote` module) |
+| `[env.<name>]` | `checkout`, `build`, `env_pass`, `deploy`, `guards`, `approval`, `serving_bank`, `probe`, `rollback` | | | Work→Production (`promote` module); `build` is the `build` guard's command list, empty means the `[merge].check_cmds` / `[project].check_cmds` fallback; `env_pass` lists secret **names** for the bank, deploy, probe and rollback commands |
 | `[gates]` | `<set name> = [Gate…]` | | | named gate sets referenced by `vowp job add --gates <set>` |
 | `[loops.<name>]` | `interval_secs`, `state`, plus `LoopBounds` keys | | built-in defaults | overrides for loops, e.g. `[loops.l1-supervisor] stall_minutes = 20` |
 | `[[schedules]]` | `name`, `cron` \| `every`, `tz`, `missed`, `action` | | | L9 (see `loops.md` §11) |
@@ -283,6 +283,7 @@ deploy = ["./scripts/deploy-work.sh"]
 
 [env.prod]
 checkout = "~/myapp-prod"              # fast-forward-only clone of main
+build = ["npm ci && npm run build"]    # the build guard runs these in the checkout (empty = merge/project check_cmds)
 deploy = ["vercel deploy --prod"]
 guards = ["clean_tree", "head_equals_remote", "build", "no_active_jobs"]
 approval = "human"                     # human | policy
@@ -321,6 +322,14 @@ tail_turns = 2
 rebase = true
 timeout_secs = 2700
 secret_scan = true
+```
+
+Promotion commands can name vault secrets. Only the names appear in configuration; the promoter
+resolves them and passes the values in the child environment alone:
+
+```toml
+[env.prod]
+env_pass = ["DEPLOY_TOKEN", "PROBE_TOKEN"]   # names only; never values
 ```
 
 ### 5.3 Validation rules (`VowpConfig::validate`)

@@ -1,4 +1,4 @@
-//! `vowp graph`: ASCII, Mermaid, YAML export and YAML import.
+//! `vowp graph`: ASCII, Mermaid, JSON, YAML export and YAML import.
 //!
 //! Spec: `docs/design/cli.md` §3 and `docs/design/crates/vowp-graph.md` §6–7. Rendering is
 //! exactly `vowp_graph::render_ascii`/`render_mermaid`; export and import use the stable YAML
@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 use vowp_graph::{Graph, export_yaml, import_yaml, render_ascii, render_mermaid};
-use vowp_protocol::JobId;
+use vowp_protocol::{Edge, Job, JobId};
 use vowp_store::JobFilter;
 
 use crate::cli::GraphArgs;
@@ -19,6 +19,16 @@ use crate::{CliError, Ctx, IoStreams};
 struct ImportOutput {
     imported: Vec<String>,
     conflicts: Vec<String>,
+}
+
+/// JSON shape for `vowp graph --json`.
+///
+/// Jobs are ordered by id and serialised exactly like the `Job` objects of
+/// `vowp job ls --json`; edges keep the store/graph insertion order.
+#[derive(Debug, Serialize)]
+struct GraphOutput<'a> {
+    jobs: Vec<&'a Job>,
+    edges: &'a [Edge],
 }
 
 /// Runs `vowp graph`.
@@ -45,6 +55,12 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &GraphArgs) -> Result<i32, C
 
     if args.mermaid {
         write!(io.out(), "{}", render_mermaid(&graph))?;
+    } else if ctx.json() {
+        let output = GraphOutput {
+            jobs: graph.jobs().collect(),
+            edges: graph.edges(),
+        };
+        crate::output::print_json(io, &output)?;
     } else {
         write!(io.out(), "{}", render_ascii(&graph))?;
     }

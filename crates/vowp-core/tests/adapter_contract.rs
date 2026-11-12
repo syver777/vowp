@@ -8,6 +8,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 
 use tempfile::{TempDir, tempdir};
+use vowp_adapters::acp::{AcpAdapter, AcpConfig};
 use vowp_adapters::claude_code::{ClaudeCodeAdapter, ClaudeConfig};
 use vowp_adapters::cli::CliAdapter;
 use vowp_adapters::opencode::{OpencodeAdapter, OpencodeConfig};
@@ -33,6 +34,15 @@ fn write_fake(dir: &Path) -> PathBuf {
     let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("chmod fake harness");
+    path
+}
+
+/// Returns the committed ACP fake, making it executable in case the checkout lost the bit.
+fn fake_acp() -> PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vowp-adapters/tests/fakes/fake_acp.py");
+    let mut permissions = std::fs::metadata(&path).expect("stat ACP fake").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod ACP fake");
     path
 }
 
@@ -91,14 +101,30 @@ fn adapters(dir: &Path) -> Vec<(&'static str, Box<dyn Adapter>, PathBuf)> {
         ..OpencodeConfig::default()
     });
     let cli = CliAdapter::from_mapping_file(&mapping).expect("cli mapping");
+    let acp = AcpAdapter::new(AcpConfig {
+        binary: Some(fake_acp().to_string_lossy().into_owned()),
+        ..AcpConfig::default()
+    });
     vec![
         ("claude-code", Box::new(claude), claude_fixture),
         ("opencode", Box::new(opencode), opencode_fixture),
-        ("cli", Box::new(cli), cli_fixture),
+        ("cli", Box::new(cli), cli_fixture.clone()),
+        ("acp", Box::new(acp), cli_fixture),
     ]
 }
 
 fn start_input(cwd: &Path, fixture: &Path, exit: &str, hang: bool) -> StartInput {
+    // The ACP fake selects its scripted turn from the same scenario; the other adapters
+    // ignore this variable.
+    let acp_mode = if hang {
+        "hang"
+    } else if exit != "0" {
+        "quota"
+    } else if fixture.exists() {
+        "ok"
+    } else {
+        "empty"
+    };
     StartInput {
         session_id: vowp_protocol::SessionId::new(),
         executor: vowp_protocol::Executor::parse("opencode:deepseek/deepseek-flash").expect("executor"),
@@ -114,6 +140,7 @@ fn start_input(cwd: &Path, fixture: &Path, exit: &str, hang: bool) -> StartInput
                 if hang { "1".to_owned() } else { String::new() },
             ),
             ("FAKE_SLEEP".to_owned(), "0".to_owned()),
+            ("FAKE_ACP_MODE".to_owned(), acp_mode.to_owned()),
         ],
         permission_mode: None,
         system_note: None,
@@ -196,6 +223,11 @@ fn adapter_kinds_match_their_contract() {
     let kinds: Vec<HarnessKind> = adapters.iter().map(|(_, adapter, _)| adapter.kind()).collect();
     assert_eq!(
         kinds,
-        vec![HarnessKind::ClaudeCode, HarnessKind::Opencode, HarnessKind::Cli]
+        vec![
+            HarnessKind::ClaudeCode,
+            HarnessKind::Opencode,
+            HarnessKind::Cli,
+            HarnessKind::Acp
+        ]
     );
 }

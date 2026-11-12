@@ -1,5 +1,9 @@
 //! `cmd` and `script` gates: run one shell command in the worktree and check its result.
 //! Spec: `docs/design/loops.md` §4.
+//!
+//! Stored evidence is redacted with the vault's exact-value redactor: the tail and any
+//! spilled output blob carry `[REDACTED:<NAME>]` instead of a value the command printed.
+//! The raw output still feeds `expect_pattern`, and exit codes and timeouts are untouched.
 
 use std::path::Path;
 use std::time::Instant;
@@ -77,6 +81,9 @@ fn evaluate_inner(
                 }
             }
             let passed = exit_ok && pattern_ok;
+            // The pattern above matched the command's real output; only the stored tail is
+            // redacted. The command text, exit code and timeout stay as measured.
+            let tail = crate::vault::redact_text(deps, &tail);
             let output_blob = spill(deps, &output.output);
             Outcome {
                 passed,
@@ -173,12 +180,16 @@ pub(crate) fn resolve_cwd(worktree: &Path, cwd: Option<&str>) -> std::path::Path
 }
 
 /// Spills output larger than [`SPILL_BYTES`] into the node's gate blob directory.
+///
+/// The bytes are redacted before they are written, so a spilled blob cannot keep a value
+/// the command printed even when the short evidence tail was redacted.
 fn spill(deps: &Deps, output: &[u8]) -> Option<String> {
     if output.len() <= SPILL_BYTES {
         return None;
     }
+    let redacted = crate::vault::redact_bytes(deps, output);
     let blobs = BlobStore::new(deps.paths.root().join("gates").join("blobs"));
-    match blobs.put(output) {
+    match blobs.put(&redacted) {
         Ok(blob) => Some(blob.sha256),
         Err(err) => {
             deps.log.log(

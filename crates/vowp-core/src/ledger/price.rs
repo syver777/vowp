@@ -20,7 +20,7 @@ pub fn estimate(cfg: &VowpConfig, exec: &Executor, tokens: &Tokens) -> Cost {
     }
     let model_key = match exec.harness {
         HarnessKind::Opencode => exec.model.rsplit('/').next().unwrap_or(exec.model.as_str()),
-        HarnessKind::ClaudeCode | HarnessKind::Cli | HarnessKind::Vowp => exec.model.as_str(),
+        HarnessKind::ClaudeCode | HarnessKind::Cli | HarnessKind::Acp | HarnessKind::Vowp => exec.model.as_str(),
     };
     let Some(entry) = cfg
         .providers

@@ -17,7 +17,7 @@ them to the graph, and applies the effects the graph returns.
 
 ## Status
 
-VOWP 0.2.0 is an early release. The graph and state-machine API is used by the shipped `vowp` CLI, but it is
+VOWP 0.3.0 is an early release. The graph and state-machine API is used by the shipped `vowp` CLI, but it is
 not yet stable while VOWP is in 0.x.
 
 ## Links

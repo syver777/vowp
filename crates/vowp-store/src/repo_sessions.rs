@@ -522,6 +522,29 @@ impl Store {
         Ok(natives)
     }
 
+    /// Returns the canonical session already mapped to a harness-side session id.
+    ///
+    /// The oldest mapping wins so a transcript importer keeps appending to the first
+    /// session it created for that uuid instead of starting a second one.
+    pub fn session_for_native(&self, harness: HarnessKind, native: &str) -> Result<Option<Session>, StoreError> {
+        let raw = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_COLUMNS} FROM main.sessions
+                     WHERE id = (
+                        SELECT session_id FROM main.session_natives
+                        WHERE harness = ?1 AND native_session_id = ?2
+                        ORDER BY created_at, first_seq, session_id LIMIT 1
+                     )"
+                ),
+                params![enum_to_text(&harness)?, native],
+                read_session_row,
+            )
+            .optional()?;
+        raw.map(session_from_row).transpose()
+    }
+
     /// Returns the most recent native session id for one harness, when recorded.
     pub fn native_for(&self, session: &SessionId, harness: HarnessKind) -> Result<Option<String>, StoreError> {
         let native = self

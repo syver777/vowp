@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vowp_protocol::Timestamp;
 
@@ -19,12 +20,25 @@ use crate::CoreError;
 use crate::surface::native::{TranscriptEntry, TranscriptKind};
 
 /// How far one importer pass has read into a transcript file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The cursor is serialised as JSON under the node's `watch:<native>` key, so a later
+/// pass reads only the suffix after the last complete line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportCursor {
     /// Byte offset of the first byte not yet read.
     pub offset: u64,
     /// App-side id of the last complete line read, when the line carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_uuid: Option<String>,
+}
+
+/// One complete transcript line and the entries it produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedLine {
+    /// The parsed JSON object.
+    pub value: Value,
+    /// Entries mapped from this line.
+    pub entries: Vec<TranscriptEntry>,
 }
 
 /// One importer pass.
@@ -34,6 +48,11 @@ pub struct ImportBatch {
     pub entries: Vec<TranscriptEntry>,
     /// Lines that were not JSON objects or had an unknown shape.
     pub skipped_lines: u64,
+    /// The parsed lines behind `entries`, in file order.
+    ///
+    /// The CLI keeps each line's raw JSON next to the events it appends; the mirror only
+    /// uses `entries`.
+    pub lines: Vec<ImportedLine>,
 }
 
 /// Reads complete transcript lines after `cursor.offset`, advances the cursor and maps them.
@@ -70,11 +89,15 @@ pub fn import_file(path: &Path, cursor: &mut ImportCursor) -> Result<ImportBatch
         let line = &bytes[position..end];
         let line_offset = start + position as u64;
         position = end + 1;
-        if let Some((entries, uuid)) = map_bytes(line, line_offset, &mut batch.skipped_lines) {
-            if uuid.is_some() {
-                cursor.last_uuid.clone_from(&uuid);
+        if let Some(mapped) = map_bytes(line, line_offset, &mut batch.skipped_lines) {
+            if mapped.uuid.is_some() {
+                cursor.last_uuid.clone_from(&mapped.uuid);
             }
-            batch.entries.extend(entries);
+            batch.lines.push(ImportedLine {
+                value: mapped.value,
+                entries: mapped.entries.clone(),
+            });
+            batch.entries.extend(mapped.entries);
         }
     }
     cursor.offset = start + position as u64;
@@ -95,14 +118,14 @@ pub fn scan_file(path: &Path) -> Result<Vec<TranscriptEntry>, CoreError> {
         let line = &bytes[position..end];
         let line_offset = position as u64;
         position = end + 1;
-        if let Some((mapped, _)) = map_bytes(line, line_offset, &mut skipped) {
-            entries.extend(mapped);
+        if let Some(mapped) = map_bytes(line, line_offset, &mut skipped) {
+            entries.extend(mapped.entries);
         }
     }
     if position < bytes.len() {
         let line = &bytes[position..];
-        if let Some((mapped, _)) = map_bytes(line, position as u64, &mut skipped) {
-            entries.extend(mapped);
+        if let Some(mapped) = map_bytes(line, position as u64, &mut skipped) {
+            entries.extend(mapped.entries);
         }
     }
     Ok(entries)
@@ -397,8 +420,33 @@ fn cost_entry(
     }
 }
 
-/// Parses one UTF-8 line and maps it; returns the entries and the line's uuid.
-fn map_bytes(line: &[u8], line_offset: u64, skipped: &mut u64) -> Option<(Vec<TranscriptEntry>, Option<String>)> {
+/// One parsed transcript line before it is added to an [`ImportBatch`].
+struct MappedLine {
+    value: Value,
+    entries: Vec<TranscriptEntry>,
+    uuid: Option<String>,
+}
+
+/// Returns the app-side id of one transcript line, when the line carries one.
+///
+/// Claude Code writes `uuid` on most lines; assistant lines may only carry
+/// `message.id`. The importer uses this value as the cursor's last-complete-line mark.
+pub fn line_uuid(value: &Value) -> Option<String> {
+    value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Parses one UTF-8 line and maps it; returns the parsed value, entries and line uuid.
+fn map_bytes(line: &[u8], line_offset: u64, skipped: &mut u64) -> Option<MappedLine> {
     let Ok(text) = std::str::from_utf8(line) else {
         *skipped += 1;
         return None;
@@ -415,24 +463,14 @@ fn map_bytes(line: &[u8], line_offset: u64, skipped: &mut u64) -> Option<(Vec<Tr
         *skipped += 1;
         return None;
     }
-    let uuid = value
-        .get("uuid")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            value
-                .get("message")
-                .and_then(|message| message.get("id"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
+    let uuid = line_uuid(&value);
     let fallback = format!("line-{line_offset}");
     let entries = entries_from_value(&value, &fallback);
     if entries.is_empty() {
         *skipped += 1;
         return None;
     }
-    Some((entries, uuid))
+    Some(MappedLine { value, entries, uuid })
 }
 
 /// Reads a timestamp from the line, accepting RFC 3339 text and Unix milliseconds.
@@ -477,4 +515,117 @@ fn u64_of(value: &Value, names: &[&str]) -> u64 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+
+    use serde_json::json;
+
+    use super::*;
+
+    /// A transcript line the importer maps to one user message.
+    fn user_line(uuid: &str, text: &str) -> serde_json::Value {
+        json!({
+            "type": "user",
+            "uuid": uuid,
+            "sessionId": "claude-session",
+            "message": {"role": "user", "content": text},
+        })
+    }
+
+    #[test]
+    fn import_file_reads_only_complete_lines() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        let first = serde_json::to_string(&user_line("u1", "hello")).expect("line");
+        std::fs::write(&path, format!("{first}\n")).expect("write first line");
+        let after_first = std::fs::metadata(&path).expect("metadata").len();
+
+        let mut cursor = ImportCursor::default();
+        let batch = import_file(&path, &mut cursor).expect("first import");
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.entries[0].text.as_deref(), Some("hello"));
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.lines[0].value["uuid"], "u1");
+        assert_eq!(cursor.offset, after_first);
+        assert_eq!(cursor.last_uuid.as_deref(), Some("u1"));
+
+        // A final line without its newline is not consumed, even when it is valid JSON.
+        let second = serde_json::to_string(&user_line("u2", "not yet")).expect("line");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open transcript");
+        file.write_all(second.as_bytes()).expect("write partial line");
+        file.flush().expect("flush");
+        drop(file);
+        let batch = import_file(&path, &mut cursor).expect("partial import");
+        assert!(batch.entries.is_empty(), "a partial line was imported");
+        assert_eq!(cursor.offset, after_first);
+        assert_eq!(cursor.last_uuid.as_deref(), Some("u1"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open transcript");
+        file.write_all(b"\n").expect("complete the line");
+        file.flush().expect("flush");
+        drop(file);
+        let batch = import_file(&path, &mut cursor).expect("completed import");
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.entries[0].text.as_deref(), Some("not yet"));
+        assert_eq!(cursor.last_uuid.as_deref(), Some("u2"));
+    }
+
+    #[test]
+    fn import_file_restarts_when_the_file_shrinks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        let first = serde_json::to_string(&user_line("u1", "one")).expect("line");
+        let second = serde_json::to_string(&user_line("u2", "two")).expect("line");
+        std::fs::write(&path, format!("{first}\n{second}\n")).expect("write transcript");
+
+        let mut cursor = ImportCursor::default();
+        let batch = import_file(&path, &mut cursor).expect("first import");
+        assert_eq!(batch.entries.len(), 2);
+
+        let shorter = serde_json::to_string(&user_line("u3", "restart")).expect("line");
+        std::fs::write(&path, format!("{shorter}\n")).expect("truncate transcript");
+        let batch = import_file(&path, &mut cursor).expect("import after truncation");
+        assert_eq!(batch.entries.len(), 1, "a shorter file must restart from zero");
+        assert_eq!(batch.entries[0].text.as_deref(), Some("restart"));
+        assert_eq!(cursor.last_uuid.as_deref(), Some("u3"));
+    }
+
+    #[test]
+    fn import_cursor_round_trips_through_json() {
+        let cursor = ImportCursor {
+            offset: 42,
+            last_uuid: Some("uuid-42".to_owned()),
+        };
+        let text = serde_json::to_string(&cursor).expect("serialise cursor");
+        assert_eq!(
+            serde_json::from_str::<ImportCursor>(&text).expect("parse cursor"),
+            cursor
+        );
+
+        let empty = ImportCursor::default();
+        let text = serde_json::to_string(&empty).expect("serialise empty cursor");
+        assert_eq!(
+            serde_json::from_str::<ImportCursor>(&text).expect("parse cursor"),
+            empty
+        );
+    }
+
+    #[test]
+    fn line_uuid_accepts_message_ids() {
+        let value = json!({
+            "type": "assistant",
+            "message": {"id": "msg_1", "content": []},
+        });
+        assert_eq!(line_uuid(&value).as_deref(), Some("msg_1"));
+        assert!(line_uuid(&json!({"type": "summary"})).is_none());
+    }
 }

@@ -45,7 +45,7 @@ const ACTIVE_STATES: [JobState; 6] = [
 /// Ordinary check failures are returned as a failed [`GuardResult`], not as an error, so the
 /// caller records the refusal. [`CoreError`] is reserved for infrastructure failures the
 /// caller cannot turn into evidence (for example an unreadable database).
-pub fn run_guard(deps: &Deps, _env: &EnvConfig, name: &str, checkout: &Path) -> Result<GuardResult, CoreError> {
+pub fn run_guard(deps: &Deps, env: &EnvConfig, name: &str, checkout: &Path) -> Result<GuardResult, CoreError> {
     let (base, custom) = match name.split_once(':') {
         Some((base, command)) => (base, Some(command)),
         None => (name, None),
@@ -58,7 +58,7 @@ pub fn run_guard(deps: &Deps, _env: &EnvConfig, name: &str, checkout: &Path) -> 
     let result = match base {
         "clean_tree" => clean_tree(deps, checkout),
         "head_equals_remote" => head_equals_remote(deps, checkout),
-        "build" => build(deps, checkout),
+        "build" => build(deps, env, checkout),
         "no_active_jobs" => no_active_jobs(deps)?,
         "upload_set" => failed(
             name,
@@ -117,14 +117,16 @@ fn head_equals_remote(deps: &Deps, checkout: &Path) -> GuardResult {
     }
 }
 
-/// Passes when the project's build/check commands succeed in the checkout.
+/// Passes when the environment's build commands succeed in the checkout.
 ///
-/// `EnvConfig` has no build command of its own; the guard uses `[merge].check_cmds` when set
-/// and falls back to `[project].check_cmds`, the same repo-wide checks the merge queue runs.
-/// A project that wants a different build command can configure `build:<command>`.
-fn build(deps: &Deps, checkout: &Path) -> GuardResult {
+/// `env.build` wins when set. An environment without build commands falls back to
+/// `[merge].check_cmds`, then `[project].check_cmds`, the same repo-wide checks the merge queue
+/// runs. A one-off project that wants a different command can still configure `build:<command>`.
+fn build(deps: &Deps, env: &EnvConfig, checkout: &Path) -> GuardResult {
     let config = &deps.config;
-    let commands = if config.merge.check_cmds.is_empty() {
+    let commands = if !env.build.is_empty() {
+        &env.build
+    } else if config.merge.check_cmds.is_empty() {
         &config.project.check_cmds
     } else {
         &config.merge.check_cmds

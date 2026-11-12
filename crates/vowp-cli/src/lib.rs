@@ -209,6 +209,11 @@ fn execute(cli: Cli, original_args: &[String], io: &mut dyn IoStreams) -> Result
     if let Command::Doctor(args) = &command {
         return cmd::doctor::run(&global, io, args);
     }
+    // `schema` prints static protocol types. It needs no project, `vowp.toml` or
+    // initialised home, so it runs before `Ctx::build` applies its "run vowp init" guard.
+    if let Command::Schema(args) = &command {
+        return cmd::schema::run(global.json, io, args);
+    }
     // Node-scoped commands run before `Ctx::build`: a v0.1 home cannot open its store
     // until `vowp migrate` (or `vowp up`'s automatic migration) has split it, and the
     // registry commands need no checkout at all.

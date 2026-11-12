@@ -9,6 +9,10 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 
+use crate::api::{
+    ApiError, ApiErrorBody, Board, BoardLimit, BoardRun, CostReport, CostRow, CostTotal, EventPage, Health,
+    InboxAnswerRequest, InboxPage, JobPage, NodePage, Page, SessionDetail, SessionPage, SessionSwitchRequest,
+};
 use crate::capacity::{
     BrakeState, CapacityAdvice, CapacityReport, CapacitySnapshot, CapacityTarget, HostSample, RunUsage,
     RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
@@ -121,6 +125,25 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("Tunnel", schema_value::<Tunnel>());
     schemas.insert("MigrationReport", schema_value::<MigrationReport>());
     schemas.insert("MigrationCount", schema_value::<MigrationCount>());
+    // v0.3 loopback HTTP API documents.
+    schemas.insert("Health", schema_value::<Health>());
+    schemas.insert("Board", schema_value::<Board>());
+    schemas.insert("BoardRun", schema_value::<BoardRun>());
+    schemas.insert("BoardLimit", schema_value::<BoardLimit>());
+    schemas.insert("Page", schema_value::<Page<serde_json::Value>>());
+    schemas.insert("JobPage", schema_value::<JobPage>());
+    schemas.insert("SessionPage", schema_value::<SessionPage>());
+    schemas.insert("NodePage", schema_value::<NodePage>());
+    schemas.insert("SessionDetail", schema_value::<SessionDetail>());
+    schemas.insert("EventPage", schema_value::<EventPage>());
+    schemas.insert("InboxAnswerRequest", schema_value::<InboxAnswerRequest>());
+    schemas.insert("SessionSwitchRequest", schema_value::<SessionSwitchRequest>());
+    schemas.insert("InboxPage", schema_value::<InboxPage>());
+    schemas.insert("CostReport", schema_value::<CostReport>());
+    schemas.insert("CostRow", schema_value::<CostRow>());
+    schemas.insert("CostTotal", schema_value::<CostTotal>());
+    schemas.insert("ApiError", schema_value::<ApiError>());
+    schemas.insert("ApiErrorBody", schema_value::<ApiErrorBody>());
     schemas
 }
 

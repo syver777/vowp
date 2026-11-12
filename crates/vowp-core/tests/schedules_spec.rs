@@ -56,32 +56,66 @@ fn cron_weekday_window() {
 
 #[test]
 fn interval_every_30m() {
-    let schedule = ScheduleSpec::parse(ScheduleSpecKind::Interval, "every 30m", "UTC").expect("interval");
+    let anchor = timestamp("2026-11-09T10:07:00Z");
+    let schedule = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "every 30m", "UTC", anchor).expect("interval");
     assert_eq!(
         schedule.next_after(timestamp("2026-11-09T10:07:00Z")),
-        Some(timestamp("2026-11-09T10:30:00Z"))
+        Some(timestamp("2026-11-09T10:37:00Z"))
     );
     assert_eq!(
-        schedule.next_after(timestamp("2026-11-09T10:30:00Z")),
-        Some(timestamp("2026-11-09T11:00:00Z"))
+        schedule.next_after(timestamp("2026-11-09T10:37:00Z")),
+        Some(timestamp("2026-11-09T11:07:00Z"))
     );
     assert_eq!(
         schedule.next_after(timestamp("2026-11-09T23:50:00Z")),
-        Some(timestamp("2026-11-10T00:00:00Z"))
+        Some(timestamp("2026-11-10T00:07:00Z"))
     );
 
-    let bare = ScheduleSpec::parse(ScheduleSpecKind::Interval, "30m", "UTC").expect("bare interval");
+    let bare = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "30m", "UTC", anchor).expect("bare interval");
     assert_eq!(
         bare.next_after(timestamp("2026-11-09T10:07:00Z")),
         schedule.next_after(timestamp("2026-11-09T10:07:00Z"))
     );
 
-    let too_short = ScheduleSpec::parse(ScheduleSpecKind::Interval, "every 30s", "UTC");
+    let too_short = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "every 30s", "UTC", anchor);
     assert!(matches!(too_short, Err(CoreError::Invalid(_))), "got {too_short:?}");
-    let zero = ScheduleSpec::parse(ScheduleSpecKind::Interval, "every 0m", "UTC");
+    let zero = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "every 0m", "UTC", anchor);
     assert!(matches!(zero, Err(CoreError::Invalid(_))), "got {zero:?}");
-    let nonsense = ScheduleSpec::parse(ScheduleSpecKind::Interval, "often", "UTC");
+    let nonsense = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "often", "UTC", anchor);
     assert!(matches!(nonsense, Err(CoreError::Invalid(_))), "got {nonsense:?}");
+}
+
+#[test]
+fn interval_preserves_anchor_seconds() {
+    let anchor = timestamp("2026-11-09T10:07:13Z");
+    let schedule = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "every 30m", "UTC", anchor).expect("interval");
+    assert_eq!(
+        schedule.next_after(timestamp("2026-11-09T10:07:13Z")),
+        Some(timestamp("2026-11-09T10:37:13Z"))
+    );
+    assert_eq!(
+        schedule.next_after(timestamp("2026-11-09T10:37:13Z")),
+        Some(timestamp("2026-11-09T11:07:13Z"))
+    );
+    // One second before the phase still lands on the phase, not the previous occurrence.
+    assert_eq!(
+        schedule.next_after(timestamp("2026-11-09T10:37:12Z")),
+        Some(timestamp("2026-11-09T10:37:13Z"))
+    );
+}
+
+#[test]
+fn interval_before_anchor_returns_anchor_plus_period() {
+    let anchor = timestamp("2026-11-09T10:07:00Z");
+    let schedule = ScheduleSpec::parse_at(ScheduleSpecKind::Interval, "every 30m", "UTC", anchor).expect("interval");
+    assert_eq!(
+        schedule.next_after(timestamp("2026-11-09T10:00:00Z")),
+        Some(timestamp("2026-11-09T10:37:00Z"))
+    );
+    assert_eq!(
+        schedule.next_after(timestamp("2026-11-08T10:00:00Z")),
+        Some(timestamp("2026-11-09T10:37:00Z"))
+    );
 }
 
 #[test]

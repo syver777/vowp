@@ -53,6 +53,7 @@ python3 docs/reference/check-reference.py
 | [`vowp session capsule`](#vowp-session-capsule) | Write a capsule now |
 | [`vowp session export`](#vowp-session-export) | Export a session bundle |
 | [`vowp session import`](#vowp-session-import) | Import a session bundle |
+| [`vowp session pull`](#vowp-session-pull) | Pull a session from another node |
 | [`vowp session watch`](#vowp-session-watch) | Record interactive Claude Code transcripts |
 | [`vowp session tail`](#vowp-session-tail) | Print a session's event log |
 | [`vowp session turn-begin`](#vowp-session-turn-begin) | Hidden: begin a remote turn and print its grant |
@@ -690,6 +691,7 @@ Commands:
   capsule  Write a capsule now
   export   Export a session bundle
   import   Import a session bundle
+  pull     Pull a session from another node
   watch    Record interactive Claude Code transcripts
   tail     Print a session's event log
 
@@ -880,6 +882,30 @@ Options:
       --cwd <DIR>            Working directory
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --same-id              Keep the bundle's session id; refuse when it already exists locally
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp session pull`
+
+```text
+Pull a session from another node
+
+Usage: vowp session pull [OPTIONS] <NODE> <SESSION>
+
+Arguments:
+  <NODE>     Node that owns the source session
+  <SESSION>  Source session id or unique prefix
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --same-id              Keep the source session id; refuse when it already exists locally
+      --full                 Copy the full session directory (log, blobs, capsules, adapters.json)
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
@@ -898,6 +924,7 @@ Options:
       --json                 Print one machine-readable JSON document on stdout
       --node <NAME>          Run the command on that node over ssh
       --once                 Scan once instead of following
+      --follow               Follow new transcript lines until interrupted
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
@@ -2360,7 +2387,7 @@ Options:
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --repository <PATH>    A repository path on the home to register; repeatable [alias: --repo]
-      --harness <NAME>       A harness the workers should use (`opencode`, `claude-code`); repeatable
+      --harness <NAME>       A harness the workers should use (`opencode`, `claude-code`, `acp`); repeatable
       --no-color             Disable colour even when stdout is a terminal
       --provider <NAME>      A provider name the chosen harnesses use; repeatable, never a key
   -q, --quiet                Suppress non-essential human output
@@ -2390,7 +2417,7 @@ Options:
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
       --repository <PATH>    A repository path on the home to register; repeatable [alias: --repo]
-      --harness <NAME>       A harness the workers should use (`opencode`, `claude-code`); repeatable
+      --harness <NAME>       A harness the workers should use (`opencode`, `claude-code`, `acp`); repeatable
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
       --provider <NAME>      A provider name the chosen harnesses use; repeatable, never a key
       --secret <NAME>        A secret name to check for; repeatable, never a value

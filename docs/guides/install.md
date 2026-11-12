@@ -1,6 +1,6 @@
 # Install
 
-VOWP 0.2 has two roles:
+VOWP 0.3 has two roles:
 
 | Role | What it is | What it owns |
 |---|---|---|
@@ -134,6 +134,22 @@ service for the whole home, and its `ExecStart` is `vowp up --foreground`.
 
 If you build with `cargo install` instead, the binary lands in `$CARGO_HOME/bin` (usually
 `~/.cargo/bin`); add that directory to `PATH` or pass `--root <dir>`.
+
+## The web window daemon
+
+The loopback web window and HTTP/SSE API are served by the separate `vowp-daemon` binary. The release
+archives and the npm package contain `vowp` only, so install the matching daemon when you want the
+window:
+
+```sh
+cargo install vowp-daemon --version 0.3.0 --locked
+vowp-daemon --help
+```
+
+`vowp up` looks for `vowp-daemon` next to the running `vowp` executable, then on `PATH`;
+`VOWP_DAEMON_BIN` overrides the lookup. A missing daemon is not fatal: the supervisor prints a warning
+and keeps running without the window. The daemon binds `127.0.0.1` on the home; reach it through the
+managed SSH tunnel that `vowp up` prints.
 
 ## Create the home without the setup command
 

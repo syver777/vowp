@@ -1,6 +1,6 @@
-# Agent setup contract — VOWP 0.2.0
+# Agent setup contract — VOWP 0.3.0
 
-> **Status: current — VOWP 0.2.0.** This is the contract the README prompt points to. The setup,
+> **Status: current — VOWP 0.3.0.** This is the contract the README prompt points to. The setup,
 > control, fleet, capacity, secret and verification commands described here are implemented. Nothing on
 > this page asks for, prints or stores a secret value.
 
@@ -14,7 +14,7 @@ you do not improvise around the plan.
 
 ## 1. What you are setting up
 
-VOWP 0.2 has one **home** and, usually, one **control machine**:
+VOWP 0.3 has one **home** and, usually, one **control machine**:
 
 | Term | Meaning in this contract |
 |---|---|
@@ -66,7 +66,7 @@ Confirm these before you ask the owner:
 
 - You can run commands on this computer.
 - `ssh` is available.
-- VOWP 0.2 documents Linux homes on `x86_64` or `arm64`; macOS is supported as a control machine. If
+- VOWP 0.3 documents Linux homes on `x86_64` or `arm64`; macOS is supported as a control machine. If
   the owner's target is something else, stop and ask.
 
 Once the owner gives you the target, key-only login must work:
@@ -85,7 +85,7 @@ Send one message. Keep the five numbered questions, but write them in the owner'
 style. Ask for **names**, not values.
 
 ```text
-I can set up VOWP 0.2.0 for you. Before I show you the plan, I need five answers:
+I can set up VOWP 0.3.0 for you. Before I show you the plan, I need five answers:
 
 1. Home SSH target. Which `user@host` (or `~/.ssh/config` alias) should I use for the VPS?
    You need to log in with an SSH key, not a password; I will check that without changing anything.
@@ -99,7 +99,7 @@ I can set up VOWP 0.2.0 for you. Before I show you the plan, I need five answers
 5. Control machine. Should this computer be a control machine (snapshot cache, tunnels and the
    orchestrator surface)? Default yes.
 
-If `vowp` is not already installed on this computer, I will install the pinned 0.2.0 binary
+If `vowp` is not already installed on this computer, I will install the pinned 0.3.0 binary
 under `~/.local/bin` (no service, no cron, no watchdog) so I can show you the plan. That is the
 only change before you approve the plan.
 ```
@@ -130,14 +130,14 @@ installs the per-user binary under `~/.local/bin`, and enables no service, no cr
 
 ```sh
 if ! command -v vowp >/dev/null 2>&1; then
-  curl -fsSL "https://raw.githubusercontent.com/syver777/vowp/v0.2.0/scripts/install.sh" \
-    | sh -s -- --download --version 0.2.0 --no-service --no-cron --no-watchdog
+  curl -fsSL "https://raw.githubusercontent.com/syver777/vowp/v0.3.0/scripts/install.sh" \
+    | sh -s -- --download --version 0.3.0 --no-service --no-cron --no-watchdog
 fi
 command -v vowp >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
 vowp --version
 ```
 
-The last command must print `vowp 0.2.0` for the version in the prompt. If it prints a different
+The last command must print `vowp 0.3.0` for the version in the prompt. If it prints a different
 version, stop and report the mismatch; do not continue with a mixed install. If the archive for this
 OS or architecture does not exist, stop and ask; do not build from an unrelated checkout.
 
@@ -151,7 +151,7 @@ Pass the answers as flags. `--target` is the home's SSH destination; it is **not
 
 ```sh
 vowp setup plan --target <ssh-target> \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --name <home-name> \
   --repository <path-on-the-home> \
   --harness opencode \
@@ -222,7 +222,7 @@ Show the full text plan, not a summary that hides a phase. Then add a short plai
 
 ```text
 This is the whole plan for <ssh-target>. It has <n> phases and will:
-- install VOWP 0.2.0 on the home;
+- install VOWP 0.3.0 on the home;
 - create the non-root `vowp` user if passwordless sudo is available, or use no-sudo mode;
 - create the home, the global database, the service and the vault (or basic secret mode);
 - register <repositories>;
@@ -255,7 +255,7 @@ available, and otherwise deliberately runs in no-sudo mode.
 
 ```sh
 vowp setup home --target <ssh-target> --apply --yes \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --name <home-name> \
   --repository <path-on-the-home> \
   --harness opencode \
@@ -391,7 +391,7 @@ Give the owner a short report in the chat. If they ask for a file, write it outs
 repository; never commit it.
 
 ```text
-VOWP 0.2.0 setup — <home name or ssh target>
+VOWP 0.3.0 setup — <home name or ssh target>
 
 Home: <host> (<os>/<arch>), home at <path>, supervisor: <running/stopped>
 Control: <this computer>, ~/.vowp-control, snapshot as of <time or "not verified">
@@ -532,4 +532,4 @@ amendment will align the two.
   systemd is available.
 - It does not edit the owner's databases, session logs or repositories. It never reads or prints a
   secret value; secret files move only through the documented secret store and upgrade path.
-- It does not create a second home. VOWP 0.2 has one home, and a control machine holds no truth.
+- It does not create a second home. VOWP 0.3 has one home, and a control machine holds no truth.

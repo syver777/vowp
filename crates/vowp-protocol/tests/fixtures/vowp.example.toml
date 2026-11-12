@@ -70,6 +70,7 @@ deploy = ["./scripts/deploy-work.sh"]
 
 [env.prod]
 checkout = "~/myapp-prod"              # fast-forward-only clone of main
+build = ["npm ci && npm run build"]    # the build guard runs these in the checkout (empty = merge/project check_cmds)
 deploy = ["vercel deploy --prod"]
 guards = ["clean_tree", "head_equals_remote", "build", "no_active_jobs"]
 approval = "human"                     # human | policy

@@ -445,6 +445,7 @@ for one provider ⇒ limits row `unavailable` for 15 min** (decisions.md D15).
 | claude-code | `result.total_cost_usd` + `result.usage` | `Cost::receipt(total_cost_usd, Tokens{input: usage.input_tokens, output: usage.output_tokens − thinking_tokens (clamped ≥ 0), reasoning: usage.output_tokens_details.thinking_tokens, cache_read: usage.cache_read_input_tokens, cache_write: usage.cache_creation_input_tokens})` (`output_tokens` already includes thinking tokens, so `Tokens::total()` equals the harness's own count). The figure is a **list-price equivalent**: on a subscription nothing is billed (`modelUsage.<m>.costBasis: "list"`). The `CostEvent` is still `source: Receipt`, and the ledger row's `detail_json` gets `{"billed": false, "basis": "list"}` (core sets it for `claude-code` runs; `RunSummary` has no field for it). |
 | opencode | each `step_finish.part.cost`, `.tokens` | one `CostEvent` per step; sums via `Cost::add`; `source: Receipt`. `reasoning` is separate from `output` in opencode tokens (some providers bill reasoning as output; core's totals count both). |
 | cli | `[cost]` pointers | `Receipt` if `usd_pointer` yields a number, else `Unknown` (usd `None`). |
+| acp | `session/prompt` result `usage` | one `CostEvent` at turn end with `Cost { usd: None, tokens, source: Unknown }`; the server reports tokens, not a price. `Tokens` reads `inputTokens`, `outputTokens`, `thoughtTokens`/`reasoningTokens`, `cachedReadTokens` and `cachedWriteTokens`. A result without usage stays `Cost::unknown()`. |
 | none seen | — | `Cost::unknown()` (never zero). A run that ended without any receipt (crash before `result`/`step_finish`) is `Unknown`. |
 
 **Price-table fallback is not computed in adapters.** Core (`ledger`) turns `Unknown` into `PriceTable` when a `[providers.<p>.prices.<model>]` entry exists and token counts are non-zero.
@@ -467,6 +468,7 @@ Cheap, never calls a model, ≤ 5 s (`wait` with a poll loop; kill after 5 s).
 | claude-code | `<binary> --version` | stdout like `2.1.319 (Claude Code)` → regex `(\d+\.\d+\.\d+)`; `ok = exit==0 && version.is_some()`; `path` = resolved binary |
 | opencode | `<binary> --version` | stdout like `2.0.28` → same regex |
 | cli | `mapping.version_argv` | `ok = exit == 0`; `version` = first regex match or first line (≤ 80 chars) |
+| acp | no process probe: resolve `[harnesses.acp].binary`, else `claude-code-acp` on `PATH` | `ok = found and executable`; `version = None` (a `--version` call would wait on JSON-RPC stdin) |
 
 Missing binary → `ProbeResult{ok:false, version:None, path:None, detail:"binary not found on PATH"}`. `probe()` never returns `Err`.
 
@@ -511,9 +513,121 @@ Fake harness scripts (POSIX `sh`, executable, in `tests/fakes/`): `fake-claude.s
 
 Tests set `ClaudeConfig.binary` / `OpencodeConfig.binary` / the mapping `argv[0]` to the fake script. They never reach the real `claude`/`opencode`.
 
+The ACP fake is `tests/fakes/fake_acp.py` (Python 3, executable, no network). It speaks the
+pinned subset from §10 and reads:
+`FAKE_ACP_MODE` ∈ {`ok`, `empty`, `no-result`, `malformed`, `unknown-method`, `permission`, `quota`,
+`hang`}, `FAKE_ACP_LOG` (JSONL of every client message and its argv) and `FAKE_ACP_CHILD_PID`
+(hang mode writes a spawned child pid here, for the process-group test). It never calls a model,
+a real ACP server or the network.
+
 ### 9.1 Test index (names are defined in `crates/vowp-adapters.md` §9; summary)
 
 - classify: every row of §2.3 and §3.3 table, `parse_reset_time` examples of §5.2, redaction, precedence, status shortcuts, exit gating (talks-about-limit with exit 0 is Ok).
 - claude: fixtures → expected event sequences; argv recorded by the fake equals §2.1 exactly (prompt absent from argv, present on stdin); `--resume`/`--session-id`; `rate_limit_event` rejected → Limit with `resets_at`; stop/interrupt kills the process group (child pid dead).
 - opencode: fixtures → events (one `tool_use` → 2 events), cost sums over steps, error classes, argv equals §3.1 (prompt last), session id captured; silent hang then `stop()`.
 - cli: mapping validation errors (each rule in §4.2), both examples run through fakes, resume substitution, text chunking.
+- acp: the fake performs `initialize`/`session/new`/`session/prompt`; event order is `tool.call` → `tool.result` → `tool.call` → `tool.result` → `file.change` → `plan` → one accumulated `assistant.message` → `cost` (tokens, `Unknown`) → one `turn.ended`; the request log asserts the handshake and prompt; a permission request is answered `cancelled` (no option id) and maps to `note` + `Error{Refused}`; an exit without a result, malformed JSON, an unknown method and a JSON-RPC quota error all finish with a classified summary; `stop()` kills the process group.
+
+---
+
+## 10. ACP adapter (`AcpAdapter`, v0.2 first slice)
+
+Status: **first slice implemented**. It drives a fake ACP server through one prompt and the
+adapter-contract tests above; real ACP servers, native resume, a permission UI, live pause and
+streaming chunk events are **not** implemented. The design note is
+[`v0.2/acp-adapter.md`](v0.2/acp-adapter.md).
+
+### 10.1 Protocol pin and argv
+
+Agent Client Protocol revision **1**, JSON-RPC 2.0 over the child's stdin/stdout. One process per
+run = one prompt = one turn.
+
+```
+<binary> [<extra_args>...]
+```
+
+- Binary: `[harnesses.acp].binary`, default `claude-code-acp` on `PATH`. `probe()` only resolves
+  the executable; it does not run a `--version` command because an ACP server waits on JSON-RPC
+  stdin.
+- The adapter sends `initialize` (id 1) with `protocolVersion: 1`, empty
+  `clientCapabilities` (no `fs`, no terminal — VOWP never reads or writes the server's files) and
+  `clientInfo {name: "vowp", version: <crate version>}`.
+- Then `session/new` (id 2) with the run `cwd` and `mcpServers: []`, recording the result's
+  `sessionId` as `RunSummary.native_session_id`.
+- Then `session/prompt` (id 3) with one `{type:"text", text}` content block. ACP returns the
+  agent's streamed `session/update` notifications on the same stdout before the prompt response.
+- `resume` is ignored: `can_resume_native` is false, so core never passes one. The prompt already
+  appears in the log as the core-owned `user.message`; adapters never emit framing or user
+  events.
+
+### 10.2 Event mapping (pinned subset)
+
+| ACP signal | Emits |
+|---|---|
+| `session/update` `agent_message_chunk` with a `text` content block | no event; chunks accumulate and become **one** `assistant.message` at turn end |
+| `session/update` `tool_call` | `tool.call{call_id: toolCallId, name: kind (else title, else "tool"), input: rawInput}` on first sight |
+| `session/update` `tool_call_update` with `status: completed\|failed` | `tool.result{call_id, ok, output: rawOutput (else joined content/newText blocks), exit_code: rawOutput.exitCode}`; then `file.change{path, op}` for `kind` `edit` (Modify), `delete` (Delete) or `move` (Rename) when `locations[0].path` or `rawInput.path/filePath/file_path` is present. A `tool_call` that already carries a completion status emits the call, result and change in that order. |
+| `session/update` `plan` | `plan{items: [{text: content, status: pending\|in_progress\|completed → Pending\|InProgress\|Done}]}`; `priority` is ignored |
+| `session/update` `agent_thought_chunk`, `available_commands_update`, `current_mode_update`, `usage_update`, … | ignored; the first slice reports no reasoning and does not invent a price from context-window use |
+| `session/prompt` result `usage` | one `cost` event at turn end: `Cost {usd: None, tokens, source: Unknown}` (§6) |
+| `session/prompt` result `stopReason: end_turn` | `turn.ended{EndTurn}`, outcome `Ok` |
+| `… max_tokens` / `… max_turn_requests` | `turn.ended{MaxTurns}`, outcome `Ok` (the harness said so; L2 handles a missing report) |
+| `… refusal` | `turn.ended{EndTurn}`, outcome `Ok` (the model completed the turn by refusing) |
+| `… cancelled` (not caused by VOWP) | `turn.ended{Interrupted}`, outcome `Killed` |
+| `session/request_permission` | §10.3 |
+
+The adapter emits exactly one terminal `turn.ended` on every exit path. It never emits
+`session.executor`, `turn.started` or `user.message`; core owns that framing. `raw` follows §7 for
+tool calls/results, errors and limits.
+
+### 10.3 Permission rule
+
+A `session/request_permission` request is **never auto-approved**. The adapter:
+
+1. emits `note` ("ACP permission requested for <title>; VOWP does not answer permission dialogs")
+   and `error{kind: refused, retryable: false}`;
+2. answers the JSON-RPC request with `{"outcome":{"outcome":"cancelled"}}` — no `optionId` is
+   selected, and no keystroke is sent;
+3. finishes the turn as `Error`/`StopReason::Error` with the one `turn.ended`, without waiting
+   for a prompt result the server may never send. The pending permission cannot resume the same
+   turn; the inbox-approval fallback from the design note is **planned**, not implemented.
+
+### 10.4 Failure handling and process
+
+- A server that closes stdout without a prompt result, sends malformed JSON, an unknown method
+  (notification or request; a request also gets JSON-RPC `-32601`) or a JSON-RPC error response
+  produces a classified failed summary — never a hang. The error event precedes `turn.ended`.
+  Stderr (4 KiB tail) and non-JSON stdout are passed to `classify_text`; a classified class
+  yields the matching `LimitEvent`/outcome, otherwise the failure is `Error` with stop reason
+  `Crash` for a missing result or `Error` for a JSON-RPC error.
+- The child runs in its own process group with stdin/stdout/stderr piped. Stdout lines are teed
+  raw to `event_log_hint` before parsing and capped at 4 MiB; stderr is teed to
+  `<event_log_hint>.err`. `stop()` sends SIGTERM to the group, waits 3 s, then SIGKILL;
+  `interrupt()` sends SIGINT and escalates after 5 s; `StartInput.timeout` does the same through
+  a watchdog. After a prompt result the driver closes stdin, waits 2 s, then TERM/KILL, so a
+  server that keeps waiting on stdin does not keep the run alive.
+- The first slice does **not** write the `<run-id>.usage.json` process-measurement sidecar that
+  `proc::RunHandle` writes; capacity sampling therefore has no usage row for an ACP run until
+  that is added.
+
+### 10.5 Capabilities
+
+```rust
+AdapterCapabilities {
+    can_resume_native: false,
+    can_inject_assistant_history: false,
+    can_switch_model_in_session: false,
+    live_input: false,
+    emits_reasoning: false,
+    emits_cost_receipts: false,
+    reports_resets_at: false,
+}
+```
+
+### 10.6 Tests
+
+`crates/vowp-adapters/tests/acp.rs` against `tests/fakes/fake_acp.py`: clean event order and
+request log, accumulated message, tool call/result/file change, plan, tokens-only cost, clean
+stop reason, permission refusal with no approval option, exit-without-result, malformed JSON,
+unknown method (+ `-32601`), a JSON-RPC quota error, `stop()` killing the process group, extra
+args, probe and capabilities.

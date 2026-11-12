@@ -25,11 +25,11 @@ thiserror = "2.0.21"
 time = "0.3.45"
 toml = "1.2.1"
 ulid = "3.0.0"
-vowp-adapters = { version = "0.2.0", path = "../vowp-adapters" }
-vowp-graph = { version = "0.2.0", path = "../vowp-graph" }
-vowp-protocol = { version = "0.2.0", path = "../vowp-protocol" }
-vowp-store = { version = "0.2.0", path = "../vowp-store" }
-vowp-tmux = { version = "0.2.0", path = "../vowp-tmux" }
+vowp-adapters = { version = "0.3.0", path = "../vowp-adapters" }
+vowp-graph = { version = "0.3.0", path = "../vowp-graph" }
+vowp-protocol = { version = "0.3.0", path = "../vowp-protocol" }
+vowp-store = { version = "0.3.0", path = "../vowp-store" }
+vowp-tmux = { version = "0.3.0", path = "../vowp-tmux" }
 
 [lints]
 workspace = true

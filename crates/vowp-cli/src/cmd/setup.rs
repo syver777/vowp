@@ -46,7 +46,7 @@ pub struct SetupAnswerArgs {
     /// A repository path on the home to register; repeatable.
     #[arg(long = "repository", visible_alias = "repo", value_name = "PATH")]
     pub repositories: Vec<String>,
-    /// A harness the workers should use (`opencode`, `claude-code`); repeatable.
+    /// A harness the workers should use (`opencode`, `claude-code`, `acp`); repeatable.
     #[arg(long = "harness", value_name = "NAME")]
     pub harnesses: Vec<String>,
     /// A provider name the chosen harnesses use; repeatable, never a key.

@@ -52,6 +52,7 @@ CRATES=(
   vowp-tmux
   vowp-adapters
   vowp-core
+  vowp-daemon
   vowp-cli
 )
 

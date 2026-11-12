@@ -113,7 +113,23 @@ enum Drain {
 
 /// Runs the switch protocol for `req`; the target is attached idle.
 pub fn run_switch(deps: &Deps, req: &SwitchRequest, cancel: &CancelToken) -> Result<Switch, CoreError> {
-    run_switch_inner(deps, req, None, cancel, &SystemSleeper)
+    let store = deps.open_store()?;
+    run_switch_with_store(deps, &store, req, cancel)
+}
+
+/// Runs the switch protocol over an already-open store.
+///
+/// The caller owns the connection: the daemon opens the home writable with
+/// [`vowp_store::Store::open_writable`] so a switch can never create or migrate it. The
+/// store must be bound to the same project and [`NodePaths`](vowp_store::NodePaths) as
+/// `deps`; the session log, capsule and index rows are written through that home.
+pub fn run_switch_with_store(
+    deps: &Deps,
+    store: &Store,
+    req: &SwitchRequest,
+    cancel: &CancelToken,
+) -> Result<Switch, CoreError> {
+    run_switch_inner(deps, store, req, None, cancel, &SystemSleeper)
 }
 
 /// Runs the switch protocol with an injected sleeper for the drain waits.
@@ -126,7 +142,8 @@ pub fn run_switch_with_sleeper(
     cancel: &CancelToken,
     sleeper: &dyn DrainSleeper,
 ) -> Result<Switch, CoreError> {
-    run_switch_inner(deps, req, None, cancel, sleeper)
+    let store = deps.open_store()?;
+    run_switch_inner(deps, &store, req, None, cancel, sleeper)
 }
 
 /// Runs the switch protocol and starts the first turn on the target with a seed.
@@ -140,12 +157,14 @@ pub fn run_switch_with_input(
     next_input: &str,
     cancel: &CancelToken,
 ) -> Result<Switch, CoreError> {
-    run_switch_inner(deps, req, Some(next_input), cancel, &SystemSleeper)
+    let store = deps.open_store()?;
+    run_switch_inner(deps, &store, req, Some(next_input), cancel, &SystemSleeper)
 }
 
 /// Shared implementation of the pure and seeded switch protocols.
 fn run_switch_inner(
     deps: &Deps,
+    store: &Store,
     req: &SwitchRequest,
     next_input: Option<&str>,
     cancel: &CancelToken,
@@ -154,7 +173,6 @@ fn run_switch_inner(
     if cancel.is_cancelled() {
         return Err(CoreError::Cancelled);
     }
-    let store = deps.open_store()?;
     let session = store.require_session(&req.session_id)?;
     if session.state == SessionState::Switching {
         return Err(CoreError::Store(vowp_store::StoreError::Conflict(
@@ -198,7 +216,7 @@ fn run_switch_inner(
     let result = (|| -> Result<(SessionState, Option<vowp_protocol::CapsuleId>), CoreError> {
         // A local target is probed through its adapter. A remote target is probed over SSH
         // with `vowp doctor --json`; the local registry cannot see the executor's harness.
-        let probe = match probe_target(deps, &store, &to_node, req.to.node.is_some(), &req.to.executor) {
+        let probe = match probe_target(deps, store, &to_node, req.to.node.is_some(), &req.to.executor) {
             Ok(probe) => probe,
             Err(error) => vowp_protocol::ProbeResult {
                 ok: false,
@@ -211,7 +229,7 @@ fn run_switch_inner(
             let detail = format!("target probe failed: {}", probe.detail);
             return Err(abort(
                 deps,
-                &store,
+                store,
                 &switch,
                 previous_state,
                 previous_executor.as_ref(),
@@ -222,8 +240,8 @@ fn run_switch_inner(
             ));
         }
 
-        if is_active(&store, &session)? {
-            match drain(deps, &store, &session, req.drain_secs, cancel, sleeper) {
+        if is_active(store, &session)? {
+            match drain(deps, store, &session, req.drain_secs, cancel, sleeper) {
                 Ok(Drain::Finished { blocked }) => {
                     previous_state = if blocked {
                         SessionState::Blocked
@@ -235,7 +253,7 @@ fn run_switch_inner(
                 Err(CoreError::Cancelled) => {
                     let _ = abort(
                         deps,
-                        &store,
+                        store,
                         &switch,
                         previous_state,
                         previous_executor.as_ref(),
@@ -250,7 +268,7 @@ fn run_switch_inner(
                     let detail = error.to_string();
                     let _ = abort(
                         deps,
-                        &store,
+                        store,
                         &switch,
                         previous_state,
                         previous_executor.as_ref(),
@@ -270,7 +288,7 @@ fn run_switch_inner(
                 Some(previous) => {
                     let log = SessionLog::open(&deps.paths, &req.session_id, deps.clock.clone())?;
                     append_event(
-                        &store,
+                        store,
                         &log,
                         HarnessKind::Vowp,
                         EventBody::Note(vowp_protocol::Note {
@@ -285,7 +303,7 @@ fn run_switch_inner(
                 None => {
                     return Err(abort(
                         deps,
-                        &store,
+                        store,
                         &switch,
                         previous_state,
                         previous_executor.as_ref(),
@@ -300,7 +318,7 @@ fn run_switch_inner(
         // The service path redacts after the writer returns; this direct switch path must
         // do the same or the capsule file and row keep the value the writer just drafted.
         let capsule = match capsule {
-            Some(capsule) => Some(crate::vault::redact_capsule(deps, &store, &capsule)?),
+            Some(capsule) => Some(crate::vault::redact_capsule(deps, store, &capsule)?),
             None => None,
         };
         let capsule_id = capsule.as_ref().map(|capsule| capsule.capsule_id.clone());
@@ -308,7 +326,7 @@ fn run_switch_inner(
         let log = SessionLog::open(&deps.paths, &req.session_id, deps.clock.clone())?;
         if let Some(source) = &previous_executor {
             append_event(
-                &store,
+                store,
                 &log,
                 source.harness,
                 EventBody::SessionExecutor(SessionExecutor {
@@ -335,15 +353,15 @@ fn run_switch_inner(
                 let tail = tail_of_complete_turns(&events, deps.config.capsule.tail_turns);
                 let seeded = seed_prompt(capsule, &tail, deps.config.capsule.tail_turns, input);
                 let capsule_only = seed_prompt(capsule, &[], deps.config.capsule.tail_turns, input);
-                match run_target_turn(deps, &store, &log, &session, &to, seeded) {
+                match run_target_turn(deps, store, &log, &session, &to, seeded) {
                     Ok(state) => final_state = state,
-                    Err(first) => match run_target_turn(deps, &store, &log, &session, &to, capsule_only) {
+                    Err(first) => match run_target_turn(deps, store, &log, &session, &to, capsule_only) {
                         Ok(state) => final_state = state,
                         Err(second) => {
                             drop(log);
                             return Err(abort(
                                 deps,
-                                &store,
+                                store,
                                 &switch,
                                 previous_state,
                                 previous_executor.as_ref(),
@@ -358,7 +376,7 @@ fn run_switch_inner(
             }
             None => {
                 append_event(
-                    &store,
+                    store,
                     &log,
                     req.to.executor.harness,
                     EventBody::SessionExecutor(SessionExecutor {
@@ -377,7 +395,7 @@ fn run_switch_inner(
         }
 
         append_event(
-            &store,
+            store,
             &log,
             req.to.executor.harness,
             EventBody::Switch(SwitchEvent {
@@ -418,7 +436,7 @@ fn run_switch_inner(
                 let detail = error.to_string();
                 let _ = abort(
                     deps,
-                    &store,
+                    store,
                     &switch,
                     previous_state,
                     previous_executor.as_ref(),
@@ -1386,6 +1404,7 @@ fn harness_config<'a>(deps: &'a Deps, executor: &Executor) -> Option<&'a vowp_pr
     let key = match executor.harness {
         HarnessKind::ClaudeCode => "claude-code",
         HarnessKind::Opencode => "opencode",
+        HarnessKind::Acp => "acp",
         HarnessKind::Cli => executor.model.as_str(),
         HarnessKind::Vowp => return None,
     };
@@ -1405,4 +1424,314 @@ fn start_env(deps: &Deps, executor: &Executor) -> Vec<(String, String)> {
         .iter()
         .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::mpsc::{Receiver, channel};
+    use std::sync::{Arc, Mutex};
+
+    use vowp_protocol::{
+        Adapter, AdapterCapabilities, AdapterError, AdapterRun, AssistantMessage, Cost, EventBody, FakeClock,
+        HarnessEvent, MemoryLog, ProbeResult, RunOutcome, RunSummary, Session, StartInput, StopReason,
+    };
+    use vowp_tmux::fake::FakeWindows;
+
+    use super::*;
+    use crate::deps::{AdapterRegistry, FixedRng, SystemGit, SystemRunner};
+    use crate::session::service::SessionService;
+
+    /// Fixed instant for every unit-test row and log line.
+    fn ts() -> Timestamp {
+        Timestamp::parse("2026-11-08T18:00:00Z").expect("test timestamp")
+    }
+
+    /// The source and keeper executor used by the success fixture.
+    fn opencode() -> Executor {
+        Executor::parse("opencode:deepseek/deepseek-flash#max").expect("opencode executor")
+    }
+
+    /// The switch target used by the success fixture.
+    fn claude() -> Executor {
+        Executor::parse("claude-code:claude-sonnet-5-5@medium").expect("claude executor")
+    }
+
+    /// Returns a valid capsule draft the fake keeper adapter replays.
+    fn draft_json() -> String {
+        serde_json::json!({
+            "intent": "carry the switch work over",
+            "constraints": [],
+            "decisions": [],
+            "state": {"done": ["work"], "in_progress": [], "blocked": [], "next_steps": ["continue"]},
+            "files": [],
+            "gotchas": [],
+            "open_questions": []
+        })
+        .to_string()
+    }
+
+    /// Builds a hermetic [`Deps`] over `root` with the supplied fake adapters.
+    fn test_deps(root: &Path, registry: AdapterRegistry) -> Deps {
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let mut config = vowp_protocol::VowpConfig::with_defaults_for_tests();
+        config.project.path = Some(project.display().to_string());
+        let cmd: Arc<dyn crate::deps::CommandRunner> = Arc::new(SystemRunner);
+        Deps {
+            paths: vowp_store::NodePaths::new(root.join("node")),
+            config: Arc::new(config),
+            node: NodeName::parse("local").expect("node name"),
+            clock: Arc::new(FakeClock::at(ts())),
+            log: Arc::new(MemoryLog::new()),
+            adapters: Arc::new(registry),
+            windows: Arc::new(FakeWindows::new()),
+            git: Arc::new(SystemGit::new(Arc::clone(&cmd))),
+            cmd,
+            rng: Arc::new(FixedRng(0)),
+        }
+    }
+
+    /// A fake harness that probes successfully and replays fixed events.
+    struct FakeAdapter {
+        kind: HarnessKind,
+        events: Vec<HarnessEvent>,
+        summary: RunSummary,
+        probe: ProbeResult,
+        starts: Arc<Mutex<Vec<StartInput>>>,
+    }
+
+    impl FakeAdapter {
+        fn new(kind: HarnessKind, events: Vec<HarnessEvent>) -> Self {
+            Self {
+                kind,
+                events,
+                summary: RunSummary {
+                    exit_code: Some(0),
+                    outcome: RunOutcome::Ok,
+                    native_session_id: None,
+                    cost: Cost::unknown(),
+                    limit: None,
+                    result_text: None,
+                    stop_reason: StopReason::EndTurn,
+                },
+                probe: ProbeResult {
+                    ok: true,
+                    version: Some("fake-1.0".to_owned()),
+                    path: None,
+                    detail: "fake adapter".to_owned(),
+                },
+                starts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn capsule(kind: HarnessKind) -> Self {
+            Self::new(
+                kind,
+                vec![HarnessEvent {
+                    ts: Some(ts()),
+                    actor: Actor::Assistant,
+                    body: EventBody::AssistantMessage(AssistantMessage { text: draft_json() }),
+                    raw: None,
+                }],
+            )
+        }
+    }
+
+    impl Adapter for FakeAdapter {
+        fn kind(&self) -> HarnessKind {
+            self.kind
+        }
+
+        fn probe(&self) -> ProbeResult {
+            self.probe.clone()
+        }
+
+        fn capabilities(&self) -> AdapterCapabilities {
+            AdapterCapabilities::default()
+        }
+
+        fn start(&self, input: StartInput) -> Result<Box<dyn AdapterRun>, AdapterError> {
+            self.starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(input);
+            let (sender, receiver) = channel();
+            for event in &self.events {
+                let _ = sender.send(event.clone());
+            }
+            drop(sender);
+            Ok(Box::new(FakeRun {
+                receiver,
+                summary: self.summary.clone(),
+            }))
+        }
+    }
+
+    /// One replayed fake run.
+    struct FakeRun {
+        receiver: Receiver<HarnessEvent>,
+        summary: RunSummary,
+    }
+
+    impl AdapterRun for FakeRun {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+
+        fn events(&self) -> &Receiver<HarnessEvent> {
+            &self.receiver
+        }
+
+        fn send(&mut self, _text: &str) -> Result<(), AdapterError> {
+            Err(AdapterError::Unsupported("fake adapter has no live input"))
+        }
+
+        fn interrupt(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> Result<RunSummary, AdapterError> {
+            Ok(self.summary.clone())
+        }
+    }
+
+    /// Builds one switch request.
+    fn request(session: &SessionId, to: Executor) -> SwitchRequest {
+        SwitchRequest {
+            session_id: session.clone(),
+            to: ExecutorRef {
+                executor: to,
+                node: None,
+            },
+            reason: vowp_protocol::SwitchReason::User,
+            drain_secs: 5,
+        }
+    }
+
+    /// Builds a stored session row without opening a store.
+    fn session_row(id: &SessionId, state: SessionState, executor: Executor) -> Session {
+        Session {
+            id: id.clone(),
+            project: None,
+            job_id: None,
+            role: None,
+            title: "switch unit".to_owned(),
+            parent_session_id: None,
+            node: NodeName::parse("local").expect("node name"),
+            cwd: "/tmp".to_owned(),
+            state,
+            executor: Some(executor),
+            last_seq: 0,
+            last_capsule_id: None,
+            log_bytes: 0,
+            created_at: ts(),
+            updated_at: ts(),
+        }
+    }
+
+    #[test]
+    fn switch_with_store_guards_from_the_supplied_store_without_opening_deps() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store_paths = vowp_store::NodePaths::new(tmp.path().join("store"));
+        let store = Store::open(&store_paths).expect("supplied store");
+        let closed = SessionId::new();
+        store
+            .upsert_session(&session_row(&closed, SessionState::Closed, opencode()))
+            .expect("closed session row");
+        let deps = test_deps(
+            &tmp.path().join("deps"),
+            AdapterRegistry::new().with(
+                "claude-code",
+                Arc::new(FakeAdapter::new(HarnessKind::ClaudeCode, Vec::new())),
+            ),
+        );
+
+        let error = run_switch_with_store(&deps, &store, &request(&closed, claude()), &CancelToken::default())
+            .expect_err("a closed session must not switch");
+        assert!(
+            matches!(&error, CoreError::Invalid(message) if message.contains("closed")),
+            "unexpected guard error: {error}"
+        );
+
+        let unknown = SessionId::new();
+        let error = run_switch_with_store(&deps, &store, &request(&unknown, claude()), &CancelToken::default())
+            .expect_err("an unknown session must not switch");
+        assert!(
+            matches!(
+                &error,
+                CoreError::Store(vowp_store::StoreError::NotFound { what: "session", .. })
+            ),
+            "unexpected unknown-session error: {error}"
+        );
+
+        assert!(
+            !deps.paths.root().exists(),
+            "the store-injected guard path created the deps home"
+        );
+    }
+
+    #[test]
+    fn switch_with_store_completes_on_the_supplied_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let deps = test_deps(
+            tmp.path(),
+            AdapterRegistry::new()
+                .with("opencode", Arc::new(FakeAdapter::capsule(HarnessKind::Opencode)))
+                .with(
+                    "claude-code",
+                    Arc::new(FakeAdapter::new(HarnessKind::ClaudeCode, Vec::new())),
+                ),
+        );
+        let service = SessionService::new(deps.clone());
+        let session = service
+            .create_session(vowp_protocol::NewSession {
+                project: None,
+                job_id: None,
+                role: vowp_protocol::SessionRole::Worker,
+                title: "store-injected switch".to_owned(),
+                cwd: tmp.path().join("project"),
+                parent: None,
+                executor: Some(opencode()),
+            })
+            .expect("create session");
+        let store = deps.open_store().expect("supplied store");
+
+        let switch = service
+            .switch_with_store(&store, &request(&session, claude()))
+            .expect("switch over the supplied store");
+
+        assert_eq!(switch.state, SwitchState::Completed);
+        assert_eq!(switch.from_executor, Some(opencode()));
+        assert_eq!(switch.to_executor, claude());
+        assert!(switch.error.is_none());
+        assert!(switch.capsule_id.is_some(), "the switch records a capsule");
+        assert!(switch.ended_at.is_some());
+
+        let row = store
+            .switch(&switch.id)
+            .expect("switch row")
+            .expect("switch row exists");
+        assert_eq!(row.state, SwitchState::Completed);
+        assert_eq!(row.to_executor, claude());
+
+        let current = store.require_session(&session).expect("session row");
+        assert_eq!(current.executor, Some(claude()));
+        assert_eq!(current.state, SessionState::Idle);
+
+        let events = SessionLog::open_read(&deps.paths, &session)
+            .expect("session log")
+            .read_all()
+            .expect("stored events");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.body(), Ok(EventBody::Switch(payload)) if payload.to.executor == claude())),
+            "the switch event was not appended"
+        );
+    }
 }

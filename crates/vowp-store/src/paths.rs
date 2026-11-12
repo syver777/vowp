@@ -107,6 +107,14 @@ impl NodePaths {
         self.session_dir(id).join("adapters.json")
     }
 
+    /// Returns `<root>/sessions/<id>/manifest.json`.
+    ///
+    /// The file is written only by a full directory pull; `reindex` ignores it. A session
+    /// directory without one is an ordinary local session.
+    pub fn session_manifest_path(&self, id: &SessionId) -> PathBuf {
+        self.session_dir(id).join("manifest.json")
+    }
+
     /// Returns `<root>/logs` (supervisor log and other process output).
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")

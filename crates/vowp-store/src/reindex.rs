@@ -8,6 +8,7 @@
 //! `sessions` and `switches` rows. It never deletes capsule rows: `switches.capsule_id`
 //! points at them and must survive a reindex.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -203,6 +204,7 @@ fn reindex_session(
             .push(format!("session {id}: torn tail ({} bytes)", file_len - last_end));
     }
 
+    check_event_id_collisions(store, id, &events)?;
     let Some((created, created_ts)) = first_session_created(&events) else {
         report
             .problems
@@ -324,6 +326,40 @@ fn reindex_session(
     })?;
 
     Ok(Some(counts))
+}
+
+/// Rejects event ids repeated in this log or already owned by another session.
+///
+/// `session_events.id` is unique across the index, so a duplicate would otherwise surface
+/// as a raw SQLite constraint failure mid-transaction. The check runs before the delete
+/// and insert step, which keeps a rejected reindex from touching the existing rows.
+fn check_event_id_collisions(store: &Store, id: &SessionId, events: &[IndexedEvent]) -> Result<(), StoreError> {
+    let mut seen = HashSet::new();
+    for event in events {
+        if !seen.insert(event.envelope.id.clone()) {
+            return Err(StoreError::Conflict(format!(
+                "session {id}: duplicate event id {} in the log",
+                event.envelope.id
+            )));
+        }
+    }
+    let mut statement = store
+        .conn
+        .prepare("SELECT session_id FROM main.session_events WHERE id = ?1")?;
+    for event in events {
+        let owner: Option<String> = statement
+            .query_row([event.envelope.id.as_str()], |row| row.get(0))
+            .optional()?;
+        if let Some(owner) = owner
+            && owner != id.as_str()
+        {
+            return Err(StoreError::Conflict(format!(
+                "session {id}: event id {} already belongs to session {owner}",
+                event.envelope.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Finds the first `session.created` event and its timestamp.
@@ -608,4 +644,136 @@ fn insert_missing_switch(
 /// Converts an unsigned counter to the signed integer SQLite stores.
 fn sql_i64(value: u64, what: &str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidInput(format!("{what} does not fit in SQLite: {value}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vowp_protocol::{
+        Actor, EventBody, EventSource, FakeClock, HarnessKind, Note, SessionCreated, SessionId, Timestamp,
+    };
+
+    use super::*;
+    use crate::session_log::{NewEvent, SessionLog};
+
+    fn ts() -> Timestamp {
+        Timestamp::parse("2026-11-08T18:00:00Z").expect("timestamp")
+    }
+
+    fn clock() -> Arc<FakeClock> {
+        Arc::new(FakeClock::at(ts()))
+    }
+
+    fn setup() -> (tempfile::TempDir, Store, NodePaths) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = NodePaths::new(dir.path().join("node"));
+        paths.ensure().expect("paths");
+        let store = Store::open(&paths).expect("store").with_clock(clock());
+        (dir, store, paths)
+    }
+
+    fn create_log(paths: &NodePaths, id: &SessionId) -> SessionLog {
+        SessionLog::create(paths, id, clock()).expect("log")
+    }
+
+    fn source() -> EventSource {
+        EventSource {
+            harness: HarnessKind::Vowp,
+            model: None,
+            node: None,
+            native_session_id: None,
+        }
+    }
+
+    fn append_created(log: &SessionLog) -> vowp_protocol::EventEnvelope {
+        log.append(NewEvent {
+            actor: Actor::System,
+            source: source(),
+            body: EventBody::SessionCreated(SessionCreated {
+                title: "reindex collision".to_owned(),
+                cwd: "/tmp".to_owned(),
+                project: None,
+                job_id: None,
+                role: None,
+                parent_session_id: None,
+            }),
+            raw: None,
+            ts: None,
+        })
+        .expect("created")
+        .envelope
+    }
+
+    fn note() -> NewEvent {
+        NewEvent {
+            actor: Actor::System,
+            source: source(),
+            body: EventBody::Note(Note {
+                text: "duplicate id".to_owned(),
+            }),
+            raw: None,
+            ts: None,
+        }
+    }
+
+    #[test]
+    fn reindex_rejects_an_event_id_owned_by_another_session() {
+        let (_dir, store, paths) = setup();
+        let first = SessionId::new();
+        let first_log = create_log(&paths, &first);
+        let first_created = append_created(&first_log);
+        first_log.sync().expect("sync");
+        drop(first_log);
+        reindex(&store, &paths, Some(&first)).expect("first session indexes");
+
+        let second = SessionId::new();
+        let second_log = create_log(&paths, &second);
+        append_created(&second_log);
+        second_log
+            .append_with_id(note(), first_created.id.clone())
+            .expect("append duplicate id");
+        second_log.sync().expect("sync");
+        drop(second_log);
+
+        let error = reindex(&store, &paths, Some(&second)).expect_err("the duplicate id must be a conflict");
+        match error {
+            StoreError::Conflict(message) => {
+                assert!(message.contains("already belongs to session"), "{message}");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(
+            store.session(&second).expect("session lookup").is_none(),
+            "the rejected session row must not be inserted"
+        );
+        assert!(
+            store.event_rows(&second, 0, 10).expect("event rows").is_empty(),
+            "the rejected session must have no indexed events"
+        );
+    }
+
+    #[test]
+    fn reindex_rejects_a_duplicate_event_id_in_one_log() {
+        let (_dir, store, paths) = setup();
+        let id = SessionId::new();
+        let log = create_log(&paths, &id);
+        let created = append_created(&log);
+        log.append_with_id(note(), created.id.clone())
+            .expect("append duplicate id");
+        log.sync().expect("sync");
+        drop(log);
+
+        let error = reindex(&store, &paths, Some(&id)).expect_err("the duplicate id must be a conflict");
+        match error {
+            StoreError::Conflict(message) => {
+                assert!(message.contains("duplicate event id"), "{message}");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert!(
+            store.event_rows(&id, 0, 10).expect("event rows").is_empty(),
+            "a rejected log must not have indexed events"
+        );
+    }
 }

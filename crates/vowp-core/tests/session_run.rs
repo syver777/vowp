@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -66,18 +66,22 @@ fn deps(tmp: &TempDir, config: vowp_protocol::VowpConfig, registry: AdapterRegis
     }
 }
 
-fn create_session(service: &SessionService, tmp: &TempDir, name: &str) -> SessionId {
+fn create_session_at(service: &SessionService, name: &str, cwd: PathBuf) -> SessionId {
     service
         .create_session(vowp_protocol::NewSession {
             project: None,
             job_id: None,
             role: SessionRole::Worker,
             title: name.to_owned(),
-            cwd: tmp.path().join("project"),
+            cwd,
             parent: None,
             executor: Some(opencode()),
         })
         .expect("create session")
+}
+
+fn create_session(service: &SessionService, tmp: &TempDir, name: &str) -> SessionId {
+    create_session_at(service, name, tmp.path().join("project"))
 }
 
 fn read_events(deps: &Deps, session: &SessionId) -> Vec<EventEnvelope> {
@@ -482,6 +486,60 @@ fn run_turn_cwd_outside_allow_list_refused() {
     assert!(fake.starts().is_empty());
     let store = deps.open_store().expect("store");
     assert!(store.open_runs().expect("runs").is_empty());
+}
+
+#[test]
+fn run_turn_default_worktree_root_cwd_is_allowed() {
+    let tmp = tempdir().expect("tempdir");
+    let fake = Arc::new(FakeAdapter::new(HarnessKind::Opencode, Vec::new()));
+    let config = config_for(tmp.path());
+    assert!(
+        config.project.worktree_root.is_none(),
+        "a fresh project leaves the worktree root unset"
+    );
+    let cwd = tmp.path().join("project-wt").join("job-default-root");
+    std::fs::create_dir_all(&cwd).expect("default worktree dir");
+    let deps = deps(&tmp, config, AdapterRegistry::new().with("opencode", fake.clone()));
+    let service = SessionService::new(deps.clone());
+    let session = create_session_at(&service, "default worktree root", cwd);
+
+    service
+        .run_turn(turn(&session, opencode(), "work"), &CancelToken::default())
+        .expect("the default sibling worktree root is inside the allow-list");
+    assert_eq!(fake.starts().len(), 1);
+}
+
+#[test]
+fn run_turn_configured_worktree_root_cwd_is_allowed_but_default_sibling_is_not() {
+    let tmp = tempdir().expect("tempdir");
+    let fake = Arc::new(FakeAdapter::new(HarnessKind::Opencode, Vec::new()));
+    let custom_root = tmp.path().join("custom-wt");
+    let mut config = config_for(tmp.path());
+    config.project.worktree_root = Some(custom_root.to_string_lossy().into_owned());
+    let configured_cwd = custom_root.join("job-configured");
+    let default_cwd = tmp.path().join("project-wt").join("job-default");
+    let outside = tmp.path().join("outside");
+    for path in [&configured_cwd, &default_cwd, &outside] {
+        std::fs::create_dir_all(path).expect("test directory");
+    }
+    let deps = deps(&tmp, config, AdapterRegistry::new().with("opencode", fake.clone()));
+    let service = SessionService::new(deps.clone());
+
+    let configured = create_session_at(&service, "configured worktree root", configured_cwd);
+    service
+        .run_turn(turn(&configured, opencode(), "work"), &CancelToken::default())
+        .expect("the configured worktree root is inside the allow-list");
+    assert_eq!(fake.starts().len(), 1);
+
+    for (name, cwd) in [("default sibling ignored", default_cwd), ("outside", outside)] {
+        let session = create_session_at(&service, name, cwd);
+        let error = service
+            .run_turn(turn(&session, opencode(), "work"), &CancelToken::default())
+            .expect_err("a configured root does not admit its default sibling or unrelated directories");
+        assert!(matches!(&error, CoreError::Refused(_)), "got {error:?}");
+        assert!(error.to_string().contains("outside the allow-list"));
+    }
+    assert_eq!(fake.starts().len(), 1, "refused cwds never reach the adapter");
 }
 
 #[test]

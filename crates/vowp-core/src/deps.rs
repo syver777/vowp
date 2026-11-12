@@ -25,6 +25,7 @@ use vowp_protocol::{
 use vowp_store::{NodePaths, Store};
 
 use crate::CoreError;
+use crate::adapters::acp_adapter;
 
 /// Bytes of merged command output kept by [`SystemRunner`]; older bytes are dropped first.
 const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -650,7 +651,7 @@ impl GitOps for SystemGit {
 
 /// Maps an [`Executor`] to the adapter that can run it.
 ///
-/// Keys are `claude-code`, `opencode` and `cli:<name>`; tests inject fakes with
+/// Keys are `claude-code`, `opencode`, `acp` and `cli:<name>`; tests inject fakes with
 /// [`AdapterRegistry::with`].
 #[derive(Clone, Default)]
 pub struct AdapterRegistry {
@@ -665,8 +666,8 @@ impl AdapterRegistry {
 
     /// Builds the registry from `[harnesses.*]` and `[node].tz_offset_minutes`.
     ///
-    /// `claude-code` and `opencode` always exist, with defaults when their table is absent.
-    /// Every other harness entry must name a `mapping` file and becomes `cli:<name>`.
+    /// `claude-code`, `opencode` and `acp` always exist, with defaults when their table is
+    /// absent. Every other harness entry must name a `mapping` file and becomes `cli:<name>`.
     pub fn from_config(config: &VowpConfig) -> Result<Self, CoreError> {
         let tz = config.node.tz_offset_minutes;
         let claude = config.harnesses.get("claude-code").cloned().unwrap_or_default();
@@ -691,15 +692,16 @@ impl AdapterRegistry {
                     tz_offset_minutes: tz,
                     ..OpencodeConfig::default()
                 })),
-            );
+            )
+            .with("acp", Arc::new(acp_adapter(config)));
 
         for (name, harness) in &config.harnesses {
-            if matches!(name.as_str(), "claude-code" | "opencode" | "vowp") {
+            if matches!(name.as_str(), "claude-code" | "opencode" | "acp" | "vowp") {
                 continue;
             }
             let Some(mapping) = &harness.mapping else {
                 return Err(CoreError::Invalid(format!(
-                    "harness {name:?} has no mapping file; only claude-code and opencode are built in"
+                    "harness {name:?} has no mapping file; only claude-code, opencode and acp are built in"
                 )));
             };
             let path = mapping_path(config, mapping);
@@ -726,6 +728,7 @@ fn registry_key(exec: &Executor) -> String {
     match exec.harness {
         HarnessKind::ClaudeCode => "claude-code".to_owned(),
         HarnessKind::Opencode => "opencode".to_owned(),
+        HarnessKind::Acp => "acp".to_owned(),
         HarnessKind::Cli => format!("cli:{}", exec.model),
         HarnessKind::Vowp => "vowp".to_owned(),
     }

@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP nodes</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1rem; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .status { display: grid; gap: .2rem; justify-items: start; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  caption {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  th, td { padding: .5rem .6rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: 0; }
+  .error {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    th, td { padding: .4rem .45rem; }
+  }
+</style>
+</head>
+<body>
+<main id="nodes">
+  <header class="page-head">
+    <div>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">← Board</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/nodes" aria-current="page">Nodes</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+      <h1>Nodes</h1>
+      <p class="muted">Read-only node list.</p>
+    </div>
+    <div class="status">
+      <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+    </div>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section class="card" aria-labelledby="nodes-heading">
+    <h2 id="nodes-heading">Node list</h2>
+    <div class="table-wrap">
+      <table>
+        <caption>Registered nodes</caption>
+        <thead>
+          <tr>
+            <th scope="col">Name</th>
+            <th scope="col">SSH target</th>
+            <th scope="col">Local / remote</th>
+            <th scope="col">Last seen</th>
+            <th scope="col">Version</th>
+            <th scope="col">Capabilities / probe</th>
+          </tr>
+        </thead>
+        <tbody id="list">
+          <tr><td colspan="6" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<noscript>The nodes page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const REFRESH_MS = 5000;
+  const errorLine = document.getElementById("error");
+  const updatedLine = document.getElementById("updated");
+  let lastUpdated = null;
+
+  function formatTime(value) {
+    if (value === null || value === undefined || value === "") return "-";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function versionOf(capabilities) {
+    const version = capabilities && capabilities.vowp;
+    return typeof version === "string" && version !== "" ? version : "-";
+  }
+
+  function compactValue(value) {
+    if (value === null) return "null";
+    if (typeof value === "string") return value;
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+    try {
+      return JSON.stringify(value);
+    } catch (_error) {
+      return String(value);
+    }
+  }
+
+  function capabilitySummary(capabilities) {
+    if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) return "-";
+    const parts = [];
+    if (capabilities.surface_only === true) parts.push("surface-only");
+    if (typeof capabilities.probe_ok === "boolean") {
+      parts.push(capabilities.probe_ok ? "probe ok" : "probe failed");
+    }
+    if (typeof capabilities.probe === "string" && capabilities.probe !== "") {
+      parts.push(capabilities.probe);
+    }
+    const shown = new Set(["surface_only", "vowp", "probe_ok", "probe"]);
+    const extra = Object.keys(capabilities).filter((key) => !shown.has(key));
+    if (extra.length > 0) {
+      parts.push(extra.map((key) => key + ": " + compactValue(capabilities[key])).join(", "));
+    }
+    if (parts.length > 0) return parts.join(" · ");
+    const entries = Object.entries(capabilities);
+    if (entries.length === 0) return "-";
+    return entries.map(([key, value]) => key + ": " + compactValue(value)).join(", ");
+  }
+
+  function cell(value, mono) {
+    const detail = document.createElement("td");
+    detail.textContent = value;
+    if (mono) detail.className = "mono";
+    return detail;
+  }
+
+  function emptyRow() {
+    const row = document.createElement("tr");
+    const detail = document.createElement("td");
+    detail.colSpan = 6;
+    detail.className = "muted";
+    detail.textContent = "No nodes.";
+    row.appendChild(detail);
+    return row;
+  }
+
+  function render(data) {
+    const list = document.getElementById("list");
+    list.replaceChildren();
+    const nodes = Array.isArray(data.items) ? data.items : [];
+    if (nodes.length === 0) {
+      list.appendChild(emptyRow());
+      return;
+    }
+    for (const node of nodes) {
+      const row = document.createElement("tr");
+      row.appendChild(cell(node.name || "-", true));
+      row.appendChild(cell(node.ssh_target || "-", true));
+      row.appendChild(cell(node.is_local ? "local" : "remote"));
+      row.appendChild(cell(formatTime(node.last_seen_at)));
+      row.appendChild(cell(versionOf(node.capabilities), true));
+      row.appendChild(cell(capabilitySummary(node.capabilities)));
+      list.appendChild(row);
+    }
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch("/api/v1/nodes");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      lastUpdated = new Date();
+      render(data);
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+      errorLine.textContent = "Could not load the nodes (" + detail + ")." + when;
+      errorLine.hidden = false;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

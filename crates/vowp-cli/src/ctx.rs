@@ -365,7 +365,7 @@ fn resolve_project_root(global: &Global, paths: &NodePaths) -> Result<PathBuf, C
     }
 
     let cwd = std::env::current_dir()?;
-    if let Some(root) = find_project_root(&cwd) {
+    if let Some(root) = cwd_project_root(&cwd, paths)? {
         return Ok(root);
     }
 
@@ -386,6 +386,41 @@ fn resolve_project_root(global: &Global, paths: &NodePaths) -> Result<PathBuf, C
         _ => Err(CliError::Invalid(
             "several projects are registered; pass --project <name|path>".to_owned(),
         )),
+    }
+}
+
+/// Returns the nearest checkout from `start` when it is registered in `paths`.
+///
+/// A `vowp.toml` found from the cwd must not override an explicit `--home`: the caller may
+/// stand in a checkout registered in a different home (for example the repository while a
+/// temporary home is selected). The checkout only selects its project when the selected
+/// home has that project name at the same path; otherwise [`resolve_project_root`] falls
+/// back to the home's own projects, so fleet commands keep their fleet context.
+fn cwd_project_root(start: &Path, paths: &NodePaths) -> Result<Option<PathBuf>, CliError> {
+    let Some(root) = find_project_root(start) else {
+        return Ok(None);
+    };
+    let config = load_project_config(&root.join("vowp.toml"), paths)?;
+    let store = Store::open(paths)?;
+    let Some(project) = store.project(&config.project.name)? else {
+        return Ok(None);
+    };
+    if same_checkout(&project.path, &root) {
+        Ok(Some(root))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Returns whether two paths name the same checkout, resolving symlinks when possible.
+fn same_checkout(registered: &str, root: &Path) -> bool {
+    let registered = Path::new(registered);
+    if registered == root {
+        return true;
+    }
+    match (std::fs::canonicalize(registered), std::fs::canonicalize(root)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -543,10 +578,72 @@ fn reject_unknown_loop_keys(text: &str) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use vowp_protocol::{Project, Timestamp, VowpConfig};
 
     /// Writes a lock file whose first line is `contents`.
     fn write_lock(home: &TempDir, contents: &str) {
         std::fs::write(home.path().join("supervisor.lock"), contents).expect("write supervisor.lock");
+    }
+
+    /// Creates a checkout whose `vowp.toml` names `name`.
+    fn checkout(name: &str) -> TempDir {
+        let dir = tempfile::tempdir().expect("temp checkout");
+        let mut config = VowpConfig::with_defaults_for_tests();
+        config.project.name = ProjectName::parse(name).expect("project name");
+        config.project.path = Some(dir.path().display().to_string());
+        std::fs::write(
+            dir.path().join("vowp.toml"),
+            toml::to_string_pretty(&config).expect("config serialises"),
+        )
+        .expect("write vowp.toml");
+        dir
+    }
+
+    /// Creates a home registry with one project row for `checkout`.
+    fn home_with(checkout: &TempDir) -> (TempDir, NodePaths) {
+        let home = tempfile::tempdir().expect("temp home");
+        let paths = NodePaths::new(home.path());
+        let store = Store::open(&paths).expect("store opens");
+        let text = std::fs::read_to_string(checkout.path().join("vowp.toml")).expect("read config");
+        let config = VowpConfig::from_toml(&text).expect("valid config");
+        let now = Timestamp::now();
+        store
+            .upsert_project(&Project {
+                name: config.project.name.clone(),
+                path: checkout.path().display().to_string(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::to_value(&config).expect("config json"),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("project row");
+        (home, paths)
+    }
+
+    #[test]
+    fn cwd_checkout_must_match_the_selected_homes_name_and_path() {
+        let registered = checkout("alpha");
+        let (_home, paths) = home_with(&registered);
+        assert_eq!(
+            cwd_project_root(registered.path(), &paths).expect("resolve registered"),
+            Some(registered.path().to_path_buf()),
+            "a checkout registered in this home is selected"
+        );
+
+        let same_name = checkout("alpha");
+        assert_eq!(
+            cwd_project_root(same_name.path(), &paths).expect("resolve same name"),
+            None,
+            "the same project name at another path belongs to a different home"
+        );
+
+        let unregistered = checkout("gamma");
+        assert_eq!(
+            cwd_project_root(unregistered.path(), &paths).expect("resolve unregistered"),
+            None,
+            "an unregistered checkout must not be selected"
+        );
     }
 
     #[test]

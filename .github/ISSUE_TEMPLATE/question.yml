@@ -40,7 +40,7 @@ body:
     attributes:
       label: "`vowp --version` output"
       description: Paste the complete line, or write "not built yet".
-      placeholder: "vowp 0.2.0"
+      placeholder: "vowp 0.3.0"
     validations:
       required: true
   - type: dropdown

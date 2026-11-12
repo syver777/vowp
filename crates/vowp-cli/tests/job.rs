@@ -2,8 +2,40 @@
 
 mod common;
 
-use vowp_protocol::{JobState, ParkedReason};
+use vowp_protocol::{Evidence, Gate, GateResult, JobId, JobState, ParkedReason, Timestamp};
 use vowp_store::StateChange;
+
+/// Returns the indented lines of the human `--gates` section.
+fn gate_lines(stdout: &str) -> Vec<&str> {
+    let mut lines = stdout.lines().skip_while(|line| *line != "gates:");
+    assert_eq!(lines.next(), Some("gates:"), "missing gates section: {stdout:?}");
+    lines.take_while(|line| line.starts_with("  ")).collect()
+}
+
+/// Builds a stored gate result for `job` at `gate_index`.
+fn gate_result(
+    job: &JobId,
+    attempt: u32,
+    gate_index: i32,
+    gate: &str,
+    passed: bool,
+    evidence: Evidence,
+    duration_ms: u64,
+) -> GateResult {
+    GateResult {
+        id: None,
+        job_id: job.clone(),
+        run_id: None,
+        attempt,
+        gate_index,
+        gate: Gate::from_short(gate).expect("gate short form"),
+        passed,
+        evidence,
+        output_blob: None,
+        duration_ms,
+        ts: Timestamp::from_unix_secs(1_700_000_000),
+    }
+}
 
 #[test]
 fn job_add_ls_show_roundtrip_json() {
@@ -264,4 +296,156 @@ fn job_keeper_commands_enqueue_request_rows() {
     assert_eq!(requests[0].kind, "nudge_job");
     // The state only changes when the supervisor applies the request.
     assert_eq!(store.require_job(&job.id).expect("job").state, JobState::Stalled);
+}
+
+#[test]
+fn job_show_gates_lists_every_configured_gate_as_not_run() {
+    let env = common::TestEnv::new();
+    let (code, _, stderr) = env.run(&[
+        "job",
+        "add",
+        "--id",
+        "fresh-gates",
+        "--title",
+        "Fresh gates",
+        "--kind",
+        "build",
+        "--gates",
+        "report,secret_scan,cargo test --workspace",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let (code, stdout, stderr) = env.run(&["job", "show", "fresh-gates", "--gates"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        gate_lines(&stdout),
+        vec![
+            "  report  not run",
+            "  secret_scan  not run",
+            "  cargo test --workspace  not run",
+        ]
+    );
+}
+
+#[test]
+fn job_show_gates_replaces_only_recorded_results() {
+    let env = common::TestEnv::new();
+    let (code, _, stderr) = env.run(&[
+        "job",
+        "add",
+        "--id",
+        "recorded-gates",
+        "--title",
+        "Recorded gates",
+        "--kind",
+        "build",
+        "--gates",
+        "report,secret_scan,cargo test --workspace",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let job = JobId::parse("recorded-gates").expect("job id");
+    let store = env.store();
+    store
+        .insert_gate_result(&gate_result(
+            &job,
+            0,
+            0,
+            "report",
+            false,
+            Evidence::Report {
+                front_matter: None,
+                missing_fields: vec!["status".to_owned()],
+                problems: Vec::new(),
+            },
+            7,
+        ))
+        .expect("report result");
+    store
+        .insert_gate_result(&gate_result(
+            &job,
+            0,
+            2,
+            "cargo test --workspace",
+            true,
+            Evidence::Cmd {
+                command: "cargo test --workspace".to_owned(),
+                exit_code: Some(0),
+                timed_out: false,
+                tail: "test result: ok. 12 passed".to_owned(),
+                duration_ms: 42,
+            },
+            42,
+        ))
+        .expect("command result");
+    // Repo-wide merge-queue results carry gate_index -1 and are not part of job.gates.
+    store
+        .insert_gate_result(&gate_result(
+            &job,
+            0,
+            -1,
+            "cargo test --workspace",
+            true,
+            Evidence::Cmd {
+                command: "cargo test --workspace".to_owned(),
+                exit_code: Some(0),
+                timed_out: false,
+                tail: "merge-queue evidence".to_owned(),
+                duration_ms: 5,
+            },
+            5,
+        ))
+        .expect("merge-queue result");
+
+    let (code, stdout, stderr) = env.run(&["job", "show", "recorded-gates", "--gates"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines = gate_lines(&stdout);
+    assert_eq!(lines.len(), 3, "one line per configured gate: {stdout}");
+    assert!(lines[0].starts_with("  report  fail  7ms  "), "{}", lines[0]);
+    assert!(lines[0].contains("\"missing_fields\":[\"status\"]"), "{}", lines[0]);
+    assert_eq!(lines[1], "  secret_scan  not run");
+    assert!(lines[2].starts_with("  cmd  pass  42ms  "), "{}", lines[2]);
+    assert!(lines[2].contains("test result: ok. 12 passed"), "{}", lines[2]);
+    assert!(!stdout.contains("merge-queue evidence"), "{stdout}");
+}
+
+#[test]
+fn job_show_gates_maps_duplicate_configured_gates_by_index() {
+    let env = common::TestEnv::new();
+    let (code, _, stderr) = env.run(&[
+        "job",
+        "add",
+        "--id",
+        "duplicate-gates",
+        "--title",
+        "Duplicate gates",
+        "--kind",
+        "build",
+        "--gates",
+        "report,report",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let job = JobId::parse("duplicate-gates").expect("job id");
+    let store = env.store();
+    store
+        .insert_gate_result(&gate_result(
+            &job,
+            0,
+            1,
+            "report",
+            true,
+            Evidence::Report {
+                front_matter: None,
+                missing_fields: Vec::new(),
+                problems: Vec::new(),
+            },
+            3,
+        ))
+        .expect("report result");
+
+    let (code, stdout, stderr) = env.run(&["job", "show", "duplicate-gates", "--gates"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let lines = gate_lines(&stdout);
+    assert_eq!(lines.len(), 2, "one line per configured entry: {stdout}");
+    assert_eq!(lines[0], "  report  not run");
+    assert!(lines[1].starts_with("  report  pass  3ms  "), "{}", lines[1]);
 }

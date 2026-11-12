@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+pub mod api;
 pub mod capacity;
 pub mod capsule;
 pub mod catalog;
@@ -40,6 +41,8 @@ pub mod vault;
 // Re-exports so every public type is available at the crate root.
 #[allow(unused_imports)]
 pub use adapter::*;
+#[allow(unused_imports)]
+pub use api::*;
 #[allow(unused_imports)]
 pub use capacity::*;
 #[allow(unused_imports)]

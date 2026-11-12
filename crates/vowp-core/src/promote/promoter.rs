@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -19,7 +20,8 @@ use vowp_protocol::{
 use vowp_store::Store;
 
 use crate::CoreError;
-use crate::deps::{CommandOutput, CommandSpec, Deps};
+use crate::deps::{CommandOutput, CommandRunner, CommandSpec, Deps};
+use crate::vault;
 
 use super::{bank, guards, releases_log};
 
@@ -76,6 +78,7 @@ impl Promoter {
         opts: PromoteOpts,
     ) -> Result<Release, CoreError> {
         let env_config = self.env_config(env)?.clone();
+        let env_pass = vault::env_for_names(&self.deps, &env_config.env_pass)?;
         let checkout = PathBuf::from(&env_config.checkout);
         let repo = self.project_repo(&env_config);
 
@@ -88,7 +91,7 @@ impl Promoter {
                     return Ok(existing);
                 }
                 ReleaseState::Banked => {
-                    return self.continue_after_bank(store, existing, &env_config, &checkout, &opts);
+                    return self.continue_after_bank(store, existing, &env_config, &checkout, &opts, &env_pass);
                 }
                 _ => {}
             }
@@ -159,7 +162,7 @@ impl Promoter {
         }
 
         let bank_path = self.bank_path(&release);
-        let banked = match bank::bank_serving(&self.deps, &env_config, env, &bank_path) {
+        let banked = match bank::bank_serving(&self.deps_with_env(&env_pass), &env_config, env, &bank_path) {
             Ok(banked) => banked,
             Err(err) => {
                 return self.refuse(store, release, format!("serving bank failed: {err}"));
@@ -194,7 +197,7 @@ impl Promoter {
             }
         }
 
-        self.continue_after_bank(store, release, &env_config, &checkout, &opts)
+        self.continue_after_bank(store, release, &env_config, &checkout, &opts, &env_pass)
     }
 
     /// Redeploys the banked serving copy of `release` as a new rollback release.
@@ -212,6 +215,7 @@ impl Promoter {
             .filter(|command| !command.trim().is_empty())
             .ok_or_else(|| CoreError::Invalid(format!("release {release} has no rollback command")))?;
         let env_config = self.env_config(&original.env)?.clone();
+        let env_pass = vault::env_for_names(&self.deps, &env_config.env_pass)?;
         let checkout = PathBuf::from(&env_config.checkout);
         let now = self.deps.clock.now();
         let mut rollback_release = Release {
@@ -234,7 +238,7 @@ impl Promoter {
         };
         store.insert_release(&rollback_release)?;
 
-        match self.run_command(&rollback_cmd, &checkout, DEPLOY_TIMEOUT_SECS) {
+        match self.run_command(&rollback_cmd, &checkout, DEPLOY_TIMEOUT_SECS, &env_pass) {
             Ok(output) if !output.timed_out && output.exit_code == Some(0) => {
                 rollback_release.state = ReleaseState::RolledBack;
                 rollback_release.note = format!(
@@ -353,13 +357,14 @@ impl Promoter {
         env_config: &EnvConfig,
         checkout: &Path,
         opts: &PromoteOpts,
+        env_pass: &[(String, String)],
     ) -> Result<Release, CoreError> {
         match self.resolve_approval(store, &release, env_config, opts)? {
             ApprovalOutcome::Approved(by) => {
                 release.approved_by = Some(by);
                 release.state = ReleaseState::Approved;
                 store.update_release(&release)?;
-                self.deploy_and_probe(store, release, env_config, checkout)
+                self.deploy_and_probe(store, release, env_config, checkout, env_pass)
             }
             ApprovalOutcome::Waiting => Ok(release),
             ApprovalOutcome::Rejected(by) => self.refuse(store, release, format!("approval rejected by {by}")),
@@ -455,11 +460,12 @@ impl Promoter {
         mut release: Release,
         env_config: &EnvConfig,
         checkout: &Path,
+        env_pass: &[(String, String)],
     ) -> Result<Release, CoreError> {
         release.state = ReleaseState::Deploying;
         store.update_release(&release)?;
         for command in &env_config.deploy {
-            match self.run_command(command, checkout, DEPLOY_TIMEOUT_SECS) {
+            match self.run_command(command, checkout, DEPLOY_TIMEOUT_SECS, env_pass) {
                 Ok(output) if !output.timed_out && output.exit_code == Some(0) => {}
                 Ok(output) => {
                     return self.fail(
@@ -485,7 +491,7 @@ impl Promoter {
         release.state = ReleaseState::Probing;
         store.update_release(&release)?;
         match &env_config.probe {
-            Some(command) => match self.run_command(command, checkout, PROBE_TIMEOUT_SECS) {
+            Some(command) => match self.run_command(command, checkout, PROBE_TIMEOUT_SECS, env_pass) {
                 Ok(output) => {
                     let passed = !output.timed_out && output.exit_code == Some(0);
                     release.probe = json!({
@@ -603,15 +609,38 @@ impl Promoter {
         Ok(unexpected)
     }
 
-    /// Runs one shell command in `cwd`.
-    fn run_command(&self, command: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandOutput, CoreError> {
+    /// Runs one shell command in `cwd` with the resolved promotion environment.
+    fn run_command(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout_secs: u64,
+        env: &[(String, String)],
+    ) -> Result<CommandOutput, CoreError> {
         self.deps.cmd.run(&CommandSpec {
             shell: Some(command.to_owned()),
             argv: Vec::new(),
             cwd: Some(cwd.to_path_buf()),
-            env: Vec::new(),
+            env: env.to_vec(),
             timeout: Duration::from_secs(timeout_secs.max(1)),
         })
+    }
+
+    /// Returns dependencies whose command runner adds the resolved promotion environment.
+    ///
+    /// The serving-bank implementation builds its own [`CommandSpec`], so it receives the
+    /// same values through a wrapped runner rather than through a value in its shell string.
+    fn deps_with_env(&self, env: &[(String, String)]) -> Deps {
+        if env.is_empty() {
+            return self.deps.clone();
+        }
+        Deps {
+            cmd: Arc::new(EnvRunner {
+                inner: Arc::clone(&self.deps.cmd),
+                env: env.to_vec(),
+            }),
+            ..self.deps.clone()
+        }
     }
 
     /// Runs `git` in `cwd` and returns its non-empty output lines.
@@ -640,6 +669,23 @@ impl Promoter {
             .filter(|line| !line.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+}
+
+/// A command runner that adds the resolved promotion environment to every command.
+struct EnvRunner {
+    inner: Arc<dyn CommandRunner>,
+    env: Vec<(String, String)>,
+}
+
+impl CommandRunner for EnvRunner {
+    fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, CoreError> {
+        let mut merged = self.env.clone();
+        merged.extend(spec.env.iter().cloned());
+        self.inner.run(&CommandSpec {
+            env: merged,
+            ..spec.clone()
+        })
     }
 }
 

@@ -6,7 +6,7 @@
 //! so a reader never sees a partial blob; identical content is written once.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -119,6 +119,27 @@ impl BlobStore {
     }
 }
 
+/// Returns the lowercase hexadecimal SHA-256 of one file's content.
+///
+/// The file is read in bounded chunks, so this works for blobs and logs larger than
+/// memory. A missing file is [`StoreError::NotFound`] through the underlying I/O error.
+pub fn sha256_file(path: &Path) -> Result<String, StoreError> {
+    let file = File::open(path).map_err(|err| StoreError::io(path.display(), err))?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| StoreError::io(path.display(), err))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Returns the first [`BLOB_PREVIEW_CHARS`] characters of the content, lossily decoded.
 fn preview(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
@@ -151,5 +172,18 @@ mod tests {
         assert!(matches!(store.path_of("../x"), Err(StoreError::InvalidInput(_))));
         assert!(matches!(store.path_of("abc"), Err(StoreError::InvalidInput(_))));
         assert!(store.path_of(&"a".repeat(64)).is_ok());
+    }
+
+    #[test]
+    fn sha256_file_matches_the_blob_name_written_by_put() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path());
+        let bytes = b"a snapshot checksum covers exactly these bytes\n";
+        let stored = store.put(bytes).expect("put");
+        assert_eq!(
+            sha256_file(&dir.path().join(&stored.sha256)).expect("hash"),
+            stored.sha256,
+            "the file checksum disagrees with the content-addressed name"
+        );
     }
 }

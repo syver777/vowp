@@ -16,6 +16,7 @@ phone. It uses one home for every project; there is no separate "laptop-only" mo
 | `<your-harness>` | `opencode` or `claude-code`, installed and signed in on the home. |
 | `<your-model>` | A model identifier that harness accepts. |
 | `<your-executor>` | `opencode:<provider>/<model>` or `claude-code:<model>`, optionally with `@effort` or `#variant`. |
+| `<home-ssh-target>` | The SSH destination of the home: `user@host` or an SSH config alias. |
 
 ## 1. Check the home
 
@@ -103,6 +104,31 @@ vowp fleet queue
 for every non-archived project (including paused ones), then detaches the supervisor. Run it from the
 home, or from a checkout to register that checkout on the way. `vowp up --foreground` is what the systemd unit runs; `--once` runs one tick
 for a smoke test.
+
+`vowp up` also starts the loopback web window as a separate `vowp-daemon` child, prints
+`web window: http://127.0.0.1:<port>/`, and prints the control-machine command for that actual
+port:
+
+```text
+web window: http://127.0.0.1:54321/
+remote window: vowp tunnel open window --remote-port 54321
+  local URL: http://127.0.0.1:<local-port>/ (the command prints the chosen port)
+```
+
+Open the first URL on the home. From a laptop or phone, configure the home once as a control
+machine (`vowp control init --name home <home-ssh-target>`), run the printed
+`vowp tunnel open window --remote-port 54321`, and open the local loopback URL it prints. Pass
+`--local-port <n>` when you need a fixed local port. The daemon binds `127.0.0.1` only and the
+existing managed SSH forward is the only route; no public port is opened. `vowp down` stops the
+window together with the supervisor. The window serves one project: run `up` from that checkout,
+or pass `--project <name>`, when the home has several. If the daemon binary is not installed next
+to `vowp` or on `PATH`, `vowp up` warns and continues without the window; the supervisor is not
+optional.
+
+Reads need no token. The writes on the pages use the `VOWP_API_TOKEN` the supervisor inherited:
+set it in the environment that runs `vowp up`, enter it in the page's unlock panel, and the page
+keeps it in `sessionStorage` and never in the URL. It unlocks the inbox answer and session switch
+writes only.
 
 `vowp status` is the short screen; `vowp fleet status` is the fleet view, and
 `vowp fleet queue` explains why a ready job is not running. `vowp board --once` prints the board once.

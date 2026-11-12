@@ -8,6 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
+use vowp_adapters::proc::process_alive;
 use vowp_protocol::{EventEnvelope, InboxState, JobId, Session, SessionId, SessionRole};
 use vowp_store::SessionFilter;
 use vowp_store::session_log::SessionLog;
@@ -22,6 +23,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Lines of supervisor log shown before following.
 const SUPERVISOR_TAIL_LINES: usize = 200;
 
+/// Whether the tmux server that hosts this pane is still alive.
+///
+/// Inside a pane tmux sets `TMUX=<socket>,<server-pid>,<session>`. A killed server
+/// leaves the follower polling an empty pty; checking the pid bounds that loop so a
+/// dead test server cannot leave an orphan pane burning CPU. Outside tmux, or with
+/// an unparsable value, the follower keeps its old behaviour.
+fn tmux_server_alive() -> bool {
+    let Some(value) = std::env::var_os("TMUX") else {
+        return true;
+    };
+    let Some(value) = value.to_str() else {
+        return true;
+    };
+    let mut fields = value.rsplitn(3, ',');
+    let _session = fields.next();
+    let Some(pid) = fields.next().and_then(|pid| pid.trim().parse::<u32>().ok()) else {
+        return true;
+    };
+    process_alive(pid)
+}
+
 /// Runs `vowp __window`.
 pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &WindowArgs) -> Result<i32, CliError> {
     match args.kind.as_str() {
@@ -30,6 +52,9 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &WindowArgs) -> Result<i32, 
             // scripts and tests terminate.
             if io.is_tty() {
                 loop {
+                    if !tmux_server_alive() {
+                        return Ok(0);
+                    }
                     write!(io.out(), "\x1b[2J\x1b[H")?;
                     crate::cmd::board::render(ctx, io)?;
                     std::thread::sleep(Duration::from_secs(2));
@@ -49,6 +74,9 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &WindowArgs) -> Result<i32, 
             // so scripts and tests terminate, matching the board window.
             if io.is_tty() {
                 loop {
+                    if !tmux_server_alive() {
+                        return Ok(0);
+                    }
                     write!(io.out(), "\x1b[2J\x1b[H")?;
                     crate::cmd::capacity::show(ctx, io)?;
                     std::thread::sleep(Duration::from_secs(2));
@@ -153,6 +181,9 @@ pub(crate) fn tail_session(
     let mut last = from_seq;
     let follow = follow && io.is_tty();
     loop {
+        if !tmux_server_alive() {
+            return Ok(());
+        }
         for event in reader.read_from(last, None)? {
             last = event.seq;
             print_event(ctx, io, &event, pretty)?;
@@ -205,6 +236,9 @@ fn tail_file(io: &mut dyn IoStreams, path: &Path, initial_lines: usize) -> Resul
     let follow = io.is_tty();
     let mut printed = 0_usize;
     loop {
+        if !tmux_server_alive() {
+            return Ok(());
+        }
         if let Ok(text) = std::fs::read_to_string(path) {
             let lines: Vec<&str> = text.lines().collect();
             let start = if printed == 0 {

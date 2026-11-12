@@ -18,9 +18,14 @@ python3 docs/reference/check-reference.py
 
 | Type | Page |
 |---|---|
+| `ApiError` | [api-error.md](api-error.md) |
+| `ApiErrorBody` | [api-error-body.md](api-error-body.md) |
 | `BackupFile` | [backup-file.md](backup-file.md) |
 | `BackupReport` | [backup-report.md](backup-report.md) |
 | `BlockedJobCard` | [blocked-job-card.md](blocked-job-card.md) |
+| `Board` | [board.md](board.md) |
+| `BoardLimit` | [board-limit.md](board-limit.md) |
+| `BoardRun` | [board-run.md](board-run.md) |
 | `BrakeState` | [brake-state.md](brake-state.md) |
 | `BriefFrontMatter` | [brief-front-matter.md](brief-front-matter.md) |
 | `CapacityAdvice` | [capacity-advice.md](capacity-advice.md) |
@@ -31,8 +36,12 @@ python3 docs/reference/check-reference.py
 | `CapsuleDraft` | [capsule-draft.md](capsule-draft.md) |
 | `CatalogEntry` | [catalog-entry.md](catalog-entry.md) |
 | `Cost` | [cost.md](cost.md) |
+| `CostReport` | [cost-report.md](cost-report.md) |
+| `CostRow` | [cost-row.md](cost-row.md) |
+| `CostTotal` | [cost-total.md](cost-total.md) |
 | `Edge` | [edge.md](edge.md) |
 | `EventEnvelope` | [event-envelope.md](event-envelope.md) |
+| `EventPage` | [event-page.md](event-page.md) |
 | `Evidence` | [evidence.md](evidence.md) |
 | `FleetQueueRow` | [fleet-queue-row.md](fleet-queue-row.md) |
 | `FleetStatus` | [fleet-status.md](fleet-status.md) |
@@ -41,11 +50,15 @@ python3 docs/reference/check-reference.py
 | `GateResult` | [gate-result.md](gate-result.md) |
 | `GcClassReport` | [gc-class-report.md](gc-class-report.md) |
 | `GcReport` | [gc-report.md](gc-report.md) |
+| `Health` | [health.md](health.md) |
 | `HostSample` | [host-sample.md](host-sample.md) |
+| `InboxAnswerRequest` | [inbox-answer-request.md](inbox-answer-request.md) |
 | `InboxItem` | [inbox-item.md](inbox-item.md) |
+| `InboxPage` | [inbox-page.md](inbox-page.md) |
 | `InboxSummary` | [inbox-summary.md](inbox-summary.md) |
 | `IngestAck` | [ingest-ack.md](ingest-ack.md) |
 | `Job` | [job.md](job.md) |
+| `JobPage` | [job-page.md](job-page.md) |
 | `JobPatch` | [job-patch.md](job-patch.md) |
 | `JoinInstructions` | [join-instructions.md](join-instructions.md) |
 | `Lease` | [lease.md](lease.md) |
@@ -58,7 +71,9 @@ python3 docs/reference/check-reference.py
 | `MigrationReport` | [migration-report.md](migration-report.md) |
 | `NewJob` | [new-job.md](new-job.md) |
 | `Node` | [node.md](node.md) |
+| `NodePage` | [node-page.md](node-page.md) |
 | `OrchestratorCard` | [orchestrator-card.md](orchestrator-card.md) |
+| `Page` | [page.md](page.md) |
 | `Profile` | [profile.md](profile.md) |
 | `Project` | [project.md](project.md) |
 | `ProjectEntry` | [project-entry.md](project-entry.md) |
@@ -76,7 +91,10 @@ python3 docs/reference/check-reference.py
 | `SecretInfo` | [secret-info.md](secret-info.md) |
 | `SecretRequest` | [secret-request.md](secret-request.md) |
 | `Session` | [session.md](session.md) |
+| `SessionDetail` | [session-detail.md](session-detail.md) |
+| `SessionPage` | [session-page.md](session-page.md) |
 | `SessionSurfaceCard` | [session-surface-card.md](session-surface-card.md) |
+| `SessionSwitchRequest` | [session-switch-request.md](session-switch-request.md) |
 | `Snapshot` | [snapshot.md](snapshot.md) |
 | `SupervisorSnapshot` | [supervisor-snapshot.md](supervisor-snapshot.md) |
 | `Surface` | [surface.md](surface.md) |

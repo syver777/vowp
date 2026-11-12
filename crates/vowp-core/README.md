@@ -19,7 +19,7 @@ contains the rules; the `vowp` binary wires them to the command line.
 
 ## Status
 
-VOWP 0.2.0 is an early release. Some supervisor loops are merged but not yet complete against the design
+VOWP 0.3.0 is an early release. Some supervisor loops are merged but not yet complete against the design
 spec; the release notes list the known gaps. The Rust API is not yet stable while VOWP is in 0.x.
 
 ## Links

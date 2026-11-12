@@ -10,11 +10,12 @@
 //! supervisor watches that file and SIGTERM/SIGINT, interrupts its runners, waits for
 //! adapter/gate children and marks the heartbeat stopped before it exits.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -42,6 +43,21 @@ const CHILD_EXIT_WAIT: Duration = Duration::from_secs(6);
 
 /// Grace after SIGTERM before a direct child is killed with SIGKILL.
 const CHILD_KILL_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the supervisor waits for the optional daemon to report its bound address.
+///
+/// The daemon binds `127.0.0.1:0`, opens the existing home and prints exactly one line.
+/// A daemon that does not get that far must not hold the supervisor's startup open.
+const DAEMON_START_WAIT: Duration = Duration::from_secs(5);
+
+/// Grace after SIGTERM before the daemon child is killed with SIGKILL.
+const DAEMON_STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a detached `up` waits for the foreground supervisor's window address.
+///
+/// The foreground child starts the daemon after it owns the lock; the daemon normally
+/// reports the address in milliseconds, so this only covers a slow first store open.
+const WEB_WINDOW_WAIT: Duration = Duration::from_secs(3);
 
 /// Runs `vowp up` or `vowp down` before a project context exists.
 ///
@@ -106,6 +122,267 @@ fn register_checkout_for_up(paths: &NodePaths, deps: &Deps, checkout: Option<&Pa
     }
     crate::cmd::project::register_checkout(paths, deps, root, None, None)?;
     Ok(())
+}
+
+/// Returns `<home>/web-window`, the address reported by the supervisor's daemon child.
+///
+/// The foreground supervisor writes it so a detached `vowp up` can print the same line;
+/// it is removed when the daemon stops or before a new supervisor starts.
+fn web_window_file(paths: &NodePaths) -> PathBuf {
+    paths.root().join("web-window")
+}
+
+/// Parses the daemon's one startup line into a printable loopback URL.
+///
+/// `vowp-daemon` binds `127.0.0.1` only and prints `vowp-daemon: listening on http://…`;
+/// anything else is ignored rather than surfaced as a window address.
+fn parse_web_window_address(line: &str) -> Option<String> {
+    let address = line.strip_prefix("vowp-daemon: listening on ")?.trim();
+    if !address.starts_with("http://127.0.0.1:") {
+        return None;
+    }
+    Some(format!("{}/", address.trim_end_matches('/')))
+}
+
+/// Returns the loopback port from a printed window address.
+///
+/// [`parse_web_window_address`] only admits `http://127.0.0.1:<port>/`, so a malformed
+/// tail means no hint rather than a guessed port.
+fn web_window_port(address: &str) -> Option<u16> {
+    let port = address.strip_prefix("http://127.0.0.1:")?.trim_end_matches('/');
+    port.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+/// Prints the window URL and the control-machine tunnel command for its actual port.
+///
+/// The local port is chosen by `vowp tunnel open` on the control machine, so the second
+/// line shows the local URL shape instead of inventing a port. An address without a
+/// usable port prints only the window URL.
+fn print_web_window(io: &mut dyn IoStreams, address: &str) -> Result<(), CliError> {
+    writeln!(io.out(), "web window: {address}")?;
+    if let Some(port) = web_window_port(address) {
+        writeln!(io.out(), "remote window: vowp tunnel open window --remote-port {port}")?;
+        writeln!(
+            io.out(),
+            "  local URL: http://127.0.0.1:<local-port>/ (the command prints the chosen port)"
+        )?;
+    }
+    Ok(())
+}
+
+/// Selects the one project the optional web window serves.
+///
+/// A checkout named by `--project` (or the current directory) wins. Without one, the home
+/// must have exactly one non-archived project: the supervisor serves every project, but the
+/// window serves one, so an ambiguous home leaves the window off instead of guessing.
+fn select_daemon_project(paths: &NodePaths, checkout: Option<&Path>) -> Result<Option<ProjectName>, CliError> {
+    let store = Store::open_global(paths)?;
+    if let Some(root) = checkout {
+        if let Some(entry) = vowp_core::loops::registry::project_by_path(&store, root)? {
+            if entry.name.as_str() != vowp_store::RESERVED_NODE_PROJECT {
+                return Ok(Some(entry.name));
+            }
+        }
+    }
+    let active: Vec<_> = vowp_core::loops::registry::project_entries(&store)?
+        .into_iter()
+        .filter(|entry| {
+            entry.state != ProjectState::Archived && entry.name.as_str() != vowp_store::RESERVED_NODE_PROJECT
+        })
+        .collect();
+    Ok(match active.as_slice() {
+        [only] => Some(only.name.clone()),
+        _ => None,
+    })
+}
+
+/// Returns the daemon binary: `VOWP_DAEMON_BIN`, the `vowp` sibling, then `PATH`.
+///
+/// `VOWP_DAEMON_BIN` is an explicit override for tests and unusual installs; normal runs
+/// keep the two shipped binaries together, so the sibling lookup wins before `PATH`.
+fn daemon_binary() -> PathBuf {
+    if let Some(path) = std::env::var_os("VOWP_DAEMON_BIN") {
+        return PathBuf::from(path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(directory) = exe.parent() {
+            let sibling = directory.join("vowp-daemon");
+            if sibling.is_file() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("vowp-daemon")
+}
+
+/// The optional `vowp-daemon` child that serves the web window.
+///
+/// The child is a direct child of the foreground supervisor: it inherits
+/// `VOWP_API_TOKEN`, opens its own read-only store and keeps its read/write split. The
+/// supervisor's lock remains the only home lock. Stopping the supervisor stops this child.
+struct WebWindow {
+    child: Option<Child>,
+    stdout_reader: Option<std::thread::JoinHandle<()>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
+    address_file: PathBuf,
+    address: Option<String>,
+}
+
+impl WebWindow {
+    /// Returns the printable loopback URL, when the child reported one.
+    fn address(&self) -> Option<&str> {
+        self.address.as_deref()
+    }
+
+    /// Stops the child with SIGTERM, escalates to SIGKILL and reaps it.
+    ///
+    /// The daemon shares the supervisor's process group, so a terminal Ctrl-C or a
+    /// control-group stop reaches it too; the explicit TERM covers `vowp down` and a signal
+    /// sent to the supervisor pid alone. Waiting for the child is what keeps `vowp up` from
+    /// leaving an orphan behind.
+    fn stop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = send_term(child.id());
+        let deadline = Instant::now() + DAEMON_STOP_WAIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    break;
+                }
+                Err(_) => {
+                    let _ = child.kill();
+                    break;
+                }
+            }
+        }
+        let _ = child.wait();
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_file(&self.address_file);
+    }
+}
+
+impl Drop for WebWindow {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Starts the optional web-window daemon and waits briefly for its address.
+///
+/// A missing or unstartable binary prints a warning and returns `None`; the supervisor is
+/// not optional. `io` receives that warning, while the daemon's own stderr is forwarded to
+/// this process's stderr with the token value and home path redacted.
+fn start_web_window(paths: &NodePaths, project: &ProjectName, io: &mut dyn IoStreams) -> Option<WebWindow> {
+    let binary = daemon_binary();
+    let address_file = web_window_file(paths);
+    let _ = std::fs::remove_file(&address_file);
+
+    let mut command = Command::new(&binary);
+    command
+        .arg("--home")
+        .arg(paths.root())
+        .arg("--project")
+        .arg(project.as_str())
+        .arg("--port")
+        .arg("0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = writeln!(
+                io.err(),
+                "warning: web window not started: cannot run {}: {error}",
+                binary.display()
+            );
+            return None;
+        }
+    };
+
+    let token = std::env::var("VOWP_API_TOKEN").ok().filter(|value| !value.is_empty());
+    let home_text = paths.root().display().to_string();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader_file = address_file.clone();
+    let stdout_reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if let Some(address) = parse_web_window_address(&line) {
+                    let _ = std::fs::write(&reader_file, format!("{address}\n"));
+                    let _ = sender.send(address);
+                }
+            }
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(mut line) = line else {
+                    break;
+                };
+                if let Some(token) = token.as_deref() {
+                    line = line.replace(token, "[redacted]");
+                }
+                line = line.replace(&home_text, "[home]");
+                let _ = writeln!(std::io::stderr(), "{line}");
+            }
+        })
+    });
+
+    let address = match receiver.recv_timeout(DAEMON_START_WAIT) {
+        Ok(address) => Some(address),
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = writeln!(
+                io.err(),
+                "warning: the web window daemon did not report an address; continuing without it"
+            );
+            None
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = writeln!(
+                io.err(),
+                "warning: the web window daemon exited before reporting an address; continuing without the window"
+            );
+            None
+        }
+    };
+
+    Some(WebWindow {
+        child: Some(child),
+        stdout_reader,
+        stderr_reader,
+        address_file,
+        address,
+    })
+}
+
+/// Waits for a detached supervisor's foreground child to publish the window address.
+fn wait_for_web_window(paths: &NodePaths, timeout: Duration) -> Option<String> {
+    let path = web_window_file(paths);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(address) = text.lines().next().map(str::trim).filter(|line| !line.is_empty()) {
+                return Some(address.to_owned());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
 }
 
 /// Runs one node tick with the supplied dependencies.
@@ -242,6 +519,9 @@ struct UpOutput {
     running: bool,
     pid: Option<u32>,
     mode: &'static str,
+    /// The optional web-window address, written only when a daemon reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    web_window: Option<String>,
 }
 
 /// What `up --once --json` prints after the tick.
@@ -289,6 +569,8 @@ fn run_up(
     }
     signals::clear_stop(paths)?;
     signals::clear_stopped(paths)?;
+    // A crashed supervisor may leave an address behind; never surface a stale window.
+    let _ = std::fs::remove_file(web_window_file(paths));
 
     let mut migration = None;
     if let Some(report) = migrate_if_needed(paths, !args.no_migrate)? {
@@ -319,7 +601,7 @@ fn run_up(
         return run_once(paths, deps, json, io, migration);
     }
     if args.foreground {
-        return run_foreground(paths, deps, json, io, migration);
+        return run_foreground(paths, deps, json, io, migration, checkout.as_deref());
     }
     run_detached(paths, checkout.as_deref(), json, io)
 }
@@ -450,8 +732,17 @@ fn run_foreground(
     json: bool,
     io: &mut dyn IoStreams,
     migration: Option<MigrationReport>,
+    checkout: Option<&Path>,
 ) -> Result<i32, CliError> {
-    run_foreground_with_paths(paths, deps, json, io, migration, signals::SignalWatcher::install)
+    run_foreground_with_paths(
+        paths,
+        deps,
+        json,
+        io,
+        migration,
+        checkout,
+        signals::SignalWatcher::install,
+    )
 }
 
 /// Runs the foreground supervisor with an injectable signal-watcher installer.
@@ -469,6 +760,7 @@ where
         ctx.json(),
         io,
         None,
+        Some(ctx.project_root()),
         install,
     )
 }
@@ -480,6 +772,7 @@ fn run_foreground_with_paths<F>(
     json: bool,
     io: &mut dyn IoStreams,
     migration: Option<MigrationReport>,
+    checkout: Option<&Path>,
     install: F,
 ) -> Result<i32, CliError>
 where
@@ -508,6 +801,28 @@ where
     if !json {
         writeln!(io.out(), "supervisor running (pid {pid}); stop it with `vowp down`")?;
     }
+    // The web window is optional: one project, one daemon child. A missing or ambiguous
+    // project, a missing binary and a daemon that never prints an address all warn and let
+    // the supervisor run. The child keeps its own read-only store; the lock stays ours.
+    let mut web_window = match select_daemon_project(paths, checkout) {
+        Ok(Some(project)) => start_web_window(paths, &project, io),
+        Ok(None) => {
+            let _ = writeln!(
+                io.err(),
+                "warning: web window not started: register one project or run `vowp up --project <name>` from its checkout"
+            );
+            None
+        }
+        Err(error) => {
+            let _ = writeln!(io.err(), "warning: web window not started: {error}");
+            None
+        }
+    };
+    if !json {
+        if let Some(address) = web_window.as_ref().and_then(WebWindow::address) {
+            print_web_window(io, address)?;
+        }
+    }
     // The supervisor waits up to `tick_secs` between ticks; a cancellation alone
     // would keep `vowp down` waiting for that whole interval. Wake it as soon as the
     // stop watcher cancels so shutdown is prompt.
@@ -524,6 +839,11 @@ where
     // A failed startup returns before the stop watcher cancels; release the wake thread.
     watcher.cancel();
     let _ = wake_thread.join();
+    // Stop the daemon before `wait_for_children`: it is our direct child, and it must not
+    // keep the adapter/gate grace period open or outlive the supervisor.
+    if let Some(window) = web_window.as_mut() {
+        window.stop();
+    }
     // Runner cancellation is cooperative: wait for adapter/gate children, escalating once
     // the grace expires, so a clean signal shutdown does not orphan harness processes.
     wait_for_children();
@@ -789,6 +1109,9 @@ fn run_detached(
         }
     };
 
+    // The foreground child starts the daemon after it owns the lock; wait briefly for the
+    // address it publishes so the detached caller prints the same window line.
+    let web_window = wait_for_web_window(paths, WEB_WINDOW_WAIT);
     if json {
         crate::output::print_json(
             io,
@@ -796,10 +1119,20 @@ fn run_detached(
                 running: true,
                 pid: Some(pid),
                 mode: "detached",
+                web_window: web_window.clone(),
             },
         )?;
     } else {
         writeln!(io.out(), "supervisor started (pid {pid})")?;
+        if let Some(address) = &web_window {
+            print_web_window(io, address)?;
+        }
+    }
+    if web_window.is_none() {
+        let _ = writeln!(
+            io.err(),
+            "warning: the web window did not start; the supervisor keeps running"
+        );
     }
     Ok(0)
 }
@@ -817,6 +1150,8 @@ fn run_down(
 
     let Some(pid) = live_supervisor_pid(paths) else {
         remove_lock(paths);
+        // A crashed supervisor may leave only its window address behind.
+        let _ = std::fs::remove_file(web_window_file(paths));
         if args.kill_windows {
             kill_windows(paths, deps)?;
         }
@@ -827,6 +1162,7 @@ fn run_down(
                     running: false,
                     pid: None,
                     mode: "down",
+                    web_window: None,
                 },
             )?;
         } else {
@@ -866,6 +1202,7 @@ fn run_down(
                 running: false,
                 pid: Some(pid),
                 mode: "down",
+                web_window: None,
             },
         )?;
     } else {
@@ -1047,6 +1384,17 @@ mod tests {
         let stdout = io.stdout();
         assert!(stdout.contains("1/2 steps ok"), "{stdout}");
         assert!(stdout.contains("degraded demo/harvest: disk full"), "{stdout}");
+    }
+
+    #[test]
+    fn window_ports_come_only_from_the_loopback_url() {
+        assert_eq!(web_window_port("http://127.0.0.1:54321/"), Some(54321));
+        assert_eq!(web_window_port("http://127.0.0.1:1"), Some(1));
+        assert_eq!(web_window_port("http://127.0.0.1:0/"), None);
+        assert_eq!(web_window_port("http://127.0.0.1:/"), None);
+        assert_eq!(web_window_port("http://192.0.2.1:54321/"), None);
+        assert_eq!(web_window_port("https://127.0.0.1:54321/"), None);
+        assert_eq!(web_window_port("http://127.0.0.1:99999/"), None);
     }
 
     #[test]

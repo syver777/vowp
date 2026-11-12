@@ -2,9 +2,10 @@
 //!
 //! Spec: `docs/design/cli.md` §2. Checks are `ok|warn|fail`; the command exits 0 only when no
 //! check failed. Secret values are never read or printed: provider checks report environment
-//! variable **names** only and never touch the network.
+//! variable **names** only and never touch the network. A provider whose every profile rung is
+//! `claude-code` is harness-owned and needs no `*_API_KEY`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,9 +115,15 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, _args: &DoctorArgs) -> Resul
     if let Some(registry) = &registry {
         check_harness(registry, HarnessKind::ClaudeCode, "claude-code", &mut checks);
         check_harness(registry, HarnessKind::Opencode, "opencode", &mut checks);
+        if config_uses_harness(config.as_ref(), HarnessKind::Acp) {
+            check_harness(registry, HarnessKind::Acp, "acp", &mut checks);
+        }
     } else {
         checks.push("harness:claude-code", CheckStatus::Fail, "adapter registry unavailable");
         checks.push("harness:opencode", CheckStatus::Fail, "adapter registry unavailable");
+        if config_uses_harness(config.as_ref(), HarnessKind::Acp) {
+            checks.push("harness:acp", CheckStatus::Fail, "adapter registry unavailable");
+        }
     }
 
     check_profiles(registry.as_ref(), config.as_ref(), &mut checks);
@@ -459,6 +466,21 @@ fn check_schedules(config: Option<&VowpConfig>, checks: &mut Checks) {
     }
 }
 
+/// Returns true when `[harnesses.<name>]` exists or a profile rung uses the harness.
+///
+/// `claude-code` and `opencode` are always probed; optional harnesses such as `acp` are
+/// probed only when the project configures them, so a missing optional server is not a
+/// doctor failure for projects that do not use it.
+fn config_uses_harness(config: Option<&VowpConfig>, harness: HarnessKind) -> bool {
+    config.is_some_and(|config| {
+        config.harnesses.contains_key(harness.as_str())
+            || config
+                .profiles
+                .values()
+                .any(|profile| profile.ladder.iter().any(|executor| executor.harness == harness))
+    })
+}
+
 /// Probes one harness binary through its adapter.
 fn check_harness(registry: &AdapterRegistry, harness: HarnessKind, name: &str, checks: &mut Checks) {
     let executor = Executor {
@@ -525,27 +547,33 @@ fn check_profiles(registry: Option<&AdapterRegistry>, config: Option<&VowpConfig
 }
 
 /// Reports provider environment-variable names only, never their values.
+///
+/// A provider is harness-owned when it has at least one profile rung and every rung that uses
+/// it runs on `claude-code`, whose login needs no `*_API_KEY`. Providers listed in
+/// `[providers]` with no rung stay key-driven. The check is `ok` when every provider is either
+/// present or harness-owned.
 fn check_providers(config: Option<&VowpConfig>, checks: &mut Checks) {
     let Some(config) = config else {
         checks.push("providers", CheckStatus::Warn, "no config to check");
         return;
     };
-    let mut providers = BTreeSet::new();
-    for name in config.providers.keys() {
-        providers.insert(name.clone());
-    }
-    for profile in config.profiles.values() {
-        for executor in &profile.ladder {
-            providers.insert(executor.provider());
-        }
-    }
+    let providers = provider_harnesses(config);
     if providers.is_empty() {
         checks.push("providers", CheckStatus::Warn, "no providers configured");
         return;
     }
     let mut parts = Vec::new();
     let mut all_present = true;
-    for provider in providers {
+    for (provider, harnesses) in providers {
+        let harness_owned =
+            !harnesses.is_empty() && harnesses.iter().all(|harness| *harness == HarnessKind::ClaudeCode);
+        if harness_owned {
+            parts.push(format!(
+                "{provider}: {} uses its own login",
+                HarnessKind::ClaudeCode.as_str()
+            ));
+            continue;
+        }
         let variable = format!("{}_API_KEY", provider_env_prefix(&provider));
         let present = std::env::var_os(&variable).is_some();
         all_present &= present;
@@ -560,6 +588,26 @@ fn check_providers(config: Option<&VowpConfig>, checks: &mut Checks) {
         },
         parts.join(", "),
     );
+}
+
+/// Maps every configured provider to the harness kinds of the profile rungs that use it.
+///
+/// `[providers]` keys with no rung get an empty set, so they stay key-driven.
+fn provider_harnesses(config: &VowpConfig) -> BTreeMap<String, BTreeSet<HarnessKind>> {
+    let mut providers: BTreeMap<String, BTreeSet<HarnessKind>> = config
+        .providers
+        .keys()
+        .map(|name| (name.clone(), BTreeSet::new()))
+        .collect();
+    for profile in config.profiles.values() {
+        for executor in &profile.ladder {
+            providers
+                .entry(executor.provider())
+                .or_default()
+                .insert(executor.harness);
+        }
+    }
+    providers
 }
 
 /// Converts a provider key into an environment-variable prefix.

@@ -28,6 +28,9 @@ pub enum HarnessKind {
     /// The generic mapping-file CLI adapter.
     #[serde(rename = "cli")]
     Cli,
+    /// An Agent Client Protocol (ACP) server.
+    #[serde(rename = "acp")]
+    Acp,
     /// Events VOWP itself writes (system events, shell and gate runs).
     #[serde(rename = "vowp")]
     Vowp,
@@ -40,6 +43,7 @@ impl HarnessKind {
             Self::ClaudeCode => "claude-code",
             Self::Opencode => "opencode",
             Self::Cli => "cli",
+            Self::Acp => "acp",
             Self::Vowp => "vowp",
         }
     }
@@ -50,6 +54,7 @@ impl HarnessKind {
             "claude-code" => Ok(Self::ClaudeCode),
             "opencode" => Ok(Self::Opencode),
             "cli" => Ok(Self::Cli),
+            "acp" => Ok(Self::Acp),
             "vowp" => Ok(Self::Vowp),
             other => Err(ProtocolError::InvalidExecutor(
                 other.to_owned(),
@@ -160,7 +165,7 @@ impl Executor {
         match self.harness {
             HarnessKind::ClaudeCode => "claude".to_owned(),
             HarnessKind::Opencode => self.model.split('/').next().unwrap_or(self.model.as_str()).to_owned(),
-            HarnessKind::Cli | HarnessKind::Vowp => self.model.clone(),
+            HarnessKind::Cli | HarnessKind::Acp | HarnessKind::Vowp => self.model.clone(),
         }
     }
 
@@ -224,6 +229,33 @@ fn is_modifier(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acp_harness_round_trips_and_has_no_modifiers() {
+        assert_eq!(HarnessKind::parse("acp").expect("acp is a harness"), HarnessKind::Acp);
+        assert_eq!(HarnessKind::Acp.as_str(), "acp");
+        assert_eq!(
+            serde_json::to_value(HarnessKind::Acp).expect("harness serialises"),
+            serde_json::Value::String("acp".to_owned())
+        );
+
+        let executor = Executor::parse("acp:claude-code-acp").expect("ACP executor parses");
+        assert_eq!(executor.harness, HarnessKind::Acp);
+        assert_eq!(executor.model, "claude-code-acp");
+        assert_eq!(executor.provider(), "claude-code-acp");
+        assert_eq!(executor.model_arg(), "claude-code-acp");
+        assert_eq!(executor.to_string(), "acp:claude-code-acp");
+        assert!(executor.validate().is_ok());
+
+        // Effort and variant remain claude-code/opencode modifiers only.
+        assert!(Executor::parse("acp:m@high").is_err());
+        assert!(Executor::parse("acp:m#max").is_err());
+    }
 }
 
 /// Where an executor runs: the executor plus an optional node (`None` means this node).

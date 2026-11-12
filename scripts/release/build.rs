@@ -2,7 +2,7 @@
 //!
 //! `crates/vowp-cli/tests/control.rs` and `maint.rs` live outside this release
 //! job's owned paths. Both contain a version assertion written for the 0.1
-//! series; the 0.2.0 bump makes that assertion stale. The test targets in the
+//! series; the 0.3.0 bump makes that assertion stale. The test targets in the
 //! root manifest point at the small wrappers under `scripts/release/cargo-tests`,
 //! which include a generated copy of the original suite with only that
 //! assertion changed to compare against `CARGO_PKG_VERSION`.

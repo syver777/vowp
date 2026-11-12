@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use vowp_protocol::{
     Clock, Cost, JobId, JobKind, JobState, LimitKind, ProjectName, Role, RunOutcome, SessionState, SystemClock,
     Timestamp, Tokens,
@@ -302,6 +302,48 @@ impl Store {
                 return Err(StoreError::not_found("project", name.as_str()));
             }
             store.attach_read_only(paths, name)?;
+        }
+        Ok(store)
+    }
+
+    /// Opens an existing home for writes without creating, ensuring or migrating it.
+    ///
+    /// This follows [`Store::open_read_only`] for the existing database, busy timeout, foreign
+    /// keys, schema-version check and optional project attach, but it does not set `query_only`
+    /// and it never calls [`NodePaths::ensure`] or a migration. A missing database is
+    /// [`StoreError::NotFound`]; a database this build cannot open unchanged is
+    /// [`StoreError::MigrationRequired`] or [`StoreError::SchemaTooNew`].
+    pub fn open_writable(paths: &NodePaths, project: Option<&ProjectName>) -> Result<Store, StoreError> {
+        let path = paths.db_path();
+        if !path.is_file() {
+            return Err(StoreError::not_found("database", path.display().to_string()));
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > GLOBAL_SCHEMA_VERSION {
+            return Err(StoreError::SchemaTooNew {
+                found: version,
+                supported: GLOBAL_SCHEMA_VERSION,
+            });
+        }
+        if version != GLOBAL_SCHEMA_VERSION {
+            return Err(StoreError::MigrationRequired);
+        }
+        let store = Store {
+            conn,
+            clock: Arc::new(SystemClock),
+            savepoints: AtomicU64::new(0),
+            paths: Some(paths.clone()),
+            bound: Mutex::new(None),
+            auto_bind: false,
+        };
+        if let Some(name) = project {
+            if !store.project_row_exists(name)? {
+                return Err(StoreError::not_found("project", name.as_str()));
+            }
+            store.attach_file(paths, name)?;
         }
         Ok(store)
     }
@@ -800,6 +842,73 @@ mod tests {
         assert_eq!(SCHEMA_VERSION, 1);
         assert!(GLOBAL_SCHEMA_SQL.contains("PRAGMA user_version = 2;"));
         assert!(PROJECT_SCHEMA.contains("PRAGMA user_version = 1;"));
+    }
+
+    #[test]
+    fn open_writable_answers_and_never_creates_or_migrates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = NodePaths::new(tmp.path());
+        let project = ProjectName::parse("proj").expect("project");
+        let now = Timestamp::now();
+        let item = vowp_protocol::InboxItem {
+            id: vowp_protocol::InboxId::new(),
+            project: Some(project.clone()),
+            job_id: None,
+            kind: vowp_protocol::InboxKind::Question,
+            title: "Which way?".to_owned(),
+            body: String::new(),
+            options: vec!["left".to_owned(), "right".to_owned()],
+            state: vowp_protocol::InboxState::Open,
+            answer: None,
+            answered_by: None,
+            created_at: now,
+            answered_at: None,
+        };
+        {
+            let setup = Store::open(&paths).expect("create home");
+            setup
+                .upsert_project(&vowp_protocol::Project {
+                    name: project.clone(),
+                    path: tmp.path().display().to_string(),
+                    remote_url: None,
+                    default_branch: "main".to_owned(),
+                    config: serde_json::json!({}),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .expect("project row");
+            setup.insert_inbox(&item).expect("inbox row");
+        }
+
+        let store = Store::open_writable(&paths, Some(&project)).expect("open writable");
+        let answered = store.answer_inbox(&item.id, "left", "web").expect("answer");
+        assert_eq!(answered.state, vowp_protocol::InboxState::Answered);
+        assert_eq!(answered.answer.as_deref(), Some("left"));
+        assert_eq!(answered.answered_by.as_deref(), Some("web"));
+        let read_back = store.inbox_item(&item.id).expect("read").expect("answered row");
+        assert_eq!(read_back, answered);
+
+        let missing = tmp.path().join("missing");
+        let error = match Store::open_writable(&NodePaths::new(&missing), None) {
+            Ok(_) => panic!("open_writable opened a missing database"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::NotFound { what: "database", .. }));
+        assert!(!missing.exists(), "open_writable created a home directory");
+
+        let empty = tempfile::tempdir().expect("empty tempdir");
+        let empty_db = empty.path().join("vowp.db");
+        std::fs::write(&empty_db, []).expect("empty database file");
+        let error = match Store::open_writable(&NodePaths::new(empty.path()), None) {
+            Ok(_) => panic!("open_writable opened an unversioned database"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::MigrationRequired));
+        assert_eq!(
+            std::fs::read(&empty_db).expect("read empty database").len(),
+            0,
+            "open_writable migrated an unversioned database"
+        );
     }
 
     #[test]

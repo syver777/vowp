@@ -1,6 +1,6 @@
 # Setup
 
-> **Status: current — VOWP 0.2.0.** The setup path is implemented and is described by the
+> **Status: current — VOWP 0.3.0.** The setup path is implemented and is described by the
 > [agent setup contract](agent-setup.md).
 
 VOWP is set up by the copyable prompt at the top of the [root README](../../README.md). The prompt

@@ -113,7 +113,7 @@ pub(crate) fn executor_to_parts(executor: Option<&Executor>) -> (String, Option<
             let modifier = match executor.harness {
                 HarnessKind::ClaudeCode => executor.effort.clone(),
                 HarnessKind::Opencode => executor.variant.clone(),
-                HarnessKind::Cli | HarnessKind::Vowp => None,
+                HarnessKind::Cli | HarnessKind::Acp | HarnessKind::Vowp => None,
             };
             (
                 executor.harness.as_str().to_owned(),

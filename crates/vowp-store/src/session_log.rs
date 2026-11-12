@@ -6,7 +6,11 @@
 //! id and timestamp and writes exactly one line; [`SessionLog::open`] takes the single-writer
 //! lock, validates the existing lines and truncates a torn final line. Readers
 //! ([`SessionLogReader`]) never lock and never modify the file.
+//!
+//! The same module defines the `vowp-session-dir-v1` manifest and the file listing and
+//! verification helpers used by a full `session pull --full` directory snapshot.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15,8 +19,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use vowp_protocol::{
-    Actor, BLOB_SPILL_BYTES, Clock, EventBody, EventEnvelope, EventIndexRow, EventSource, SessionId, Timestamp,
+    Actor, BLOB_SPILL_BYTES, Clock, EventBody, EventEnvelope, EventIndexRow, EventSource, EventType, SessionId,
+    Timestamp,
 };
 
 use crate::blobs::BlobStore;
@@ -61,6 +67,20 @@ impl VerifyReport {
     pub fn is_ok(&self) -> bool {
         self.problems.is_empty() && self.torn_tail_bytes == 0
     }
+}
+
+/// The last complete event in a session log.
+///
+/// A divergence report needs the log position and the last event's type and time without
+/// reading or indexing the whole session twice.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogHead {
+    /// Sequence number of the last event; 0 for an empty log.
+    pub last_seq: u64,
+    /// Type of the last event, when the log has one.
+    pub event_type: Option<EventType>,
+    /// Timestamp of the last event, when the log has one.
+    pub ts: Option<Timestamp>,
 }
 
 /// What [`SessionLog::open`] found and repaired; all zero after [`SessionLog::create`].
@@ -393,6 +413,21 @@ impl SessionLogReader {
             last = event?.envelope.seq;
         }
         Ok(last)
+    }
+
+    /// Returns the last sequence number and the last event's type and timestamp.
+    ///
+    /// Reads the log once, like [`Self::last_seq`], but keeps the last complete event so a
+    /// caller can report a session head. An empty log yields [`LogHead::default`].
+    pub fn head(&self) -> Result<LogHead, StoreError> {
+        let mut head = LogHead::default();
+        for event in self.iter()? {
+            let envelope = event?.envelope;
+            head.last_seq = envelope.seq;
+            head.event_type = Some(envelope.event_type);
+            head.ts = Some(envelope.ts);
+        }
+        Ok(head)
     }
 
     /// Reads every complete event in file order.
@@ -867,9 +902,469 @@ fn sync_dir(dir: &Path) -> Result<(), StoreError> {
     file.sync_all().map_err(|err| StoreError::io(dir.display(), err))
 }
 
+// ---------------------------------------------------------------------------
+// Full session-directory snapshots
+// ---------------------------------------------------------------------------
+
+/// The only session-directory manifest format this build reads and writes.
+pub const SESSION_DIR_FORMAT: &str = "vowp-session-dir-v1";
+
+/// Default upper bound for one full session-directory pull (1 GiB).
+pub const SESSION_DIR_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Name of the manifest stored inside a copied session directory.
+pub const SESSION_DIR_MANIFEST: &str = "manifest.json";
+
+/// One file in a [`SessionDirManifest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDirFile {
+    /// Path relative to `sessions/<id>/`, using `/` separators.
+    pub path: String,
+    /// Exact byte size copied for this file.
+    pub bytes: u64,
+    /// Lowercase hexadecimal SHA-256 of the file content.
+    pub sha256: String,
+}
+
+/// The manifest of one full session-directory snapshot.
+///
+/// The remote side writes it as the first line of the snapshot stream and the importing
+/// side writes the verified manifest into the copied directory as `manifest.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDirManifest {
+    /// Always [`SESSION_DIR_FORMAT`].
+    pub format: String,
+    /// Origin session id.
+    pub origin: SessionId,
+    /// Every copied file, sorted by `path`.
+    pub files: Vec<SessionDirFile>,
+}
+
+impl SessionDirManifest {
+    /// Checks the format, the file paths, the digests and the sort order.
+    ///
+    /// Paths are relative to the session directory and limited to the layout this build
+    /// knows: `log.jsonl`, `adapters.json`, `blobs/<sha256>` and `capsules/<name>.json`.
+    /// Traversal, absolute paths, duplicates and the reserved `manifest.json` are refused.
+    pub fn validate(&self) -> Result<(), StoreError> {
+        if self.format != SESSION_DIR_FORMAT {
+            return Err(StoreError::InvalidInput(format!(
+                "unknown session directory manifest format: {}",
+                self.format
+            )));
+        }
+        if self.files.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "session directory manifest has no files".to_owned(),
+            ));
+        }
+        let mut previous: Option<&str> = None;
+        let mut has_log = false;
+        for file in &self.files {
+            validate_session_dir_path(&self.origin, &file.path)?;
+            if !is_lower_hex_sha256(&file.sha256) {
+                return Err(StoreError::InvalidInput(format!(
+                    "session {} manifest has an invalid sha256 for {}",
+                    self.origin, file.path
+                )));
+            }
+            if let Some(previous) = previous
+                && file.path.as_str() <= previous
+            {
+                return Err(StoreError::InvalidInput(format!(
+                    "session {} manifest is duplicated or unsorted at {}",
+                    self.origin, file.path
+                )));
+            }
+            previous = Some(file.path.as_str());
+            has_log |= file.path == "log.jsonl";
+        }
+        if !has_log {
+            return Err(StoreError::InvalidInput(format!(
+                "session {} manifest has no log.jsonl",
+                self.origin
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the sum of every file's declared size, saturating at `u64::MAX`.
+    pub fn total_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .fold(0_u64, |total, file| total.saturating_add(file.bytes))
+    }
+}
+
+/// One file found while scanning a session directory, before hashing.
+struct SessionDirEntry {
+    path: String,
+    path_on_disk: PathBuf,
+    bytes: u64,
+}
+
+/// Builds the manifest for `sessions/<id>/` without writing anything.
+///
+/// Sizes are checked against `max_bytes` before any file is hashed. The caller must
+/// quiesce the source session: this is a read-only scan, not a lock.
+pub fn session_dir_manifest(
+    paths: &NodePaths,
+    id: &SessionId,
+    max_bytes: u64,
+) -> Result<SessionDirManifest, StoreError> {
+    let entries = collect_session_dir_files(paths, id)?;
+    let total = entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.bytes)
+            .ok_or_else(|| StoreError::InvalidInput(format!("session {id} is too large to copy")))
+    })?;
+    if total > max_bytes {
+        return Err(StoreError::InvalidInput(format!(
+            "session {id} is {total} bytes; the full pull limit is {max_bytes} bytes"
+        )));
+    }
+
+    let mut files = Vec::with_capacity(entries.len());
+    for entry in entries {
+        files.push(SessionDirFile {
+            path: entry.path,
+            bytes: entry.bytes,
+            sha256: crate::blobs::sha256_file(&entry.path_on_disk)?,
+        });
+    }
+    let manifest = SessionDirManifest {
+        format: SESSION_DIR_FORMAT.to_owned(),
+        origin: id.clone(),
+        files,
+    };
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Reads and validates a `manifest.json` from a copied session directory.
+pub fn read_session_dir_manifest(path: &Path) -> Result<SessionDirManifest, StoreError> {
+    let bytes = std::fs::read(path).map_err(|err| StoreError::io(path.display(), err))?;
+    let manifest: SessionDirManifest = serde_json::from_slice(&bytes).map_err(|err| StoreError::Corrupt {
+        path: path.display().to_string(),
+        line: None,
+        reason: format!("invalid session directory manifest: {err}"),
+    })?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+/// Writes the verified manifest into `sessions/<id>/manifest.json` atomically.
+pub fn write_session_dir_manifest(
+    paths: &NodePaths,
+    id: &SessionId,
+    manifest: &SessionDirManifest,
+) -> Result<PathBuf, StoreError> {
+    manifest.validate()?;
+    if manifest.origin != *id {
+        return Err(StoreError::InvalidInput(format!(
+            "session manifest names {}, not {id}",
+            manifest.origin
+        )));
+    }
+    let path = paths.session_manifest_path(id);
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    crate::session_files::write_atomic(&path, &bytes)?;
+    Ok(path)
+}
+
+/// Re-hashes every file and checks the log, adapters and capsules of one session directory.
+///
+/// The manifest must list exactly the files present. A missing, extra, resized or changed
+/// file, an unclean log or an invalid capsule is refused, so a caller can run this before
+/// renaming a staged directory into `sessions/`.
+pub fn verify_session_dir(paths: &NodePaths, id: &SessionId, manifest: &SessionDirManifest) -> Result<(), StoreError> {
+    manifest.validate()?;
+    if manifest.origin != *id {
+        return Err(StoreError::InvalidInput(format!(
+            "session manifest names {}, not {id}",
+            manifest.origin
+        )));
+    }
+
+    let mut actual: BTreeMap<String, SessionDirEntry> = collect_session_dir_files(paths, id)?
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
+    for file in &manifest.files {
+        let Some(entry) = actual.remove(&file.path) else {
+            return Err(StoreError::Corrupt {
+                path: paths.session_dir(id).display().to_string(),
+                line: None,
+                reason: format!("manifest names a missing file: {}", file.path),
+            });
+        };
+        if entry.bytes != file.bytes {
+            return Err(StoreError::Corrupt {
+                path: entry.path_on_disk.display().to_string(),
+                line: None,
+                reason: format!("expected {} bytes, found {}", file.bytes, entry.bytes),
+            });
+        }
+        let actual_sha = crate::blobs::sha256_file(&entry.path_on_disk)?;
+        if actual_sha != file.sha256 {
+            return Err(StoreError::Corrupt {
+                path: entry.path_on_disk.display().to_string(),
+                line: None,
+                reason: format!(
+                    "sha256 mismatch for {}: expected {}, got {actual_sha}",
+                    file.path, file.sha256
+                ),
+            });
+        }
+    }
+    if let Some(entry) = actual.into_values().next() {
+        return Err(StoreError::Corrupt {
+            path: entry.path_on_disk.display().to_string(),
+            line: None,
+            reason: format!("file is not listed in the session manifest: {}", entry.path),
+        });
+    }
+
+    let log = SessionLog::open_read(paths, id)?;
+    let report = log.verify()?;
+    if !report.is_ok() {
+        return Err(StoreError::Corrupt {
+            path: paths.log_path(id).display().to_string(),
+            line: None,
+            reason: format!("session log is not clean: {}", report.problems.join("; ")),
+        });
+    }
+    verify_session_dir_blobs(paths, id, &log)?;
+    if paths.adapters_json_path(id).is_file() {
+        crate::session_files::read_adapters_json(paths, id)?;
+    }
+    for path in crate::session_files::list_capsule_files(paths, id)? {
+        let capsule = crate::session_files::read_capsule_file(&path)?;
+        if capsule.session_id != *id {
+            return Err(StoreError::Corrupt {
+                path: path.display().to_string(),
+                line: None,
+                reason: format!("capsule belongs to session {}, not {id}", capsule.session_id),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a session log that names a blob the snapshot's `blobs/` does not contain.
+///
+/// A full pull never invents a placeholder for a missing blob: the source log and its blob
+/// files must match exactly before the staged directory is renamed into place.
+fn verify_session_dir_blobs(paths: &NodePaths, id: &SessionId, log: &SessionLogReader) -> Result<(), StoreError> {
+    let blobs = BlobStore::new(paths.blobs_dir(id));
+    for item in log.iter()? {
+        let event = item?;
+        let Ok(body) = event.envelope.body() else {
+            continue;
+        };
+        let references: Vec<&str> = match &body {
+            EventBody::UserMessage(payload) => payload
+                .attachments
+                .iter()
+                .map(|reference| reference.sha256.as_str())
+                .collect(),
+            EventBody::ToolResult(payload) => payload
+                .output_ref
+                .iter()
+                .map(|reference| reference.sha256.as_str())
+                .collect(),
+            EventBody::FileChange(payload) => payload
+                .diff_ref
+                .iter()
+                .map(|reference| reference.sha256.as_str())
+                .collect(),
+            _ => Vec::new(),
+        };
+        for sha256 in references {
+            if !blobs.exists(sha256) {
+                return Err(StoreError::Corrupt {
+                    path: paths.log_path(id).display().to_string(),
+                    line: None,
+                    reason: format!("event {} references a missing blob: {sha256}", event.envelope.seq),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Lists the files a session directory snapshot contains, with their sizes.
+///
+/// Only the documented layout is accepted: `log.jsonl`, optional `adapters.json`, and the
+/// regular files under `blobs/` and `capsules/`. Hidden temporary files are skipped;
+/// symlinks and unexpected file names are refused rather than followed or silently lost.
+fn collect_session_dir_files(paths: &NodePaths, id: &SessionId) -> Result<Vec<SessionDirEntry>, StoreError> {
+    let session_dir = paths.session_dir(id);
+    let metadata = std::fs::symlink_metadata(&session_dir).map_err(|err| StoreError::io(session_dir.display(), err))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StoreError::InvalidInput(format!(
+            "session {id} directory is not a plain directory"
+        )));
+    }
+    let mut entries = Vec::new();
+    push_session_dir_file(&mut entries, id, &session_dir, "log.jsonl", true)?;
+    push_session_dir_file(&mut entries, id, &session_dir, "adapters.json", false)?;
+
+    for dir_name in ["blobs", "capsules"] {
+        let dir = session_dir.join(dir_name);
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(StoreError::io(dir.display(), err)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(StoreError::InvalidInput(format!(
+                "session {id} contains a symlink: {}",
+                dir.display()
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(StoreError::InvalidInput(format!(
+                "session {id} has a non-directory {dir_name}/"
+            )));
+        }
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|err| StoreError::io(dir.display(), err))? {
+            let entry = entry.map_err(|err| StoreError::io(dir.display(), err))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(StoreError::InvalidInput(format!(
+                    "session {id} has a non-UTF-8 file name in {dir_name}/"
+                )));
+            };
+            names.push(name);
+        }
+        names.sort();
+        for name in names {
+            if name.starts_with('.') {
+                continue;
+            }
+            let path_on_disk = dir.join(&name);
+            let metadata =
+                std::fs::symlink_metadata(&path_on_disk).map_err(|err| StoreError::io(path_on_disk.display(), err))?;
+            if metadata.file_type().is_symlink() {
+                return Err(StoreError::InvalidInput(format!(
+                    "session {id} contains a symlink: {}",
+                    path_on_disk.display()
+                )));
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let relative = format!("{dir_name}/{name}");
+            validate_session_dir_path(id, &relative)?;
+            entries.push(SessionDirEntry {
+                path: relative,
+                path_on_disk,
+                bytes: metadata.len(),
+            });
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+/// Adds one root file to the scan, requiring or skipping it as requested.
+fn push_session_dir_file(
+    entries: &mut Vec<SessionDirEntry>,
+    id: &SessionId,
+    session_dir: &Path,
+    name: &str,
+    required: bool,
+) -> Result<(), StoreError> {
+    let path_on_disk = session_dir.join(name);
+    let metadata = match std::fs::symlink_metadata(&path_on_disk) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoreError::NotFound {
+                what: "session file",
+                id: format!("{id}/{name}"),
+            });
+        }
+        Err(err) => return Err(StoreError::io(path_on_disk.display(), err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(StoreError::InvalidInput(format!(
+            "session {id} contains a symlink: {}",
+            path_on_disk.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(StoreError::InvalidInput(format!("session {id} has a non-file {name}")));
+    }
+    entries.push(SessionDirEntry {
+        path: name.to_owned(),
+        path_on_disk,
+        bytes: metadata.len(),
+    });
+    Ok(())
+}
+
+/// Validates one manifest path against the session-directory layout.
+fn validate_session_dir_path(origin: &SessionId, path: &str) -> Result<(), StoreError> {
+    if path.is_empty() || path.contains('\\') || path.contains('\0') {
+        return Err(StoreError::InvalidInput(format!(
+            "session {origin} manifest has an invalid path: {path:?}"
+        )));
+    }
+    if path == SESSION_DIR_MANIFEST || path == ".lock" || path == "import.json" {
+        return Err(StoreError::InvalidInput(format!(
+            "session {origin} manifest may not copy {path}"
+        )));
+    }
+    let mut parts = path.split('/');
+    let first = parts.next().unwrap_or_default();
+    let rest: Vec<&str> = parts.collect();
+    let allowed = match (first, rest.as_slice()) {
+        ("log.jsonl" | "adapters.json", []) => true,
+        ("blobs", [name]) => is_blob_name(name),
+        ("capsules", [name]) => is_capsule_name(name),
+        _ => false,
+    };
+    if !allowed {
+        return Err(StoreError::InvalidInput(format!(
+            "session {origin} manifest has an unexpected path: {path}"
+        )));
+    }
+    Ok(())
+}
+
+/// Returns true for a lowercase hexadecimal SHA-256 name.
+fn is_blob_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Returns true for a capsule file name (`<at_seq:010>-<ulid>.json`).
+fn is_capsule_name(name: &str) -> bool {
+    name.len() > ".json".len()
+        && name.ends_with(".json")
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+}
+
+/// Returns true for a lowercase hexadecimal SHA-256 digest.
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && is_blob_name(value)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use vowp_protocol::{FakeClock, HarnessKind, SessionCreated};
+
     use super::*;
+    use crate::blobs::BlobStore;
 
     #[test]
     fn trim_newline_removes_only_one_newline() {
@@ -901,5 +1396,171 @@ mod tests {
             assert!(!pid_alive(pid), "{pid} must count as not alive");
         }
         assert!(pid_alive(std::process::id()));
+    }
+
+    fn snapshot_setup() -> (tempfile::TempDir, NodePaths, SessionId) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = NodePaths::new(dir.path().join("node"));
+        paths.ensure().expect("paths");
+        let id = SessionId::new();
+        let log = SessionLog::create(&paths, &id, Arc::new(FakeClock::at(Timestamp::now()))).expect("log");
+        log.append(NewEvent {
+            actor: Actor::System,
+            source: EventSource {
+                harness: HarnessKind::Vowp,
+                model: None,
+                node: None,
+                native_session_id: None,
+            },
+            body: EventBody::SessionCreated(SessionCreated {
+                title: "snapshot".to_owned(),
+                cwd: "/tmp".to_owned(),
+                project: None,
+                job_id: None,
+                role: None,
+                parent_session_id: None,
+            }),
+            raw: None,
+            ts: None,
+        })
+        .expect("created");
+        log.sync().expect("sync");
+        drop(log);
+        (dir, paths, id)
+    }
+
+    #[test]
+    fn session_log_head_reports_the_last_complete_event() {
+        let (_dir, paths, id) = snapshot_setup();
+        let log = SessionLog::open(&paths, &id, Arc::new(FakeClock::at(Timestamp::now()))).expect("log");
+        let appended = log
+            .append(NewEvent {
+                actor: Actor::User,
+                source: EventSource {
+                    harness: HarnessKind::Opencode,
+                    model: None,
+                    node: None,
+                    native_session_id: None,
+                },
+                body: EventBody::UserMessage(vowp_protocol::UserMessage {
+                    text: "advance the local side".to_owned(),
+                    attachments: Vec::new(),
+                    note: None,
+                }),
+                raw: None,
+                ts: None,
+            })
+            .expect("user message");
+        log.sync().expect("sync");
+        drop(log);
+
+        let reader = SessionLog::open_read(&paths, &id).expect("reader");
+        let head = reader.head().expect("head");
+        assert_eq!(head.last_seq, appended.envelope.seq);
+        assert_eq!(head.event_type, Some(EventType::UserMessage));
+        assert_eq!(head.ts, Some(appended.envelope.ts));
+        assert_eq!(reader.last_seq().expect("last seq"), head.last_seq);
+    }
+
+    #[test]
+    fn session_log_head_is_empty_for_an_empty_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = NodePaths::new(dir.path().join("node"));
+        paths.ensure().expect("paths");
+        let id = SessionId::new();
+        let log = SessionLog::create(&paths, &id, Arc::new(FakeClock::at(Timestamp::now()))).expect("log");
+        drop(log);
+
+        let head = SessionLog::open_read(&paths, &id)
+            .expect("reader")
+            .head()
+            .expect("head");
+        assert_eq!(head, LogHead::default());
+    }
+
+    #[test]
+    fn session_dir_manifest_verifies_and_detects_corruption() {
+        let (_dir, paths, id) = snapshot_setup();
+        let blob_content = b"a blob inside the snapshot";
+        let blob = BlobStore::new(paths.blobs_dir(&id)).put(blob_content).expect("blob");
+        let manifest = session_dir_manifest(&paths, &id, SESSION_DIR_MAX_BYTES).expect("manifest");
+        assert_eq!(manifest.format, SESSION_DIR_FORMAT);
+        assert_eq!(manifest.origin, id);
+        assert!(manifest.files.iter().any(|file| file.path == "log.jsonl"));
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.path == format!("blobs/{}", blob.sha256))
+        );
+        verify_session_dir(&paths, &id, &manifest).expect("the fresh snapshot verifies");
+        let path = write_session_dir_manifest(&paths, &id, &manifest).expect("manifest write");
+        assert_eq!(read_session_dir_manifest(&path).expect("manifest read"), manifest);
+
+        let blob_path = paths.blobs_dir(&id).join(&blob.sha256);
+        std::fs::write(&blob_path, vec![b'X'; blob_content.len()]).expect("tamper");
+        let error = verify_session_dir(&paths, &id, &manifest).expect_err("a changed blob must fail");
+        match error {
+            StoreError::Corrupt { reason, .. } => assert!(reason.contains("sha256 mismatch"), "{reason}"),
+            other => panic!("expected a corrupt error, got {other:?}"),
+        }
+
+        std::fs::write(&blob_path, blob_content).expect("restore");
+        let extra = paths.blobs_dir(&id).join("b".repeat(64));
+
+        std::fs::write(&extra, b"not listed").expect("extra file");
+        let error = verify_session_dir(&paths, &id, &manifest).expect_err("an extra file must fail");
+        match error {
+            StoreError::Corrupt { reason, .. } => assert!(reason.contains("not listed"), "{reason}"),
+            other => panic!("expected a corrupt error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_dir_manifest_refuses_a_directory_over_the_size_cap() {
+        let (_dir, paths, id) = snapshot_setup();
+        let error = session_dir_manifest(&paths, &id, 1).expect_err("the cap must refuse the session");
+        match error {
+            StoreError::InvalidInput(message) => {
+                assert!(message.contains("full pull limit is 1 bytes"), "{message}");
+            }
+            other => panic!("expected an invalid-input error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_dir_manifest_rejects_traversal_and_reserved_paths() {
+        let id = SessionId::new();
+        let valid = SessionDirFile {
+            path: "log.jsonl".to_owned(),
+            bytes: 1,
+            sha256: "0".repeat(64),
+        };
+        for bad in [
+            "../log.jsonl",
+            "/log.jsonl",
+            "blobs/../x",
+            "capsules/../x.json",
+            "manifest.json",
+            ".lock",
+            "import.json",
+            "blobs/not-a-digest",
+            "capsules/not-json.txt",
+            "summary.md",
+        ] {
+            let manifest = SessionDirManifest {
+                format: SESSION_DIR_FORMAT.to_owned(),
+                origin: id.clone(),
+                files: vec![
+                    valid.clone(),
+                    SessionDirFile {
+                        path: bad.to_owned(),
+                        bytes: 1,
+                        sha256: "0".repeat(64),
+                    },
+                ],
+            };
+            assert!(manifest.validate().is_err(), "{bad} must be refused");
+        }
     }
 }

@@ -128,6 +128,7 @@ pub enum HarnessKind {
     #[serde(rename = "claude-code")] ClaudeCode,
     #[serde(rename = "opencode")]    Opencode,
     #[serde(rename = "cli")]         Cli,       // generic mapping-file adapter
+    #[serde(rename = "acp")]         Acp,       // Agent Client Protocol server
     #[serde(rename = "vowp")]        Vowp,      // events VOWP itself writes (system events, shell/gate runs)
 }
 impl HarnessKind { pub fn as_str(&self) -> &'static str; pub fn parse(s: &str) -> Result<Self, ProtocolError>; }
@@ -149,7 +150,7 @@ pub struct Executor {
 impl Executor {
     pub fn parse(s: &str) -> Result<Self, ProtocolError>;          // FromStr too
     pub fn provider(&self) -> String;   // limits key. claude-code -> "claude"; opencode -> text before first '/' of model
-                                        // (e.g. "provider"); cli -> the model/entry name
+                                        // (e.g. "provider"); cli/acp -> the model/entry name
     pub fn model_arg(&self) -> String;  // opencode: "provider/model-b#max"; claude-code: "model-a"
 }
 

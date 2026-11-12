@@ -5,14 +5,18 @@
 
 use crate::cli::SchemaArgs;
 use crate::output::print_json;
-use crate::{CliError, Ctx, IoStreams};
+use crate::{CliError, IoStreams};
 
 /// Runs `vowp schema`.
-pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &SchemaArgs) -> Result<i32, CliError> {
+///
+/// This handler is context-free: the schema list is compiled into the binary, so it needs
+/// no project, `vowp.toml` or initialised home. The CLI calls it before [`crate::Ctx::build`]
+/// and passes only the global `--json` flag.
+pub fn run(json: bool, io: &mut dyn IoStreams, args: &SchemaArgs) -> Result<i32, CliError> {
     match args.type_name.as_deref() {
         None => {
             let names: Vec<&str> = vowp_protocol::schema::all_schemas().keys().copied().collect();
-            if ctx.json() {
+            if json {
                 print_json(io, &names)?;
             } else {
                 for name in names {

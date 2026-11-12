@@ -50,6 +50,14 @@ pub fn test_deps(root: &Path, config: VowpConfig) -> Deps {
     test_deps_with_git(root, config, Arc::new(SystemGit::default()))
 }
 
+/// Builds hermetic dependencies whose log is the caller's [`MemoryLog`].
+pub fn test_deps_with_log(root: &Path, config: VowpConfig, log: Arc<MemoryLog>) -> Deps {
+    Deps {
+        log,
+        ..test_deps(root, config)
+    }
+}
+
 /// Builds hermetic dependencies with a chosen [`GitOps`] implementation.
 pub fn test_deps_with_git(root: &Path, config: VowpConfig, git: Arc<dyn GitOps>) -> Deps {
     Deps {
@@ -77,6 +85,8 @@ pub fn config_for(repo: &Path) -> VowpConfig {
 pub fn env_config(checkout: &Path) -> EnvConfig {
     EnvConfig {
         checkout: checkout.display().to_string(),
+        build: Vec::new(),
+        env_pass: Vec::new(),
         deploy: Vec::new(),
         guards: Vec::new(),
         approval: Approval::Human,

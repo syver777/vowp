@@ -51,6 +51,7 @@ TEXT_DIR = Path(__file__).resolve().parent / "license-texts"
 # Keep this order: it is the order of the full-text sections in the bundle.
 LICENCE_TEXTS = (
     ("MIT", "MIT.txt", "MIT License"),
+    ("MIT-0", "MIT-0.txt", "MIT No Attribution"),
     ("Apache-2.0", "Apache-2.0.txt", "Apache License 2.0"),
     (
         "Apache-2.0 WITH LLVM-exception",
@@ -129,7 +130,7 @@ MARKER_RE = re.compile(r"(?<![A-Za-z])(?:Copyright\b(?:\s*©)?|©)")
 
 
 def allowed_text_id(identifier: str) -> bool:
-    if identifier in ("MIT", "Apache-2.0", "ISC", "Zlib"):
+    if identifier in ("MIT", "MIT-0", "Apache-2.0", "ISC", "Zlib"):
         return True
     if identifier in ("Apache-2.0 WITH LLVM-exception", "Unicode-3.0"):
         return True
@@ -382,7 +383,7 @@ def build_bundle(rows: list[dict]) -> str:
         + ".",
         "",
         "The full texts below cover every licence identifier used by this locked",
-        "tree, plus BSD-3-Clause and ISC from the audit's allowed set. A locked",
+        "tree and the other reviewed texts in the audit's allowed set. A locked",
         "identifier without a reviewed text in `scripts/release/license-texts/`",
         "makes the generator fail instead of shipping an incomplete bundle.",
         "",

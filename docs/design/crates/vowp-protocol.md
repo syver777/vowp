@@ -34,6 +34,7 @@ crates/vowp-protocol/
   src/loops.rs        // Loop, LoopKind, LoopBounds, ActiveState, Schedule*, MissedPolicy, ScheduleAction
   src/release.rs      // Release, ReleaseState, GuardResult
   src/config.rs       // VowpConfig and sub-structs
+  src/api.rs          // v0.3 loopback API documents: Health, Board, BoardRun, BoardLimit, Page<T>, JobPage, SessionPage, NodePage, SessionDetail, EventPage, InboxPage, InboxAnswerRequest, SessionSwitchRequest, CostReport, CostRow, CostTotal, ApiError
   src/adapter.rs      // Adapter, AdapterRun, StartInput, RunSummary, AdapterCapabilities, ProbeResult, AdapterError
   src/services.rs     // SessionOps, NewSession, TurnRequest, TurnResult, SwitchRequest, CancelToken, ServiceError
   src/schema.rs       // all_schemas, schema_for_name
@@ -89,10 +90,10 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 4. **Ids.** ULID ids: 26 chars `[0-9A-HJKMNP-TV-Z]`, uppercase on output; parsing accepts lowercase and normalises to uppercase.
    `CapsuleId` = `cap_` + ULID. Slugs (`JobId`, `NodeName`, `ProjectName`): `^[a-z0-9][a-z0-9-]{0,63}$`, no trailing `-`.
    `new()` is monotonic within one process (shared `Mutex<ulid::Generator>`; on overflow in the same ms, wait 1 ms and retry).
-5. **Executor grammar.** `harness ":" model [ "@" effort ] [ "#" variant ]`. `harness` ∈ {claude-code, opencode, cli, vowp}.
+5. **Executor grammar.** `harness ":" model [ "@" effort ] [ "#" variant ]`. `harness` ∈ {claude-code, opencode, cli, acp, vowp}.
    `model` non-empty, chars `[A-Za-z0-9._:/-]`. `effort`/`variant` `[a-z0-9_-]+`. `@effort` is only valid for `claude-code`, `#variant`
    only for `opencode`; both → `InvalidExecutor`. `Display(parse(s)) == s` for all valid `s` with canonical order (`@` before `#`).
-   `provider()`: claude-code → `"claude"`; opencode → text before the first `/` (whole model if no `/`); cli → model.
+   `provider()`: claude-code → `"claude"`; opencode → text before the first `/` (whole model if no `/`); cli/acp → model.
 6. **`Profile::validate`**: ladder non-empty; no duplicate executor; every executor `validate`d; `node` slug-valid if set.
    **`Profile::pick(limited, now)`**: iterate rungs in order; skip a rung when `limited[provider]` is `None` (indefinite) or
    `Some(t)` with `t > now`; return the first remaining `(index, &Executor)`; `None` if all are skipped.
@@ -112,9 +113,24 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 11. **`VowpConfig::validate`**: rules listed in `architecture.md` §5.3 (profile names referenced by jobs exist; every ladder valid;
     provider referenced by a ladder executor need not be declared; env guards known names or `script:`/`no_active_jobs:` prefix; cron strings
     parse with the `cron` crate is checked in vowp-core `ScheduleSpec::parse`; here only: `cron`/`every` XOR, exactly 5 whitespace-separated cron fields, `every` pattern, tz format, unique names).
-12. **Schema export**: `all_schemas()` keys are the Rust type names (`"EventEnvelope"`, `"Capsule"`, `"CapsuleDraft"`, `"Job"`, `"NewJob"`, `"JobPatch"`,
-    `"Gate"`, `"Evidence"`, `"GateResult"`, `"ReportFrontMatter"`, `"BriefFrontMatter"`, `"VowpConfig"`, `"Schedule"`, `"Release"`, `"InboxItem"`, `"Run"`,
-    `"Worker"`, `"Session"`, `"Limit"`, `"Cost"`, `"Switch"`, `"Loop"`, `"Node"`, `"Project"`, `"Profile"`, `"Edge"`, `"LedgerEntry"`). Output is deterministic (BTreeMap, stable ordering).
+12. **Schema export**: `all_schemas()` keys are the Rust type names. The exported set is
+    `"ApiError"`, `"ApiErrorBody"`, `"BackupFile"`, `"BackupReport"`, `"Board"`, `"BoardLimit"`,
+    `"BoardRun"`, `"BlockedJobCard"`, `"BrakeState"`,
+    `"BriefFrontMatter"`, `"CapacityAdvice"`, `"CapacityReport"`, `"CapacitySnapshot"`, `"CapacityTarget"`,
+    `"Capsule"`, `"CapsuleDraft"`, `"CatalogEntry"`, `"Cost"`, `"CostReport"`, `"CostRow"`,
+    `"CostTotal"`, `"Edge"`, `"EventEnvelope"`, `"EventPage"`,
+    `"Evidence"`, `"FleetQueueRow"`, `"FleetStatus"`, `"Gate"`, `"GateFailureCard"`, `"GateResult"`,
+    `"GcClassReport"`, `"GcReport"`, `"Health"`, `"HostSample"`, `"InboxAnswerRequest"`,
+    `"InboxItem"`, `"InboxPage"`, `"InboxSummary"`,
+    `"IngestAck"`, `"Job"`, `"JobPage"`, `"JobPatch"`, `"JoinInstructions"`, `"Lease"`, `"LeaseStatus"`,
+    `"LedgerEntry"`, `"Limit"`, `"Loop"`, `"MergeCard"`, `"MigrationCount"`, `"MigrationReport"`, `"NewJob"`,
+    `"Node"`, `"NodePage"`, `"OrchestratorCard"`, `"Page"`, `"Profile"`, `"Project"`, `"ProjectEntry"`,
+    `"ProjectSnapshot"`, `"QueueJobCard"`, `"Release"`, `"RemoteEvent"`, `"RemoteLine"`,
+    `"ReportFrontMatter"`, `"Run"`, `"RunUsage"`, `"RunningCapacity"`, `"RunningJobCard"`, `"Schedule"`,
+    `"SecretInfo"`, `"SecretRequest"`, `"Session"`, `"SessionDetail"`, `"SessionPage"`, `"SessionSwitchRequest"`,
+    `"SessionSurfaceCard"`, `"Snapshot"`, `"SupervisorSnapshot"`, `"Surface"`, `"SurfaceRef"`, `"Switch"`, `"TakeoverReport"`,
+    `"Tunnel"`, `"TurnGrant"`, `"UsageEstimate"`, `"VowpConfig"`, `"WaitReason"`, `"WaitingJob"`, `"Worker"`.
+    Output is deterministic (BTreeMap, stable ordering).
 13. **No panics**: all constructors/parsers return `Result`; regex literals inside use `// invariant:` comments.
 
 ## 5. Error enum
@@ -134,8 +150,8 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 | `timestamp_normalises_offsets` | `"2026-11-08T21:25:47+02:00"` equals `"2026-11-08T19:25:47.000Z"` |
 | `timestamp_ordering_matches_strings` | proptest: `a<b ⇔ a.as_rfc3339()<b.as_rfc3339()` |
 | `fake_clock_advances` | `FakeClock::at(t)`, `advance(90s)` → `now()==t+90s`; clones share state |
-| `executor_parse_table` | valid: the three examples in types.md §3 + `opencode:anthropic/claude-x#high`; invalid: no colon, `@` on opencode, `#` on claude-code, empty model, unknown harness, `claude-code:m@Hi` → `InvalidExecutor`; each valid one `to_string()` back to input |
-| `executor_provider_and_model_arg` | `provider()` = `claude` for claude-code, the text before `/` for opencode, the model/entry name for cli; `model_arg()` round-trips the model and optional variant |
+| `executor_parse_table` | valid: the three examples in types.md §3 + `opencode:anthropic/claude-x#high` + `acp:claude-code-acp`; invalid: no colon, `@` on opencode, `#` on claude-code, `@`/`#` on acp, empty model, unknown harness, `claude-code:m@Hi` → `InvalidExecutor`; each valid one `to_string()` back to input |
+| `executor_provider_and_model_arg` | `provider()` = `claude` for claude-code, the text before `/` for opencode, the model/entry name for cli and acp; `model_arg()` round-trips the model and optional variant |
 | `executor_serde_is_string` | `serde_json::to_string(&e)` is a JSON string equal to Display; deserialising bad string errors |
 | `profile_validate_rejects_empty_and_duplicates` | empty ladder, duplicate rung → error |
 | `profile_pick_skips_limited_rungs` | 2-rung ladder: claude limited until future → rung 1; limited until past → rung 0; `None` (indefinite) → skipped; both limited → `None` |
@@ -166,10 +182,13 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 | `config_rejects_unknown_fields_and_bad_values` | unknown key in `[node]`, both `cron` and `every` on a schedule, empty ladder, `max_workers=0` → errors |
 | `config_defaults_are_documented_values` | `NodeConfig::default()`: name `local`, 4, 2, 60, tz 0; `MergeConfig::default()`: rebase true, 2700, secret_scan true |
 | `schema_export_covers_listed_types` | `all_schemas()` has every key of rule 12; each value is an object with `"$schema"` or `"type"`/`"definitions"`; deterministic across two calls |
+| `inbox_answer_request_has_one_required_answer_field` | `InboxAnswerRequest { answer }` serialises to `{"answer":"…"}`, round-trips, and its exported schema requires `answer` |
+| `session_switch_request_defaults_reason_and_force_and_has_a_schema` | `SessionSwitchRequest { to }` defaults `reason` to `user` and `force` to false, serialises all three fields, round-trips, and its exported schema requires only `to` |
 | `types_md_examples_validate` | each JSON example fixture (`job.json`, `capsule.json`, `cost.json`, `limit.json`, `events.jsonl`, `profile.json`, `edge.json`, `run.json`, `session.json`, `inbox_item.json`, `loop.json`, `release.json`, `schedule.json`, `gate_result.json`, `worker.json`, `switch.json`) deserialises into its Rust type and validates against its exported schema (use a tiny structural checker: required properties present, no unknown top-level keys for `deny_unknown_fields` types) |
 | `log_format_line` | `format_log_line` golden string; `MemoryLog` records in order |
 | `service_cancel_token` | clones share cancellation; `ServiceError` Display strings |
 
 ## 7. Out of scope / v0.2
 
-HTTP API types, ACP event mapping, permission.request/resolve events, IANA timezone support, signed/hash-chained logs (field reserved: none in v0.1).
+ACP event mapping, permission.request/resolve events, IANA timezone support, signed/hash-chained logs (field reserved: none in v0.1).
+The v0.3 loopback API documents live in `src/api.rs`; see `docs/design/v0.3/http-api.md`.

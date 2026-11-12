@@ -157,6 +157,14 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
           "default": "human",
           "description": "Who approves a promotion."
         },
+        "build": {
+          "default": [],
+          "description": "Commands run in the checkout by the `build` guard; empty means the\n`[merge].check_cmds` / `[project].check_cmds` fallback.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "checkout": {
           "description": "Checkout directory for this environment.",
           "type": "string"
@@ -164,6 +172,14 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
         "deploy": {
           "default": [],
           "description": "Deployment commands.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env_pass": {
+          "default": [],
+          "description": "Environment-variable **names** to resolve from the vault and pass to the\nserving-bank, deploy, probe and rollback commands; never values.",
           "items": {
             "type": "string"
           },

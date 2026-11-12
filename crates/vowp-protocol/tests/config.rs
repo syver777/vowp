@@ -70,6 +70,40 @@ fn config_example_parses() {
 }
 
 #[test]
+fn env_build_commands_parse_and_default_empty() {
+    let config = parse(&format!(
+        "{BASE}\n[env.prod]\ncheckout = \"~/prod\"\nbuild = [\"make build\"]\n"
+    ));
+    assert_eq!(config.env["prod"].build, ["make build"]);
+
+    let config = parse(&format!("{BASE}\n[env.work]\ncheckout = \"~/work\"\n"));
+    assert!(config.env["work"].build.is_empty());
+
+    // An environment still rejects unknown keys.
+    reject(&format!("{BASE}\n[env.bad]\ncheckout = \"~/bad\"\nnot_a_key = true\n"));
+}
+
+#[test]
+fn env_pass_parses_names_and_defaults_empty() {
+    let config = parse(&format!(
+        "{BASE}\n[env.prod]\ncheckout = \"~/prod\"\nenv_pass = [\"DEPLOY_TOKEN\", \"DEPLOY_TOKEN\", \"API_KEY\"]\n"
+    ));
+    assert_eq!(
+        config.env["prod"].env_pass,
+        ["DEPLOY_TOKEN", "DEPLOY_TOKEN", "API_KEY"],
+        "env_pass holds names verbatim; de-duplication happens when it is resolved"
+    );
+
+    let config = parse(&format!("{BASE}\n[env.work]\ncheckout = \"~/work\"\n"));
+    assert!(config.env["work"].env_pass.is_empty());
+
+    // Unknown keys beside env_pass are still rejected.
+    reject(&format!(
+        "{BASE}\n[env.bad]\ncheckout = \"~/bad\"\nenv_pass = [\"DEPLOY_TOKEN\"]\nnot_a_key = true\n"
+    ));
+}
+
+#[test]
 fn config_rejects_unknown_fields_and_bad_values() {
     parse(BASE); // the baseline must be valid, or the cases below prove nothing.
 

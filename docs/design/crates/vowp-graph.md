@@ -208,12 +208,26 @@ L0 skeleton [done] Cargo workspace skeleton
 L1 protocol [running] protocol types  <- skeleton
 L2 graph-engine [pending] graph engine  <- protocol
 ```
-**Mermaid**: first line `graph TD`; one node line per job ordered by id: `    graph_engine["graph-engine (pending)"]` (node key = id with `-` → `_`, label escaped: `"` → `'`); then edge lines ordered by `(kind, src, dst)`: `needs` as `dst_key --> src_key` (dependency flows into dependent); `verifies` `src -.->|verifies| dst`; `fixes` `src ==>|fixes| dst`; `escalates` `src -.->|escalates| dst`; `blocks` `src -->|blocks| dst`. Then `classDef` lines are NOT emitted (state colours are v0.2).
+**Mermaid**: first line `graph TD`; one node line per job ordered by id: `    graph_engine["graph-engine (pending)"]` (node key = id with `-` → `_`, label escaped: `"` → `'`); then edge lines ordered by `(kind, src, dst)`: `needs` as `dst_key --> src_key` (dependency flows into dependent); `verifies` `src -.->|verifies| dst`; `fixes` `src ==>|fixes| dst`; `escalates` `src -.->|escalates| dst`; `blocks` `src -->|blocks| dst`. Then four `classDef` lines in the fixed group order `running`, `waiting`, `failed`, `done`, with readable fill/stroke/text colours (the label already carries the state, so colour is never the only signal). Then one `class <key> <group>` line per job in job id order.
+
+State-to-group mapping (it reuses the protocol predicates, so there is no second state vocabulary):
+
+- `running`: `running`, `stalled`, `gating`, `reviewing`, `fixing`, `merging` — exactly `JobState::holds_lock()`.
+- `waiting`: `pending`, `ready`.
+- `failed`: `failed`, `parked`.
+- `done`: `done`, `replanned`, `cancelled` — exactly `JobState::is_terminal()`.
+
 ```
 graph TD
-    skeleton["skeleton (done)"]
     protocol["protocol (running)"]
+    skeleton["skeleton (done)"]
     skeleton --> protocol
+    classDef running fill:#fff4d6,stroke:#b7791f,color:#744210
+    classDef waiting fill:#e8f0fe,stroke:#3b6fb6,color:#1a3d6d
+    classDef failed fill:#fde8e8,stroke:#b42318,color:#7a1a12
+    classDef done fill:#e6f4ea,stroke:#2f7d4f,color:#1d4d31
+    class protocol running
+    class skeleton done
 ```
 
 ## 7. YAML export/import (`yaml.rs`)
@@ -335,11 +349,11 @@ Dispatch
 - proptest `prop_dispatch_never_two_overlapping_owns` — random ready sets/owns/caps: chosen ∪ running owns pairwise non-overlapping (except fix-group), `choices.len() <= slots`.
 
 Rendering / YAML / guards
-- `render_ascii_golden` and `render_mermaid_golden` — compare with `tests/fixtures/*.txt` goldens for a 4-job graph.
+- `render_ascii_golden` and `render_mermaid_golden` — compare with inline goldens for a 4-job graph; `render_mermaid_classes_cover_every_group` and `render_mermaid_maps_every_state_to_its_group` cover the fixed `classDef` order, the per-job assignments and the complete state mapping; the ASCII test also asserts no colour syntax leaks in.
 - `yaml_roundtrip_preserves_jobs_and_edges` — export → import → equal `NewJob`s; `yaml_import_rejects_bad_gate_and_cycle` ; `yaml_export_excludes_runtime_fields`.
 - `stall_judge_matrix` — table of (silent?, idle minutes, commit/event recency) → verdict, incl. boundary 7/8 and 19/20 minutes; `stall_judge_commit_resets_idle`.
 - `repeat_guard_trips_on_third_identical`, `repeat_guard_resets_on_new_fingerprint`, `repeat_guard_resets_on_new_key`.
 - `attempts_left_saturates`.
 
 ## 11. Out of scope (v0.2)
-Weighted/critical-path scheduling, mermaid state colours, per-edge metadata, graph diffing, multi-project graphs.
+Weighted/critical-path scheduling, per-edge metadata, graph diffing, multi-project graphs.

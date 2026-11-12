@@ -7,6 +7,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod adapters;
+
 pub mod capacity;
 pub mod deps;
 pub mod error;

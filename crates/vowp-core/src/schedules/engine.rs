@@ -4,6 +4,9 @@
 //! `tick` advances `last_run_at`/`next_run_at` **before** returning a due run, so a crash can
 //! lose at most one firing and can never double-fire. `fire` writes the ledger row carrying
 //! the idempotency key `"<schedule id>@<due>"` before it executes the action.
+//!
+//! Interval schedules re-arm on the row's `created_at` phase, so a restart never snaps an
+//! occurrence to the epoch-aligned grid; cron schedules ignore the anchor.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -60,7 +63,8 @@ impl ScheduleEngine {
     ///
     /// Existing rows keep their id, state and run history; a changed spec, timezone, action or
     /// missed policy replaces the row in one transaction. New rows get a fresh id and their
-    /// first `next_run_at`.
+    /// first `next_run_at`. Interval phase is anchored at `created_at` (or `now` for a new row);
+    /// an existing non-null `next_run_at` is never recomputed.
     pub fn sync_from_config(&self, store: &Store, cfg: &VowpConfig) -> Result<(), CoreError> {
         let now = store.clock().now();
         for entry in &cfg.schedules {
@@ -82,11 +86,13 @@ impl ScheduleEngine {
                     )));
                 }
             };
-            let parsed = ScheduleSpec::parse(kind, &spec, &tz)?;
+            let existing = store.schedule(&entry.name)?;
+            let anchor = existing.as_ref().map_or(now, |schedule| schedule.created_at);
+            let parsed = ScheduleSpec::parse_at(kind, &spec, &tz, anchor)?;
             let missed = entry.missed.unwrap_or(MissedPolicy::RunOnce);
             let next_run_at = parsed.next_after(now);
 
-            match store.schedule(&entry.name)? {
+            match existing {
                 Some(existing)
                     if existing.spec_kind == kind
                         && existing.spec == spec
@@ -164,7 +170,7 @@ impl ScheduleEngine {
             if due_at > now || now.since(due_at) <= self.late_threshold() {
                 continue;
             }
-            let parsed = ScheduleSpec::parse(schedule.spec_kind, &schedule.spec, &schedule.tz)?;
+            let parsed = ScheduleSpec::parse_at(schedule.spec_kind, &schedule.spec, &schedule.tz, schedule.created_at)?;
             let next_run_at = parsed.next_after(now);
             let key = idempotency_key(&schedule.id, due_at);
             let already_fired = self.already_fired(store, &key)?;
@@ -201,7 +207,8 @@ impl ScheduleEngine {
         // loops.md §11 step 3a: an active schedule without a next time is armed, not fired.
         for schedule in store.list_schedules()? {
             if schedule.state == ActiveState::Active && schedule.next_run_at.is_none() {
-                let parsed = ScheduleSpec::parse(schedule.spec_kind, &schedule.spec, &schedule.tz)?;
+                let parsed =
+                    ScheduleSpec::parse_at(schedule.spec_kind, &schedule.spec, &schedule.tz, schedule.created_at)?;
                 store.record_schedule_run(
                     &schedule.id,
                     schedule.last_run_at.unwrap_or(schedule.created_at),
@@ -216,7 +223,7 @@ impl ScheduleEngine {
             let Some(due_at) = schedule.next_run_at else {
                 continue;
             };
-            let parsed = ScheduleSpec::parse(schedule.spec_kind, &schedule.spec, &schedule.tz)?;
+            let parsed = ScheduleSpec::parse_at(schedule.spec_kind, &schedule.spec, &schedule.tz, schedule.created_at)?;
             let next_run_at = parsed.next_after(now);
             let key = idempotency_key(&schedule.id, due_at);
             if self.already_fired(store, &key)? {

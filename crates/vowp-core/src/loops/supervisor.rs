@@ -2041,7 +2041,7 @@ impl Supervisor {
             self.runners.cancel_and_wait(&previous.id);
         }
         let worktree = super::job_worktree(&job)?;
-        dispatch::write_brief(&self.deps, &job, &worktree)?;
+        dispatch::write_brief(&job, &worktree, &repo)?;
         if super::latest_session(&self.store, &job.id)?.is_none() {
             let role = match job.role {
                 vowp_protocol::Role::Verifier => SessionRole::Verifier,

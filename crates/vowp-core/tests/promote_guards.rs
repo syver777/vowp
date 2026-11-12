@@ -74,6 +74,62 @@ fn guards_head_equals_remote_behind_fails() {
 }
 
 #[test]
+fn guards_build_uses_env_commands_and_reports_failures() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    let mut config = config_for(&root.join("repo"));
+    config.merge.check_cmds = vec!["printf merge > marker; exit 9".to_owned()];
+    config.project.check_cmds = vec!["printf project > marker; exit 8".to_owned()];
+    let deps = test_deps(root, config);
+    let mut env = env_config(&checkout);
+
+    env.build = vec!["printf built > marker".to_owned()];
+    let result = guards::run_guard(&deps, &env, "build", &checkout).unwrap();
+    assert!(result.passed, "env build command must pass: {}", result.detail);
+    assert_eq!(read(&checkout.join("marker")), "built");
+    assert_eq!(result.detail, "1 build command(s) passed");
+
+    let command = "printf broken > marker; exit 3";
+    env.build = vec![command.to_owned()];
+    let result = guards::run_guard(&deps, &env, "build", &checkout).unwrap();
+    assert!(!result.passed, "a failing env build command must fail the guard");
+    assert!(result.detail.contains(command), "detail: {}", result.detail);
+    assert!(result.detail.contains("exit Some(3)"), "detail: {}", result.detail);
+}
+
+#[test]
+fn guards_build_falls_back_and_keeps_the_no_command_note() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path();
+    let checkout = root.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    let mut config = config_for(&root.join("repo"));
+    config.merge.check_cmds = vec!["printf merge > marker".to_owned()];
+    config.project.check_cmds = vec!["printf project > marker".to_owned()];
+    let env = env_config(&checkout);
+
+    let deps = test_deps(root, config.clone());
+    let result = guards::run_guard(&deps, &env, "build", &checkout).unwrap();
+    assert!(result.passed, "merge check command must pass: {}", result.detail);
+    assert_eq!(read(&checkout.join("marker")), "merge");
+
+    config.merge.check_cmds.clear();
+    let deps = test_deps(root, config.clone());
+    let result = guards::run_guard(&deps, &env, "build", &checkout).unwrap();
+    assert!(result.passed, "project check command must pass: {}", result.detail);
+    assert_eq!(read(&checkout.join("marker")), "project");
+
+    config.project.check_cmds.clear();
+    let deps = test_deps(root, config);
+    let result = guards::run_guard(&deps, &env, "build", &checkout).unwrap();
+    assert!(result.passed);
+    assert_eq!(result.detail, "no build commands configured; nothing to run");
+}
+
+#[test]
 fn guard_failure_marks_refused_and_never_deploys() {
     let temp = TempDir::new().unwrap();
     let root = temp.path();

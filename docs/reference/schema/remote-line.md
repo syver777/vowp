@@ -257,6 +257,11 @@ Exported by `vowp schema RemoteLine` and generated from the protocol types in
           "type": "string"
         },
         {
+          "const": "acp",
+          "description": "An Agent Client Protocol (ACP) server.",
+          "type": "string"
+        },
+        {
           "const": "vowp",
           "description": "Events VOWP itself writes (system events, shell and gate runs).",
           "type": "string"

@@ -406,6 +406,33 @@ fn run_bare_json(env: &common::TestEnv, args: &[&str]) -> (i32, serde_json::Valu
     (code, value, stderr)
 }
 
+/// Runs the real binary from `cwd` with `--home` but without `--project`.
+fn run_bare_in(env: &common::TestEnv, cwd: &std::path::Path, args: &[&str]) -> std::process::Output {
+    env.command(env!("CARGO_BIN_EXE_vowp"))
+        .current_dir(cwd)
+        .arg("--home")
+        .arg(env.home_path())
+        .args(args)
+        .output()
+        .expect("run vowp")
+}
+
+/// Parses a successful command's JSON stdout, including its failure output in the message.
+fn output_json(output: &std::process::Output) -> serde_json::Value {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "vowp exited {:?}; stderr: {stderr}",
+        output.status.code()
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout is not JSON ({error}): {:?}; stderr: {stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
 /// Returns the snapshot path for a test home.
 fn snapshot_path(env: &common::TestEnv) -> std::path::PathBuf {
     env.home_path().join("snapshot.json")
@@ -572,6 +599,72 @@ fn two_project_home_routes_status_board_and_fleet() {
     );
     assert!(snapshot_path(&env).is_file(), "--refresh wrote the snapshot");
     drop(beta_dir);
+}
+
+/// A cwd checkout registered in another home must not replace the selected home's fleet.
+///
+/// Both homes name their project `test`, so only the registry path can tell them apart.
+/// A name-only selection would silently show the wrong project instead of the fleet.
+#[test]
+fn cwd_checkout_from_another_home_keeps_the_fleet_context() {
+    let env = common::TestEnv::new();
+    let (beta_dir, beta_config) = add_project(&env, "beta");
+    let alpha = env.config.project.name.clone();
+    let beta = beta_config.project.name.clone();
+    for id in ["a01-alpha-pending", "a02-alpha-pending"] {
+        insert_job(&env, &alpha, id);
+    }
+    for id in ["b01-beta-pending", "b02-beta-pending", "b03-beta-pending"] {
+        insert_job(&env, &beta, id);
+    }
+
+    // A complete second home whose checkout happens to share the project name.
+    let other = common::TestEnv::new();
+
+    let output = run_bare_in(&env, other.project_path(), &["--json", "status"]);
+    let value = output_json(&output);
+    assert_eq!(value["home"], "local", "{value}");
+    assert_eq!(value["projects"].as_array().expect("projects").len(), 2, "{value}");
+    assert_eq!(
+        value["jobs"]["pending"], 5,
+        "the selected home's fleet aggregates both projects, not the cwd checkout: {value}"
+    );
+
+    let output = run_bare_in(&env, other.project_path(), &["board", "--once"]);
+    assert!(
+        output.status.success(),
+        "bare board must use the fleet context; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("projects: 2"), "{stdout}");
+
+    let output = run_bare_in(&env, other.project_path(), &["--json", "fleet", "status", "--refresh"]);
+    let value = output_json(&output);
+    assert_eq!(
+        value["snapshot"]["projects"].as_array().expect("cards").len(),
+        2,
+        "{value}"
+    );
+
+    // A cwd checkout registered in the selected home still selects its project.
+    let output = run_bare_in(&env, env.project_path(), &["--json", "status"]);
+    let value = output_json(&output);
+    assert_eq!(
+        value["jobs"]["pending"], 2,
+        "the registered cwd checkout selects alpha's board: {value}"
+    );
+
+    // Explicit --project still wins from an unrelated cwd.
+    let output = run_bare_in(&env, other.project_path(), &["--json", "--project", "beta", "status"]);
+    let value = output_json(&output);
+    assert_eq!(
+        value["jobs"]["pending"], 3,
+        "explicit --project selects beta's board: {value}"
+    );
+
+    drop(beta_dir);
+    drop(other);
 }
 
 #[test]

@@ -378,6 +378,7 @@ fn harness_config<'a>(ctx: &'a Ctx, executor: &Executor) -> Option<&'a vowp_prot
     let key = match executor.harness {
         vowp_protocol::HarnessKind::ClaudeCode => "claude-code",
         vowp_protocol::HarnessKind::Opencode => "opencode",
+        vowp_protocol::HarnessKind::Acp => "acp",
         vowp_protocol::HarnessKind::Cli => executor.model.as_str(),
         vowp_protocol::HarnessKind::Vowp => return None,
     };

@@ -1,7 +1,17 @@
 //! `vowp up`, `vowp down`, `plan` and tmux-layout tests.
 //!
 //! Everything is hermetic: temporary node homes, temporary git repositories, fake adapters
-//! and a private tmux socket (`-L vowp-test-…`) killed by a guard on drop.
+//! and a private tmux socket (`-L vowp-t-…`) killed by a guard on drop. Names stay short
+//! because macOS caps a Unix socket path at 104 bytes.
+//!
+//! The first `TestEnv` and each direct private-server test run
+//! [`common::sweep_stale_test_servers_once`] before starting tmux. A test process killed
+//! by a timeout or the OOM killer never runs its `Drop`, so its server would otherwise
+//! outlive the temporary home and keep every `vowp __window` pane polling. The sweep only
+//! removes private servers whose session is `vowp-…` and whose private path is gone, never
+//! `vowp-home`, the default socket, `vowp-ops` or `vowp-orchestrator`. The board test
+//! also proves that killing a private server takes its `vowp __window board` pane down
+//! with it.
 
 mod common;
 
@@ -21,7 +31,7 @@ use vowp_protocol::{
 };
 use vowp_store::{NodePaths, Store, StoreError};
 use vowp_tmux::fake::FakeWindows;
-use vowp_tmux::{Tmux, WindowManager};
+use vowp_tmux::{Tmux, WindowManager, WindowSpec};
 
 /// Runs one git command in `dir` and asserts success.
 fn git(dir: &Path, args: &[&str]) {
@@ -551,6 +561,7 @@ struct V01Env {
 
 impl V01Env {
     fn new(name: &str) -> Self {
+        common::sweep_stale_test_servers_once();
         let home = tempfile::tempdir().expect("v0.1 home");
         let project = tempfile::tempdir().expect("v0.1 project");
         let mut config = vowp_protocol::VowpConfig::with_defaults_for_tests();
@@ -608,6 +619,22 @@ impl V01Env {
     }
 }
 
+impl Drop for V01Env {
+    fn drop(&mut self) {
+        // `up --once --no-tmux` still creates the `vowp-<project>` session.
+        common::kill_private_server_for_home(self.home.path());
+    }
+}
+
+/// Kills the private tmux server owned by a temporary home when the test ends.
+struct HomeTmuxGuard(PathBuf);
+
+impl Drop for HomeTmuxGuard {
+    fn drop(&mut self) {
+        common::kill_private_server_for_home(&self.0);
+    }
+}
+
 /// Rebuilds the recorded v0.1 database from hex and tagged literal/zero segments.
 ///
 /// Hex keeps the recorded bytes clear of every secret-scan pattern (no `-`, `_` or
@@ -656,15 +683,20 @@ fn decode_hex(value: &str) -> Vec<u8> {
 /// and the full workspace runs these tests beside other heavy test binaries. Five seconds
 /// was too tight under that load; the extra headroom does not hide a stuck supervisor
 /// because the predicate still has to become true.
-fn eventually(mut predicate: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn eventually(predicate: impl FnMut() -> bool) -> bool {
+    eventually_within(Duration::from_secs(30), predicate)
+}
+
+/// Polls `predicate` for up to `timeout`.
+fn eventually_within(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if predicate() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    false
+    predicate()
 }
 
 /// A fake adapter that records `StartInput`s and finishes immediately with an `Ok` summary.
@@ -826,14 +858,27 @@ impl Drop for ChildCleanup {
 /// One spawned `vowp up --foreground` process, killed if the test panics.
 struct SupervisorProcess {
     child: Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
 }
 
 impl SupervisorProcess {
     /// Spawns the real binary against a temporary home and project.
+    ///
+    /// Existing supervisor tests opt out of the optional window with a missing
+    /// `VOWP_DAEMON_BIN`, so a stray `vowp-daemon` in `target/debug` cannot change them.
     fn spawn(home: &Path, repo: &Path) -> Self {
+        Self::spawn_with(home, repo, &[])
+    }
+
+    /// Spawns the real binary with extra environment variables for its child.
+    fn spawn_with(home: &Path, repo: &Path, env: &[(&str, String)]) -> Self {
+        let stdout = home.join("supervisor.stdout");
         let stderr = home.join("supervisor.stderr");
-        let file = std::fs::File::create(&stderr).expect("supervisor stderr file");
-        let child = Command::new(env!("CARGO_BIN_EXE_vowp"))
+        let stdout_file = std::fs::File::create(&stdout).expect("supervisor stdout file");
+        let stderr_file = std::fs::File::create(&stderr).expect("supervisor stderr file");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vowp"));
+        command
             .arg("--home")
             .arg(home)
             .arg("--project")
@@ -843,20 +888,33 @@ impl SupervisorProcess {
             .arg("--no-tmux")
             .env("HOME", home)
             .env("TMUX_TMPDIR", home.join("tmux"))
+            .env("VOWP_DAEMON_BIN", home.join("missing-vowp-daemon"))
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
             .env_remove("VOWP_TMUX_SOCKET")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(file))
-            .spawn()
-            .expect("spawn vowp up");
-        Self { child }
+            .stdout(Stdio::from(stdout_file))
+            .stderr(Stdio::from(stderr_file));
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn vowp up");
+        Self { child, stdout, stderr }
     }
 
     /// Returns the supervisor pid.
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Returns the captured stdout.
+    fn stdout(&self) -> String {
+        std::fs::read_to_string(&self.stdout).unwrap_or_default()
+    }
+
+    /// Returns the captured stderr.
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr).unwrap_or_default()
     }
 
     /// Polls for exit up to `timeout`.
@@ -881,6 +939,135 @@ impl Drop for SupervisorProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A fake `vowp-daemon` that records its arguments, environment and lifecycle.
+///
+/// It never opens a store, binds a socket or touches a real home: it only writes under its
+/// own temporary directory. The stderr line deliberately contains the token and home path
+/// so the supervisor's forwarder is tested for redaction.
+struct FakeDaemon {
+    _tools: tempfile::TempDir,
+    script: PathBuf,
+    args: PathBuf,
+    token: PathBuf,
+    pid: PathBuf,
+    stopped: PathBuf,
+}
+
+impl FakeDaemon {
+    /// Writes the fake daemon script and its recording paths.
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("fake daemon tools");
+        let script = tools.path().join("vowp-daemon");
+        let args = tools.path().join("daemon.args");
+        let token = tools.path().join("daemon.token");
+        let pid = tools.path().join("daemon.pid");
+        let stopped = tools.path().join("daemon.stopped");
+        let body = r#"#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_DAEMON_ARGS"
+printf '%s' "${VOWP_API_TOKEN-}" > "$FAKE_DAEMON_TOKEN"
+printf '%s\n' "$$" > "$FAKE_DAEMON_PID"
+printf '%s\n' "fake-daemon stderr: home=$FAKE_DAEMON_HOME token=${VOWP_API_TOKEN-}" >&2
+printf '%s\n' "vowp-daemon: listening on http://127.0.0.1:54321"
+trap 'kill "$child" 2>/dev/null; printf stopped > "$FAKE_DAEMON_STOPPED"; exit 0' TERM INT
+while :; do
+  sleep 0.2 &
+  child=$!
+  wait "$child"
+done
+"#;
+        std::fs::write(&script, body).expect("fake daemon script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod daemon");
+        Self {
+            _tools: tools,
+            script,
+            args,
+            token,
+            pid,
+            stopped,
+        }
+    }
+
+    /// Returns the environment that points `vowp up` at this fake daemon.
+    fn envs(&self, token: &str, home: &Path) -> Vec<(&'static str, String)> {
+        vec![
+            ("VOWP_DAEMON_BIN", self.script.display().to_string()),
+            ("FAKE_DAEMON_ARGS", self.args.display().to_string()),
+            ("FAKE_DAEMON_TOKEN", self.token.display().to_string()),
+            ("FAKE_DAEMON_PID", self.pid.display().to_string()),
+            ("FAKE_DAEMON_STOPPED", self.stopped.display().to_string()),
+            ("FAKE_DAEMON_HOME", home.display().to_string()),
+            ("VOWP_API_TOKEN", token.to_owned()),
+        ]
+    }
+
+    /// Returns the recorded argv, when the daemon started.
+    fn args(&self) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(&self.args).ok()?;
+        Some(text.lines().map(str::to_owned).collect())
+    }
+
+    /// Returns the recorded `VOWP_API_TOKEN` value, when the daemon started.
+    fn token(&self) -> Option<String> {
+        std::fs::read_to_string(&self.token).ok()
+    }
+
+    /// Returns the recorded daemon pid, when it started.
+    fn pid(&self) -> Option<u32> {
+        read_pid_file(&self.pid)
+    }
+
+    /// Returns whether the daemon observed SIGTERM/SIGINT.
+    fn stopped(&self) -> bool {
+        self.stopped.is_file()
+    }
+}
+
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid() {
+            kill_group(pid);
+        }
+    }
+}
+
+/// A detached supervisor stopped by `vowp down` even when the test panics.
+struct DetachedUp {
+    home: PathBuf,
+    project: PathBuf,
+    cwd: PathBuf,
+}
+
+impl DetachedUp {
+    fn new(env: &common::TestEnv, cwd: &Path) -> Self {
+        Self {
+            home: env.home_path().to_path_buf(),
+            project: env.project_path().to_path_buf(),
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for DetachedUp {
+    fn drop(&mut self) {
+        let _ = Command::new(env!("CARGO_BIN_EXE_vowp"))
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--project")
+            .arg(&self.project)
+            .args(["down", "--force"])
+            .current_dir(&self.cwd)
+            .env("HOME", &self.home)
+            .env("VOWP_HOME", &self.home)
+            .env("TMUX_TMPDIR", self.home.join("tmux"))
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("VOWP_TMUX_SOCKET")
+            .output();
     }
 }
 
@@ -1002,6 +1189,15 @@ impl SignalEnv {
             read_pid_file(&self.pid_file).expect("harness pid"),
             read_pid_file(&self.child_file).expect("harness child pid"),
         )
+    }
+}
+
+impl Drop for SignalEnv {
+    fn drop(&mut self) {
+        // `--no-tmux` skips the node layout, but dispatching a job still creates
+        // `vowp-<project>` and its scratch/job windows. The supervisor is killed
+        // before this field-level drop, so no later tick can recreate the server.
+        common::kill_private_server_for_home(self.home.path());
     }
 }
 
@@ -1135,6 +1331,8 @@ fn down_writes_stop_file_and_clears_stale_lock() {
     let env = common::TestEnv::new();
     let lock = env.home_path().join("supervisor.lock");
     std::fs::write(&lock, format!("{}\n{}\n", u32::MAX, Timestamp::now().as_rfc3339())).expect("lock");
+    let window = env.home_path().join("web-window");
+    std::fs::write(&window, "http://127.0.0.1:1/\n").expect("stale web-window");
 
     let (code, stdout, stderr) = env.run(&["down"]);
     assert_eq!(code, 0, "down with no live supervisor must succeed: {stderr}");
@@ -1147,6 +1345,7 @@ fn down_writes_stop_file_and_clears_stale_lock() {
         "stop file holds unix seconds: {value:?}"
     );
     assert!(!lock.exists(), "a stale lock is removed");
+    assert!(!window.exists(), "a stale window address is removed");
 
     // A later `up` clears the stop and stopped files so the supervisor starts fresh.
     let stopped = env.home_path().join("heartbeat.stopped");
@@ -1177,6 +1376,217 @@ fn up_removes_lock_when_signal_install_fails() {
         io.stdout().is_empty(),
         "no running banner is printed: {:?}",
         io.stdout()
+    );
+}
+
+/// Waits for the fake daemon to write its pid.
+fn wait_for_fake_daemon(fake: &FakeDaemon, supervisor: &SupervisorProcess) -> u32 {
+    assert!(
+        eventually(|| fake.pid().is_some()),
+        "the fake daemon did not start; supervisor stdout:\n{}\nstderr:\n{}",
+        supervisor.stdout(),
+        supervisor.stderr()
+    );
+    fake.pid().expect("fake daemon pid")
+}
+
+#[test]
+fn up_starts_daemon_with_home_project_port_and_token() {
+    let env = common::TestEnv::new();
+    let fake = FakeDaemon::new();
+    let mut supervisor = SupervisorProcess::spawn_with(
+        env.home_path(),
+        env.project_path(),
+        &fake.envs("test-token", env.home_path()),
+    );
+    let daemon_pid = wait_for_fake_daemon(&fake, &supervisor);
+
+    assert!(
+        eventually(|| fake.args().is_some()),
+        "the fake daemon recorded no arguments; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert_eq!(
+        fake.args().expect("daemon args"),
+        vec![
+            "--home".to_owned(),
+            env.home_path().display().to_string(),
+            "--project".to_owned(),
+            env.config.project.name.as_str().to_owned(),
+            "--port".to_owned(),
+            "0".to_owned(),
+        ],
+        "the daemon must serve the supervisor's home and one registered project on an ephemeral port"
+    );
+    assert_eq!(
+        fake.token().as_deref(),
+        Some("test-token"),
+        "the daemon inherits VOWP_API_TOKEN"
+    );
+
+    let address = "http://127.0.0.1:54321/";
+    assert!(
+        eventually(|| supervisor.stdout().contains(&format!("web window: {address}"))),
+        "the window address was not surfaced; stdout:\n{}",
+        supervisor.stdout()
+    );
+    let stdout = supervisor.stdout();
+    assert!(
+        stdout.contains("remote window: vowp tunnel open window --remote-port 54321"),
+        "the tunnel hint must carry the daemon's actual port; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("local URL: http://127.0.0.1:<local-port>/"),
+        "the tunnel hint must show the local URL shape; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("test-token"),
+        "the supervisor output must not leak the token: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&env.home_path().display().to_string()),
+        "the supervisor output must not leak the home path: {stdout}"
+    );
+    assert!(
+        eventually(|| env.home_path().join("web-window").is_file()),
+        "the foreground supervisor publishes the address for a detached parent"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.home_path().join("web-window")).expect("web-window file"),
+        format!("{address}\n")
+    );
+
+    assert!(
+        eventually(|| supervisor.stderr().contains("fake-daemon stderr:")),
+        "daemon stderr is forwarded; stderr:\n{}",
+        supervisor.stderr()
+    );
+    let stderr = supervisor.stderr();
+    assert!(
+        !stderr.contains("test-token"),
+        "the forwarded stderr must not leak the token: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&env.home_path().display().to_string()),
+        "the forwarded stderr must not leak the home path: {stderr}"
+    );
+
+    kill_signal(supervisor.pid(), "TERM");
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("SIGTERM must stop the supervisor within 15 s");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a cancelled supervisor exits cleanly; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        eventually(|| !process_alive(daemon_pid)),
+        "the daemon child {daemon_pid} survived the supervisor"
+    );
+    assert!(
+        eventually(|| fake.stopped()),
+        "the daemon did not observe SIGTERM; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        !env.home_path().join("web-window").exists(),
+        "the address file is removed on shutdown"
+    );
+}
+
+#[test]
+fn up_down_stops_the_daemon_child() {
+    let env = common::TestEnv::new();
+    let fake = FakeDaemon::new();
+    let mut supervisor = SupervisorProcess::spawn_with(
+        env.home_path(),
+        env.project_path(),
+        &fake.envs("down-token", env.home_path()),
+    );
+    let daemon_pid = wait_for_fake_daemon(&fake, &supervisor);
+    assert!(
+        eventually(|| env.home_path().join("web-window").is_file()),
+        "the supervisor did not publish the window address; stderr:\n{}",
+        supervisor.stderr()
+    );
+
+    let (code, stdout, stderr) = env.run(&["down"]);
+    assert_eq!(code, 0, "down failed: {stderr}");
+    assert!(stdout.contains("supervisor stopped"), "{stdout}");
+
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("down must stop the supervisor within 15 s");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the supervisor exits cleanly; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        eventually(|| !process_alive(daemon_pid)),
+        "down left the daemon child {daemon_pid} running"
+    );
+    assert!(
+        eventually(|| fake.stopped()),
+        "the daemon did not observe the stop; stderr:\n{}",
+        supervisor.stderr()
+    );
+}
+
+#[test]
+fn up_warns_and_continues_when_the_daemon_binary_is_missing() {
+    let env = common::TestEnv::new();
+    let missing = env.home_path().join("no-such-vowp-daemon");
+    let mut supervisor = SupervisorProcess::spawn_with(
+        env.home_path(),
+        env.project_path(),
+        &[("VOWP_DAEMON_BIN", missing.display().to_string())],
+    );
+
+    assert!(
+        eventually(|| env.home_path().join("heartbeat").is_file()),
+        "the supervisor did not complete a first tick; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        !supervisor.exited(),
+        "a missing daemon must not stop the supervisor; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        eventually(|| supervisor.stderr().contains("web window not started")),
+        "the missing daemon must warn; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        !supervisor.stdout().contains("web window:"),
+        "no address is surfaced without a daemon; stdout:\n{}",
+        supervisor.stdout()
+    );
+    assert!(
+        !supervisor.stdout().contains("remote window:"),
+        "a missing daemon must not advertise a tunnel; stdout:\n{}",
+        supervisor.stdout()
+    );
+    assert!(
+        !supervisor.stdout().contains("--remote-port"),
+        "a missing daemon must not print a bogus port; stdout:\n{}",
+        supervisor.stdout()
+    );
+    assert!(!env.home_path().join("web-window").exists());
+
+    kill_signal(supervisor.pid(), "TERM");
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("the supervisor must still stop cleanly");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "missing window is optional, the supervisor is not; stderr:\n{}",
+        supervisor.stderr()
     );
 }
 
@@ -1240,25 +1650,110 @@ impl Drop for TmuxGuard {
     }
 }
 
-#[test]
-fn tmux_layout_created_on_private_socket() {
-    let socket = format!(
-        "vowp-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.subsec_nanos())
-            .unwrap_or(0)
-    );
+static SOCKET_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns a short, unique private socket name for one test server.
+///
+/// tmux builds the socket path as `<TMUX_TMPDIR>/tmux-<uid>/<socket>`, and
+/// macOS limits a Unix socket path to 104 bytes. A long temporary directory
+/// plus a long test name otherwise fails with `File name too long` before the
+/// server starts, so keep this name deliberately short.
+fn private_socket_name() -> String {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0)
+        ^ SOCKET_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u32;
+    format!("vowp-t-{}-{nonce:08x}", std::process::id())
+}
+
+/// Starts a guarded `vowp-t-…` private server, or returns `None` without tmux.
+fn private_tmux_guard() -> Option<TmuxGuard> {
+    let socket = private_socket_name();
     let dir = tempfile::tempdir().expect("private tmux dir");
     let tmux = Tmux::in_private_dir(socket, dir.path()).expect("private tmux manager");
+    common::assert_private_tmux(&tmux, dir.path());
     if !tmux.has_tmux() {
         eprintln!("SKIP: tmux not installed");
-        return;
+        return None;
     }
-    let guard = TmuxGuard {
-        tmux: tmux.clone(),
-        _dir: dir,
+    Some(TmuxGuard { tmux, _dir: dir })
+}
+
+#[test]
+fn private_tmux_socket_path_fits_the_platform_limit() {
+    let dir = tempfile::tempdir().expect("private tmux dir");
+    // tmux resolves TMUX_TMPDIR before building the socket path; on macOS a
+    // /var/folders path becomes /private/var/folders and gains eight bytes.
+    let dir = std::fs::canonicalize(dir.path()).expect("canonical tmux dir");
+    let uid = Command::new("id").arg("-u").output().expect("run id -u");
+    assert!(uid.status.success(), "id -u did not succeed");
+    let uid = String::from_utf8(uid.stdout).expect("id -u output is utf-8");
+    let path = dir.join(format!("tmux-{}", uid.trim())).join(private_socket_name());
+    // `sun_path` holds the trailing NUL: 104 bytes on macOS, 108 on Linux.
+    let limit = if cfg!(target_os = "macos") { 104 } else { 108 };
+    let actual = path.as_os_str().len() + 1;
+    assert!(
+        actual <= limit,
+        "private tmux socket path is {actual} bytes (limit {limit}): {}",
+        path.display()
+    );
+}
+
+#[test]
+fn parses_the_macos_ps_output_used_by_the_stale_server_sweep() {
+    // Shape of `ps -A -o pid=,command=` on macOS: right-aligned pid, then argv.
+    let listing = "\
+  501 /opt/homebrew/bin/tmux -L vowp-t-501-deadbeef -f /dev/null new-session -d -s vowp-test
+  777 /usr/bin/sleep 30
+  888
+";
+    assert_eq!(
+        common::parse_ps_pid_command(listing),
+        vec![
+            (
+                501,
+                vec![
+                    "/opt/homebrew/bin/tmux".to_owned(),
+                    "-L".to_owned(),
+                    "vowp-t-501-deadbeef".to_owned(),
+                    "-f".to_owned(),
+                    "/dev/null".to_owned(),
+                    "new-session".to_owned(),
+                    "-d".to_owned(),
+                    "-s".to_owned(),
+                    "vowp-test".to_owned(),
+                ],
+            ),
+            (777, vec!["/usr/bin/sleep".to_owned(), "30".to_owned()]),
+        ]
+    );
+
+    // Shape of `ps -p <pid> -E -o command=`: the environment shares the command
+    // line. BSD `ps` prints it before the argv; accept it on either side.
+    let env = "PATH=/usr/bin:/bin TMUX_TMPDIR=/private/var/folders/h5/t85nd63d71x27_8gl5gw3l_w0000gn/T/.tmp8SuL1L HOME=/Users/me";
+    let tmux = "/opt/homebrew/bin/tmux -L vowp-t-501-deadbeef -f /dev/null new-session -d -s vowp-test";
+    assert_eq!(
+        common::tmpdir_from_ps(&format!("{env} {tmux}")),
+        Some(PathBuf::from(
+            "/private/var/folders/h5/t85nd63d71x27_8gl5gw3l_w0000gn/T/.tmp8SuL1L"
+        ))
+    );
+    assert_eq!(
+        common::tmpdir_from_ps(&format!("{tmux} {env}")),
+        Some(PathBuf::from(
+            "/private/var/folders/h5/t85nd63d71x27_8gl5gw3l_w0000gn/T/.tmp8SuL1L"
+        ))
+    );
+    assert_eq!(common::tmpdir_from_ps("PATH=/usr/bin:/bin"), None);
+    assert_eq!(common::tmpdir_from_ps("TMUX_TMPDIR="), None);
+}
+
+#[test]
+fn tmux_layout_created_on_private_socket() {
+    common::sweep_stale_test_servers_once();
+    let Some(guard) = private_tmux_guard() else {
+        return;
     };
     let cwd = tempfile::tempdir().expect("temp cwd");
     let program = vec!["sh".to_owned(), "-c".to_owned(), "sleep 30".to_owned()];
@@ -1278,6 +1773,121 @@ fn tmux_layout_created_on_private_socket() {
     vowp_cli::cmd::up::ensure_project_windows(&guard.tmux, "n09b-test", Some(cwd.path()), &program)
         .expect("second layout");
     assert_eq!(guard.tmux.list_windows("vowp-n09b-test").expect("windows").len(), 5);
+}
+
+#[test]
+fn stale_server_sweep_kills_a_server_whose_private_dir_is_gone() {
+    common::sweep_stale_test_servers_once();
+    let Some(guard) = private_tmux_guard() else {
+        return;
+    };
+    guard.tmux.ensure_session("vowp-legacy").expect("private session");
+    let pid = guard
+        .tmux
+        .server_pid()
+        .expect("server pid")
+        .expect("private server is running");
+
+    // Simulate a test process killed before its Drop: the home and TMUX_TMPDIR
+    // disappear, but the daemonized server and its panes stay behind.
+    std::fs::remove_dir_all(guard._dir.path()).expect("remove the private tmux dir");
+    common::sweep_stale_test_servers();
+
+    assert!(
+        eventually(|| !process_alive(pid)),
+        "the sweep left stale private server {pid} running"
+    );
+    assert!(
+        !guard
+            .tmux
+            .session_exists("vowp-legacy")
+            .expect("probe the private socket"),
+        "the stale project session still answers on its private socket"
+    );
+}
+
+#[test]
+fn stale_server_sweep_keeps_a_live_private_server() {
+    common::sweep_stale_test_servers_once();
+    let Some(guard) = private_tmux_guard() else {
+        return;
+    };
+    guard.tmux.ensure_session("vowp-one").expect("private session");
+    let pid = guard
+        .tmux
+        .server_pid()
+        .expect("server pid")
+        .expect("private server is running");
+
+    common::sweep_stale_test_servers();
+
+    assert_eq!(
+        guard.tmux.server_pid().expect("probe the private socket"),
+        Some(pid),
+        "the sweep killed a server whose private directory still exists"
+    );
+    assert!(
+        guard.tmux.session_exists("vowp-one").expect("session probe"),
+        "the live project session survived the sweep"
+    );
+}
+
+#[test]
+fn window_board_exits_when_its_tmux_server_is_killed() {
+    common::sweep_stale_test_servers_once();
+    let env = common::TestEnv::new();
+    let Some(guard) = private_tmux_guard() else {
+        return;
+    };
+    guard.tmux.ensure_session("vowp-test").expect("private session");
+
+    // Ignore SIGHUP (and the other common teardown signals) so only the
+    // follower's own liveness check can end the loop.
+    let argv = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "trap '' HUP INT TERM; exec \"$@\"".to_owned(),
+        "sh".to_owned(),
+        env!("CARGO_BIN_EXE_vowp").to_owned(),
+        "--home".to_owned(),
+        env.home_path().display().to_string(),
+        "--project".to_owned(),
+        env.project_path().display().to_string(),
+        "__window".to_owned(),
+        "board".to_owned(),
+    ];
+    guard
+        .tmux
+        .new_window(
+            "vowp-test",
+            "board",
+            &WindowSpec {
+                argv,
+                cwd: None,
+                env: Vec::new(),
+            },
+        )
+        .expect("board window");
+    let windows = guard.tmux.list_windows("vowp-test").expect("list windows");
+    let pane_pid = windows
+        .iter()
+        .find(|window| window.name == "board")
+        .and_then(|window| window.pane_pid)
+        .expect("the board pane has a pid");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        process_alive(pane_pid),
+        "the board pane exited before its server was killed instead of following"
+    );
+
+    guard
+        .tmux
+        .kill_server_for_tests()
+        .expect("kill the private tmux server");
+    assert!(
+        eventually_within(Duration::from_secs(5), || !process_alive(pane_pid)),
+        "the __window board pane {pane_pid} outlived its tmux server"
+    );
 }
 
 /// Writes the fake planner harness, its mapping and a config that uses it.
@@ -1913,6 +2523,7 @@ fn detached_up_passes_the_project_context_to_its_child() {
         .current_dir(cwd.path())
         .env("HOME", env.home_path())
         .env("VOWP_HOME", env.home_path())
+        .env("VOWP_DAEMON_BIN", env.home_path().join("missing-vowp-daemon"))
         .env("TMUX_TMPDIR", env.home_path().join("tmux"))
         .env_remove("TMUX")
         .env_remove("TMUX_PANE")
@@ -1947,6 +2558,98 @@ fn detached_up_passes_the_project_context_to_its_child() {
         down.status.success(),
         "down after detached up failed: {}",
         String::from_utf8_lossy(&down.stderr)
+    );
+}
+
+#[test]
+fn detached_up_surfaces_the_web_window_and_down_stops_the_daemon() {
+    let env = common::TestEnv::new();
+    let fake = FakeDaemon::new();
+    let cwd = tempfile::tempdir().expect("cwd");
+    let mut up = Command::new(env!("CARGO_BIN_EXE_vowp"));
+    up.arg("--home")
+        .arg(env.home_path())
+        .arg("--project")
+        .arg(env.project_path())
+        .arg("up")
+        .arg("--no-tmux")
+        .current_dir(cwd.path())
+        .env("HOME", env.home_path())
+        .env("VOWP_HOME", env.home_path())
+        .env("TMUX_TMPDIR", env.home_path().join("tmux"))
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("VOWP_TMUX_SOCKET");
+    for (key, value) in fake.envs("detached-token", env.home_path()) {
+        up.env(key, value);
+    }
+    let output = up.output().expect("run detached vowp up");
+    assert!(
+        output.status.success(),
+        "detached up failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _guard = DetachedUp::new(&env, cwd.path());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("supervisor started"), "{stdout}");
+    assert!(
+        stdout.contains("web window: http://127.0.0.1:54321/"),
+        "the detached caller prints the address published by its foreground child: {stdout}"
+    );
+    assert!(
+        stdout.contains("remote window: vowp tunnel open window --remote-port 54321"),
+        "the detached caller prints the tunnel hint with the actual port: {stdout}"
+    );
+    assert!(
+        stdout.contains("local URL: http://127.0.0.1:<local-port>/"),
+        "the detached caller shows the local URL shape: {stdout}"
+    );
+    assert!(eventually(|| fake.pid().is_some()), "the fake daemon did not start");
+    let daemon_pid = fake.pid().expect("daemon pid");
+    assert_eq!(
+        fake.args().expect("daemon args").get(3).map(String::as_str),
+        Some(env.config.project.name.as_str()),
+        "the detached supervisor's daemon serves the selected project"
+    );
+    assert!(
+        std::fs::read_to_string(env.home_path().join("web-window"))
+            .expect("web-window file")
+            .contains("http://127.0.0.1:54321/"),
+        "the address file is readable by the detached caller"
+    );
+
+    let down = Command::new(env!("CARGO_BIN_EXE_vowp"))
+        .arg("--home")
+        .arg(env.home_path())
+        .arg("--project")
+        .arg(env.project_path())
+        .args(["down", "--force"])
+        .current_dir(cwd.path())
+        .env("HOME", env.home_path())
+        .env("VOWP_HOME", env.home_path())
+        .env("TMUX_TMPDIR", env.home_path().join("tmux"))
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .env_remove("VOWP_TMUX_SOCKET")
+        .output()
+        .expect("run vowp down");
+    assert!(
+        down.status.success(),
+        "down after detached up failed: {}",
+        String::from_utf8_lossy(&down.stderr)
+    );
+    assert!(
+        eventually(|| !process_alive(daemon_pid)),
+        "detached down left the daemon child {daemon_pid} running"
+    );
+    assert!(
+        eventually(|| fake.stopped()),
+        "the detached daemon did not observe the stop"
+    );
+    assert!(
+        !env.home_path().join("web-window").exists(),
+        "the address file is removed when the detached supervisor stops"
     );
 }
 
@@ -2432,7 +3135,9 @@ fn project_by_path_canonicalizes_symlinked_checkouts() {
 
 #[test]
 fn up_once_from_the_home_after_init_ticks_every_project() {
+    common::sweep_stale_test_servers_once();
     let home = tempfile::tempdir().expect("home");
+    let _home_guard = HomeTmuxGuard(home.path().to_path_buf());
     let first = git_repo();
     let second = git_repo();
     let bin = env!("CARGO_BIN_EXE_vowp");

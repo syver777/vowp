@@ -11,7 +11,7 @@ use vowp_core::lifecycle::backup::{BackupOptions, backup as write_backup, restor
 use vowp_protocol::BackupReport;
 use vowp_store::{NodePaths, SessionFilter, Store};
 
-use crate::cli::{BackupArgs, MaintCommand, ReindexArgs, SchemaArgs};
+use crate::cli::{BackupArgs, MaintCommand, ReindexArgs};
 use crate::output::print_json;
 use crate::{CliError, Ctx, IoStreams};
 
@@ -31,7 +31,15 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &MaintCommand) -> Result<
     match command {
         MaintCommand::Reindex(args) => reindex(ctx, io, args),
         MaintCommand::Backup(args) => backup(ctx, io, args),
-        MaintCommand::Schema(args) => schema(ctx, io, args),
+        MaintCommand::Schema(args) => {
+            // `MaintCommand::Schema` is public and keeps its v0.1 lookup. `snapshot` is an
+            // alias owned by the `vowp schema` command, not a name in `vowp_protocol::schema`,
+            // so this path still reports it as not found.
+            if args.type_name.as_deref() == Some("snapshot") {
+                return Err(CliError::NotFound("schema snapshot".to_owned()));
+            }
+            super::schema::run(ctx.json(), io, args)
+        }
         MaintCommand::Version => version(ctx, io),
     }
 }
@@ -121,28 +129,6 @@ fn print_report(ctx: &Ctx, io: &mut dyn IoStreams, report: &BackupReport) -> Res
         writeln!(io.err(), "skipped: {skipped}")?;
     }
     Ok(())
-}
-
-/// Lists or prints one JSON Schema.
-fn schema(ctx: &Ctx, io: &mut dyn IoStreams, args: &SchemaArgs) -> Result<i32, CliError> {
-    match &args.type_name {
-        None => {
-            let names: Vec<&str> = vowp_protocol::schema::all_schemas().keys().copied().collect();
-            if ctx.json() {
-                print_json(io, &names)?;
-            } else {
-                for name in names {
-                    writeln!(io.out(), "{name}")?;
-                }
-            }
-        }
-        Some(name) => {
-            let schema = vowp_protocol::schema::schema_for_name(name)
-                .ok_or_else(|| CliError::NotFound(format!("schema {name}")))?;
-            print_json(io, &schema)?;
-        }
-    }
-    Ok(0)
 }
 
 /// Prints the binary, git and schema versions.

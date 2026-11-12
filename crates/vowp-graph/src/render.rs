@@ -1,10 +1,17 @@
 //! Deterministic text renderings of a job graph.
 //! Spec: `docs/design/crates/vowp-graph.md` §6.
 //!
-//! Both renderers are pure and stable: jobs are ordered explicitly and no timestamps or
-//! colours appear in the output. ASCII shows `needs` edges only; Mermaid shows every kind.
+//! Both renderers are pure and stable: jobs are ordered explicitly and no timestamps appear in
+//! the output. ASCII shows `needs` edges only and never emits colour; Mermaid shows every kind
+//! and ends with deterministic state colours.
+//!
+//! Mermaid state groups reuse the protocol predicates: `running` is
+//! [`JobState::holds_lock`] (`running`, `stalled`, `gating`, `reviewing`, `fixing`, `merging`),
+//! `waiting` is `pending`/`ready`, `failed` is `failed`/`parked`, and `done` is
+//! [`JobState::is_terminal`] (`done`, `replanned`, `cancelled`). The label already spells out
+//! the state, so colour is never the only signal.
 
-use vowp_protocol::{Edge, EdgeKind, Job, JobId};
+use vowp_protocol::{Edge, EdgeKind, Job, JobId, JobState};
 
 use crate::graph::Graph;
 
@@ -41,7 +48,9 @@ pub fn render_ascii(g: &Graph) -> String {
 /// Nodes are emitted in id order with the key `id` with `-` replaced by `_` and the label
 /// `"id (state)"`; `"` in a label is replaced by `'`. Edges are emitted in
 /// `(kind, src, dst)` order. Dependency (`needs`) edges point from the dependency to the
-/// dependent; every other kind points from source to destination.
+/// dependent; every other kind points from source to destination. Then one `classDef` line
+/// per [`StateGroup`] follows in the fixed order `running`, `waiting`, `failed`, `done`, and
+/// finally one `class <key> <group>` line per job in id order.
 pub fn render_mermaid(g: &Graph) -> String {
     let mut out = String::from("graph TD\n");
 
@@ -71,7 +80,80 @@ pub fn render_mermaid(g: &Graph) -> String {
         }
     }
 
+    for group in StateGroup::ALL {
+        out.push_str(&format!("    classDef {} {}\n", group.name(), group.style()));
+    }
+
+    for job in g.jobs() {
+        out.push_str(&format!(
+            "    class {} {}\n",
+            mermaid_key(&job.id),
+            StateGroup::of(job.state).name()
+        ));
+    }
+
     out
+}
+
+/// The visual state groups of the Mermaid rendering, in fixed `classDef` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateGroup {
+    /// A worker or verifier holds a slot.
+    Running,
+    /// Waiting to be dispatched.
+    Waiting,
+    /// Waiting for a retry or a human.
+    Failed,
+    /// Finished.
+    Done,
+}
+
+impl StateGroup {
+    /// Every group in the fixed `classDef` output order.
+    const ALL: [StateGroup; 4] = [
+        StateGroup::Running,
+        StateGroup::Waiting,
+        StateGroup::Failed,
+        StateGroup::Done,
+    ];
+
+    /// Returns the group for a job state.
+    ///
+    /// `Running` is exactly [`JobState::holds_lock`] and `Done` is exactly
+    /// [`JobState::is_terminal`]; the other two groups cover the remaining states.
+    fn of(state: JobState) -> StateGroup {
+        match state {
+            JobState::Pending | JobState::Ready => StateGroup::Waiting,
+            JobState::Failed | JobState::Parked => StateGroup::Failed,
+            JobState::Done | JobState::Replanned | JobState::Cancelled => StateGroup::Done,
+            JobState::Running
+            | JobState::Stalled
+            | JobState::Gating
+            | JobState::Reviewing
+            | JobState::Fixing
+            | JobState::Merging => StateGroup::Running,
+        }
+    }
+
+    /// Returns the Mermaid class name.
+    fn name(self) -> &'static str {
+        match self {
+            StateGroup::Running => "running",
+            StateGroup::Waiting => "waiting",
+            StateGroup::Failed => "failed",
+            StateGroup::Done => "done",
+        }
+    }
+
+    /// Returns the readable fill/stroke/text style used by `classDef`.
+    fn style(self) -> &'static str {
+        match self {
+            StateGroup::Running => "fill:#fff4d6,stroke:#b7791f,color:#744210",
+            StateGroup::Waiting => "fill:#e8f0fe,stroke:#3b6fb6,color:#1a3d6d",
+            StateGroup::Failed => "fill:#fde8e8,stroke:#b42318,color:#7a1a12",
+            StateGroup::Done => "fill:#e6f4ea,stroke:#2f7d4f,color:#1d4d31",
+        }
+    }
 }
 
 /// Returns the stable sort rank of an edge kind.

@@ -233,6 +233,7 @@ pub fn probe(runner: &mut dyn SetupRunner, harnesses: &[String]) -> Result<Probe
 pub(crate) fn harness_binary(harness: &str) -> &str {
     match harness {
         "claude-code" => "claude",
+        "acp" => "claude-code-acp",
         other => other,
     }
 }
@@ -737,6 +738,7 @@ fn default_executor(harness: &str, provider: Option<&str>) -> Result<vowp_protoc
         ("opencode", Some(provider)) => format!("opencode:{provider}/default"),
         ("claude-code", None | Some("anthropic")) => "claude-code:claude-sonnet-5-5@medium".to_owned(),
         ("claude-code", Some(provider)) => format!("claude-code:{provider}/default"),
+        ("acp", _) => "acp:claude-code-acp".to_owned(),
         (harness, _) => format!("{harness}:default"),
     };
     Ok(vowp_protocol::Executor::parse(&text)?)

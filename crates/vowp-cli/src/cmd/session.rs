@@ -4,29 +4,41 @@
 //! append-only log; the rows here are the store index. Ids are accepted by unique prefix of
 //! at least six characters.
 
-use std::io::Write as _;
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Write as _};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use time::{OffsetDateTime, macros::format_description};
-use vowp_core::session::bundle;
+use vowp_core::session::bundle::{self, ImportMode};
+use vowp_core::session::importer::{ImportCursor, import_file, line_uuid};
 use vowp_core::session::remote::{BeginTurn, IngestGrant, IngestSession, begin_turn};
-use vowp_core::session::service::SessionService;
+use vowp_core::session::service::{SessionHead, SessionService, local_head};
+use vowp_core::surface::native::{TranscriptEntry, TranscriptKind};
 use vowp_protocol::{
-    Actor, AttachAction, CapsuleTrigger, EventBody, EventEnvelope, EventSource, Executor, ExecutorRef, HarnessKind,
-    NewSession, NodeName, RunPurpose, Session, SessionId, SessionRole, SessionState, Switch, SwitchEvent, SwitchId,
-    SwitchReason, SwitchState, Timestamp,
+    Actor, AssistantMessage, AssistantReasoning, AttachAction, CapsuleTrigger, Cost, CostEvent, CostSource, EventBody,
+    EventEnvelope, EventSource, EventType, Executor, ExecutorRef, HarnessKind, NewSession, NodeName, RunPurpose,
+    Session, SessionId, SessionRole, SessionState, Switch, SwitchEvent, SwitchId, SwitchReason, SwitchState, Timestamp,
+    ToolCall, ToolResult, UserMessage,
 };
-use vowp_store::session_log::SessionLog;
-use vowp_store::{SessionFilter, Store};
+use vowp_store::reindex::reindex;
+use vowp_store::session_log::{
+    SESSION_DIR_MAX_BYTES, SessionDirManifest, SessionLog, session_dir_manifest, verify_session_dir,
+    write_session_dir_manifest,
+};
+use vowp_store::{NodePaths, SessionFilter, Store};
 
 use crate::cli::{
-    ChatArgs, Global, SessionCapsuleArgs, SessionCommand, SessionExportArgs, SessionImportArgs, SessionLsArgs,
-    SessionNewArgs, SessionShowArgs, SessionSwitchArgs, SessionTailArgs, SessionWatchArgs,
+    ChatArgs, Global, SessionCapsuleArgs, SessionCommand, SessionDirExportArgs, SessionExportArgs, SessionImportArgs,
+    SessionLsArgs, SessionNewArgs, SessionPullArgs, SessionShowArgs, SessionSwitchArgs, SessionTailArgs,
+    SessionWatchArgs,
 };
 use crate::node_ctx::NodeRole;
 use crate::output::{Table, local_time_at, print_json};
+use crate::remote::{RemoteExit, RemoteStream};
 use crate::{CliError, Ctx, IoStreams};
 
 /// Runs one session subcommand.
@@ -40,6 +52,8 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &SessionCommand) -> Resul
         SessionCommand::Capsule(args) => capsule(ctx, io, args),
         SessionCommand::Export(args) => export(ctx, io, args),
         SessionCommand::Import(args) => import(ctx, io, args),
+        SessionCommand::Pull(args) => pull(ctx, io, args),
+        SessionCommand::DirExport(args) => dir_export(ctx, io, args),
         SessionCommand::Watch(args) => watch(ctx, io, args),
         SessionCommand::Tail(args) => tail(ctx, io, args),
         SessionCommand::TurnBegin(args) => turn_begin(ctx, io, args),
@@ -79,6 +93,13 @@ pub fn maybe_run_remote(
     let crate::cli::Command::Session { command } = command else {
         return Ok(None);
     };
+    // `session pull` runs in this process: it fetches one bundle from the named source node,
+    // verifies it and imports a local child. Its first positional argument is the source,
+    // so it must not reach the generic `--node` SSH redirect below.
+    if let SessionCommand::Pull(args) = command {
+        let ctx = Ctx::build(global, io)?;
+        return Ok(Some(pull(&ctx, io, args)?));
+    }
     // The hidden session interfaces run on the home that owns the session. Their `--node`
     // names the executor or surface, not a redirect target, so they must not go through the
     // generic `--node` SSH redirect below.
@@ -285,6 +306,9 @@ fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &Session
     if let Some(cwd) = &args.cwd {
         remote.extend(["--cwd".to_owned(), cwd.display().to_string()]);
     }
+    if args.same_id {
+        remote.push("--same-id".to_owned());
+    }
     let run = run_remote_capture(target, &remote, Some(&text))?;
     if run.code != 0 {
         return relay_failure(io, &run);
@@ -296,6 +320,660 @@ fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &Session
         writeln!(io.out(), "{}", session.id)?;
     }
     Ok(0)
+}
+
+/// JSON shape for a cross-node pull.
+///
+/// The default child mode serialises `child_session`; `--same-id` serialises
+/// `same_id_session` instead, so existing consumers keep their exact document.
+#[derive(Debug, serde::Serialize)]
+struct PullOutput {
+    node: NodeName,
+    source_session: SessionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_session: Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    same_id_session: Option<SessionId>,
+}
+
+/// Pulls a session bundle from another node and imports it locally.
+///
+/// The default path captures a bundle from the remote `session export` stdout, stages it in
+/// a private temporary directory and verifies it by [`bundle::from_json`] before
+/// [`bundle::import_with_mode`] creates anything. A failed remote run, malformed bundle or
+/// checksum mismatch therefore imports nothing. The default creates a child whose parent is
+/// the source; `--same-id` keeps the source id and refuses a duplicate instead of
+/// overwriting. `--full` instead copies the whole session directory; see [`pull_full`].
+fn pull(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPullArgs) -> Result<i32, CliError> {
+    let (node, target) = pull_target(ctx, &args.node)?;
+    if args.full {
+        return pull_full(ctx, io, &node, &target, args);
+    }
+
+    let mut remote = remote_prefix(ctx);
+    remote.extend([
+        "session".to_owned(),
+        "export".to_owned(),
+        args.session.clone(),
+        "--out".to_owned(),
+        "-".to_owned(),
+    ]);
+    let run = run_remote_capture(&target, &remote, None)?;
+    if run.code != 0 {
+        return relay_failure(io, &run);
+    }
+
+    let staged = StagedBundle::write(&run.stdout)?;
+    let bundle = bundle::from_json(&staged.read()?)?;
+    let source = bundle.session.id.clone();
+    // A same-id pull never overwrites: when the id is already local, report both heads
+    // and let the operator choose a side before anything is imported.
+    if args.same_id && local_session_present(ctx, &source)? {
+        let local = local_head(ctx.deps(), &source)?;
+        let remote = bundle::head(&bundle);
+        return report_divergence(ctx, io, &node, &source, &local, &remote);
+    }
+    let mode = if args.same_id {
+        ImportMode::SameId
+    } else {
+        ImportMode::Child
+    };
+    let imported = bundle::import_with_mode(ctx.deps(), &bundle, None, None, mode)?;
+    if ctx.json() {
+        let output = if args.same_id {
+            PullOutput {
+                node,
+                source_session: source.clone(),
+                child_session: None,
+                same_id_session: Some(imported.clone()),
+            }
+        } else {
+            PullOutput {
+                node,
+                source_session: source.clone(),
+                child_session: Some(imported.clone()),
+                same_id_session: None,
+            }
+        };
+        print_json(io, &output)?;
+    } else if args.same_id {
+        writeln!(io.out(), "pulled session {source} from {node} with same id {imported}")?;
+    } else {
+        writeln!(io.out(), "pulled session {source} from {node} as child {imported}")?;
+    }
+    Ok(0)
+}
+
+/// Resolves the source node and refuses a local node before any remote work.
+fn pull_target(ctx: &Ctx, node: &str) -> Result<(NodeName, String), CliError> {
+    let node = NodeName::parse(node)?;
+    let store = ctx.store()?;
+    let row = store.require_node(&node)?;
+    if row.is_local {
+        return Err(CliError::Invalid(format!(
+            "node {node} is local; use `vowp session export` and `vowp session import` for a local copy"
+        )));
+    }
+    let target = row
+        .ssh_target
+        .ok_or_else(|| CliError::Invalid(format!("node {node} has no ssh target")))?;
+    Ok((node, target))
+}
+
+/// JSON shape for `session pull --full`.
+#[derive(Debug, serde::Serialize)]
+struct FullPullOutput {
+    node: NodeName,
+    source_session: SessionId,
+    full_session: SessionId,
+    files: usize,
+    bytes: u64,
+}
+
+/// Pulls the full `sessions/<id>/` directory and imports it under the origin id.
+///
+/// The remote side streams one manifest line followed by the file bodies. The manifest is
+/// checked for the size cap and the local id before a staging directory is created; every
+/// digest is verified before the staged directory is renamed into place. The source is
+/// never modified and no lease is moved: the caller must leave it quiescent.
+fn pull_full(
+    ctx: &Ctx,
+    io: &mut dyn IoStreams,
+    node: &NodeName,
+    target: &str,
+    args: &SessionPullArgs,
+) -> Result<i32, CliError> {
+    // The source manifest resolves a prefix and names the exact origin. A present local id
+    // is reported with both heads after the manifest arrives; the snapshot is not copied
+    // into the local session store.
+    let mut remote = remote_prefix(ctx);
+    remote.extend([
+        "session".to_owned(),
+        "dir-export".to_owned(),
+        args.session.clone(),
+        "--max-bytes".to_owned(),
+        SESSION_DIR_MAX_BYTES.to_string(),
+    ]);
+    let mut stream = RemoteStream::spawn(target, &remote)?;
+    let line = match read_manifest_line(stream.stdout()) {
+        Ok(line) => line,
+        Err(error) => return finish_stream_error(io, stream, error),
+    };
+    let manifest: SessionDirManifest = match serde_json::from_slice(&line) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            return finish_stream_error(
+                io,
+                stream,
+                CliError::Invalid(format!("remote sent an invalid session directory manifest: {error}")),
+            );
+        }
+    };
+    if let Err(error) = manifest.validate() {
+        return finish_stream_error(io, stream, error.into());
+    }
+    if let Ok(requested) = SessionId::parse(&args.session)
+        && manifest.origin != requested
+    {
+        return finish_stream_error(
+            io,
+            stream,
+            CliError::Invalid(format!(
+                "remote resolved session {} but the pull named {requested}",
+                manifest.origin
+            )),
+        );
+    }
+
+    let origin = manifest.origin.clone();
+    if local_session_present(ctx, &origin)? {
+        // Stop the snapshot stream before it is copied anywhere, then read the source's
+        // head with a cheap read-only command. Nothing local is written.
+        let exit = stream.abort()?;
+        if exit.code != 0 {
+            return relay_remote_exit(io, exit);
+        }
+        let local = local_head(ctx.deps(), &origin)?;
+        let remote = remote_full_head(ctx, target, &origin)?;
+        return report_divergence(ctx, io, node, &origin, &local, &remote);
+    }
+    let bytes = manifest.total_bytes();
+    if bytes > SESSION_DIR_MAX_BYTES {
+        return finish_stream_error(
+            io,
+            stream,
+            CliError::Invalid(format!(
+                "session {origin} is {bytes} bytes; the full pull limit is {SESSION_DIR_MAX_BYTES} bytes"
+            )),
+        );
+    }
+
+    let staged = StagedSession::create(ctx, &origin)?;
+    let mut copy_error = None;
+    for file in &manifest.files {
+        if let Err(error) = copy_stream_file(stream.stdout(), &staged.dir().join(&file.path), file.bytes) {
+            copy_error = Some(error);
+            break;
+        }
+    }
+    if copy_error.is_none() {
+        let mut trailing = [0_u8; 1];
+        match stream.stdout().read(&mut trailing) {
+            Ok(0) => {}
+            Ok(_) => {
+                copy_error = Some(CliError::Invalid(
+                    "remote sent trailing bytes after the session directory snapshot".to_owned(),
+                ));
+            }
+            Err(error) => copy_error = Some(error.into()),
+        }
+    }
+    if let Some(error) = copy_error {
+        return finish_stream_error(io, stream, error);
+    }
+    let finished = stream.finish()?;
+    if finished.code != 0 {
+        return relay_remote_exit(io, finished);
+    }
+    verify_session_dir(&staged.paths, &origin, &manifest)?;
+    write_session_dir_manifest(&staged.paths, &origin, &manifest)?;
+
+    let final_dir = ctx.paths().session_dir(&origin);
+    if let Some(parent) = final_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if final_dir.exists() {
+        return Err(full_exists(&origin));
+    }
+    std::fs::rename(staged.dir(), &final_dir)?;
+
+    let store = ctx.store()?;
+    let report = match reindex(&store, ctx.paths(), Some(&origin)) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(error.into());
+        }
+    };
+    if report.sessions != 1 {
+        let _ = std::fs::remove_dir_all(&final_dir);
+        let detail = if report.problems.is_empty() {
+            "reindex did not index the pulled session".to_owned()
+        } else {
+            report.problems.join("; ")
+        };
+        return Err(CliError::Conflict(format!(
+            "full pull of {origin} was not indexed cleanly: {detail}"
+        )));
+    }
+    // An absent local project or job row is the only expected warning: reindex keeps the
+    // session and leaves those foreign keys null. The index row exists, so removing the
+    // directory here would leave a dangling session.
+    for problem in &report.problems {
+        writeln!(io.err(), "warning: {problem}")?;
+    }
+
+    let file_count = manifest.files.len();
+    if ctx.json() {
+        print_json(
+            io,
+            &FullPullOutput {
+                node: node.clone(),
+                source_session: origin.clone(),
+                full_session: origin,
+                files: file_count,
+                bytes,
+            },
+        )?;
+    } else {
+        writeln!(
+            io.out(),
+            "pulled session {origin} from {node} as a full directory snapshot ({file_count} files, {bytes} bytes)"
+        )?;
+    }
+    Ok(0)
+}
+
+/// Returns whether a session id already exists locally as a row or a directory.
+fn local_session_present(ctx: &Ctx, id: &SessionId) -> Result<bool, CliError> {
+    Ok(ctx.store()?.session(id)?.is_some() || ctx.paths().session_dir(id).exists())
+}
+
+/// The refusal for a full pull whose id already exists locally.
+fn full_exists(id: &SessionId) -> CliError {
+    CliError::Conflict(format!(
+        "session {id} already exists locally; --full refuses to overwrite"
+    ))
+}
+
+/// Reads the source head for a full-pull divergence report.
+///
+/// The directory manifest names the origin but carries no log position, so the source's
+/// existing read-only `session show --json --events 1` supplies its last seq, event,
+/// state and executor. This does not copy the directory and changes nothing.
+fn remote_full_head(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<SessionHead, CliError> {
+    let mut remote = remote_prefix(ctx);
+    remote.extend([
+        "--json".to_owned(),
+        "session".to_owned(),
+        "show".to_owned(),
+        "--events".to_owned(),
+        "1".to_owned(),
+        origin.to_string(),
+    ]);
+    let run = run_remote_capture(target, &remote, None)?;
+    if run.code != 0 {
+        return Err(CliError::Remote(format!(
+            "remote session show for {origin} failed with exit {}: {}",
+            run.code,
+            run.stderr.trim()
+        )));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Show {
+        #[serde(flatten)]
+        session: Session,
+        #[serde(default)]
+        events: Vec<EventEnvelope>,
+    }
+    let show: Show = serde_json::from_str(&run.stdout)
+        .map_err(|error| CliError::Remote(format!("remote printed an invalid session document: {error}")))?;
+    if show.session.id != *origin {
+        return Err(CliError::Remote(format!(
+            "remote resolved session {} but the manifest named {origin}",
+            show.session.id
+        )));
+    }
+    Ok(SessionHead::from_session(&show.session, show.events.last()))
+}
+
+/// The stable JSON code for a pull whose id exists on both sides.
+const DIVERGENCE_CODE: &str = "session_divergence";
+
+/// The manual-choice note printed with a divergence report.
+const DIVERGENCE_NOTE: &str = "choose which side advances; no merge performed";
+
+/// The exit code for a divergence report: the conflict code from `cli.md` §1.1.
+const DIVERGENCE_EXIT: i32 = 4;
+
+/// JSON shape for a divergent pull.
+#[derive(Debug, serde::Serialize)]
+struct DivergenceOutput {
+    error: DivergenceError,
+}
+
+/// The `error` document a divergent pull prints under `--json`.
+#[derive(Debug, serde::Serialize)]
+struct DivergenceError {
+    kind: &'static str,
+    code: &'static str,
+    message: String,
+    hint: &'static str,
+    node: NodeName,
+    source_session: SessionId,
+    local: HeadOutput,
+    remote: HeadOutput,
+    note: &'static str,
+}
+
+/// One head in a divergence report.
+#[derive(Debug, serde::Serialize)]
+struct HeadOutput {
+    session: SessionId,
+    node: NodeName,
+    last_seq: u64,
+    last_event: Option<EventType>,
+    last_event_at: Option<Timestamp>,
+    state: Option<SessionState>,
+    executor: Option<String>,
+    updated_at: Option<Timestamp>,
+}
+
+impl HeadOutput {
+    /// Converts a collected head into its JSON form.
+    fn from_head(head: &SessionHead) -> Self {
+        Self {
+            session: head.session_id.clone(),
+            node: head.node.clone(),
+            last_seq: head.last_seq,
+            last_event: head.last_event,
+            last_event_at: head.last_event_at,
+            state: head.state,
+            executor: head.executor.as_ref().map(ToString::to_string),
+            updated_at: head.updated_at,
+        }
+    }
+}
+
+/// Prints a divergence report and returns its conflict exit code.
+///
+/// This is an error path, but it owns the whole document: the generic error renderer only
+/// carries `kind`, `message` and `hint`, and the report must expose both heads with one
+/// stable shape. Nothing is written to the local session store.
+fn report_divergence(
+    ctx: &Ctx,
+    io: &mut dyn IoStreams,
+    node: &NodeName,
+    source: &SessionId,
+    local: &SessionHead,
+    remote: &SessionHead,
+) -> Result<i32, CliError> {
+    let message = format!("session {source} exists locally and on {node}; refusing to overwrite or merge");
+    let hint = "delete or export one side, then pull again";
+    // The source row names its own node; the operator knows it by the local registry name.
+    let remote = SessionHead {
+        node: node.clone(),
+        ..remote.clone()
+    };
+    if ctx.json() {
+        print_json(
+            io,
+            &DivergenceOutput {
+                error: DivergenceError {
+                    kind: "conflict",
+                    code: DIVERGENCE_CODE,
+                    message,
+                    hint,
+                    node: node.clone(),
+                    source_session: source.clone(),
+                    local: HeadOutput::from_head(local),
+                    remote: HeadOutput::from_head(&remote),
+                    note: DIVERGENCE_NOTE,
+                },
+            },
+        )?;
+    } else {
+        writeln!(io.err(), "vowp: {message}")?;
+        writeln!(io.err(), "local:  {}", head_line(local))?;
+        writeln!(io.err(), "remote: {}", head_line(&remote))?;
+        writeln!(io.err(), "{DIVERGENCE_NOTE}")?;
+        writeln!(io.err(), "hint: {hint}")?;
+    }
+    Ok(DIVERGENCE_EXIT)
+}
+
+/// Renders one head as a single human line, without the session cwd or any secret.
+fn head_line(head: &SessionHead) -> String {
+    let last = match (head.last_event, head.last_event_at) {
+        (Some(event), Some(ts)) => format!("{event} at {}", ts.as_rfc3339()),
+        (Some(event), None) => event.to_string(),
+        (None, _) => "no readable log event".to_owned(),
+    };
+    format!(
+        "{} on {}: seq {}, last {}, state {}, executor {}",
+        head.session_id,
+        head.node,
+        head.last_seq,
+        last,
+        head.state.map(state_name).unwrap_or("-"),
+        head.executor
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_owned())
+    )
+}
+
+/// Upper bound on one manifest line; larger streams are not trusted.
+const PULL_MANIFEST_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Reads the first newline-terminated line of the remote snapshot stream.
+fn read_manifest_line(reader: &mut BufReader<std::process::ChildStdout>) -> Result<Vec<u8>, CliError> {
+    let mut line = Vec::new();
+    let read = reader
+        .by_ref()
+        .take(PULL_MANIFEST_MAX_BYTES + 1)
+        .read_until(b'\n', &mut line)?;
+    if read == 0 {
+        return Err(CliError::Invalid(
+            "remote sent no session directory manifest".to_owned(),
+        ));
+    }
+    if line.len() as u64 > PULL_MANIFEST_MAX_BYTES {
+        return Err(CliError::Invalid(format!(
+            "remote session directory manifest is larger than {PULL_MANIFEST_MAX_BYTES} bytes"
+        )));
+    }
+    if !line.ends_with(b"\n") {
+        return Err(CliError::Invalid(
+            "remote session directory manifest has no terminator".to_owned(),
+        ));
+    }
+    line.pop();
+    Ok(line)
+}
+
+/// Copies exactly `bytes` from the snapshot stream into one staged file.
+fn copy_stream_file(
+    reader: &mut BufReader<std::process::ChildStdout>,
+    path: &Path,
+    bytes: u64,
+) -> Result<(), CliError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let copied = std::io::copy(&mut reader.by_ref().take(bytes), &mut file)?;
+    if copied != bytes {
+        return Err(CliError::Invalid(format!(
+            "remote session directory stream ended early for {}: expected {bytes} bytes, got {copied}",
+            path.display()
+        )));
+    }
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Aborts a snapshot stream and relays a remote failure when the source produced one.
+fn finish_stream_error(io: &mut dyn IoStreams, stream: RemoteStream, error: CliError) -> Result<i32, CliError> {
+    let exit = stream.abort()?;
+    if exit.code != 0 {
+        return relay_remote_exit(io, exit);
+    }
+    Err(error)
+}
+
+/// Prints a failed remote stream's stderr and returns its exit code.
+fn relay_remote_exit(io: &mut dyn IoStreams, exit: RemoteExit) -> Result<i32, CliError> {
+    if !exit.stderr.is_empty() {
+        ia_write(io.err(), &exit.stderr)?;
+    }
+    Ok(exit.code)
+}
+
+/// One full session directory staged under `<home>/tmp` until it is verified.
+struct StagedSession {
+    root: PathBuf,
+    paths: NodePaths,
+    id: SessionId,
+}
+
+impl StagedSession {
+    /// Creates a fresh private staging root containing `sessions/<id>/`.
+    fn create(ctx: &Ctx, id: &SessionId) -> Result<Self, CliError> {
+        let staging_base = ctx.paths().tmp_dir();
+        std::fs::create_dir_all(&staging_base)?;
+        let root = private_dir_in(&staging_base, "session-pull")?;
+        let paths = NodePaths::new(&root);
+        std::fs::create_dir_all(paths.session_dir(id))?;
+        Ok(Self {
+            root,
+            paths,
+            id: id.clone(),
+        })
+    }
+
+    /// Returns the staged `sessions/<id>/` path.
+    fn dir(&self) -> PathBuf {
+        self.paths.session_dir(&self.id)
+    }
+}
+
+impl Drop for StagedSession {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// Streams one full session directory for `session pull --full`.
+///
+/// The first line is the JSON manifest; the remaining bytes are the listed files in
+/// manifest order. Nothing is written to local state on the source and no lock is taken.
+fn dir_export(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionDirExportArgs) -> Result<i32, CliError> {
+    let store = ctx.store()?;
+    let session = resolve_session(&store, &args.id)?;
+    if !ctx.paths().log_path(&session.id).is_file() {
+        return Err(CliError::Invalid(format!(
+            "session {} has no log.jsonl (it was compacted); use the bundle pull, which carries its capsule",
+            session.id
+        )));
+    }
+    let max_bytes = args.max_bytes.unwrap_or(SESSION_DIR_MAX_BYTES);
+    let manifest = session_dir_manifest(ctx.paths(), &session.id, max_bytes)?;
+
+    let line = serde_json::to_vec(&manifest)
+        .map_err(|error| CliError::Invalid(format!("cannot encode session directory manifest: {error}")))?;
+    io.out().write_all(&line)?;
+    io.out().write_all(b"\n")?;
+    for file in &manifest.files {
+        let path = ctx.paths().session_dir(&session.id).join(&file.path);
+        let mut source = std::fs::File::open(&path)?;
+        let copied = std::io::copy(&mut Read::by_ref(&mut source).take(file.bytes), io.out())?;
+        if copied != file.bytes {
+            return Err(CliError::Invalid(format!(
+                "session {} file {} changed while it was copied",
+                session.id, file.path
+            )));
+        }
+    }
+    io.out().flush()?;
+    Ok(0)
+}
+
+/// One pulled bundle staged in a private temporary directory until import.
+struct StagedBundle {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl StagedBundle {
+    /// Writes `text` into a fresh private temporary directory.
+    fn write(text: &str) -> Result<Self, CliError> {
+        let dir = private_temp_dir()?;
+        let staged = Self {
+            path: dir.join("bundle.json"),
+            dir,
+        };
+        std::fs::write(&staged.path, text)?;
+        std::fs::set_permissions(&staged.path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(staged)
+    }
+
+    /// Reads the staged document back for verification and import.
+    fn read(&self) -> Result<String, CliError> {
+        Ok(std::fs::read_to_string(&self.path)?)
+    }
+}
+
+impl Drop for StagedBundle {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir(&self.dir);
+    }
+}
+
+/// Creates a fresh private directory under the OS temporary root.
+fn private_temp_dir() -> Result<PathBuf, CliError> {
+    private_dir_in(&std::env::temp_dir(), "vowp-pull")
+}
+
+/// Creates a fresh 0700 directory named `<prefix>-<pid>-<millis>-<counter>` under `base`.
+fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, CliError> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let name = format!(
+            "{prefix}-{}-{}-{}",
+            std::process::id(),
+            Timestamp::now().unix_millis(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = base.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => match std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+                Ok(()) => return Ok(dir),
+                Err(error) => {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(error.into());
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CliError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not create a private temporary directory for {prefix}"),
+    )))
 }
 
 /// Moves a session to a remote node: export locally, import remotely, switch there.
@@ -1092,7 +1770,12 @@ fn import(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionImportArgs) -> Result
         }),
         None => None,
     };
-    let id = bundle::import(ctx.deps(), &bundle, executor, args.cwd.as_deref())?;
+    let mode = if args.same_id {
+        ImportMode::SameId
+    } else {
+        ImportMode::Child
+    };
+    let id = bundle::import_with_mode(ctx.deps(), &bundle, executor, args.cwd.as_deref(), mode)?;
     let store = ctx.store()?;
     let session = store.require_session(&id)?;
     if ctx.json() {
@@ -1103,7 +1786,24 @@ fn import(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionImportArgs) -> Result
     Ok(0)
 }
 
+/// Two-second poll interval for the follow mode.
+const WATCH_POLL: Duration = Duration::from_secs(2);
+
+/// How often the follow wait re-checks the interrupt flag.
+const WATCH_WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// Executor recorded for a session imported from Claude Code.
+const CLAUDE_EXECUTOR: &str = "claude-code:claude-sonnet-5-5@medium";
+
+/// Model recorded on imported Claude events.
+const CLAUDE_MODEL: &str = "claude-sonnet-5-5";
+
 /// Records interactive Claude Code transcripts (the optional v0.1 importer).
+///
+/// `--follow`, or a plain terminal run without `--once`, follows the transcript tree
+/// every two seconds until Ctrl-C; `--once`, or a non-TTY run without `--follow`, makes
+/// one incremental pass so scripts and tests do not hang. Every file is opened
+/// read-only.
 fn watch(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionWatchArgs) -> Result<i32, CliError> {
     let dir = args.claude_dir.clone().unwrap_or_else(default_claude_dir);
     if !dir.is_dir() {
@@ -1112,24 +1812,22 @@ fn watch(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionWatchArgs) -> Result<i
             format!("Claude transcript directory {} is unreadable", dir.display()),
         )));
     }
-    if !args.once && io.is_tty() {
-        return Err(CliError::Invalid(
-            "session watch --follow is not available in this build; use --once".to_owned(),
-        ));
-    }
-    let transcripts = transcript_files(&dir)?;
-    // The optional importer records new transcript lines once and stores the processed line
-    // count next to the node. Its parser is deliberately small: only the event-bearing line
-    // types are mapped, and unknown lines are skipped.
-    let mut imported = 0;
-    for path in &transcripts {
-        imported += import_transcript(ctx, path)?;
-    }
+    let follow = args.follow || (!args.once && io.is_tty());
+    let (transcripts, imported) = if follow {
+        let count = transcript_files(&dir)?.len();
+        if !ctx.json() {
+            writeln!(io.out(), "watching {count} transcripts (press Ctrl-C to stop)")?;
+        }
+        let interrupted = interrupt_flag()?;
+        watch_until(ctx, &dir, WATCH_POLL, &|| interrupted.load(Ordering::SeqCst))?
+    } else {
+        watch_pass(ctx, &dir)?
+    };
     if ctx.json() {
         print_json(
             io,
             &serde_json::json!({
-                "watching": transcripts.len(),
+                "watching": transcripts,
                 "imported": imported,
                 "dir": dir.display().to_string(),
             }),
@@ -1137,8 +1835,7 @@ fn watch(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionWatchArgs) -> Result<i
     } else {
         writeln!(
             io.out(),
-            "watching {} transcripts ({imported} events imported)",
-            transcripts.len()
+            "watching {transcripts} transcripts ({imported} events imported)"
         )?;
     }
     Ok(0)
@@ -1153,7 +1850,7 @@ fn default_claude_dir() -> PathBuf {
 }
 
 /// Lists `*.jsonl` transcript files recursively under `dir`.
-fn transcript_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, CliError> {
+fn transcript_files(dir: &Path) -> Result<Vec<PathBuf>, CliError> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
@@ -1171,46 +1868,222 @@ fn transcript_files(dir: &std::path::Path) -> Result<Vec<PathBuf>, CliError> {
     Ok(files)
 }
 
-/// Imports one Claude transcript file into a canonical session.
-fn import_transcript(ctx: &Ctx, path: &std::path::Path) -> Result<usize, CliError> {
-    let text = std::fs::read_to_string(path)?;
-    let Some(first) = text
-        .lines()
-        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-    else {
+/// Runs one incremental pass over every transcript under `dir`.
+fn watch_pass(ctx: &Ctx, dir: &Path) -> Result<(usize, usize), CliError> {
+    let transcripts = transcript_files(dir)?;
+    let store = ctx.store()?;
+    let mut imported = 0;
+    for path in &transcripts {
+        imported += import_transcript(ctx, &store, path)?;
+    }
+    Ok((transcripts.len(), imported))
+}
+
+/// Repeats [`watch_pass`] every `poll` until `stop` returns true.
+///
+/// Public so integration tests can inject a short poll and a stop flag. The command
+/// passes [`WATCH_POLL`] and a flag set by SIGINT/SIGTERM, so Ctrl-C ends the loop
+/// after the pass in flight and returns `0`.
+#[doc(hidden)]
+pub fn watch_until(
+    ctx: &Ctx,
+    dir: &Path,
+    poll: Duration,
+    stop: &(dyn Fn() -> bool + Send + Sync),
+) -> Result<(usize, usize), CliError> {
+    let mut imported = 0;
+    let mut transcripts = 0;
+    loop {
+        if stop() {
+            break;
+        }
+        let (count, events) = watch_pass(ctx, dir)?;
+        transcripts = count;
+        imported += events;
+        if stop() {
+            break;
+        }
+        wait_for_stop(poll, stop);
+    }
+    Ok((transcripts, imported))
+}
+
+/// Sleeps for up to `poll`, returning early when `stop` observes an interrupt.
+fn wait_for_stop(poll: Duration, stop: &dyn Fn() -> bool) {
+    let deadline = Instant::now() + poll;
+    while !stop() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep(WATCH_WAIT_SLICE.min(deadline - now));
+    }
+}
+
+/// Registers SIGINT/SIGTERM to flip one interrupt flag.
+fn interrupt_flag() -> Result<Arc<AtomicBool>, CliError> {
+    let interrupted = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&interrupted))?;
+    }
+    Ok(interrupted)
+}
+
+/// Imports one Claude transcript file into its one canonical session.
+fn import_transcript(ctx: &Ctx, store: &Store, path: &Path) -> Result<usize, CliError> {
+    let Some(native) = transcript_native_id(path)? else {
         return Ok(0);
     };
-    let native = first
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    if native.is_empty() {
-        return Ok(0);
-    }
-    let store = ctx.store()?;
     let marker_key = format!("watch:{native}");
-    let processed: usize = store
-        .kv_get(&marker_key)?
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= processed {
+    let (mut cursor, legacy_marker) = load_cursor(store, &marker_key, path)?;
+    let start_offset = cursor.offset;
+    let batch = import_file(path, &mut cursor)?;
+    let cursor_moved = cursor.offset != start_offset;
+    if batch.entries.is_empty() {
+        if cursor_moved || legacy_marker {
+            save_cursor(store, &marker_key, &cursor)?;
+        }
         return Ok(0);
     }
-    let title = lines
-        .iter()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find_map(|value| {
-            (value.get("type").and_then(serde_json::Value::as_str) == Some("user"))
-                .then(|| {
-                    value
-                        .get("message")
-                        .and_then(|message| message.get("content"))
-                        .and_then(|content| content.as_str())
-                        .map(|text| text.chars().take(60).collect::<String>())
+
+    let session = canonical_session(ctx, store, &native, &batch.entries)?;
+    let log =
+        SessionLog::open(ctx.paths(), &session.id, ctx.deps().clock.clone()).map_err(vowp_core::CoreError::from)?;
+    let harness = HarnessKind::ClaudeCode;
+    let mut imported = 0;
+    for line in &batch.lines {
+        for entry in &line.entries {
+            // The native-id map makes a re-read idempotent, including after a crash
+            // before the cursor was saved or a file that was rewritten in place.
+            if store.native_event(&session.id, harness, &entry.native_id)?.is_some() {
+                continue;
+            }
+            let Some((body, actor)) = transcript_event(entry) else {
+                continue;
+            };
+            let appended = log
+                .append(vowp_store::session_log::NewEvent {
+                    actor,
+                    source: EventSource {
+                        harness,
+                        model: Some(CLAUDE_MODEL.to_owned()),
+                        node: Some(ctx.config().node.name.clone()),
+                        native_session_id: Some(native.clone()),
+                    },
+                    body,
+                    raw: Some(line.value.clone()),
+                    ts: None,
                 })
-                .flatten()
+                .map_err(vowp_core::CoreError::from)?;
+            store.index_event(&vowp_store::session_log::index_row(&appended))?;
+            store.insert_native_event(
+                &session.id,
+                harness,
+                &entry.native_id,
+                &appended.envelope.id,
+                appended.envelope.ts,
+            )?;
+            imported += 1;
+        }
+    }
+    log.sync().map_err(vowp_core::CoreError::from)?;
+    if cursor_moved || imported > 0 || legacy_marker {
+        save_cursor(store, &marker_key, &cursor)?;
+    }
+    Ok(imported)
+}
+
+/// Returns the Claude native session uuid from a transcript's JSON lines.
+fn transcript_native_id(path: &Path) -> Result<Option<String>, CliError> {
+    let mut reader = BufReader::new(std::fs::File::open(path)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let native = value
+            .get("session_id")
+            .or_else(|| value.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !native.is_empty() {
+            return Ok(Some(native.to_owned()));
+        }
+    }
+}
+
+/// Loads a cursor and reports whether the stored marker is not already a JSON cursor.
+///
+/// The value is JSON under `watch:<native>`. A bare integer is the v0.1 line count:
+/// it is converted to the byte offset after that many complete lines so an upgrade
+/// does not re-import the prefix. A line count past the end of a truncated file
+/// starts over from zero. An unreadable marker starts over and is rewritten.
+fn load_cursor(store: &Store, key: &str, path: &Path) -> Result<(ImportCursor, bool), CliError> {
+    let Some(value) = store.kv_get(key)? else {
+        return Ok((ImportCursor::default(), false));
+    };
+    let value = value.trim();
+    if value.starts_with('{') {
+        return Ok((serde_json::from_str(value).unwrap_or_default(), true));
+    }
+    let Ok(lines) = value.parse::<usize>() else {
+        return Ok((ImportCursor::default(), true));
+    };
+    Ok((legacy_cursor(path, lines)?, true))
+}
+
+/// Converts a v0.1 processed-line count into a byte cursor.
+fn legacy_cursor(path: &Path, lines: usize) -> Result<ImportCursor, CliError> {
+    if lines == 0 {
+        return Ok(ImportCursor::default());
+    }
+    let bytes = std::fs::read(path)?;
+    let mut offset = 0usize;
+    let mut last_uuid = None;
+    for _ in 0..lines {
+        let Some(relative) = bytes[offset..].iter().position(|byte| *byte == b'\n') else {
+            return Ok(ImportCursor::default());
+        };
+        let end = offset + relative;
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes[offset..end]) {
+            if let Some(uuid) = line_uuid(&value) {
+                last_uuid = Some(uuid);
+            }
+        }
+        offset = end + 1;
+    }
+    Ok(ImportCursor {
+        offset: u64::try_from(offset).map_err(|_| CliError::Invalid("transcript is too large".to_owned()))?,
+        last_uuid,
+    })
+}
+
+/// Persists one cursor in the node database.
+fn save_cursor(store: &Store, key: &str, cursor: &ImportCursor) -> Result<(), CliError> {
+    let value = serde_json::to_string(cursor)
+        .map_err(|error| CliError::Invalid(format!("cannot encode watch cursor: {error}")))?;
+    store.kv_set(key, &value)?;
+    Ok(())
+}
+
+/// Finds the one canonical session for a Claude uuid, creating it on the first pass.
+fn canonical_session(ctx: &Ctx, store: &Store, native: &str, entries: &[TranscriptEntry]) -> Result<Session, CliError> {
+    if let Some(session) = store.session_for_native(HarnessKind::ClaudeCode, native)? {
+        return Ok(session);
+    }
+    let title = entries
+        .iter()
+        .find_map(|entry| match entry.kind {
+            TranscriptKind::UserMessage => entry
+                .text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+                .map(|text| text.chars().take(60).collect::<String>()),
+            _ => None,
         })
         .unwrap_or_else(|| format!("claude {native}"));
     let service = SessionService::new(ctx.deps().clone());
@@ -1221,92 +2094,77 @@ fn import_transcript(ctx: &Ctx, path: &std::path::Path) -> Result<usize, CliErro
         title,
         cwd: ctx.project_root().to_path_buf(),
         parent: None,
-        executor: Some(Executor::parse("claude-code:claude-sonnet-5-5@medium")?),
+        executor: Some(Executor::parse(CLAUDE_EXECUTOR)?),
     })?;
-    let log = SessionLog::open(ctx.paths(), &id, ctx.deps().clock.clone()).map_err(vowp_core::CoreError::from)?;
-    let mut imported = 0;
-    for line in &lines[processed..] {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Some(body) = transcript_body(&value) {
-            let appended = log
-                .append(vowp_store::session_log::NewEvent {
-                    actor: match body {
-                        EventBody::AssistantMessage(_) | EventBody::ToolCall(_) => vowp_protocol::Actor::Assistant,
-                        _ => vowp_protocol::Actor::User,
-                    },
-                    source: vowp_protocol::EventSource {
-                        harness: vowp_protocol::HarnessKind::ClaudeCode,
-                        model: Some("claude-sonnet-5-5".to_owned()),
-                        node: Some(ctx.config().node.name.clone()),
-                        native_session_id: Some(native.clone()),
-                    },
-                    body,
-                    raw: Some(value),
-                    ts: None,
-                })
-                .map_err(vowp_core::CoreError::from)?;
-            store.index_event(&vowp_store::session_log::index_row(&appended))?;
-            imported += 1;
-        }
-    }
-    log.sync().map_err(vowp_core::CoreError::from)?;
-    store.kv_set(&marker_key, &lines.len().to_string())?;
-    Ok(imported)
+    let session = store.require_session(&id)?;
+    store.upsert_native(
+        &id,
+        HarnessKind::ClaudeCode,
+        native,
+        &ctx.config().node.name,
+        session.last_seq.saturating_add(1),
+    )?;
+    Ok(session)
 }
 
-/// Maps one Claude transcript line to a canonical event body.
-fn transcript_body(value: &serde_json::Value) -> Option<EventBody> {
-    let kind = value.get("type").and_then(serde_json::Value::as_str)?;
-    match kind {
-        "user" => {
-            let text = value
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(serde_json::Value::as_str)?;
-            Some(EventBody::UserMessage(vowp_protocol::UserMessage {
-                text: text.to_owned(),
+/// Maps one transcript entry to a canonical event body and actor.
+fn transcript_event(entry: &TranscriptEntry) -> Option<(EventBody, Actor)> {
+    let mapped = match entry.kind {
+        TranscriptKind::UserMessage => (
+            EventBody::UserMessage(UserMessage {
+                text: entry.text.clone()?,
                 attachments: Vec::new(),
                 note: None,
-            }))
+            }),
+            Actor::User,
+        ),
+        TranscriptKind::AssistantMessage => (
+            EventBody::AssistantMessage(AssistantMessage {
+                text: entry.text.clone()?,
+            }),
+            Actor::Assistant,
+        ),
+        TranscriptKind::Reasoning => (
+            EventBody::AssistantReasoning(AssistantReasoning {
+                text: entry.text.clone()?,
+            }),
+            Actor::Assistant,
+        ),
+        TranscriptKind::ToolCall => (
+            EventBody::ToolCall(ToolCall {
+                call_id: entry.call_id.clone().unwrap_or_else(|| entry.native_id.clone()),
+                name: entry.tool.clone().unwrap_or_else(|| "tool".to_owned()),
+                input: entry.input.clone().unwrap_or(serde_json::Value::Null),
+            }),
+            Actor::Assistant,
+        ),
+        TranscriptKind::ToolResult => (
+            EventBody::ToolResult(ToolResult {
+                call_id: entry.call_id.clone().unwrap_or_else(|| entry.native_id.clone()),
+                ok: entry.ok.unwrap_or(true),
+                output: entry.output.clone(),
+                output_ref: None,
+                exit_code: None,
+            }),
+            Actor::Tool,
+        ),
+        TranscriptKind::Cost => {
+            let tokens = entry.tokens.unwrap_or_default();
+            let cost = match entry.usd {
+                Some(usd) => Cost::receipt(usd, tokens),
+                None => Cost {
+                    usd: None,
+                    tokens,
+                    source: CostSource::Unknown,
+                },
+            };
+            (EventBody::Cost(CostEvent { cost, run_id: None }), Actor::System)
         }
-        "assistant" => {
-            let blocks = value
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(serde_json::Value::as_array)?;
-            for block in blocks {
-                match block.get("type").and_then(serde_json::Value::as_str) {
-                    Some("text") => {
-                        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
-                            return Some(EventBody::AssistantMessage(vowp_protocol::AssistantMessage {
-                                text: text.to_owned(),
-                            }));
-                        }
-                    }
-                    Some("tool_use") => {
-                        return Some(EventBody::ToolCall(vowp_protocol::ToolCall {
-                            call_id: block
-                                .get("id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
-                            name: block
-                                .get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
-                            input: block.get("input").cloned().unwrap_or(serde_json::Value::Null),
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-            None
+        TranscriptKind::TurnStarted | TranscriptKind::TurnEnded | TranscriptKind::Error | TranscriptKind::Note => {
+            return None;
         }
-        _ => None,
-    }
+    };
+    Some(mapped)
 }
 
 /// Prints a session's event log as JSONL or pretty lines.

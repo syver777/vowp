@@ -216,6 +216,18 @@ the child is seeded with the bundle capsule and tail. Importing the same bundle 
 independent children; the origin is never modified. A compacted origin exports its capsule with an
 empty event tail and says so.
 
+`import --same-id` keeps the bundle's session id instead of creating a child:
+
+```sh
+vowp session import planner.vowp-bundle.json --same-id
+```
+
+The import is refused with exit 4 when that id already exists locally (a session row or a session
+directory). Nothing is overwritten or merged. A same-id import has no parent, writes a fresh
+`session.created`, copies the rest of the bundle tail into the log (event ids and timestamps are
+preserved; local sequence numbers are contiguous) and attaches the bundle capsule. A duplicate
+event id is a conflict, not a warning. A compacted bundle keeps its capsule and an empty tail.
+
 Common rejections:
 
 | Error | Meaning |
@@ -224,21 +236,91 @@ Common rejections:
 | `bundle too new` | `protocol_version` is newer than this binary. |
 | `checksum mismatch` | The JSON was edited or truncated. Nothing was created. |
 
+## Pull from another node
+
+```sh
+vowp session pull <node> <session>
+vowp session pull vps 01KA1V0Z7A0000000000000000
+vowp --json session pull vps 01KA1V0Z7A0000000000000000
+vowp session pull --same-id vps 01KA1V0Z7A0000000000000000
+vowp session pull --full vps 01KA1V0Z7A0000000000000000
+vowp --json session pull --full vps 01KA1V0Z7A0000000000000000
+```
+
+`pull` exports the bundle from the named node over the existing SSH transport, stages it in a
+private temporary directory, verifies the format, protocol version and sha256 checksum locally,
+then imports it as a child session. It prints the source id and the new child id; `--json` prints
+`{"node","source_session","child_session"}`. The child follows the same rules as `session import`:
+a new id, `parent_session_id` set to the source, a title ending in `(imported)`, and a first turn
+seeded from the bundle capsule and tail.
+
+`pull --same-id` keeps the source id when it is absent locally, with no parent and the same log and
+capsule rules as `session import --same-id`. It prints `pulled session <source> from <node> with
+same id <id>`; `--json` prints `{"node","source_session","same_id_session"}`.
+
+`pull --full` copies the whole `sessions/<id>/` directory instead of the bundle: the full event
+log, every blob, the capsule files and `adapters.json`. It always keeps the source id (there is no
+child and `--full` cannot be combined with `--same-id`). The files arrive as a
+`vowp-session-dir-v1` manifest plus raw bytes, are written into a private staging directory and
+checked against the manifest's byte sizes and sha256 digests before the directory is renamed into
+`sessions/<id>/`. The resulting directory contains `manifest.json` for inspection. A failed copy,
+digest mismatch, corrupt log or over-cap directory leaves no final `sessions/<id>/` and no staging
+directory. `vowp reindex` then registers the session.
+
+The full-pull limit is 1 GiB (1 073 741 824 bytes), checked from the remote file sizes before
+anything is copied. There is no partial copy and no placeholder for missing blobs: an over-cap or
+unreadable session is refused. A compacted source has no log to copy and is refused; use the bundle
+pull for it.
+
+If `--same-id` or `--full` finds the source id already present locally, the pull does not overwrite,
+silently refuse or merge. It prints both heads and exits 4 (conflict):
+
+```text
+vowp: session 01KA… exists locally and on vps; refusing to overwrite or merge
+local:  01KA… on laptop: seq 12, last user.message at 2026-11-12T09:14:02.118Z, state idle, executor opencode:…
+remote: 01KA… on vps: seq 15, last assistant.message at 2026-11-12T09:20:41.006Z, state idle, executor claude-code:…
+choose which side advances; no merge performed
+hint: delete or export one side, then pull again
+```
+
+`--json` writes one document:
+`{"error":{"kind":"conflict","code":"session_divergence","message","hint","node",
+"source_session","local","remote","note"}}`. Each head carries `session`, `node`, `last_seq`,
+`last_event`, `last_event_at`, `state`, `executor` and `updated_at`; unavailable fields are `null`.
+The local head comes from the index row and `log.jsonl`. The remote head comes from the bundle tail;
+for `--full` it comes from the source's read-only `session show --json --events 1` because the
+directory manifest carries no log position. Neither form prints a token, cwd or home path.
+
+The choice is manual and the pull itself writes nothing locally: delete or export one side, then
+pull again. There is no force flag and no merge. Both pull modes are one-way snapshots and no live
+lease is migrated. A bundle export writes its usual export capsule on the source; the directory
+export and head read are read-only and take no lock. For `--full`, leave the source lease released
+or quiescent while it runs and run the same build on both nodes. A failed ssh/remote read,
+truncated stream or checksum mismatch leaves the local home unchanged. Push, bidirectional
+sync/merge, live lease migration and an offline retry queue remain out of scope. For a local file
+copy use `session export` and `session import`.
+
 ## Watch an interactive Claude Code session
 
 ```sh
 vowp session watch --once
+vowp session watch --follow
 vowp session watch --once --claude-dir ~/.claude
 ```
 
-`session watch` is an optional importer. `--once` scans `*.jsonl` files under `--claude-dir`
-(default `$CLAUDE_CONFIG_DIR`, else `~/.claude`). For a transcript with new lines it creates a
-canonical session and records user text, assistant text and tool calls; other line types are skipped.
-It reads transcripts read-only and never writes to Claude's files. The processed line count is stored
-in the node database under `watch:<native session id>`; a later scan imports only lines after that
-count, and a transcript that is shorter or unchanged is skipped rather than restarted. Continuous
-following is not available: in a terminal, `session watch` without `--once` exits 2 with a message to
-use `--once`. Run it from cron for repeated scans.
+`session watch` is an optional importer. It scans `*.jsonl` files under `--claude-dir`
+(default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) and records user text, assistant text and tool
+calls; other line types are skipped. It reads transcripts read-only and never writes to Claude's
+files. The importer stores a byte cursor (offset plus the last complete line's id) in the node
+database under `watch:<native session id>`, so a later pass imports only newly completed lines. A
+partial final line waits for its newline, and a transcript that shrank below the cursor restarts at
+zero. One Claude native uuid maps to one canonical VOWP session (`role=user`, title from the first
+user message); later passes append only new events and never create a second session.
+
+`--once` makes one incremental pass. `--follow` polls every two seconds until Ctrl-C, importing
+newly completed lines; a terminal run without `--once` or `--follow` follows the same way. A non-TTY
+run without `--follow` makes one pass even when `--once` is omitted, so scripts do not hang. Run it
+from cron with `--once` for repeated scans.
 
 ## When to switch
 

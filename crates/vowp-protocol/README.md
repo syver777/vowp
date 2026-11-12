@@ -17,7 +17,7 @@ adapters, core and CLI use.
 
 ## Status
 
-VOWP 0.2.0 is an early release. The types in this crate back the shipped `vowp` CLI, but the API is not yet
+VOWP 0.3.0 is an early release. The types in this crate back the shipped `vowp` CLI, but the API is not yet
 stable and may change in a minor release while VOWP is in 0.x.
 
 ## Links

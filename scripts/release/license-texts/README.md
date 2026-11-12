@@ -9,6 +9,7 @@ and `--check` fails when the bundle is stale.
 | File | Licence identifier | Source |
 |---|---|---|
 | `MIT.txt` | MIT | `anyhow` 1.0.104 `LICENSE-MIT` (the standard MIT text without a copyright line) |
+| `MIT-0.txt` | MIT-0 | `borrow-or-share` 0.2.4 `LICENSE` (MIT No Attribution, without the package copyright line) |
 | `Apache-2.0.txt` | Apache-2.0 | `anyhow` 1.0.104 `LICENSE-APACHE` |
 | `Apache-2.0-WITH-LLVM-exception.txt` | Apache-2.0 WITH LLVM-exception | `linux-raw-sys` 0.12.1 `LICENSE-Apache-2.0_WITH_LLVM-exception` |
 | `BSD-2-Clause.txt` | BSD-2-Clause | `zerocopy` 0.8.63 `LICENSE-BSD` |

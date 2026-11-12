@@ -1,8 +1,10 @@
 # v0.2 — ACP adapter
 
-Status: design only. v0.1 ships the `claude-code`, `opencode` and generic `cli` adapters. ACP is a
-v0.2 adapter in `plan.md` §4.2 and is out of scope in
-`docs/design/crates/vowp-protocol.md` §7.
+Status: current. The first slice is implemented (v0.2); v0.1 ships the
+`claude-code`, `opencode` and generic `cli` adapters. The ACP adapter, its registry entry, fake-server
+tests and pinned subset are in
+`docs/design/adapters.md` §10. Real ACP servers, native resume, a permission UI, live pause and
+streaming chunk events remain **planned**.
 
 ## Goal
 
@@ -38,47 +40,64 @@ event type exists.
 - `vowp-adapters::classify` — limit/auth/credit/rate/context classification and redaction.
 - `vowp-core::session::service::run_turn` — the caller; it already treats an adapter as a stream of
   `HarnessEvent`s and does not care which harness produced them.
-- `vowp-protocol::HarnessKind` — currently `claude-code`, `opencode`, `cli`, `vowp`. ACP needs either
-  a new `acp` variant or a `cli:<name>` mapping; the first is cleaner but is an additive wire change.
+- `vowp-protocol::HarnessKind` — now `claude-code`, `opencode`, `cli`, `acp`, `vowp`. The additive
+  `acp` variant is implemented; the executor string is `acp:<model>`.
 
 ## Mapping sketch
 
-The exact ACP schema version must be pinned before implementation. The intended mapping is:
+ACP revision 1 is pinned. The adapter's mapping is:
 
-| ACP signal | Canonical event |
+| ACP signal | Adapter event |
 |---|---|
-| `session/new` result | `SessionExecutor { attach }` with the native id |
-| `session/prompt` start | `turn.started`; the prompt content becomes `user.message` |
 | agent message chunk | accumulate; emit one `assistant.message` at turn end |
-| tool call (start/update) | `tool.call`, then `tool.result` or `file.change` on completion |
+| tool call (start/update) | `tool.call`, then `tool.result` and optionally `file.change` on completion |
 | plan update | `plan` |
-| usage/cost update | `cost` with `CostSource::Receipt` when real, otherwise `Unknown` |
-| permission request | a `note` + an inbox approval, or an `error` with `retryable: false`; no fake auto-approval |
+| usage on the prompt result | `cost` with tokens and `CostSource::Unknown` (no price is invented) |
+| permission request | `note` + `error{retryable: false}` and a `cancelled` answer; no fake auto-approval and no inbox approval yet |
 | `session/prompt` result | `turn.ended` with the mapped stop reason |
+
+Core still appends the framing: `session.executor{attach}` with the native id, `turn.started`,
+`user.message` (the prompt), and `session.executor{detach}`. The adapter never emits those.
 
 Do not replay ACP tool calls into a new native session; the v0.1 rule is that a switch carries plain
 text, not native tool history.
 
-## Open questions
+## Decisions for the first slice
 
-1. **Protocol version.** Which ACP revision and method names are stable enough to support? Pin one and
-   record it in `docs/design/adapters.md`.
-2. **Permission flow.** The protocol has permission requests but `EventType` has no permission event.
-   Options: (a) add additive `permission.request`/`permission.resolve` events in v0.2, or (b) map a
-   request to an inbox `approval` and a `note`, with no live pause. Option (b) is smaller but cannot
-   resume the same turn automatically.
-3. **Streaming text.** v0.1 emits one `assistant.message` per turn. Keep that for the first slice and
-   add a chunk event later, so the log stays small and the web timeline stays simple.
-4. **Resume.** Does the server support `session/load`/resume across processes? If not,
-   `can_resume_native = false` and the normal capsule seed is used.
-5. **Cost.** ACP usage may be tokens only; report `CostSource::Unknown` rather than inventing a price.
+1. **Protocol version.** ACP revision **1** is pinned in `ACP_PROTOCOL_VERSION`; the supported
+   methods are exactly `initialize`, `session/new` and `session/prompt`, with the update kinds in
+   `docs/design/adapters.md` §10.2.
+2. **Permission flow.** Option (b) without the inbox step: a request becomes a `note` plus a
+   non-retryable `error{refused}` and the client answers `cancelled`; the turn ends. The inbox
+   approval variant is **planned** and needs a way for a worker run to pause and resume, which
+   this slice does not have.
+3. **Streaming text.** One `assistant.message` per turn, built from accumulated
+   `agent_message_chunk` text; a chunk event is **planned**.
+4. **Resume.** `session/load`/resume is not implemented; `can_resume_native = false`, so core uses
+   the normal capsule seed.
+5. **Cost.** Usage is tokens only with `CostSource::Unknown` and `usd: None`; the price table is
+   core's fallback, never the adapter's.
 
-## First-issue-sized slice
+## First slice — implemented
 
-Add an ACP adapter module that starts a fake ACP server script (JSON-RPC over stdio), performs
-`initialize`, `session/new` and one `session/prompt`, and maps the streamed updates to
-`user.message`, `assistant.message`, `tool.call`, `tool.result` and `turn.ended`. Run the existing
-adapter-contract tests against it, including a clean stop and a server that exits without a result. No
-permission UI and no real ACP server in the test suite.
+`crates/vowp-adapters/src/acp/` drives a fake ACP server (JSON-RPC 2.0 over stdio) through
+`initialize`, `session/new` and one `session/prompt`, mapping the streamed updates to
+`tool.call`, `tool.result`, `file.change`, `plan`, one `assistant.message`, `cost` (tokens only)
+and `turn.ended`. Core still appends `session.executor`, `turn.started` and `user.message`.
 
-The test must fail if the adapter drops or reorders the events; a fixture-only replay is not enough.
+The tests cover the existing adapter contract (a clean turn and a refused permission), an
+exited-without-result server, malformed JSON, an unknown method, a JSON-RPC quota error and
+`stop()` killing the process group. `HarnessKind::Acp` is registered in `vowp-core` and probed by
+`vowp doctor` when `[harnesses.acp]` or an ACP profile rung is configured.
+
+**Still planned:** a real ACP server, authentication, native resume, a permission UI or live
+pause, streaming chunk events, the inbox-approval fallback, the process-usage sidecar and the
+ACP cost price table/receipts.
+
+## Slice history
+
+The first-issue-sized slice was: add an ACP adapter module that starts a fake ACP server script
+(JSON-RPC over stdio), performs `initialize`, `session/new` and one `session/prompt`, and maps the
+streamed updates to canonical content events plus `turn.ended`. That slice is implemented; the
+event-order tests fail if the adapter drops or reorders events, and a fixture-only replay is not
+used. The prompt's `user.message` is the core-owned framing event, not an adapter event.

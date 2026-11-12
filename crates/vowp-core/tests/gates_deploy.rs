@@ -45,6 +45,8 @@ fn deploy_gate_runs_command_then_probe() {
     let order = tmp.path().join("order.log");
     let env = EnvConfig {
         checkout: env_dir.display().to_string(),
+        build: Vec::new(),
+        env_pass: Vec::new(),
         deploy: Vec::new(),
         guards: Vec::new(),
         approval: Approval::Human,
@@ -102,6 +104,8 @@ fn deploy_gate_probe_mismatch_fails() {
     fs::create_dir_all(&env_dir).unwrap();
     let env = EnvConfig {
         checkout: env_dir.display().to_string(),
+        build: Vec::new(),
+        env_pass: Vec::new(),
         deploy: Vec::new(),
         guards: Vec::new(),
         approval: Approval::Human,

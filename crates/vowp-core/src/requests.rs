@@ -357,3 +357,24 @@ fn kind_name(req: &Request) -> &'static str {
         Request::Wake => "wake",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vowp_protocol::InboxId;
+    use vowp_store::Store;
+
+    #[test]
+    fn push_encodes_answer_inbox_with_the_inbox_id() {
+        let store = Store::open_memory().expect("memory store");
+        let id = InboxId::new();
+        let request_id = push(&store, &Request::AnswerInbox { id: id.clone() }).expect("push request");
+        let stored = store.take_requests().expect("take requests");
+        assert_eq!(stored.len(), 1, "push must write exactly one request row");
+        assert_eq!(stored[0].id, request_id);
+        assert_eq!(stored[0].kind, "answer_inbox");
+        assert_eq!(stored[0].payload, serde_json::json!({ "id": id.as_str() }));
+        let decoded = decode(&stored[0].kind, &stored[0].payload).expect("decode request");
+        assert_eq!(decoded, Request::AnswerInbox { id });
+    }
+}

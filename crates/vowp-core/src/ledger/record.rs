@@ -4,6 +4,10 @@
 //! Every method appends one row through [`Store::append_ledger`]; the table trigger rejects
 //! updates and deletes, so this module never tries to correct a row. Timestamps come from the
 //! store's injected clock, never from the wall clock.
+//!
+//! [`Ledger::record`] redacts the vault's exact secret values from the summary and from the
+//! string values of `detail` before appending. Object keys, row identity, cost and timestamps
+//! are left unchanged.
 
 use serde::Serialize;
 use serde_json::json;
@@ -12,6 +16,7 @@ use vowp_protocol::{
 };
 use vowp_store::{LedgerFilter, Store};
 
+use crate::vault::Redactor;
 use crate::{CoreError, Deps};
 
 use super::price;
@@ -29,7 +34,15 @@ impl Ledger {
     }
 
     /// Appends one arbitrary ledger entry and returns its row id.
-    pub fn record(&self, store: &Store, entry: LedgerEntry) -> Result<i64, CoreError> {
+    ///
+    /// The summary and the string values of `detail` are redacted with the vault's exact-value
+    /// redactor before the row is written; object keys and every other column are unchanged.
+    pub fn record(&self, store: &Store, mut entry: LedgerEntry) -> Result<i64, CoreError> {
+        let redactor = Redactor::load(&self.deps)?;
+        if !redactor.is_empty() {
+            entry.summary = redactor.redact(&entry.summary);
+            redactor.redact_value(&mut entry.detail);
+        }
         Ok(store.append_ledger(&entry)?)
     }
 

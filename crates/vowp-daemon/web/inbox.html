@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP inbox</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0; font-size: 1rem; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .page-nav a { margin-right: .75rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .toolbar { display: flex; flex-wrap: wrap; gap: .5rem .75rem; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
+  .picker { display: flex; flex-wrap: wrap; gap: .35rem .5rem; align-items: center; }
+  .picker label { color: var(--muted); font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  select, input[type="text"], input[type="password"] {
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: .4rem;
+    padding: .25rem .45rem;
+    font: inherit;
+  }
+  button {
+    background: var(--accent);
+    color: var(--card);
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    padding: .25rem .6rem;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .answer-form { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; min-width: 14rem; }
+  .answer-form input[type="text"] { min-width: 8rem; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+  td.state { font-weight: 700; }
+  .preview { min-width: 12rem; max-width: 28rem; overflow-wrap: anywhere; }
+  .error, .notice {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  .notice { border-color: var(--accent); color: var(--accent); }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    th, td { padding: .35rem .4rem; }
+  }
+</style>
+</head>
+<body>
+<main id="inbox">
+  <header class="page-head">
+    <div>
+      <h1>VOWP inbox</h1>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">Board</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox" aria-current="page">Inbox</a>
+      </nav>
+      <p class="muted">Questions, approvals and notices. Answering needs the daemon write token.</p>
+    </div>
+    <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+  <p id="notice" class="notice" role="status" hidden></p>
+
+  <section id="unlock" class="card" aria-labelledby="unlock-heading" hidden>
+    <h2 id="unlock-heading">Unlock answering</h2>
+    <p class="muted">Paste the daemon write token. It stays in this tab's sessionStorage and is never put in the URL.</p>
+    <form id="unlock-form" class="answer-form">
+      <label for="token">Token</label>
+      <input id="token" name="token" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit">Save token</button>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="inbox-heading">
+    <div class="toolbar">
+      <h2 id="inbox-heading">Inbox items</h2>
+      <div class="picker">
+        <label for="state">State</label>
+        <select id="state" name="state">
+          <option value="open" selected>Open</option>
+          <option value="all">All</option>
+          <option value="answered">Answered</option>
+          <option value="dismissed">Dismissed</option>
+        </select>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Kind</th>
+            <th>Job</th>
+            <th>Title</th>
+            <th>Age</th>
+            <th>State</th>
+            <th>Options</th>
+            <th>Body preview</th>
+            <th>Answer</th>
+          </tr>
+        </thead>
+        <tbody id="items">
+          <tr><td colspan="9" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<noscript>The inbox page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const REFRESH_MS = 5000;
+  const DEFAULT_STATE = "open";
+  const STATES = ["open", "answered", "dismissed"];
+  const FILTERS = ["all", ...STATES];
+  const TOKEN_KEY = "vowp-api-token";
+  const MAX_ANSWER_BYTES = 10000;
+  const QUEUED_MESSAGE = "Answer queued; the supervisor applies it on the next tick";
+  const errorLine = document.getElementById("error");
+  const noticeLine = document.getElementById("notice");
+  const updatedLine = document.getElementById("updated");
+  const stateSelect = document.getElementById("state");
+  const itemsBody = document.getElementById("items");
+  const unlockSection = document.getElementById("unlock");
+  const unlockForm = document.getElementById("unlock-form");
+  const tokenInput = document.getElementById("token");
+  let lastUpdated = null;
+
+  const initial = new URLSearchParams(window.location.search).get("state");
+  let state = FILTERS.includes(initial) ? initial : DEFAULT_STATE;
+  stateSelect.value = state;
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function showNotice(message) {
+    noticeLine.textContent = message;
+    noticeLine.hidden = false;
+  }
+
+  function hideNotice() {
+    noticeLine.textContent = "";
+    noticeLine.hidden = true;
+  }
+
+  function storedToken() {
+    try {
+      return window.sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function setStoredToken(value) {
+    try {
+      if (value) {
+        window.sessionStorage.setItem(TOKEN_KEY, value);
+      } else {
+        window.sessionStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {
+      // A browser with storage disabled cannot unlock; reads still work.
+    }
+    updateUnlock();
+  }
+
+  function updateUnlock() {
+    unlockSection.hidden = storedToken() !== "";
+  }
+
+  function cell(value, className) {
+    const element = document.createElement("td");
+    element.textContent = value;
+    if (className) element.className = className;
+    return element;
+  }
+
+  function formatValue(value, fallback) {
+    if (value === null || value === undefined || value === "") return fallback;
+    return String(value);
+  }
+
+  function formatAge(value) {
+    if (value === null || value === undefined || value === "") return "unknown";
+    const created = new Date(value).getTime();
+    if (Number.isNaN(created)) return "unknown";
+    const seconds = Math.max(0, Math.floor((Date.now() - created) / 1000));
+    if (seconds < 60) return seconds + "s";
+    if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+    if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
+    return Math.floor(seconds / 86400) + "d";
+  }
+
+  function clip(text, limit) {
+    const oneLine = String(text == null ? "" : text).split(/\s+/).filter(Boolean).join(" ");
+    if (oneLine.length <= limit) return oneLine;
+    return oneLine.slice(0, limit - 1) + "…";
+  }
+
+  async function errorDetail(response) {
+    try {
+      const body = await response.json();
+      if (body && body.error && body.error.message) return body.error.message;
+    } catch {
+      // Fall back to the status when the body is not the API error document.
+    }
+    return "HTTP " + response.status;
+  }
+
+  async function submitAnswer(itemId, answer) {
+    const token = storedToken();
+    if (!token) {
+      updateUnlock();
+      showError("Unlock answering with the daemon write token first.");
+      return;
+    }
+    hideNotice();
+    try {
+      const response = await fetch("/api/v1/inbox/" + encodeURIComponent(itemId) + "/answer", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + token,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ answer }),
+      });
+      if (response.status === 202) {
+        showNotice(QUEUED_MESSAGE);
+        await refresh();
+        return;
+      }
+      if (response.status === 401) {
+        setStoredToken("");
+        showError("The token was rejected. Unlock with the current daemon write token.");
+        return;
+      }
+      if (response.status === 503) {
+        showError("Writes are disabled: the daemon was started without VOWP_API_TOKEN.");
+        return;
+      }
+      showError("Could not answer (" + (await errorDetail(response)) + ").");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showError("Could not answer (" + detail + ").");
+    }
+  }
+
+  function answerCell(item) {
+    const element = document.createElement("td");
+    if (item.state !== "open") {
+      element.textContent = "—";
+      return element;
+    }
+    const form = document.createElement("form");
+    form.className = "answer-form";
+    form.setAttribute("aria-label", "Answer inbox item " + item.id);
+    const options = Array.isArray(item.options) ? item.options : [];
+    let select = null;
+    if (options.length > 0) {
+      select = document.createElement("select");
+      select.name = "option";
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "Choose…";
+      select.appendChild(blank);
+      for (const value of options) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = String(value);
+        select.appendChild(option);
+      }
+      form.appendChild(select);
+    }
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = "answer";
+    input.placeholder = options.length > 0 ? "or type an answer" : "answer";
+    input.autocomplete = "off";
+    input.maxLength = MAX_ANSWER_BYTES;
+    form.appendChild(input);
+    const button = document.createElement("button");
+    button.type = "submit";
+    button.textContent = "Answer";
+    form.appendChild(button);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const typed = input.value.trim();
+      const answer = typed || (select ? select.value : "");
+      if (!answer) {
+        showError("Choose an option or type an answer.");
+        return;
+      }
+      submitAnswer(item.id, answer);
+    });
+    element.appendChild(form);
+    return element;
+  }
+
+  async function fetchState(value) {
+    const response = await fetch("/api/v1/inbox?state=" + encodeURIComponent(value));
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const page = await response.json();
+    return Array.isArray(page.items) ? page.items : [];
+  }
+
+  function render(items) {
+    itemsBody.replaceChildren();
+    if (items.length === 0) {
+      const row = document.createElement("tr");
+      const empty = cell("No inbox items.", "muted");
+      empty.colSpan = 9;
+      row.appendChild(empty);
+      itemsBody.appendChild(row);
+      return;
+    }
+    for (const item of items) {
+      const row = document.createElement("tr");
+      const options = Array.isArray(item.options) && item.options.length > 0 ? item.options.join(", ") : "none";
+      row.append(
+        cell(formatValue(item.id, "unknown"), "mono"),
+        cell(formatValue(item.kind, "unknown")),
+        cell(formatValue(item.job_id, "none"), "mono"),
+        cell(formatValue(item.title, "untitled")),
+        cell(formatAge(item.created_at), "num"),
+        cell(formatValue(item.state, "unknown"), "state"),
+        cell(options),
+        cell(clip(item.body, 160) || "—", "preview"),
+        answerCell(item)
+      );
+      itemsBody.appendChild(row);
+    }
+  }
+
+  async function refresh() {
+    try {
+      let items;
+      if (state === "all") {
+        const pages = await Promise.all(STATES.map(fetchState));
+        items = pages.flat();
+      } else {
+        items = await fetchState(state);
+      }
+      items.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)));
+      render(items);
+      lastUpdated = new Date();
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+      showError("Could not load the inbox (" + detail + ")." + when);
+    }
+  }
+
+  unlockForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = tokenInput.value.trim();
+    if (!value) {
+      showError("Enter the daemon write token.");
+      return;
+    }
+    setStoredToken(value);
+    tokenInput.value = "";
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+    showNotice("Token saved for this tab.");
+  });
+
+  stateSelect.addEventListener("change", () => {
+    state = FILTERS.includes(stateSelect.value) ? stateSelect.value : DEFAULT_STATE;
+    const url = new URL(window.location.href);
+    if (state === DEFAULT_STATE) {
+      url.searchParams.delete("state");
+    } else {
+      url.searchParams.set("state", state);
+    }
+    window.history.replaceState(null, "", url);
+    hideNotice();
+    refresh();
+  });
+
+  updateUnlock();
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

@@ -18,7 +18,18 @@ fn graph_ascii_and_mermaid_golden() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(
         stdout,
-        "graph TD\n    a_job[\"a-job (pending)\"]\n    b_job[\"b-job (pending)\"]\n    a_job --> b_job\n"
+        concat!(
+            "graph TD\n",
+            "    a_job[\"a-job (pending)\"]\n",
+            "    b_job[\"b-job (pending)\"]\n",
+            "    a_job --> b_job\n",
+            "    classDef running fill:#fff4d6,stroke:#b7791f,color:#744210\n",
+            "    classDef waiting fill:#e8f0fe,stroke:#3b6fb6,color:#1a3d6d\n",
+            "    classDef failed fill:#fde8e8,stroke:#b42318,color:#7a1a12\n",
+            "    classDef done fill:#e6f4ea,stroke:#2f7d4f,color:#1d4d31\n",
+            "    class a_job waiting\n",
+            "    class b_job waiting\n",
+        )
     );
 }
 
@@ -81,6 +92,85 @@ fn graph_export_import_roundtrip() {
     assert_eq!(code, 4);
     assert_eq!(value["imported"].as_array().expect("imported").len(), 0);
     assert_eq!(value["conflicts"].as_array().expect("conflicts").len(), 3);
+}
+
+/// Returns the `(id, state)` pairs of a serialised job array.
+fn ids_and_states(jobs: &[serde_json::Value]) -> Vec<(String, String)> {
+    jobs.iter()
+        .map(|job| {
+            (
+                job["id"].as_str().expect("job id").to_owned(),
+                job["state"].as_str().expect("job state").to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn graph_json_matches_job_ls_and_keeps_needs_edge() {
+    let env = common::TestEnv::new();
+    env.insert_job("a-job", "Alpha", JobKind::Build, &[]);
+    env.insert_job("b-job", "Beta", JobKind::Build, &["a-job"]);
+
+    let (code, graph, stderr) = env.run_json(&["graph"]);
+    assert_eq!(code, 0, "{stderr}");
+    let jobs = graph["jobs"].as_array().expect("jobs array");
+    let edges = graph["edges"].as_array().expect("edges array");
+
+    // Jobs are ordered by id and serialised like the `job ls --json` objects.
+    assert_eq!(
+        jobs.iter()
+            .map(|job| job["id"].as_str().expect("job id"))
+            .collect::<Vec<_>>(),
+        ["a-job", "b-job"]
+    );
+    // Edges keep the store/graph order: the stored needs edge for b-job.
+    assert_eq!(edges.len(), 1, "{graph}");
+    assert_eq!(edges[0]["src"], "b-job");
+    assert_eq!(edges[0]["dst"], "a-job");
+    assert_eq!(edges[0]["kind"], "needs");
+
+    let (code, listed, stderr) = env.run_json(&["job", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    let listed = listed.as_array().expect("job ls array");
+    let mut graph_jobs = ids_and_states(jobs);
+    graph_jobs.sort();
+    let mut listed_jobs = ids_and_states(listed);
+    listed_jobs.sort();
+    assert_eq!(graph_jobs.len(), 2);
+    assert_eq!(graph_jobs, listed_jobs);
+    assert_eq!(
+        graph_jobs,
+        vec![
+            ("a-job".to_owned(), "pending".to_owned()),
+            ("b-job".to_owned(), "pending".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn graph_json_mermaid_prints_only_mermaid() {
+    let env = common::TestEnv::new();
+    env.insert_job("a-job", "Alpha", JobKind::Build, &[]);
+
+    let (code, stdout, stderr) = env.run(&["graph", "--json", "--mermaid"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        concat!(
+            "graph TD\n",
+            "    a_job[\"a-job (pending)\"]\n",
+            "    classDef running fill:#fff4d6,stroke:#b7791f,color:#744210\n",
+            "    classDef waiting fill:#e8f0fe,stroke:#3b6fb6,color:#1a3d6d\n",
+            "    classDef failed fill:#fde8e8,stroke:#b42318,color:#7a1a12\n",
+            "    classDef done fill:#e6f4ea,stroke:#2f7d4f,color:#1d4d31\n",
+            "    class a_job waiting\n",
+        )
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&stdout).is_err(),
+        "mermaid output must not be JSON: {stdout:?}"
+    );
 }
 
 #[test]

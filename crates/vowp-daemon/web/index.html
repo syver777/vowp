@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP board</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1rem; }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .page-nav a { color: var(--accent); }
+  .status { display: grid; gap: .2rem; justify-items: end; }
+  .live { margin: 0; font-weight: 600; }
+  .live[data-state="live"] { color: var(--accent); }
+  .live[data-state="reconnecting"],
+  .live[data-state="error"] { color: var(--warn); }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .grid { display: grid; grid-template-columns: 1fr; gap: 1rem; }
+  @media (min-width: 560px) {
+    .grid { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .value { margin: .2rem 0; font-size: 1.45rem; font-weight: 700; overflow-wrap: anywhere; }
+  .value.small { font-size: 1.05rem; }
+  .chips { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+  .chip { display: flex; gap: .4rem; align-items: baseline; border: 1px solid var(--line); border-radius: 999px; padding: .2rem .7rem; }
+  .chip .count { color: var(--accent); font-weight: 700; }
+  .cards { display: grid; gap: .6rem; margin: 0; padding: 0; list-style: none; }
+  .job-card { border: 1px solid var(--line); border-radius: .5rem; padding: .65rem .75rem; min-width: 0; }
+  .job-head { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; margin: 0 0 .45rem; }
+  .badge {
+    display: inline-block;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .05rem .55rem;
+    color: var(--accent);
+    font-size: .8rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+  }
+  .facts { display: grid; grid-template-columns: 1fr; gap: .35rem .9rem; margin: 0; }
+  @media (min-width: 420px) {
+    .facts { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  }
+  .fact { min-width: 0; }
+  .fact dt { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+  .fact dd { margin: 0; overflow-wrap: anywhere; }
+  .error {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    .value { font-size: 1.25rem; }
+    .grid, .cards { gap: .6rem; }
+    .job-card { padding: .55rem .6rem; }
+    .facts { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main id="board">
+  <header class="page-head">
+    <div>
+      <h1>VOWP board</h1>
+      <p id="project" class="muted">Project: unknown</p>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/" aria-current="page">Board</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+    </div>
+    <div class="status">
+      <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+      <p id="live" class="muted live" aria-live="polite" hidden>Live updates: connecting…</p>
+    </div>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section class="card" aria-labelledby="running-heading">
+    <h2 id="running-heading">Running jobs</h2>
+    <ul id="running" class="cards">
+      <li class="job-card muted">
+        <dl class="facts">
+          <div class="fact"><dt>Job</dt><dd>Loading…</dd></div>
+          <div class="fact"><dt>Executor</dt><dd>Loading…</dd></div>
+          <div class="fact"><dt>Age</dt><dd>–</dd></div>
+          <div class="fact"><dt>Last event age</dt><dd>–</dd></div>
+        </dl>
+      </li>
+    </ul>
+  </section>
+
+  <section class="card" aria-labelledby="counts-heading">
+    <h2 id="counts-heading">Job counts</h2>
+    <ul id="counts" class="chips"><li class="muted">Loading…</li></ul>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="slots-heading">
+      <h2 id="slots-heading">Slots</h2>
+      <p id="slots" class="value">–</p>
+      <p class="muted">Worker and verifier slots busy / total.</p>
+    </section>
+    <section class="card" aria-labelledby="cost-heading">
+      <h2 id="cost-heading">Cost today</h2>
+      <p id="cost" class="value">unknown</p>
+      <p class="muted">USD recorded today (UTC); unknown means no total is known.</p>
+    </section>
+    <section class="card" aria-labelledby="inbox-heading">
+      <h2 id="inbox-heading">Inbox open</h2>
+      <p class="value"><span id="inbox" class="badge">–</span></p>
+      <p class="muted">Inbox items waiting for an answer.</p>
+    </section>
+    <section class="card" aria-labelledby="checkpoint-heading">
+      <h2 id="checkpoint-heading">Last checkpoint</h2>
+      <p id="checkpoint" class="value small">–</p>
+    </section>
+  </div>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="planner-heading">
+      <h2 id="planner-heading">Planner</h2>
+      <p id="planner" class="mono">not configured</p>
+    </section>
+    <section class="card" aria-labelledby="keeper-heading">
+      <h2 id="keeper-heading">Keeper</h2>
+      <p id="keeper" class="mono">not configured</p>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="limits-heading">
+    <h2 id="limits-heading">Limits</h2>
+    <ul id="limits" class="cards">
+      <li class="job-card muted">
+        <dl class="facts">
+          <div class="fact"><dt>Provider</dt><dd>Loading…</dd></div>
+          <div class="fact"><dt>Kind</dt><dd>–</dd></div>
+          <div class="fact"><dt>Resets</dt><dd>–</dd></div>
+        </dl>
+      </li>
+    </ul>
+  </section>
+</main>
+
+<noscript>The board requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const REFRESH_MS = 5000;
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 15000;
+  const STREAM_URL = "/api/v1/board/stream";
+  const errorLine = document.getElementById("error");
+  const updatedLine = document.getElementById("updated");
+  const liveLine = document.getElementById("live");
+  let lastUpdated = null;
+  let eventSource = null;
+  let retryTimer = null;
+  let retryDelay = RETRY_MIN_MS;
+  let fallbackTimer = null;
+
+  function text(id, value) {
+    document.getElementById(id).textContent = value;
+  }
+
+  function formatAge(secs) {
+    if (secs === null || secs === undefined) return "unknown";
+    const value = Number(secs);
+    if (!Number.isFinite(value) || value < 0) return "unknown";
+    if (value < 60) return Math.round(value) + "s";
+    const minutes = Math.round(value / 60);
+    if (minutes < 60) return minutes + "m";
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest ? hours + "h " + rest + "m" : hours + "h";
+  }
+
+  function formatTime(value) {
+    if (value === null || value === undefined) return "unknown";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatCost(value) {
+    if (value === null || value === undefined) return "unknown";
+    const amount = Number(value);
+    if (!Number.isFinite(amount)) return "unknown";
+    return "$" + amount.toFixed(2);
+  }
+
+  function emptyItem(message) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = message;
+    return item;
+  }
+
+  function fact(label, value, mono) {
+    const row = document.createElement("div");
+    row.className = "fact";
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    if (mono) detail.className = "mono";
+    row.append(term, detail);
+    return row;
+  }
+
+  function cardHead(label) {
+    const head = document.createElement("p");
+    head.className = "job-head";
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = label;
+    head.appendChild(badge);
+    return head;
+  }
+
+  function renderCounts(jobs) {
+    const list = document.getElementById("counts");
+    list.replaceChildren();
+    const entries = Object.entries(jobs || {});
+    if (entries.length === 0) {
+      list.appendChild(emptyItem("No jobs."));
+      return;
+    }
+    for (const [state, count] of entries) {
+      const item = document.createElement("li");
+      item.className = "chip";
+      const number = document.createElement("span");
+      number.className = "count";
+      number.textContent = String(count);
+      const label = document.createElement("span");
+      label.textContent = state;
+      item.append(number, label);
+      list.appendChild(item);
+    }
+  }
+
+  function renderRunning(runs) {
+    const list = document.getElementById("running");
+    list.replaceChildren();
+    if (runs.length === 0) {
+      list.appendChild(emptyItem("No running jobs."));
+      return;
+    }
+    for (const run of runs) {
+      const item = document.createElement("li");
+      item.className = "job-card";
+      const facts = document.createElement("dl");
+      facts.className = "facts";
+      facts.append(
+        fact("Job", run.job || "unknown", true),
+        fact("Executor", run.executor || "unknown", true),
+        fact("Age", formatAge(run.age_secs), false),
+        fact("Last event age", formatAge(run.last_event_age_secs), false)
+      );
+      item.append(cardHead("running"), facts);
+      list.appendChild(item);
+    }
+  }
+
+  function renderLimits(limits) {
+    const list = document.getElementById("limits");
+    list.replaceChildren();
+    if (limits.length === 0) {
+      list.appendChild(emptyItem("No active limits."));
+      return;
+    }
+    for (const limit of limits) {
+      const item = document.createElement("li");
+      item.className = "job-card";
+      const facts = document.createElement("dl");
+      facts.className = "facts";
+      facts.append(
+        fact("Provider", limit.provider || "unknown", true),
+        fact("Kind", limit.kind || "unknown", false),
+        fact("Resets", limit.resets_at ? formatTime(limit.resets_at) : "no reset time", false)
+      );
+      item.append(cardHead("limit"), facts);
+      list.appendChild(item);
+    }
+  }
+
+  function render(data) {
+    text("project", "Project: " + (data.project || "unknown"));
+    renderCounts(data.jobs);
+    renderRunning(Array.isArray(data.running) ? data.running : []);
+    text("slots", (data.slots_busy ?? "?") + " / " + (data.slots_total ?? "?") + " busy");
+    text("planner", data.planner || "not configured");
+    text("keeper", data.keeper || "not configured");
+    renderLimits(Array.isArray(data.limits) ? data.limits : []);
+    text("cost", formatCost(data.cost_today_usd));
+    text("inbox", String(data.inbox_open ?? "?"));
+    text("checkpoint", data.last_checkpoint ? formatTime(data.last_checkpoint) : "none");
+  }
+
+  function setLive(message, state) {
+    liveLine.textContent = message;
+    liveLine.dataset.state = state;
+    liveLine.hidden = false;
+  }
+
+  function markHeartbeat(value) {
+    const at = value === null || value === undefined || value === "" ? "now" : formatTime(value);
+    setLive("Live updates: streaming · heartbeat " + at, "live");
+  }
+
+  function closeStream() {
+    if (eventSource === null) return;
+    const source = eventSource;
+    eventSource = null;
+    source.onopen = null;
+    source.onerror = null;
+    source.close();
+  }
+
+  function clearRetry() {
+    if (retryTimer === null) return;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  function stopFallbackPolling() {
+    if (fallbackTimer === null) return;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+
+  function startFallbackPolling() {
+    if (fallbackTimer !== null) return;
+    fallbackTimer = setInterval(refresh, REFRESH_MS);
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null) return;
+    const delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      startStream();
+    }, delay);
+  }
+
+  function handleStreamFailure() {
+    closeStream();
+    setLive("Reconnecting... polling every 5 seconds.", "reconnecting");
+    startFallbackPolling();
+    scheduleRetry();
+    refresh();
+  }
+
+  function startStream() {
+    clearRetry();
+    closeStream();
+    if (typeof EventSource !== "function") {
+      setLive("Live updates unavailable in this browser; polling every 5 seconds.", "polling");
+      startFallbackPolling();
+      return;
+    }
+    let source;
+    try {
+      source = new EventSource(STREAM_URL);
+    } catch (_error) {
+      setLive("Live updates could not start; polling every 5 seconds.", "reconnecting");
+      startFallbackPolling();
+      scheduleRetry();
+      return;
+    }
+    eventSource = source;
+    source.onopen = () => {
+      clearRetry();
+      retryDelay = RETRY_MIN_MS;
+      setLive("Live updates: streaming", "live");
+      stopFallbackPolling();
+    };
+    source.addEventListener("board", (message) => {
+      let data;
+      try {
+        data = JSON.parse(message.data);
+      } catch (_error) {
+        return;
+      }
+      retryDelay = RETRY_MIN_MS;
+      render(data);
+      lastUpdated = new Date();
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+      setLive("Live updates: streaming", "live");
+      stopFallbackPolling();
+    });
+    source.addEventListener("heartbeat", (message) => {
+      let at = null;
+      try {
+        at = JSON.parse(message.data).at;
+      } catch (_error) {
+        at = null;
+      }
+      retryDelay = RETRY_MIN_MS;
+      markHeartbeat(at);
+    });
+    source.onerror = () => {
+      if (eventSource !== source) return;
+      handleStreamFailure();
+    };
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch("/api/v1/board");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      lastUpdated = new Date();
+      render(data);
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+      errorLine.textContent = "Could not load the board (" + detail + ")." + when;
+      errorLine.hidden = false;
+    }
+  }
+
+  async function load() {
+    setLive("Live updates: connecting…", "connecting");
+    startFallbackPolling();
+    await refresh();
+    startStream();
+  }
+
+  load();
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

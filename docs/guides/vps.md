@@ -265,6 +265,29 @@ round-robin order and the snapshot write. `up` exits 4 if a supervisor already h
 `--no-migrate` only when you intentionally want the refusal instead. The migration refuses while a
 supervisor is running.
 
+When the web-window daemon starts, `vowp up` prints its loopback URL and the control-machine
+command for that actual port:
+
+```text
+web window: http://127.0.0.1:54321/
+remote window: vowp tunnel open window --remote-port 54321
+  local URL: http://127.0.0.1:<local-port>/ (the command prints the chosen port)
+```
+
+On the laptop or phone, configure the home once as a control machine
+(`vowp control init --name home <home-ssh-target>`), run the printed
+`vowp tunnel open window --remote-port 54321`, and open the local loopback URL it prints. Pass
+`--local-port <n>` when you need a fixed local port. The daemon binds `127.0.0.1` on the home;
+the existing managed SSH forward is the only route, no public port is opened, and the firewall
+still allows only SSH. A missing daemon binary warns and prints no tunnel hint while the
+supervisor keeps running; `up --once` starts no daemon.
+
+Reads need no token. Set `VOWP_API_TOKEN` in the environment that runs `vowp up` (for example a
+mode-0600 `EnvironmentFile=` on the user unit) and enter the value in the page's unlock panel to
+enable the inbox answer and session switch writes. The page keeps it in `sessionStorage`, never
+in the URL; `vowp up` never prints it. Rotating it means restarting the daemon with the new value
+and unlocking again.
+
 Under systemd, do not also start a detached `vowp up`. The unit owns the process:
 
 ```sh
@@ -467,9 +490,10 @@ refused rather than guessed at.
 
 ## SSH and firewall
 
-The home opens no public listening socket. The only inbound service is SSH. The opencode app host
-and the one-time secret page bind loopback and are reached through an SSH tunnel; never expose them
-on a public interface. Claude Remote Control opens no local port: it connects outbound to claude.ai.
+The home opens no public listening socket. The only inbound service is SSH. The opencode app host,
+the one-time secret page and the v0.3 web window daemon bind loopback and are reached through an
+SSH tunnel; never expose them on a public interface. Claude Remote Control opens no local port: it
+connects outbound to claude.ai.
 
 On a server with `ufw`:
 
@@ -492,6 +516,8 @@ outbound access to the git remote and to the harness's provider.
 | `vowp: command not found` under systemd | `PATH` and `ExecStart` in the unit; install with the script so the path is `~/.local/bin/vowp`. |
 | `vowp setup home` exits 5 | Read the `handoff` object: sudo command, harness login, secret name or owner answer. Finish that, re-run the same command. |
 | `vowp up` exits 4 | A supervisor is already running. `vowp status` shows it; use the service instead of a second `up`. |
+| `vowp up` prints no `web window:` line | The daemon binary is missing or did not start; the warning names the reason. Install `vowp-daemon` beside `vowp` or set `VOWP_DAEMON_BIN`. |
+| The window URL does not open from the laptop | Open the tunnel's local loopback URL, not the home's `127.0.0.1` address; run `vowp tunnel ls` from the machine that opened it. |
 | `doctor` fails a harness | The harness is installed and signed in as `<your-user>`; check `[harnesses.<name>].binary`. |
 | `doctor` reports a provider `absent` | Set the variable in the service environment; VOWP only reports the name. |
 | No tmux session after `up` | Read `~/.vowp/logs/supervisor.log`; install tmux and check the private socket directory. |

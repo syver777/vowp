@@ -6,9 +6,10 @@
 //! does not fire twice. Day-of-week follows standard cron numbering (`0`/`7` Sunday, `1`
 //! Monday); the `cron` crate numbers Sunday as 1, so that one field is matched here.
 //!
-//! Interval occurrences are aligned to the Unix epoch (`anchor + k·period` with anchor 0),
-//! because [`ScheduleSpec::parse`] receives no `created_at`. This is the one deviation from
-//! loops.md §11's `anchor = created_at`; see the job report.
+//! Interval occurrences keep their creation phase: `anchor + k·period` with
+//! `anchor = created_at`, the smallest `k >= 1`, so an `every 30m` schedule created at
+//! 10:07 runs at 10:37, 11:07, … [`ScheduleSpec::parse_at`] carries that anchor;
+//! [`ScheduleSpec::parse`] is the epoch-anchored wrapper for callers that only have a spec.
 
 use std::str::FromStr;
 
@@ -37,18 +38,27 @@ enum Spec {
         offset_minutes: i32,
         days: DayOfWeekSpec,
     },
-    /// A fixed period in seconds.
-    Interval { period_secs: u64 },
+    /// A fixed period in seconds and the instant its phase is anchored at.
+    Interval { period_secs: u64, anchor_secs: i64 },
 }
 
 impl ScheduleSpec {
-    /// Parses `spec` for `kind` evaluated in `tz`.
+    /// Parses `spec` for `kind` evaluated in `tz`, with the Unix epoch as the interval anchor.
+    ///
+    /// Use [`ScheduleSpec::parse_at`] when the schedule's `created_at` is known; `parse`
+    /// keeps epoch-aligned intervals for callers that only need to validate a spec.
+    pub fn parse(kind: ScheduleSpecKind, spec: &str, tz: &str) -> Result<Self, CoreError> {
+        Self::parse_at(kind, spec, tz, Timestamp::from_unix_secs(0))
+    }
+
+    /// Parses `spec` for `kind` evaluated in `tz`, anchoring interval occurrences at `anchor`.
     ///
     /// Cron accepts exactly five fields (`min hour dom mon dow`) and prefixes the seconds
-    /// field required by the `cron` crate. Interval accepts `every <n><s|m|h|d>` or the bare
-    /// `<n><unit>` form used by `[[schedules]].every`, with a minimum period of 60 seconds.
-    /// `tz` is `UTC` or a fixed `±HH:MM` offset.
-    pub fn parse(kind: ScheduleSpecKind, spec: &str, tz: &str) -> Result<Self, CoreError> {
+    /// field required by the `cron` crate; its anchor is irrelevant. Interval accepts
+    /// `every <n><s|m|h|d>` or the bare `<n><unit>` form used by `[[schedules]].every`, with a
+    /// minimum period of 60 seconds, and keeps `anchor`'s phase. `tz` is `UTC` or a fixed
+    /// `±HH:MM` offset.
+    pub fn parse_at(kind: ScheduleSpecKind, spec: &str, tz: &str, anchor: Timestamp) -> Result<Self, CoreError> {
         let offset_minutes = parse_tz(tz)?;
         let inner = match kind {
             ScheduleSpecKind::Cron => {
@@ -75,6 +85,7 @@ impl ScheduleSpec {
             }
             ScheduleSpecKind::Interval => Spec::Interval {
                 period_secs: parse_interval(spec)?,
+                anchor_secs: anchor.unix_secs(),
             },
         };
         Ok(Self { inner })
@@ -88,7 +99,10 @@ impl ScheduleSpec {
                 offset_minutes,
                 days,
             } => cron_next_after(schedule.as_ref(), *offset_minutes, days, after),
-            Spec::Interval { period_secs } => interval_next_after(*period_secs, after),
+            Spec::Interval {
+                period_secs,
+                anchor_secs,
+            } => interval_next_after(*period_secs, *anchor_secs, after),
         }
     }
 }
@@ -149,13 +163,17 @@ fn cron_next_after(
     None
 }
 
-/// Computes the next epoch-aligned interval occurrence strictly after `after`.
-fn interval_next_after(period_secs: u64, after: Timestamp) -> Option<Timestamp> {
+/// Computes the first `anchor + k·period` strictly after `after`, with `k >= 1`.
+///
+/// An `after` before the anchor still yields `anchor + period`, never the anchor itself.
+fn interval_next_after(period_secs: u64, anchor_secs: i64, after: Timestamp) -> Option<Timestamp> {
     let period = i64::try_from(period_secs).ok()?;
     if period <= 0 {
         return None;
     }
-    let next = (after.unix_secs().div_euclid(period) + 1).checked_mul(period)?;
+    let elapsed = after.unix_secs().checked_sub(anchor_secs)?;
+    let k = elapsed.div_euclid(period).checked_add(1)?.max(1);
+    let next = anchor_secs.checked_add(k.checked_mul(period)?)?;
     Some(Timestamp::from_unix_secs(next))
 }
 

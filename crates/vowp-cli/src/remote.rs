@@ -13,10 +13,11 @@
 //! never use the cache. `secret request` is wrapped in a local tunnel so the owner's
 //! browser only sees a control-machine loopback URL (§9.2–§9.3).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, ChildStdout, Command as ProcessCommand, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -267,6 +268,109 @@ pub fn build_ssh_argv(target: &str, args: &[String], interactive: bool) -> Vec<S
     }
     argv.push(remote);
     argv
+}
+
+/// A running remote command whose stdout is streamed and whose stderr is captured.
+///
+/// `session pull --full` uses this instead of [`run_remote`] because the snapshot is
+/// binary: it reads the manifest line and the file bytes directly from the pipe while a
+/// helper thread drains stderr, so a remote error cannot deadlock on a full pipe.
+pub struct RemoteStream {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+    stderr: JoinHandle<Vec<u8>>,
+    target: String,
+}
+
+/// The result of a finished [`RemoteStream`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteExit {
+    /// Remote process exit code.
+    pub code: i32,
+    /// Everything the remote command wrote to stderr.
+    pub stderr: String,
+}
+
+impl RemoteStream {
+    /// Spawns `ssh … vowp <args>` with piped stdout and captured stderr.
+    pub fn spawn(target: &str, args: &[String]) -> Result<Self, CliError> {
+        let argv = build_ssh_argv(target, args, false);
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| CliError::Remote("empty ssh argv".to_owned()))?;
+        let mut child = ProcessCommand::new(program)
+            .args(rest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| CliError::Remote(format!("ssh {target}: {error}")))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CliError::Remote(format!("ssh {target} produced no stdout")))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| CliError::Remote(format!("ssh {target} produced no stderr")))?;
+        let stderr = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        Ok(Self {
+            child,
+            stdout: BufReader::new(stdout),
+            stderr,
+            target: target.to_owned(),
+        })
+    }
+
+    /// Returns the buffered remote stdout.
+    pub fn stdout(&mut self) -> &mut BufReader<ChildStdout> {
+        &mut self.stdout
+    }
+
+    /// Waits for the remote command and returns its exit code and stderr.
+    pub fn finish(mut self) -> Result<RemoteExit, CliError> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| CliError::Remote(format!("ssh {}: {error}", self.target)))?;
+        let stderr = self.stderr.join().unwrap_or_default();
+        finish_stream(&self.target, status, stderr)
+    }
+
+    /// Kills the remote command, reaps it and returns its exit code and stderr.
+    ///
+    /// A status without a code means this call's own kill ended the process. That is a
+    /// deliberate local abort, not a remote failure, so it becomes exit code 0 and the
+    /// caller's local error stays authoritative.
+    pub fn abort(mut self) -> Result<RemoteExit, CliError> {
+        let _ = self.child.kill();
+        let status = self
+            .child
+            .wait()
+            .map_err(|error| CliError::Remote(format!("ssh {}: {error}", self.target)))?;
+        let stderr = self.stderr.join().unwrap_or_default();
+        if status.code().is_none() {
+            return Ok(RemoteExit {
+                code: 0,
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            });
+        }
+        finish_stream(&self.target, status, stderr)
+    }
+}
+
+/// Maps a finished stream process onto [`RemoteExit`], with ssh's own failure as 7.
+fn finish_stream(target: &str, status: std::process::ExitStatus, stderr: Vec<u8>) -> Result<RemoteExit, CliError> {
+    let stderr = String::from_utf8_lossy(&stderr).into_owned();
+    match status.code() {
+        Some(255) => Err(CliError::Remote(format!("ssh {target} failed with exit 255"))),
+        Some(code) => Ok(RemoteExit { code, stderr }),
+        None => Err(CliError::Remote(format!("ssh {target} terminated by a signal"))),
+    }
 }
 
 /// Runs `ssh` with inherited stdio and returns the remote exit code.

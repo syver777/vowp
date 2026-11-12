@@ -31,7 +31,7 @@ crates/vowp-store/
   src/repo_ledger.rs    // ledger, cost_totals
   src/repo_misc.rs      // inbox, limits, releases, kv, requests
   src/blobs.rs          // BlobStore
-  src/session_log.rs    // SessionLog, NewEvent, VerifyReport, lockfile
+  src/session_log.rs    // SessionLog, NewEvent, VerifyReport, lockfile, full-pull manifest/verification
   src/session_files.rs  // capsule files, adapters.json
   src/reindex.rs        // reindex
   tests/*.rs
@@ -59,6 +59,7 @@ impl NodePaths {
     pub fn blobs_dir(&self, id: &SessionId) -> PathBuf;                  // .../blobs
     pub fn capsules_dir(&self, id: &SessionId) -> PathBuf;               // .../capsules
     pub fn adapters_json_path(&self, id: &SessionId) -> PathBuf;         // .../adapters.json
+    pub fn session_manifest_path(&self, id: &SessionId) -> PathBuf;      // .../manifest.json (full pull only)
     pub fn logs_dir(&self) -> PathBuf;                                   // <root>/logs         (supervisor.log, ...)
     pub fn runs_dir(&self) -> PathBuf;                                   // <root>/runs/<run-id>.jsonl raw harness output mirror
     pub fn run_raw_path(&self, id: &RunId) -> PathBuf;
@@ -80,6 +81,8 @@ pub const SCHEMA_VERSION: i64 = 1;
 impl Store {
     /// `paths.ensure()`, open `paths.db_path()`, apply pragmas, migrate. Uses `SystemClock`.
     pub fn open(paths: &NodePaths) -> Result<Store, StoreError>;
+    /// Existing DB only: no `ensure`, no migration, no `query_only`; missing DB → NotFound.
+    pub fn open_writable(paths: &NodePaths, project: Option<&ProjectName>) -> Result<Store, StoreError>;
     pub fn open_path(path: &std::path::Path) -> Result<Store, StoreError>;     // file DB at path, parent dir must exist
     pub fn open_memory() -> Result<Store, StoreError>;                          // :memory:, for tests
     pub fn with_clock(self, clock: std::sync::Arc<dyn Clock>) -> Store;          // tests inject FakeClock (used for created_at/updated_at stamping)
@@ -103,6 +106,13 @@ Migration/pragma rules (all in `Store::open*`):
 4. Migrations are `const MIGRATIONS: &[&str] = &[include_str!("schema/001_init.sql")]`. `001_init.sql` is **byte-identical** to
    `docs/design/schema.sql`; it is copied byte for byte. Future schema changes are new files `002_*.sql` and a new design amendment — never edits to 001.
 5. Insert `kv('schema_created_at')` and `kv('node_id')` (a fresh ULID) on first creation.
+6. `open_writable(paths, project)` is the daemon's narrow write constructor. It requires the
+   existing `vowp.db` (missing → `NotFound`), uses read-write flags without create, sets the busy
+   timeout and foreign keys, checks `user_version = 2` (newer → `SchemaTooNew`, older →
+   `MigrationRequired`), and attaches an existing registered project with the same schema check.
+   It never calls `paths.ensure`, `resume_migration` or a schema file, so opening it cannot create
+   or migrate a home. It is not a general write-open: `Store::open` remains the CLI/supervisor
+   constructor.
 
 ### 3.3 Filters and small structs
 
@@ -285,6 +295,8 @@ impl BlobStore {
     pub fn exists(&self, sha256: &str) -> bool;
     pub fn path_of(&self, sha256: &str) -> PathBuf;                     // rejects non-hex / wrong length with InvalidInput (path traversal guard)
 }
+/// Lowercase hex SHA-256 of one file, read in bounded chunks (used by full-pull manifests).
+pub fn sha256_file(path: &std::path::Path) -> Result<String, StoreError>;
 ```
 
 ### 3.6 SessionLog (`session_log.rs`)
@@ -325,9 +337,15 @@ impl SessionLog {
 impl Drop for SessionLog { /* best-effort sync(), then release the lock file */ }
 pub struct AppendedEvent { pub envelope: EventEnvelope, pub byte_offset: u64, pub byte_len: u64 }
 
+/// Last complete event of a log, used by the divergence report.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LogHead { pub last_seq: u64, pub event_type: Option<EventType>, pub ts: Option<Timestamp> }
+
 pub struct SessionLogReader { /* path, BlobStore */ }
 impl SessionLogReader {
     pub fn last_seq(&self) -> Result<u64, StoreError>;
+    /// Last seq plus the last event's type/timestamp, in one read; empty log => `LogHead::default()`.
+    pub fn head(&self) -> Result<LogHead, StoreError>;
     pub fn read_all(&self) -> Result<Vec<EventEnvelope>, StoreError>;
     pub fn read_from(&self, after_seq: u64, limit: Option<usize>) -> Result<Vec<EventEnvelope>, StoreError>;   // seq > after_seq
     pub fn tail(&self, n: usize) -> Result<Vec<EventEnvelope>, StoreError>;                                  // last n, ascending
@@ -342,6 +360,29 @@ pub struct IndexedEvent { pub envelope: EventEnvelope, pub byte_offset: u64, pub
 ```
 
 Plus `pub fn index_row(a: &AppendedEvent) -> EventIndexRow` (builds the `session_events` row: harness/model from `source`, `summary` from `EventBody::summary()`).
+
+Full session-directory snapshots (`session pull --full`) use the same module:
+
+```rust
+pub const SESSION_DIR_FORMAT: &str = "vowp-session-dir-v1";
+pub const SESSION_DIR_MAX_BYTES: u64 = 1_073_741_824;                  // 1 GiB default cap
+pub const SESSION_DIR_MANIFEST: &str = "manifest.json";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDirFile { pub path: String, pub bytes: u64, pub sha256: String }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDirManifest { pub format: String, pub origin: SessionId, pub files: Vec<SessionDirFile> }
+impl SessionDirManifest {
+    pub fn validate(&self) -> Result<(), StoreError>;                  // format, safe layout, digests, sorted unique paths, log.jsonl present
+    pub fn total_bytes(&self) -> u64;                                  // saturating sum of declared sizes
+}
+/// Size check first, then hash; the listing is log.jsonl, optional adapters.json, blobs/<sha256>, capsules/*.json.
+pub fn session_dir_manifest(paths: &NodePaths, id: &SessionId, max_bytes: u64) -> Result<SessionDirManifest, StoreError>;
+pub fn read_session_dir_manifest(path: &std::path::Path) -> Result<SessionDirManifest, StoreError>;
+pub fn write_session_dir_manifest(paths: &NodePaths, id: &SessionId, m: &SessionDirManifest) -> Result<PathBuf, StoreError>;
+/// Re-hash every listed file, require the manifest set to equal the directory set, verify the log, adapters and capsules.
+pub fn verify_session_dir(paths: &NodePaths, id: &SessionId, m: &SessionDirManifest) -> Result<(), StoreError>;
+```
 
 ### 3.7 Session files and reindex
 
@@ -362,6 +403,7 @@ pub fn add_adapter_mapping(paths: &NodePaths, id: &SessionId, m: AdapterMapping)
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReindexReport { pub sessions: u32, pub events: u64, pub capsules: u32, pub natives: u32, pub torn_tails: u32, pub problems: Vec<String> }
 /// Rebuild the index tables for one session (Some) or every directory under sessions/ (None): see rule 8.
+/// A duplicate event id in one log or across sessions is `StoreError::Conflict` before any row changes.
 pub fn reindex(store: &Store, paths: &NodePaths, session: Option<&SessionId>) -> Result<ReindexReport, StoreError>;
 ```
 
@@ -392,18 +434,25 @@ pub fn reindex(store: &Store, paths: &NodePaths, session: Option<&SessionId>) ->
 
 7. Blob names are lowercase hex SHA-256 of the exact bytes; `put` is idempotent; writes are atomic (tmp in the same dir, fsync file, rename, fsync dir). `get` re-hashes.
    Capsule and adapters.json writes use the same atomic recipe through `NodePaths::tmp_dir()`-independent temp files in the target directory (rename must stay on one filesystem).
+   A full-pull directory may also carry `manifest.json` (format `vowp-session-dir-v1`). It lists only
+   the content files with their byte sizes and lowercase sha256 digests; `reindex` ignores it. A
+   snapshot is written into a staging directory, `verify_session_dir` re-hashes every listed file
+   and requires the manifest set to equal the actual set (plus a clean log and valid capsules), and
+   only then is the directory renamed to `sessions/<id>/`. A file that is missing, extra, resized
+   or changed is a `Corrupt` error.
 
 ### 4.3 Reindex
 
 8. `reindex(store, paths, session)` algorithm, per session directory `<id>` whose name parses as `SessionId` (others are skipped with a problem line):
    1. `SessionLogReader::iter()` over `log.jsonl`; a torn tail is ignored and counted; corruption (rule 5) → the session is skipped, problem recorded, other sessions continue.
-   2. In **one transaction** per session: delete that session's `session_events` and `session_natives` rows (**not** `capsules`, `sessions`, `runs`, `switches`, `ledger`: `switches.capsule_id` has `ON DELETE SET NULL`, so deleting capsule rows would silently clear every switch→capsule link);
+   2. Check event ids **before touching the index**: an id repeated in this log, or one already owned by another session in `session_events`, returns `StoreError::Conflict` (`duplicate event id` / `already belongs to session`); no rows are changed. `session_events.id` is unique across the whole index, so this is a conflict, not a problem line.
+   3. In **one transaction** per session: delete that session's `session_events` and `session_natives` rows (**not** `capsules`, `sessions`, `runs`, `switches`, `ledger`: `switches.capsule_id` has `ON DELETE SET NULL`, so deleting capsule rows would silently clear every switch→capsule link);
       then for each event insert the `session_events` row; track `last_seq`, `log_bytes`, `updated_at = last event ts`.
-   3. Rebuild the `sessions` row **if missing** (db deleted): from `session.created` (title, cwd, project, job_id, role, parent) and the latest `session.executor`
+   4. Rebuild the `sessions` row **if missing** (db deleted): from `session.created` (title, cwd, project, job_id, role, parent) and the latest `session.executor`
       (`executor` string, `node`), `state = idle` (or `closed` if a trailing `note` text `closed`; v0.1 always `idle`). If the row exists, only `last_seq`, `log_bytes`, `updated_at`, `executor` are refreshed.
-   4. `session_natives` rebuilt from every `session.executor` attach event carrying `native_session_id` (`first_seq` = that event's seq), then merged with `adapters.json` (union).
-   5. `capsules` **upserted** from `capsules/*.json` with `INSERT … ON CONFLICT(id) DO UPDATE` (never `INSERT OR REPLACE`/delete, which would fire the FK action); invalid files → problem line, skipped; capsule rows whose file is missing are left untouched and reported as a problem; `sessions.last_capsule_id` = latest by `at_seq`.
-   6. `switches` rows missing from the DB are re-created from `switch` events (`state = completed`, `to_node` = the `to.node` or this node); existing rows untouched (their `capsule_id` is preserved; a re-created row's `capsule_id` comes from the `switch` event's `capsule_id`, set only if that capsule row exists).
+   5. `session_natives` rebuilt from every `session.executor` attach event carrying `native_session_id` (`first_seq` = that event's seq), then merged with `adapters.json` (union).
+   6. `capsules` **upserted** from `capsules/*.json` with `INSERT … ON CONFLICT(id) DO UPDATE` (never `INSERT OR REPLACE`/delete, which would fire the FK action); invalid files → problem line, skipped; capsule rows whose file is missing are left untouched and reported as a problem; `sessions.last_capsule_id` = latest by `at_seq`.
+   7. `switches` rows missing from the DB are re-created from `switch` events (`state = completed`, `to_node` = the `to.node` or this node); existing rows untouched (their `capsule_id` is preserved; a re-created row's `capsule_id` comes from the `switch` event's `capsule_id`, set only if that capsule row exists).
    Result: after `rm vowp.db && Store::open && reindex(None)`, `sessions`, `session_events`, `session_natives`, `capsules` (and lineage `switches`) equal the pre-deletion rows
    except fields that only the DB held (`sessions.state` of in-flight sessions, `job_id` when the creating event lacks it). **Content is never lost.**
 9. `reindex` is idempotent: running twice yields identical tables (test `reindex_is_idempotent`).
@@ -451,6 +500,7 @@ impl From<rusqlite::Error> for StoreError { /* maps SQLITE_BUSY → Busy, UNIQUE
 | `open_creates_schema_version_1` | fresh temp DB: `schema_version()==1`, tables listed in schema.sql all exist, WAL mode (`PRAGMA journal_mode` = `wal`), `foreign_keys` = 1 |
 | `open_refuses_newer_schema` | set `PRAGMA user_version = 99` on a temp DB file, `Store::open_path` → `SchemaTooNew{found:99,supported:1}`, file bytes unchanged |
 | `open_is_idempotent` | open twice on the same file: no error, `node_id` kv unchanged |
+| `open_writable_answers_and_never_creates_or_migrates` | `open_writable` opens an existing home, answers an inbox item and reads it back; a missing `vowp.db` is `NotFound` and its directory is not created; an empty zero-byte file is `MigrationRequired` and stays untouched |
 | `schema_matches_enums` | parse every `CHECK (col IN ('a','b',...))` list from `schema.sql` and compare to the serde names of the matching Rust enum for: `jobs.kind/role/state`, `edges.kind`, `runs.role/purpose/outcome/limit_kind/cost_source`, `gate_results.gate_kind`, `session_events.type/actor`, `sessions.state/role`, `capsules.trigger`, `switches.reason/state`, `loops.kind/state`, `schedules.spec_kind/action_kind/missed_policy/state`, `ledger.kind`, `inbox.kind/state`, `limits.kind`, `releases.state`, `workers.kind/state` — sets must be equal |
 | `job_insert_defaults_and_needs_edges` | `insert_job` with minimal `NewJob` yields state Pending, priority 50, brief path `.vowp/jobs/<id>/brief.md`, default gates for kind, and `job.needs` equals the `needs` edges |
 | `job_insert_duplicate_and_unknown_need` | duplicate id → `Conflict`; unknown need → `NotFound`; no partial rows left (transaction) |
@@ -495,7 +545,13 @@ impl From<rusqlite::Error> for StoreError { /* maps SQLITE_BUSY → Busy, UNIQUE
 | `reindex_is_idempotent` | run twice; tables identical |
 | `reindex_single_session_leaves_others` | modifying one log then `reindex(Some(id))` updates only that session's rows |
 | `reindex_skips_corrupt_session` | one session with a corrupt middle line: reported in `problems`, others indexed |
+| `reindex_rejects_an_event_id_owned_by_another_session` | the second session's log reuses an indexed event id → `StoreError::Conflict` (`already belongs to session`), no row or events for the rejected session |
+| `reindex_rejects_a_duplicate_event_id_in_one_log` | one log repeats an event id → `StoreError::Conflict` (`duplicate event id`), no indexed events |
 | `paths_layout` | `NodePaths::new("/x")` produces every path exactly as listed in §3.1 (no I/O); `from_env` honours `VOWP_HOME` (test sets the env var inside a mutex-guarded section) and errors with neither set |
+| `sha256_file_matches_the_blob_name_written_by_put` | a file written by `BlobStore::put` hashes to the blob name returned by `put` |
+| `session_dir_manifest_verifies_and_detects_corruption` | a log+blob manifest verifies, `manifest.json` round-trips, a same-size changed blob is `Corrupt` (`sha256 mismatch`) and an extra blob file is `Corrupt` (`not listed`) |
+| `session_dir_manifest_refuses_a_directory_over_the_size_cap` | `session_dir_manifest(..., max_bytes=1)` refuses a larger session with `InvalidInput` naming the limit |
+| `session_dir_manifest_rejects_traversal_and_reserved_paths` | `..`, absolute paths, `manifest.json`, `.lock`, `import.json`, non-digest blob names, non-JSON capsule names and `summary.md` are refused |
 
 ## 7. Out of scope / v0.2
 

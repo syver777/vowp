@@ -16,7 +16,7 @@ does not scrape a TUI, and does not read or forward harness login tokens.
 
 ## Status
 
-VOWP 0.2.0 is an early release. The adapter interfaces are used by the shipped `vowp` CLI, but they are not
+VOWP 0.3.0 is an early release. The adapter interfaces are used by the shipped `vowp` CLI, but they are not
 yet stable while VOWP is in 0.x.
 
 ## Links

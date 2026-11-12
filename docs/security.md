@@ -8,9 +8,9 @@ configured, and any public or production action needs an explicit human approval
 This page describes the model and what it does **not** protect against. The vulnerability-reporting
 policy is in [`SECURITY.md`](../SECURITY.md).
 
-> **Status: current.** The home/control split, leases, MCP write checks, secrets, lifecycle, backup,
-> gates, promotion and `vowp doctor` on this page are implemented, and these rules are binding on the
-> code on `main`.
+> **Status: current.** The home/control split, leases, MCP write checks, secrets, the daemon's two
+> token-gated writes, lifecycle, backup, gates, promotion and `vowp doctor` on this page are implemented,
+> and these rules are binding on the code on `main`.
 
 ## Reporting a vulnerability
 
@@ -62,6 +62,7 @@ Trust boundaries:
 | **One writer per session** | `sessions/<id>/log.jsonl` is appended only on the home, by the session service or the hidden `session ingest` path. `seq` has no gaps or duplicates; ingest is idempotent by event id. |
 | **The home is authoritative** | A control machine and the apps and MCP instance on it never write a VOWP DB file; their commands route to the home. On the home, the `vowp mcp` server reads and writes the home database directly, and every write tool checks the session lease. A control machine keeps only a snapshot cache, a spool and local surface/tunnel state. |
 | **No public listener** | The supervisor opens no public HTTP, SSE or API port. The opencode app host and the one-time secret paste page listen on loopback only, and a control machine reaches both through an SSH tunnel; the secret vector is one-time. Claude Remote Control opens no local port: it connects outbound to claude.ai from the home. |
+| **Two daemon writes** | The loopback daemon serves every read without a token. `POST /api/v1/inbox/{id}/answer` and the local `POST /api/v1/sessions/{id}/switch` require `Authorization: Bearer <VOWP_API_TOKEN>`; a daemon started without the variable answers `503` and writes nothing. The token is read at startup, compared in constant time, never logged, echoed or put in a URL, and rotation is a daemon restart. |
 | **No credentials in configuration** | `vowp.toml` holds no token values; `env_pass` contains environment-variable **names**; `HarnessConfig` has no value fields. VOWP stores the values it manages in the secret store, and a listed `env_pass` name may also be forwarded from the process environment (see [Secrets](#secrets)). `vowp doctor` reports presence by name and never calls the network. This covers configuration and argv, not every stored byte: exact-value redaction covers the session-service and remote-ingest event paths and the snapshot, but `supervisor.log`, gate evidence, ledger rows, the switch turn path and the `session watch` importer are written unredacted and can hold a value a command printed (see [Redaction](#redaction)). |
 | **Stock binaries only** | Adapters spawn `claude`, `opencode` or a configured CLI exactly as a user would. No client spoofing, no "sign in with Claude" inside VOWP, no token forwarding. The optional `session watch` importer reads transcript JSONL read-only; it does not read auth files. |
 | **cwd allow-list** | Before a run, the session layer checks that the working directory is inside the job worktree, the project path, the worktree root, `[node].cwd_allow` or the VOWP-owned orchestrator root `<VOWP_HOME>/orchestrators/<name>/`. Anything else, including paths elsewhere under `VOWP_HOME`, is refused. |
@@ -131,8 +132,13 @@ vowp secret request <NAME>      # one-time 127.0.0.1 paste page, URL and expiry
 - A harness run's `env_pass` is a list of **names**. VOWP resolves each name from the secret store
   when a value is set there, and otherwise forwards it from the process environment of the machine
   running the turn; the home session service and the remote `__exec` path both do this. A name that
-  cannot be resolved is a warning on the home path and an error on a remote surface. The promoter
-  still runs `[env.*]` deploy/probe commands with no added secret environment.
+  cannot be resolved is a warning on the home path and an error on a remote surface. Promotion
+  commands use the separate `[env.<name>].env_pass` list, also names only. The promoter resolves
+  those names from the store once at the start of `promote` and `rollback`, before anything is
+  banked or deployed, and passes the values only through the child environments of the serving
+  bank, deploy, probe and rollback commands. A configured name that is not stored is an error that
+  names the variable and aborts the operation before a command runs; harness `env_pass` keeps its
+  warn-and-skip behaviour.
 - `__vault-exec` is the hidden read/inject helper: `__vault-exec --env NAME -- <cmd…>` reads the
   named file and execs `<cmd…>` as `vowp-vault` with that one variable set. It is not limited to
   `env_pass` names: any stored name works, and the command runs with the vault user's access. The
@@ -219,6 +225,46 @@ stored; a hit records `{path, line, rule}` only.
 
 A `.env` file is never read, printed or committed, even when it would be convenient for a test. Use a
 temporary directory and a fake value.
+
+## The daemon write token
+
+The v0.3 loopback daemon (`vowp-daemon`) is read-only by default: every `GET` is token-free and
+served from `Store::open_read_only`. The two exceptions are
+`POST /api/v1/inbox/{id}/answer` and the local `POST /api/v1/sessions/{id}/switch`. Both are
+gated by one bearer token, not by a user account.
+
+- **Where the value lives.** The daemon reads `VOWP_API_TOKEN` from its own environment at
+  startup. The value is not in `vowp.toml`, not in a token file and not in a URL. A missing or
+  empty value disables writes: the route answers `503` and writes nothing. There is no
+  placeholder mode that accepts an unauthenticated write.
+- **Transport.** The request carries `Authorization: Bearer <token>`. A missing or wrong value
+  is `401` with `WWW-Authenticate: Bearer`. The comparison is constant-time and the configured
+  value is never logged, echoed or returned. The handlers check the token before they parse the
+  body or load the row, so an unauthorized request cannot probe item or session ids or states.
+- **Rotation.** Restart the daemon with a new `VOWP_API_TOKEN`. There is no token file, rotation
+  service, multi-user account or per-user permission. The page keeps the value in
+  `sessionStorage`; a `401` clears it and shows the unlock panel again.
+- **Scope.** Both writes call `Store::open_writable`, which opens the existing home without
+  `ensure` or a migration and refuses a missing or unversioned database. The answer stores the
+  item with `answered_by = "web"` and, when the item belongs to a job, queues the same
+  `answer_inbox` request as the CLI; the supervisor applies the request and the browser never
+  changes job state directly. The switch runs the same `SessionService` switch as
+  `vowp session switch` against that store, with the CLI's guards and a five-second drain.
+  It is local-node only: the request has no node field and the daemon opens no SSH path.
+- **Force.** A running session is refused with `409` unless the request sets
+  `force: true`. Force lets the current turn drain for up to five seconds and then stops it;
+  the page shows the returned state and never claims the executor moved when the switch was
+  aborted. A `switching` or `closed` session and a target provider with an active limit are
+  also refused with `409`, mirroring the CLI.
+- **Exposure.** The listener binds `127.0.0.1` only. This is not TLS, not a multi-user login and
+  not safe to expose on a public interface. A local process that can read the daemon's
+  environment can read the token; reach the daemon through an SSH tunnel and treat the token as
+  a secret value. Tests use a fixed fake token in-process and never read or set the real
+  environment.
+
+The rest of the API has no auth surface. Job retry/park/cancel, cross-node switching, capsule
+edits and every other write remain later and must not reuse this token as a blanket service
+credential without a new design.
 
 ## Session logs and the control cache are sensitive
 

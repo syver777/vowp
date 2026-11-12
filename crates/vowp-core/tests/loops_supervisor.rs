@@ -4,6 +4,7 @@
 #[path = "loops_support.rs"]
 mod h;
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -1261,4 +1262,95 @@ fn request_rows_apply_every_kind_end_to_end() {
         );
     }
     assert!(store.take_requests().expect("queue").is_empty());
+}
+
+#[test]
+fn dispatch_brief_precedence_copies_project_then_keeps_worktree_then_falls_back() {
+    // 1. The planner's project-checkout brief reaches the worktree byte-for-byte.
+    let node = TestNode::new();
+    let job = worker_job(&node, "brief-project");
+    let project_brief = node.main_repo.join(&job.brief);
+    std::fs::create_dir_all(project_brief.parent().expect("project brief dir")).expect("project brief dir");
+    let planned = vowp_protocol::Brief::from_job(&job, "# Planner task\n\nImplement the real thing.\n").render();
+    std::fs::write(&project_brief, &planned).expect("project brief");
+    let mut supervisor = node.supervisor();
+    let tick = supervisor.tick().expect("tick");
+    assert!(
+        tick.dispatched.contains(&job.id),
+        "job was not dispatched: {:?}",
+        tick.dispatched
+    );
+    node.wait_runs();
+    let dispatched = node.store().require_job(&job.id).expect("job");
+    let worktree = PathBuf::from(dispatched.worktree.as_ref().expect("worktree"));
+    let worktree_brief = worktree.join(&dispatched.brief);
+    assert_eq!(
+        std::fs::read(&worktree_brief).expect("worktree brief"),
+        std::fs::read(&project_brief).expect("project brief"),
+        "the worktree brief must be a byte-for-byte copy of the project brief"
+    );
+    assert!(
+        std::fs::read_to_string(&worktree_brief)
+            .expect("brief")
+            .contains("Implement the real thing."),
+        "the planner's body must reach the worker"
+    );
+
+    // 2. An existing worktree brief wins over a different project copy.
+    let node = TestNode::new();
+    let job = worker_job(&node, "brief-existing");
+    let worktree = node.tmp.path().join("worktrees").join(job.id.as_str());
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    let existing = vowp_protocol::Brief::from_job(&job, "# Worktree task\n\nKeep this worktree copy.\n").render();
+    let worktree_brief = worktree.join(&job.brief);
+    std::fs::create_dir_all(worktree_brief.parent().expect("worktree brief dir")).expect("worktree brief dir");
+    std::fs::write(&worktree_brief, &existing).expect("worktree brief");
+    let project_brief = node.main_repo.join(&job.brief);
+    std::fs::create_dir_all(project_brief.parent().expect("project brief dir")).expect("project brief dir");
+    std::fs::write(
+        &project_brief,
+        vowp_protocol::Brief::from_job(&job, "# Project task\n\nDo not use this copy.\n").render(),
+    )
+    .expect("project brief");
+    node.store()
+        .set_job_workspace(&job.id, Some("job/brief-existing"), Some(&worktree_text))
+        .expect("workspace");
+    let mut supervisor = node.supervisor();
+    let tick = supervisor.tick().expect("tick");
+    assert!(
+        tick.dispatched.contains(&job.id),
+        "job was not dispatched: {:?}",
+        tick.dispatched
+    );
+    node.wait_runs();
+    assert_eq!(
+        std::fs::read_to_string(&worktree_brief).expect("worktree brief"),
+        existing,
+        "an existing worktree brief is never overwritten"
+    );
+
+    // 3. With neither source, the generated fallback is written.
+    let node = TestNode::new();
+    let job = worker_job(&node, "brief-fallback");
+    let mut supervisor = node.supervisor();
+    let tick = supervisor.tick().expect("tick");
+    assert!(
+        tick.dispatched.contains(&job.id),
+        "job was not dispatched: {:?}",
+        tick.dispatched
+    );
+    node.wait_runs();
+    let dispatched = node.store().require_job(&job.id).expect("job");
+    let worktree = PathBuf::from(dispatched.worktree.as_ref().expect("worktree"));
+    let fallback_body = format!(
+        "Do job {job}. Read AGENTS.md first, change only the paths in `owns`, commit on the job branch, run the gates, and write the report at {report}.\n",
+        job = dispatched.id,
+        report = dispatched.report,
+    );
+    let expected = vowp_protocol::Brief::from_job(&dispatched, &fallback_body).render();
+    assert_eq!(
+        std::fs::read_to_string(worktree.join(&dispatched.brief)).expect("fallback brief"),
+        expected,
+        "with neither source, the generated fallback must be written"
+    );
 }

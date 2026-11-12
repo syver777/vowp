@@ -4,7 +4,7 @@ The npm package for **VOWP** — a local-first supervisor for AI coding agents.
 It installs the prebuilt `vowp` binary for your platform; Rust is not
 required.
 
-> **Status: early release (0.2.0).** The v0.2 command surface is complete, but
+> **Status: early release (0.3.0).** The v0.3 command surface is complete, but
 > VOWP is young and interfaces may still change. The source, documentation and
 > issue tracker live at [github.com/syver777/vowp](https://github.com/syver777/vowp).
 
@@ -23,6 +23,10 @@ npx vowp --version
 
 Requires Node.js 18 or newer. `npm install` runs a postinstall step that
 downloads the archive for the current platform and verifies it before use.
+
+The package installs `vowp` only. The loopback web window is served by the
+separate `vowp-daemon`; install it separately when you want the window (see the
+[install guide](https://github.com/syver777/vowp/blob/main/docs/guides/install.md)).
 
 ## Supported platforms
 

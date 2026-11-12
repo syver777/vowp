@@ -4,14 +4,14 @@
 use as a small engineering team on a home machine you own: one supervisor for every project, an
 append-only session log, measured capacity and a single merge queue.
 
-## Set up VOWP 0.2.0
+## Set up VOWP 0.3.0
 
 Paste this prompt into Claude Code, opencode or another harness on the computer you want to use as
 the control machine:
 
 ```text
-Set up VOWP 0.2.0 for me. Read
-https://raw.githubusercontent.com/syver777/vowp/v0.2.0/docs/setup/agent-setup.md
+Set up VOWP 0.3.0 for me. Read
+https://raw.githubusercontent.com/syver777/vowp/v0.3.0/docs/setup/agent-setup.md
 and follow it exactly. Ask me only what it tells you to ask, show me the full plan once,
 and run it after I approve. Never ask me to paste a secret into this chat.
 ```
@@ -36,8 +36,8 @@ What you need before you paste it:
 - **A repository, optionally:** an existing checkout on the home with a `vowp.toml`, or no project
   yet. Setup registers repositories; it does not clone or rewrite them.
 
-> **Status: current — VOWP 0.2.** The v0.2 command surface, including the setup commands, is
-> implemented. The release process owns the 0.2.0 tag and published binaries. The
+> **Status: current — VOWP 0.3.0.** The v0.3 command surface, including the setup commands and the
+> loopback window, is implemented. The release process owns the 0.3.0 tag and published binaries. The
 > [roadmap](docs/roadmap.md) lists what is deliberately deferred.
 
 ## How it fits together
@@ -113,7 +113,7 @@ never kills a running job. A job that waits says why (`waiting: RAM 1.2 GB short
 sentence appears in the queue and the snapshot.
 
 On a host without `/proc` (macOS or a minimal container), the sampler says `fallback`: auto proposes
-1, RAM and CPU checks are skipped, and the disk check still runs. There is no cost cap in v0.2; cost
+1, RAM and CPU checks are skipped, and the disk check still runs. There is no cost cap; cost
 is reported separately as receipts, labelled estimates or `unknown`. See
 [Capacity](docs/concepts/capacity.md).
 
@@ -207,16 +207,17 @@ Also: [security model](docs/security.md), [troubleshooting](docs/troubleshooting
 [contributing](CONTRIBUTING.md), the [v0.2 specification](docs/design/v0.2/home-and-surfaces.md),
 the [CLI reference](docs/reference/cli.md) and the [roadmap](docs/roadmap.md).
 
-## Limits of v0.2
+## Limits of v0.3
 
 - **One home.** There is no replication, leader election or multi-home scheduling.
-- **No public API or page.** There is no HTTP+SSE daemon, web window or phone browser board. App hosts
-  and the secret page are loopback-only and reached through SSH.
+- **Loopback window, separate daemon.** The web window and HTTP/SSE API are served by `vowp-daemon`
+  on `127.0.0.1` only. The archives and npm package install `vowp` only, so install the daemon
+  separately for the window; without it the supervisor runs without a window.
 - **SSH is the transport.** A control machine needs key-based, batch-mode SSH to the home. A phone
   needs an SSH app and the key.
 - **Apps keep their own limits.** VOWP can configure and host an app; it cannot close another vendor's
   window or force an app build to expose MCP tools.
-- **One operator.** Multi-user accounts, quotas, roles and audit are not in v0.2.
+- **One operator.** Multi-user accounts, quotas, roles and audit are not in v0.3.
 - **Linux home, Linux/macOS control.** Windows is not supported, and there is no native VOWP desktop
   app; the apps are the surfaces.
 

@@ -83,6 +83,8 @@ fn order(log: &Path) -> Vec<String> {
 fn env_config(checkout: &Path, scripts: &Scripts, approval: Approval) -> EnvConfig {
     EnvConfig {
         checkout: checkout.display().to_string(),
+        build: Vec::new(),
+        env_pass: Vec::new(),
         deploy: vec![scripts.deploy.display().to_string()],
         guards: vec![format!("ok:{}", scripts.guard.display())],
         approval,

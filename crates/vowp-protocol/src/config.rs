@@ -271,6 +271,14 @@ pub enum Approval {
 pub struct EnvConfig {
     /// Checkout directory for this environment.
     pub checkout: String,
+    /// Commands run in the checkout by the `build` guard; empty means the
+    /// `[merge].check_cmds` / `[project].check_cmds` fallback.
+    #[serde(default)]
+    pub build: Vec<String>,
+    /// Environment-variable **names** to resolve from the vault and pass to the
+    /// serving-bank, deploy, probe and rollback commands; never values.
+    #[serde(default)]
+    pub env_pass: Vec<String>,
     /// Deployment commands.
     #[serde(default)]
     pub deploy: Vec<String>,

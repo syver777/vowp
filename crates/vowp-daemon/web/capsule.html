@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP capsule</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1rem; }
+  h3 { margin: 0 0 .35rem; font-size: .9rem; }
+  h4 { margin: .55rem 0 .2rem; color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .page-nav a { margin-right: .75rem; }
+  .back { margin: .35rem 0 0; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .facts { display: grid; grid-template-columns: 1fr; gap: .35rem .9rem; margin: 0; }
+  @media (min-width: 420px) {
+    .facts { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+  }
+  .fact { min-width: 0; }
+  .fact dt { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+  .fact dd { margin: 0; overflow-wrap: anywhere; }
+  .capsule-section { margin-top: .9rem; }
+  .bullets { margin: 0; padding-left: 1.15rem; }
+  .bullets li { margin: .15rem 0; overflow-wrap: anywhere; }
+  .summary { margin: 0; overflow-wrap: anywhere; }
+  .error {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    .facts { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main id="capsule">
+  <header class="page-head">
+    <div>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">← Board</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+      <h1 id="heading">Capsule</h1>
+      <p id="subtitle" class="muted">Read-only capsule view.</p>
+      <p class="back"><a id="back-link" href="/sessions">← Session</a></p>
+    </div>
+    <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+  <p id="not-found" class="error" role="alert" hidden>Capsule not found.</p>
+
+  <section id="capsule-body" class="card" aria-labelledby="capsule-heading">
+    <h2 id="capsule-heading">Capsule</h2>
+    <dl id="meta" class="facts">
+      <div class="fact"><dt>Capsule ID</dt><dd>Loading…</dd></div>
+      <div class="fact"><dt>Session ID</dt><dd>–</dd></div>
+      <div class="fact"><dt>Created</dt><dd>–</dd></div>
+      <div class="fact"><dt>At seq</dt><dd>–</dd></div>
+      <div class="fact"><dt>Trigger</dt><dd>–</dd></div>
+      <div class="fact"><dt>From</dt><dd>–</dd></div>
+      <div class="fact"><dt>Harness</dt><dd>–</dd></div>
+      <div class="fact"><dt>Model</dt><dd>–</dd></div>
+      <div class="fact"><dt>Profile</dt><dd>–</dd></div>
+    </dl>
+    <p id="telemetry" class="muted"></p>
+
+    <section class="capsule-section" aria-labelledby="intent-label">
+      <h3 id="intent-label">Intent</h3>
+      <p id="intent" class="summary"></p>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="constraints-label">
+      <h3 id="constraints-label">Constraints</h3>
+      <ul id="constraints" class="bullets"></ul>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="decisions-label">
+      <h3 id="decisions-label">Decisions</h3>
+      <ul id="decisions" class="bullets"></ul>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="state-label">
+      <h3 id="state-label">State</h3>
+      <h4>Done</h4>
+      <ul id="done" class="bullets"></ul>
+      <h4>In progress</h4>
+      <ul id="in-progress" class="bullets"></ul>
+      <h4>Blocked</h4>
+      <ul id="blocked" class="bullets"></ul>
+      <h4>Next steps</h4>
+      <ul id="next-steps" class="bullets"></ul>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="files-label">
+      <h3 id="files-label">Files</h3>
+      <ul id="files" class="bullets"></ul>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="gotchas-label">
+      <h3 id="gotchas-label">Gotchas</h3>
+      <ul id="gotchas" class="bullets"></ul>
+    </section>
+
+    <section class="capsule-section" aria-labelledby="questions-label">
+      <h3 id="questions-label">Open questions</h3>
+      <ul id="questions" class="bullets"></ul>
+    </section>
+  </section>
+</main>
+
+<noscript>The capsule page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const errorLine = document.getElementById("error");
+  const notFoundLine = document.getElementById("not-found");
+  const updatedLine = document.getElementById("updated");
+  const heading = document.getElementById("heading");
+  const subtitle = document.getElementById("subtitle");
+  const backLink = document.getElementById("back-link");
+  const capsuleBody = document.getElementById("capsule-body");
+  const meta = document.getElementById("meta");
+  const telemetryLine = document.getElementById("telemetry");
+  const intent = document.getElementById("intent");
+  const constraints = document.getElementById("constraints");
+  const decisions = document.getElementById("decisions");
+  const done = document.getElementById("done");
+  const inProgress = document.getElementById("in-progress");
+  const blocked = document.getElementById("blocked");
+  const nextSteps = document.getElementById("next-steps");
+  const files = document.getElementById("files");
+  const gotchas = document.getElementById("gotchas");
+  const questions = document.getElementById("questions");
+
+  const ids = pathIds();
+  let lastUpdated = null;
+
+  function pathIds() {
+    const parts = window.location.pathname.split("/").filter((part) => part.length > 0);
+    if (parts.length !== 4 || parts[0] !== "sessions" || parts[2] !== "capsules") return null;
+    try {
+      return {
+        sessionId: decodeURIComponent(parts[1]),
+        capsuleId: decodeURIComponent(parts[3]),
+      };
+    } catch (_error) {
+      return { sessionId: parts[1], capsuleId: parts[3] };
+    }
+  }
+
+  function formatTime(value) {
+    if (value === null || value === undefined || value === "") return "unknown";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatValue(value, fallback) {
+    if (value === null || value === undefined || value === "") return fallback;
+    return String(value);
+  }
+
+  function fact(label, value, mono) {
+    const row = document.createElement("div");
+    row.className = "fact";
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    if (mono) detail.className = "mono";
+    row.append(term, detail);
+    return row;
+  }
+
+  function linkedFact(label, value, href, mono) {
+    const row = fact(label, "", mono);
+    const detail = row.querySelector("dd");
+    const link = document.createElement("a");
+    link.href = href;
+    link.textContent = value;
+    detail.appendChild(link);
+    return row;
+  }
+
+  function emptyItem(message) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = message;
+    return item;
+  }
+
+  function listItem(text, mono) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    if (mono) item.className = "mono";
+    return item;
+  }
+
+  function fillList(target, items, render) {
+    target.replaceChildren();
+    if (!Array.isArray(items) || items.length === 0) {
+      target.appendChild(emptyItem("None."));
+      return;
+    }
+    for (const item of items) target.appendChild(render(item));
+  }
+
+  function executorText(value) {
+    if (!value || !value.executor) return "none";
+    return value.node ? value.executor + " on " + value.node : String(value.executor);
+  }
+
+  function executorPart(value, part) {
+    const text = value && value.executor ? String(value.executor) : "";
+    if (!text) return "–";
+    const colon = text.indexOf(":");
+    if (colon < 0) return part === "harness" ? text : "–";
+    const harness = text.slice(0, colon);
+    let model = text.slice(colon + 1);
+    let profile = "";
+    const hash = model.indexOf("#");
+    if (hash >= 0) {
+      profile = model.slice(hash);
+      model = model.slice(0, hash);
+    }
+    const at = model.indexOf("@");
+    if (at >= 0) {
+      profile = model.slice(at) + profile;
+      model = model.slice(0, at);
+    }
+    if (part === "harness") return harness || "–";
+    if (part === "model") return model || "–";
+    return profile;
+  }
+
+  function renderTelemetry(telemetry) {
+    if (!telemetry) {
+      telemetryLine.textContent = "";
+      return;
+    }
+    const turns = formatValue(telemetry.turns, "?");
+    let usd = "unknown";
+    if (telemetry.usd !== null && telemetry.usd !== undefined) {
+      const amount = Number(telemetry.usd);
+      if (Number.isFinite(amount)) usd = "$" + amount.toFixed(2);
+    }
+    telemetryLine.textContent = "Telemetry: " + turns + " turns · " + usd;
+  }
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function showNotFound() {
+    notFoundLine.hidden = false;
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+    capsuleBody.hidden = true;
+    updatedLine.textContent = "Last updated: capsule not found";
+  }
+
+  function renderCapsule(capsule) {
+    notFoundLine.hidden = true;
+    capsuleBody.hidden = false;
+    meta.replaceChildren(
+      fact("Capsule ID", formatValue(capsule.capsule_id, "unknown"), true),
+      linkedFact(
+        "Session ID",
+        formatValue(capsule.session_id, "unknown"),
+        "/sessions/" + encodeURIComponent(formatValue(capsule.session_id, "")),
+        true
+      ),
+      fact("Created", formatTime(capsule.created_at), false),
+      fact("At seq", formatValue(capsule.at_seq, "–"), false),
+      fact("Trigger", formatValue(capsule.trigger, "unknown"), false),
+      fact("From", executorText(capsule.from), true),
+      fact("Harness", executorPart(capsule.from, "harness"), true),
+      fact("Model", executorPart(capsule.from, "model"), true)
+    );
+    const profile = executorPart(capsule.from, "profile");
+    if (profile) meta.appendChild(fact("Profile", profile, true));
+
+    const state = capsule.state || {};
+    intent.textContent = formatValue(capsule.intent, "–");
+    renderTelemetry(capsule.telemetry);
+    fillList(constraints, capsule.constraints, (item) => listItem(item));
+    fillList(decisions, capsule.decisions, (decision) => {
+      let text = formatValue(decision.what, "decision");
+      const why = formatValue(decision.why, "");
+      if (why) text += " — " + why;
+      if (decision.at_seq !== null && decision.at_seq !== undefined) {
+        text += " (at seq " + decision.at_seq + ")";
+      }
+      return listItem(text);
+    });
+    fillList(done, state.done, (item) => listItem(item));
+    fillList(inProgress, state.in_progress, (item) => listItem(item));
+    fillList(blocked, state.blocked, (item) => listItem(item));
+    fillList(nextSteps, state.next_steps, (item) => listItem(item));
+    fillList(files, capsule.files, (file) => {
+      const path = formatValue(file.path, "unknown");
+      const action = formatValue(file.role, "unknown");
+      const note = formatValue(file.note, "");
+      return listItem(path + " (" + action + ")" + (note ? ": " + note : ""), true);
+    });
+    fillList(gotchas, capsule.gotchas, (item) => listItem(item));
+    fillList(questions, capsule.open_questions, (item) => listItem(item));
+  }
+
+  async function refresh() {
+    try {
+      const url =
+        "/api/v1/sessions/" +
+        encodeURIComponent(ids.sessionId) +
+        "/capsules/" +
+        encodeURIComponent(ids.capsuleId);
+      const response = await fetch(url);
+      if (response.status === 404) {
+        showNotFound();
+        return;
+      }
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const capsule = await response.json();
+      renderCapsule(capsule);
+      lastUpdated = new Date();
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      errorLine.hidden = true;
+      errorLine.textContent = "";
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+      showError("Could not load the capsule (" + detail + ")." + when);
+    }
+  }
+
+  if (ids === null) {
+    capsuleBody.hidden = true;
+    showError("The capsule path is invalid.");
+    return;
+  }
+
+  heading.textContent = "Capsule";
+  subtitle.textContent = "Capsule " + ids.capsuleId;
+  backLink.href = "/sessions/" + encodeURIComponent(ids.sessionId);
+  refresh();
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

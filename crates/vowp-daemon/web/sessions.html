@@ -1,0 +1,1083 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP sessions</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1rem; }
+  h3 { margin: 0 0 .35rem; font-size: .9rem; }
+  h4 { margin: .55rem 0 .2rem; color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .status { display: grid; gap: .2rem; justify-items: start; }
+  .live { margin: 0; font-weight: 600; }
+  .live[data-state="live"] { color: var(--accent); }
+  .live[data-state="reconnecting"],
+  .live[data-state="error"] { color: var(--warn); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .chips { display: flex; flex-wrap: wrap; gap: .5rem; margin: 0; padding: 0; list-style: none; }
+  .cards { display: grid; gap: .6rem; margin: 0; padding: 0; list-style: none; }
+  .session-card, .event-card { border: 1px solid var(--line); border-radius: .5rem; padding: .65rem .75rem; min-width: 0; }
+  .session-head, .event-head { display: flex; flex-wrap: wrap; gap: .4rem .7rem; align-items: center; margin: 0 0 .45rem; }
+  .session-link { font-weight: 700; overflow-wrap: anywhere; }
+  .badge {
+    display: inline-block;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .05rem .55rem;
+    color: var(--accent);
+    font-size: .8rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+  }
+  .facts { display: grid; grid-template-columns: 1fr; gap: .35rem .9rem; margin: 0; }
+  @media (min-width: 420px) {
+    .facts { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+  }
+  .fact { min-width: 0; }
+  .fact dt { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; }
+  .fact dd { margin: 0; overflow-wrap: anywhere; }
+  .event-summary { margin: 0; overflow-wrap: anywhere; }
+  .capsule-section { margin-top: .9rem; }
+  .bullets { margin: 0; padding-left: 1.15rem; }
+  .bullets li { margin: .15rem 0; overflow-wrap: anywhere; }
+  .lineage { margin: 0; padding-left: 1.25rem; display: grid; gap: .3rem; }
+  .lineage li { overflow-wrap: anywhere; }
+  .error {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  .switch-form { display: grid; gap: .55rem; max-width: 34rem; }
+  .switch-form label { font-weight: 600; }
+  .switch-form input[type="text"],
+  .switch-form input[type="password"],
+  .switch-form select {
+    width: 100%;
+    padding: .45rem .55rem;
+    border: 1px solid var(--line);
+    border-radius: .4rem;
+    background: var(--paper);
+    color: var(--ink);
+    font: inherit;
+  }
+  .switch-form button {
+    justify-self: start;
+    padding: .45rem .9rem;
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    background: var(--accent);
+    color: var(--paper);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .switch-form button:disabled { opacity: .6; cursor: progress; }
+  .switch-check { display: flex; gap: .5rem; align-items: flex-start; font-weight: 600; }
+  .switch-check input { margin-top: .25rem; }
+  .warning { margin: 0; color: var(--warn); font-weight: 600; }
+  .switch-status { margin: .7rem 0 0; font-weight: 600; }
+  .switch-status[data-state="error"] { color: var(--warn); }
+  .switch-status[data-state="done"] { color: var(--accent); }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    .cards { gap: .6rem; }
+    .session-card, .event-card { padding: .55rem .6rem; }
+    .facts { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<main id="sessions">
+  <header class="page-head">
+    <div>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">← Board</a>
+        <a href="/sessions" aria-current="page">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+      <h1 id="heading">Sessions</h1>
+      <p id="subtitle" class="muted">Read-only session list.</p>
+    </div>
+    <div class="status">
+      <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+      <p id="live" class="muted live" aria-live="polite" hidden>Live updates: connecting…</p>
+    </div>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section id="list-view" aria-labelledby="list-heading">
+    <h2 id="list-heading">Session list</h2>
+    <ul id="list" class="cards">
+      <li class="session-card muted">
+        <dl class="facts">
+          <div class="fact"><dt>ID</dt><dd>Loading…</dd></div>
+          <div class="fact"><dt>Title</dt><dd>–</dd></div>
+          <div class="fact"><dt>Project</dt><dd>–</dd></div>
+          <div class="fact"><dt>Job</dt><dd>–</dd></div>
+          <div class="fact"><dt>Role</dt><dd>–</dd></div>
+          <div class="fact"><dt>State</dt><dd>–</dd></div>
+          <div class="fact"><dt>Executor</dt><dd>–</dd></div>
+          <div class="fact"><dt>Last seq</dt><dd>–</dd></div>
+          <div class="fact"><dt>Updated</dt><dd>–</dd></div>
+        </dl>
+      </li>
+    </ul>
+  </section>
+
+  <section id="detail-view" aria-labelledby="detail-heading" hidden>
+    <div class="card">
+      <h2 id="detail-heading">Session</h2>
+      <dl id="meta" class="facts">
+        <div class="fact"><dt>ID</dt><dd>Loading…</dd></div>
+        <div class="fact"><dt>Title</dt><dd>–</dd></div>
+        <div class="fact"><dt>Project</dt><dd>–</dd></div>
+        <div class="fact"><dt>Job</dt><dd>–</dd></div>
+        <div class="fact"><dt>Role</dt><dd>–</dd></div>
+        <div class="fact"><dt>State</dt><dd>–</dd></div>
+        <div class="fact"><dt>Executor</dt><dd>–</dd></div>
+        <div class="fact"><dt>Node</dt><dd>–</dd></div>
+        <div class="fact"><dt>Last seq</dt><dd>–</dd></div>
+        <div class="fact"><dt>Created</dt><dd>–</dd></div>
+        <div class="fact"><dt>Updated</dt><dd>–</dd></div>
+      </dl>
+    </div>
+
+    <div class="card" id="switch-panel" aria-labelledby="switch-heading">
+      <h2 id="switch-heading">Switch executor</h2>
+      <p id="switch-current" class="muted">Current executor: loading…</p>
+      <section id="switch-unlock" aria-labelledby="switch-unlock-heading" hidden>
+        <p id="switch-unlock-heading"><strong>Unlock switching</strong></p>
+        <p class="muted">Paste the daemon write token. It stays in this tab's sessionStorage and is never put in the URL.</p>
+        <form id="switch-unlock-form" class="switch-form">
+          <label for="switch-token">Token</label>
+          <input id="switch-token" name="token" type="password" autocomplete="off" spellcheck="false">
+          <button type="submit">Save token</button>
+        </form>
+      </section>
+      <form id="switch-form" class="switch-form">
+        <label for="switch-to">Target executor</label>
+        <input id="switch-to" name="to" type="text" autocomplete="off" spellcheck="false"
+               placeholder="opencode:deepseek/deepseek-flash#max" required>
+        <label for="switch-reason">Reason</label>
+        <select id="switch-reason" name="reason">
+          <option value="user" selected>User request</option>
+          <option value="limit">Provider limit</option>
+          <option value="context">Context window</option>
+          <option value="failover">Failover</option>
+          <option value="takeover">Takeover</option>
+        </select>
+        <label class="switch-check" for="switch-force">
+          <input id="switch-force" name="force" type="checkbox">
+          <span>Force a running turn to drain and stop</span>
+        </label>
+        <p class="warning">Forcing a switch lets the current turn drain for up to five seconds, then stops it. The result may be a blocked session rather than a clean handoff.</p>
+        <button id="switch-submit" type="submit">Switch executor</button>
+      </form>
+      <p id="switch-status" class="switch-status" role="status" aria-live="polite" hidden></p>
+    </div>
+
+    <div class="card" id="capsule-panel" aria-labelledby="capsule-heading">
+      <h2 id="capsule-heading">Capsule</h2>
+      <p id="capsule-empty" class="muted" hidden>No capsule yet.</p>
+      <div id="capsule-body" hidden>
+        <p><a id="capsule-link" class="session-link" href="/sessions">View capsule</a></p>
+        <dl id="capsule-meta" class="facts">
+          <div class="fact"><dt>Capsule ID</dt><dd>–</dd></div>
+          <div class="fact"><dt>At seq</dt><dd>–</dd></div>
+          <div class="fact"><dt>Trigger</dt><dd>–</dd></div>
+          <div class="fact"><dt>From</dt><dd>–</dd></div>
+        </dl>
+
+        <section class="capsule-section" aria-labelledby="capsule-intent-label">
+          <h3 id="capsule-intent-label">Intent</h3>
+          <p id="capsule-intent" class="event-summary"></p>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-constraints-label">
+          <h3 id="capsule-constraints-label">Constraints</h3>
+          <ul id="capsule-constraints" class="bullets"></ul>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-decisions-label">
+          <h3 id="capsule-decisions-label">Decisions</h3>
+          <ul id="capsule-decisions" class="bullets"></ul>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-state-label">
+          <h3 id="capsule-state-label">State</h3>
+          <h4>Done</h4>
+          <ul id="capsule-done" class="bullets"></ul>
+          <h4>In progress</h4>
+          <ul id="capsule-in-progress" class="bullets"></ul>
+          <h4>Blocked</h4>
+          <ul id="capsule-blocked" class="bullets"></ul>
+          <h4>Next steps</h4>
+          <ul id="capsule-next-steps" class="bullets"></ul>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-files-label">
+          <h3 id="capsule-files-label">Files</h3>
+          <ul id="capsule-files" class="bullets"></ul>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-gotchas-label">
+          <h3 id="capsule-gotchas-label">Gotchas</h3>
+          <ul id="capsule-gotchas" class="bullets"></ul>
+        </section>
+
+        <section class="capsule-section" aria-labelledby="capsule-questions-label">
+          <h3 id="capsule-questions-label">Open questions</h3>
+          <ul id="capsule-questions" class="bullets"></ul>
+        </section>
+      </div>
+    </div>
+
+    <div class="card" id="lineage-panel" aria-labelledby="lineage-heading">
+      <h2 id="lineage-heading">Parent lineage</h2>
+      <p id="lineage-empty" class="muted" hidden>No parent sessions.</p>
+      <ol id="lineage" class="lineage"></ol>
+    </div>
+
+    <div class="card">
+      <h2 id="events-heading">Event timeline</h2>
+      <ul id="events" class="cards">
+        <li class="event-card muted">
+          <dl class="facts">
+            <div class="fact"><dt>Seq</dt><dd>Loading…</dd></div>
+            <div class="fact"><dt>Time</dt><dd>–</dd></div>
+            <div class="fact"><dt>Type</dt><dd>–</dd></div>
+            <div class="fact"><dt>Actor</dt><dd>–</dd></div>
+            <div class="fact"><dt>Summary</dt><dd>–</dd></div>
+          </dl>
+        </li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<noscript>The session view requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const REFRESH_MS = 5000;
+  const EVENT_LIMIT = 200;
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 15000;
+  const TOKEN_KEY = "vowp-api-token";
+  const errorLine = document.getElementById("error");
+  const updatedLine = document.getElementById("updated");
+  const liveLine = document.getElementById("live");
+  const heading = document.getElementById("heading");
+  const subtitle = document.getElementById("subtitle");
+  const listView = document.getElementById("list-view");
+  const detailView = document.getElementById("detail-view");
+  const list = document.getElementById("list");
+  const meta = document.getElementById("meta");
+  const events = document.getElementById("events");
+  const capsuleEmpty = document.getElementById("capsule-empty");
+  const capsuleBody = document.getElementById("capsule-body");
+  const capsuleLink = document.getElementById("capsule-link");
+  const capsuleMeta = document.getElementById("capsule-meta");
+  const capsuleIntent = document.getElementById("capsule-intent");
+  const capsuleConstraints = document.getElementById("capsule-constraints");
+  const capsuleDecisions = document.getElementById("capsule-decisions");
+  const capsuleDone = document.getElementById("capsule-done");
+  const capsuleInProgress = document.getElementById("capsule-in-progress");
+  const capsuleBlocked = document.getElementById("capsule-blocked");
+  const capsuleNextSteps = document.getElementById("capsule-next-steps");
+  const capsuleFiles = document.getElementById("capsule-files");
+  const capsuleGotchas = document.getElementById("capsule-gotchas");
+  const capsuleQuestions = document.getElementById("capsule-questions");
+  const lineageList = document.getElementById("lineage");
+  const lineageEmpty = document.getElementById("lineage-empty");
+  const switchCurrent = document.getElementById("switch-current");
+  const switchUnlock = document.getElementById("switch-unlock");
+  const switchUnlockForm = document.getElementById("switch-unlock-form");
+  const switchToken = document.getElementById("switch-token");
+  const switchForm = document.getElementById("switch-form");
+  const switchTo = document.getElementById("switch-to");
+  const switchReason = document.getElementById("switch-reason");
+  const switchForce = document.getElementById("switch-force");
+  const switchSubmit = document.getElementById("switch-submit");
+  const switchStatus = document.getElementById("switch-status");
+
+  const sessionId = pathSessionId();
+  const detailMode = sessionId !== null;
+  const renderedSeqs = new Set();
+  let lastUpdated = null;
+  let lastSeq = 0;
+  let eventsLoaded = false;
+  let emptyRow = null;
+  let eventSource = null;
+  let retryTimer = null;
+  let retryDelay = RETRY_MIN_MS;
+  let fallbackTimer = null;
+  let refreshing = false;
+  let sessionMissing = false;
+
+  function pathSessionId() {
+    const parts = window.location.pathname.split("/").filter((part) => part.length > 0);
+    if (parts.length < 2 || parts[0] !== "sessions") return null;
+    try {
+      return decodeURIComponent(parts[1]);
+    } catch (_error) {
+      return parts[1];
+    }
+  }
+
+  function formatTime(value) {
+    if (value === null || value === undefined || value === "") return "unknown";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatValue(value, fallback) {
+    if (value === null || value === undefined || value === "") return fallback;
+    return String(value);
+  }
+
+  function fact(label, value, mono) {
+    const row = document.createElement("div");
+    row.className = "fact";
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    if (mono) detail.className = "mono";
+    row.append(term, detail);
+    return row;
+  }
+
+  function emptyItem(message) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = message;
+    return item;
+  }
+
+  function listItem(text, mono) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    if (mono) item.className = "mono";
+    return item;
+  }
+
+  function fillList(target, items, render) {
+    target.replaceChildren();
+    if (!Array.isArray(items) || items.length === 0) {
+      target.appendChild(emptyItem("None."));
+      return;
+    }
+    for (const item of items) target.appendChild(render(item));
+  }
+
+  function markUpdated() {
+    lastUpdated = new Date();
+    updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+  }
+
+  function clearError() {
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+  }
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function failureText(what, error) {
+    const detail = error && error.message ? error.message : "the daemon may be down";
+    const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+    return "Could not load " + what + " (" + detail + ")." + when;
+  }
+
+  function storedToken() {
+    try {
+      return window.sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function setStoredToken(value) {
+    try {
+      if (value) {
+        window.sessionStorage.setItem(TOKEN_KEY, value);
+      } else {
+        window.sessionStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {
+      // A browser with storage disabled cannot unlock; reads still work.
+    }
+    updateSwitchUnlock();
+  }
+
+  function updateSwitchUnlock() {
+    switchUnlock.hidden = storedToken() !== "";
+  }
+
+  function showSwitchStatus(message, state) {
+    switchStatus.textContent = message;
+    switchStatus.dataset.state = state;
+    switchStatus.hidden = false;
+  }
+
+  function hideSwitchStatus() {
+    switchStatus.textContent = "";
+    switchStatus.hidden = true;
+    delete switchStatus.dataset.state;
+  }
+
+  async function errorDetail(response) {
+    try {
+      const body = await response.json();
+      if (body && body.error && body.error.message) return body.error.message;
+    } catch {
+      // Fall back to the status when the body is not the API error document.
+    }
+    return "HTTP " + response.status;
+  }
+
+  function describeSwitch(result) {
+    const from = formatValue(result.from_executor, "none");
+    const to = formatValue(result.to_executor, "unknown");
+    const capsule = result.capsule_id ? " (capsule " + result.capsule_id + ")" : "";
+    let text = "Switch " + formatValue(result.state, "unknown") + ": " + from + " -> " + to + capsule;
+    if (result.error) text += ". Error: " + result.error;
+    return text;
+  }
+
+  async function submitSwitch(event) {
+    event.preventDefault();
+    const token = storedToken();
+    if (!token) {
+      updateSwitchUnlock();
+      showError("Unlock switching with the daemon write token first.");
+      return;
+    }
+    const to = switchTo.value.trim();
+    if (!to) {
+      showError("Enter a target executor, for example opencode:deepseek/deepseek-flash#max.");
+      return;
+    }
+    hideSwitchStatus();
+    clearError();
+    switchSubmit.disabled = true;
+    showSwitchStatus("Switching… the current turn may drain for up to five seconds.", "working");
+    try {
+      const response = await fetch("/api/v1/sessions/" + encodeURIComponent(sessionId) + "/switch", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + token,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          to,
+          reason: switchReason.value,
+          force: switchForce.checked,
+        }),
+      });
+      if (response.status === 200) {
+        const switched = await response.json();
+        showSwitchStatus(describeSwitch(switched), switched.error ? "error" : "done");
+        await refreshDetail();
+        return;
+      }
+      if (response.status === 401) {
+        setStoredToken("");
+        showSwitchStatus("The token was rejected. Unlock with the current daemon write token.", "error");
+        return;
+      }
+      if (response.status === 503) {
+        showSwitchStatus("Writes are disabled: the daemon was started without VOWP_API_TOKEN.", "error");
+        return;
+      }
+      showSwitchStatus("Could not switch the session (" + (await errorDetail(response)) + ").", "error");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showSwitchStatus("Could not switch the session (" + detail + ").", "error");
+    } finally {
+      switchSubmit.disabled = false;
+    }
+  }
+
+  function setLive(message, state) {
+    liveLine.textContent = message;
+    liveLine.dataset.state = state;
+    liveLine.hidden = false;
+  }
+
+  function markHeartbeat(value) {
+    lastUpdated = new Date();
+    updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString() + " (heartbeat)";
+    const at = value === null || value === undefined || value === "" ? lastUpdated.toLocaleString() : formatTime(value);
+    setLive("Live updates: streaming · heartbeat " + at, "live");
+  }
+
+  function closeStream() {
+    if (eventSource === null) return;
+    const source = eventSource;
+    eventSource = null;
+    source.onopen = null;
+    source.onerror = null;
+    source.close();
+  }
+
+  function clearRetry() {
+    if (retryTimer === null) return;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  function stopFallbackPolling() {
+    if (fallbackTimer === null) return;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+
+  function startFallbackPolling() {
+    if (fallbackTimer !== null) return;
+    fallbackTimer = setInterval(refreshDetail, REFRESH_MS);
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null || sessionMissing) return;
+    const delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      startStream();
+    }, delay);
+  }
+
+  function markSessionMissing() {
+    sessionMissing = true;
+    clearRetry();
+    stopFallbackPolling();
+    closeStream();
+    setLive("Live updates: stopped because the session was not found.", "error");
+  }
+
+  function streamUrl(after) {
+    return "/api/v1/sessions/" + encodeURIComponent(sessionId) + "/events/stream?after_seq=" + after;
+  }
+
+  function handleStreamFailure() {
+    closeStream();
+    if (sessionMissing) return;
+    setLive("Reconnecting to live updates… polling every 5 seconds.", "reconnecting");
+    startFallbackPolling();
+    scheduleRetry();
+    refreshDetail();
+  }
+
+  function startStream() {
+    if (sessionMissing) return;
+    clearRetry();
+    closeStream();
+    if (typeof EventSource !== "function") {
+      setLive("Live updates unavailable in this browser; polling every 5 seconds.", "polling");
+      startFallbackPolling();
+      return;
+    }
+    let source;
+    try {
+      source = new EventSource(streamUrl(lastSeq));
+    } catch (_error) {
+      setLive("Live updates could not start; polling every 5 seconds.", "reconnecting");
+      startFallbackPolling();
+      scheduleRetry();
+      return;
+    }
+    eventSource = source;
+    source.onopen = () => {
+      clearRetry();
+      setLive("Live updates: streaming", "live");
+      stopFallbackPolling();
+      refreshDetail();
+    };
+    source.addEventListener("session", (message) => {
+      let event;
+      try {
+        event = JSON.parse(message.data);
+      } catch (_error) {
+        return;
+      }
+      retryDelay = RETRY_MIN_MS;
+      if (!renderEvent(event)) return;
+      markUpdated();
+      clearError();
+    });
+    source.addEventListener("heartbeat", (message) => {
+      let at = null;
+      try {
+        at = JSON.parse(message.data).at;
+      } catch (_error) {
+        at = null;
+      }
+      retryDelay = RETRY_MIN_MS;
+      markHeartbeat(at);
+    });
+    source.addEventListener("resync", (message) => {
+      let cursor = null;
+      try {
+        const value = JSON.parse(message.data);
+        if (typeof value.after_seq === "number") cursor = value.after_seq;
+      } catch (_error) {
+        cursor = null;
+      }
+      if (cursor !== null) lastSeq = cursor;
+      setLive("Reconnecting after a log resync… polling every 5 seconds.", "reconnecting");
+      handleStreamFailure();
+    });
+    source.onerror = () => {
+      if (eventSource !== source) return;
+      handleStreamFailure();
+    };
+  }
+
+  async function fetchSessionDetail() {
+    const response = await fetch("/api/v1/sessions/" + encodeURIComponent(sessionId));
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    return response.json();
+  }
+
+  async function fetchSessions() {
+    const response = await fetch("/api/v1/sessions");
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const page = await response.json();
+    return Array.isArray(page.items) ? page.items : [];
+  }
+
+  function renderSession(session) {
+    const item = document.createElement("li");
+    item.className = "session-card";
+
+    const head = document.createElement("p");
+    head.className = "session-head";
+    const link = document.createElement("a");
+    link.className = "session-link";
+    link.href = "/sessions/" + encodeURIComponent(session.id);
+    link.textContent = formatValue(session.title, formatValue(session.id, "session"));
+    const badge = document.createElement("span");
+    badge.className = "badge";
+    badge.textContent = formatValue(session.state, "unknown");
+    head.append(link, badge);
+
+    const facts = document.createElement("dl");
+    facts.className = "facts";
+    facts.append(
+      fact("ID", formatValue(session.id, "unknown"), true),
+      fact("Title", formatValue(session.title, "untitled"), false),
+      fact("Project", formatValue(session.project, "none"), true),
+      fact("Job", formatValue(session.job_id, "none"), true),
+      fact("Role", formatValue(session.role, "none"), false),
+      fact("State", formatValue(session.state, "unknown"), false),
+      fact("Executor", formatValue(session.executor, "none"), true),
+      fact("Last seq", formatValue(session.last_seq, "–"), false),
+      fact("Updated", formatTime(session.updated_at), false)
+    );
+    item.append(head, facts);
+    return item;
+  }
+
+  function renderList(sessions) {
+    list.replaceChildren();
+    if (sessions.length === 0) {
+      list.appendChild(emptyItem("No sessions."));
+      return;
+    }
+    for (const session of sessions) list.appendChild(renderSession(session));
+  }
+
+  function executorText(value) {
+    if (!value || !value.executor) return "none";
+    return value.node ? value.executor + " on " + value.node : String(value.executor);
+  }
+
+  function clip(text, limit) {
+    const oneLine = String(text == null ? "" : text).split(/\s+/).filter(Boolean).join(" ");
+    if (oneLine.length <= limit) return oneLine;
+    return oneLine.slice(0, limit - 1) + "…";
+  }
+
+  function compactJson(value) {
+    try {
+      const text = JSON.stringify(value);
+      return text === undefined ? "" : text;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function eventSummary(event) {
+    const payload = event.payload || {};
+    switch (event.type) {
+      case "user.message":
+      case "assistant.message":
+      case "assistant.reasoning":
+      case "note":
+        return clip(payload.text, 200);
+      case "error":
+        return clip((payload.kind || "error") + ": " + (payload.message || ""), 200);
+      case "tool.call":
+        return clip((payload.name || "tool") + " " + compactJson(payload.input), 200);
+      case "tool.result":
+        return clip((payload.call_id || "tool") + ": " + (payload.ok ? "ok" : "failed"), 200);
+      case "session.created":
+        return clip("session created: " + (payload.title || "untitled"), 200);
+      case "session.executor":
+        return clip((payload.action || "attach") + " " + (payload.executor || "") + " on " + (payload.node || ""), 200);
+      case "turn.started":
+        return clip("turn " + (payload.turn ?? "?") + " started", 200);
+      case "turn.ended":
+        return clip("turn " + (payload.turn ?? "?") + " ended: " + (payload.stop_reason || ""), 200);
+      case "file.change":
+        return clip((payload.op || "change") + " " + (payload.path || ""), 200);
+      case "plan": {
+        const items = Array.isArray(payload.items)
+          ? payload.items.map((item) => (item.status || "") + ": " + (item.text || "")).join("; ")
+          : "";
+        return clip("plan: " + items, 200);
+      }
+      case "limit":
+        return clip("limit " + (payload.provider || "") + ": " + (payload.message || ""), 200);
+      case "cost":
+        return payload.cost && payload.cost.usd !== null && payload.cost.usd !== undefined
+          ? clip("cost $" + Number(payload.cost.usd).toFixed(4), 200)
+          : "cost unknown";
+      case "switch":
+        return clip("switch " + executorText(payload.from) + " -> " + executorText(payload.to), 200);
+      case "capsule":
+        return clip("capsule " + (payload.capsule_id || ""), 200);
+      default:
+        return clip(compactJson(payload), 200);
+    }
+  }
+
+  function appendEvent(event) {
+    const item = document.createElement("li");
+    item.className = "event-card";
+
+    const head = document.createElement("p");
+    head.className = "event-head";
+    const seq = document.createElement("span");
+    seq.className = "badge";
+    seq.textContent = "#" + event.seq;
+    const type = document.createElement("span");
+    type.className = "mono";
+    type.textContent = formatValue(event.type, "event");
+    const actor = document.createElement("span");
+    actor.className = "muted";
+    actor.textContent = formatValue(event.actor, "unknown");
+    const time = document.createElement("time");
+    time.className = "muted";
+    if (event.ts) time.dateTime = event.ts;
+    time.textContent = formatTime(event.ts);
+    head.append(seq, type, actor, time);
+
+    const summary = document.createElement("p");
+    summary.className = "event-summary";
+    summary.textContent = eventSummary(event);
+    item.append(head, summary);
+    events.appendChild(item);
+  }
+
+  function renderEvent(event) {
+    if (typeof event.seq !== "number" || renderedSeqs.has(event.seq)) return false;
+    if (emptyRow !== null) {
+      emptyRow.remove();
+      emptyRow = null;
+    }
+    appendEvent(event);
+    renderedSeqs.add(event.seq);
+    if (event.seq > lastSeq) lastSeq = event.seq;
+    return true;
+  }
+
+  function renderMeta(session) {
+    meta.replaceChildren(
+      fact("ID", formatValue(session.id, "unknown"), true),
+      fact("Title", formatValue(session.title, "untitled"), false),
+      fact("Project", formatValue(session.project, "none"), true),
+      fact("Job", formatValue(session.job_id, "none"), true),
+      fact("Role", formatValue(session.role, "none"), false),
+      fact("State", formatValue(session.state, "unknown"), false),
+      fact("Executor", formatValue(session.executor, "none"), true),
+      fact("Node", formatValue(session.node, "unknown"), true),
+      fact("Last seq", formatValue(session.last_seq, "–"), false),
+      fact("Created", formatTime(session.created_at), false),
+      fact("Updated", formatTime(session.updated_at), false)
+    );
+    switchCurrent.textContent = "Current executor: " + formatValue(session.executor, "none");
+  }
+
+  function renderCapsule(capsule) {
+    if (!capsule) {
+      capsuleBody.hidden = true;
+      capsuleEmpty.hidden = false;
+      return;
+    }
+    capsuleEmpty.hidden = true;
+    capsuleBody.hidden = false;
+    capsuleLink.href =
+      "/sessions/" +
+      encodeURIComponent(capsule.session_id) +
+      "/capsules/" +
+      encodeURIComponent(capsule.capsule_id);
+    capsuleMeta.replaceChildren(
+      fact("Capsule ID", formatValue(capsule.capsule_id, "unknown"), true),
+      fact("At seq", formatValue(capsule.at_seq, "–"), false),
+      fact("Trigger", formatValue(capsule.trigger, "unknown"), false),
+      fact("From", executorText(capsule.from), true)
+    );
+    capsuleIntent.textContent = formatValue(capsule.intent, "–");
+    const state = capsule.state || {};
+    fillList(capsuleConstraints, capsule.constraints, (item) => listItem(item));
+    fillList(capsuleDecisions, capsule.decisions, (decision) => {
+      let text = formatValue(decision.what, "decision");
+      const why = formatValue(decision.why, "");
+      if (why) text += " — " + why;
+      if (decision.at_seq !== null && decision.at_seq !== undefined) {
+        text += " (at seq " + decision.at_seq + ")";
+      }
+      return listItem(text);
+    });
+    fillList(capsuleDone, state.done, (item) => listItem(item));
+    fillList(capsuleInProgress, state.in_progress, (item) => listItem(item));
+    fillList(capsuleBlocked, state.blocked, (item) => listItem(item));
+    fillList(capsuleNextSteps, state.next_steps, (item) => listItem(item));
+    fillList(capsuleFiles, capsule.files, (file) => {
+      const path = formatValue(file.path, "unknown");
+      const action = formatValue(file.role, "unknown");
+      const note = formatValue(file.note, "");
+      return listItem(path + " (" + action + ")" + (note ? ": " + note : ""), true);
+    });
+    fillList(capsuleGotchas, capsule.gotchas, (item) => listItem(item));
+    fillList(capsuleQuestions, capsule.open_questions, (item) => listItem(item));
+  }
+
+  function renderLineage(lineage, sessions) {
+    const titles = new Map();
+    for (const session of sessions) {
+      if (session && typeof session.id === "string") titles.set(session.id, session.title);
+    }
+    lineageList.replaceChildren();
+    if (!Array.isArray(lineage) || lineage.length === 0) {
+      lineageEmpty.hidden = false;
+      lineageList.hidden = true;
+      return;
+    }
+    lineageEmpty.hidden = true;
+    lineageList.hidden = false;
+    for (const id of lineage) {
+      const item = document.createElement("li");
+      const link = document.createElement("a");
+      link.className = "session-link";
+      link.href = "/sessions/" + encodeURIComponent(id);
+      const title = titles.get(id);
+      link.textContent = formatValue(title, formatValue(id, "session"));
+      item.appendChild(link);
+      if (title) {
+        const ref = document.createElement("span");
+        ref.className = "mono muted";
+        ref.textContent = " " + id;
+        item.appendChild(ref);
+      }
+      lineageList.appendChild(item);
+    }
+  }
+
+  async function fetchNewEvents() {
+    let after = lastSeq;
+    for (;;) {
+      const url =
+        "/api/v1/sessions/" +
+        encodeURIComponent(sessionId) +
+        "/events?after_seq=" +
+        after +
+        "&limit=" +
+        EVENT_LIMIT;
+      const response = await fetch(url);
+      if (response.status === 404) {
+        showError("Session " + sessionId + " not found.");
+        return false;
+      }
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const page = await response.json();
+      const items = Array.isArray(page.items) ? page.items : [];
+      if (!eventsLoaded) {
+        eventsLoaded = true;
+        events.replaceChildren();
+      }
+      for (const event of items) renderEvent(event);
+      if (page.next === null || page.next === undefined || items.length === 0 || page.next <= after) break;
+      after = page.next;
+    }
+    if (eventsLoaded && events.childElementCount === 0) {
+      emptyRow = emptyItem("No events.");
+      events.appendChild(emptyRow);
+    }
+    return true;
+  }
+
+  async function refreshList() {
+    try {
+      const sessions = await fetchSessions();
+      renderList(sessions);
+      markUpdated();
+      clearError();
+    } catch (error) {
+      showError(failureText("the session list", error));
+    }
+  }
+
+  async function refreshDetail() {
+    if (refreshing) return "busy";
+    refreshing = true;
+    try {
+      const detail = await fetchSessionDetail();
+      if (detail === null) {
+        showError("Session " + sessionId + " not found.");
+        markSessionMissing();
+        return "missing";
+      }
+      sessionMissing = false;
+      renderMeta(detail.session);
+      renderCapsule(detail.latest_capsule);
+      let sessions = [];
+      try {
+        sessions = await fetchSessions();
+      } catch (_error) {
+        sessions = [];
+      }
+      renderLineage(detail.lineage, sessions);
+      const loaded = await fetchNewEvents();
+      if (!loaded) {
+        markSessionMissing();
+        return "missing";
+      }
+      markUpdated();
+      clearError();
+      return "ok";
+    } catch (error) {
+      showError(failureText("the session", error));
+      return "failed";
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  async function loadDetail() {
+    const result = await refreshDetail();
+    if (result === "missing") return;
+    setLive("Live updates: connecting…", "connecting");
+    if (result !== "ok") startFallbackPolling();
+    startStream();
+  }
+
+  switchForm.addEventListener("submit", submitSwitch);
+  switchUnlockForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = switchToken.value.trim();
+    if (!value) {
+      showError("Enter the daemon write token.");
+      return;
+    }
+    setStoredToken(value);
+    switchToken.value = "";
+    clearError();
+    showSwitchStatus("Token saved for this tab.", "done");
+  });
+  updateSwitchUnlock();
+
+  if (detailMode) {
+    heading.textContent = "Session";
+    subtitle.textContent = "Session " + sessionId;
+    listView.hidden = true;
+    detailView.hidden = false;
+    liveLine.hidden = false;
+    loadDetail();
+  } else {
+    heading.textContent = "Sessions";
+    subtitle.textContent = "Read-only session list.";
+    refreshList();
+    setInterval(refreshList, REFRESH_MS);
+  }
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

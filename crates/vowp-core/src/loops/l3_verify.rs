@@ -53,7 +53,6 @@ fn create_verify_job_with_suffix(
         // invariant: a retried supervisor tick reuses the existing verify job.
         return Ok(store.require_job(&id)?);
     }
-    let brief = verify_prompt(original, &original.brief, evidence, diff_summary);
     let mut reads = original.owns.clone();
     reads.extend(original.reads.iter().cloned());
     let new = NewJob {
@@ -68,7 +67,9 @@ fn create_verify_job_with_suffix(
         gates: Some(vec![Gate::Report(ReportGate::default())]),
         priority: Some(original.priority),
         loop_: Some(original.loop_.clone()),
-        brief_text: Some(brief.clone()),
+        // The prompt names the verify job's own report path, so it is rendered after the
+        // insert has assigned that path.
+        brief_text: None,
     };
     let verify = store.insert_job(&original.project, &new, "l3")?;
     store.add_edge(&Edge {
@@ -83,6 +84,7 @@ fn create_verify_job_with_suffix(
         .as_ref()
         .map(PathBuf::from)
         .ok_or_else(|| CoreError::Invalid(format!("verify job {} has no worktree", verify.id)))?;
+    let brief = verify_prompt(&verify, &original.brief, evidence, diff_summary);
     let brief = vowp_protocol::Brief::from_job(&verify, &brief);
     let brief_path = worktree.join(&verify.brief);
     if let Some(dir) = brief_path.parent() {
@@ -167,6 +169,9 @@ pub fn parse_verdict(report: &Report) -> Result<(Verdict, Vec<String>), CoreErro
 }
 
 /// The verifier prompt (loops.md §5.1).
+///
+/// Names the exact report file (`job.worktree` joined with `job.report`) and tells the verifier
+/// to write it with a tool instead of only printing it in chat.
 pub fn verify_prompt(job: &Job, brief: &str, evidence: &[GateResult], diff_summary: &str) -> String {
     let mut lines = String::new();
     for result in evidence {
@@ -180,17 +185,24 @@ pub fn verify_prompt(job: &Job, brief: &str, evidence: &[GateResult], diff_summa
     if lines.is_empty() {
         lines.push_str("- (no gate evidence yet)\n");
     }
+    let worktree = job.worktree.as_deref().unwrap_or(".");
+    let report_path = PathBuf::from(worktree).join(&job.report);
     format!(
         "You are the verifier for job {job_id} of project {project}. The original brief is at {brief_path}.\n\
          The job worktree is {worktree}. The change under review: {diff}\n\
          Gate evidence for this attempt:\n{evidence}\
          Judge only against evidence and the brief; run the commands yourself; do not edit files.\n\
-         Write your report with front-matter `verdict: pass|fail` and, on fail, `findings:` as a list of concrete, checkable problems (file, command, expected, actual). Report `status: done` when you finished judging.\n\
+         Use the write tool to write the report file at {report_path}; do not only print it in chat.\n\
+         The report needs front-matter `job`, `status: done`, `branch`, `commits`, `tests`, `verdict: pass|fail` and `findings`.\n\
+         `tests:` must be a single string (for example `cargo test …: 15 passed, 0 failed`) or a map with `command`, `passed` and `failed`. Never write `tests:` as a YAML list. When you ran multiple commands, put them all in the one string, or use the map form for the main command and put the rest in the report body.\n\
+         `findings` is a YAML list of strings, one string per finding; each string names the file, command, expected and actual. Do not use YAML maps/objects for findings. Use `findings: []` when the verdict is pass.\n\
+         Report `status: done` when you finished judging.\n\
          Job: {job_id}",
         job_id = job.id,
         project = job.project,
         brief_path = brief,
-        worktree = job.worktree.as_deref().unwrap_or("."),
+        worktree = worktree,
+        report_path = report_path.display(),
         evidence = lines,
         diff = diff_summary,
     )
@@ -284,5 +296,285 @@ fn summarise_evidence(evidence: &Evidence) -> String {
             ..
         } => format!("`{command}` exited {exit_code:?}; probe: {}", summarise_evidence(probe)),
         Evidence::SecretScan { hits, .. } => format!("{} secret hit(s)", hits.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use vowp_protocol::{
+        FakeClock, Job, JobId, JobKind, JobLoop, JobState, MemoryLog, NewJob, NodeName, Project, ProjectName, Report,
+        Role, TestsField, Timestamp, VowpConfig,
+    };
+    use vowp_store::{NodePaths, Store};
+
+    use super::{create_verify_job_with_suffix, verify_prompt};
+    use crate::Deps;
+    use crate::SystemGit;
+    use crate::deps::{AdapterRegistry, FixedRng, SystemRunner};
+
+    fn test_deps(root: &Path) -> Deps {
+        Deps {
+            paths: NodePaths::new(root),
+            config: Arc::new(VowpConfig::with_defaults_for_tests()),
+            node: NodeName::parse("local").expect("node"),
+            clock: Arc::new(FakeClock::at(
+                Timestamp::parse("2026-11-12T00:00:00Z").expect("timestamp"),
+            )),
+            log: Arc::new(MemoryLog::new()),
+            adapters: Arc::new(AdapterRegistry::new()),
+            windows: Arc::new(vowp_tmux::fake::FakeWindows::new()),
+            git: Arc::new(SystemGit::new(Arc::new(SystemRunner))),
+            cmd: Arc::new(SystemRunner),
+            rng: Arc::new(FixedRng(0)),
+        }
+    }
+
+    fn sample_verify_job() -> Job {
+        let ts = Timestamp::parse("2026-11-12T00:00:00Z").expect("timestamp");
+        Job {
+            id: JobId::parse("demo-verify-0").expect("id"),
+            project: ProjectName::parse("demo").expect("project"),
+            title: "verify demo".to_owned(),
+            kind: JobKind::Verify,
+            role: Role::Verifier,
+            profile: "verifier".to_owned(),
+            state: JobState::Running,
+            priority: 50,
+            needs: Vec::new(),
+            owns: Vec::new(),
+            reads: Vec::new(),
+            brief: ".vowp/jobs/demo-verify-0/brief.md".to_owned(),
+            report: ".vowp/jobs/demo-verify-0/report.md".to_owned(),
+            gates: Vec::new(),
+            loop_: JobLoop::default(),
+            branch: Some("job/demo".to_owned()),
+            worktree: Some("/worktrees/demo".to_owned()),
+            attempts: 0,
+            continues: 0,
+            hang_restarts: 0,
+            parked_reason: None,
+            note: String::new(),
+            created_by: "l3".to_owned(),
+            last_progress_at: None,
+            state_changed_at: ts,
+            created_at: ts,
+            updated_at: ts,
+        }
+    }
+
+    #[test]
+    fn verify_prompt_names_the_report_file() {
+        let job = sample_verify_job();
+
+        let prompt = verify_prompt(
+            &job,
+            ".vowp/jobs/demo-verify-0/brief.md",
+            &[],
+            "git diff main...job/demo",
+        );
+
+        assert!(
+            prompt.contains("/worktrees/demo/.vowp/jobs/demo-verify-0/report.md"),
+            "prompt must name the exact report path: {prompt}"
+        );
+        assert!(
+            prompt.contains("write the report file"),
+            "prompt must say to write the report file: {prompt}"
+        );
+        for field in [
+            "`job`",
+            "`status: done`",
+            "`branch`",
+            "`commits`",
+            "`tests`",
+            "`verdict: pass|fail`",
+            "`findings`",
+        ] {
+            assert!(
+                prompt.contains(field),
+                "prompt must name the front-matter field {field}: {prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_prompt_requires_string_findings() {
+        let job = sample_verify_job();
+
+        let prompt = verify_prompt(
+            &job,
+            ".vowp/jobs/demo-verify-0/brief.md",
+            &[],
+            "git diff main...job/demo",
+        );
+
+        assert!(
+            prompt.contains("`findings` is a YAML list of strings, one string per finding"),
+            "prompt must require one string per finding: {prompt}"
+        );
+        assert!(
+            prompt.contains("each string names the file, command, expected and actual"),
+            "prompt must say what each finding string contains: {prompt}"
+        );
+        assert!(
+            prompt.contains("Do not use YAML maps/objects for findings"),
+            "prompt must forbid YAML maps/objects for findings: {prompt}"
+        );
+        assert!(
+            prompt.contains("Use `findings: []` when the verdict is pass"),
+            "prompt must show the empty list for a pass: {prompt}"
+        );
+        assert!(
+            !prompt.contains("a list of concrete, checkable problems"),
+            "prompt must not invite structured finding maps: {prompt}"
+        );
+
+        let sample = concat!(
+            "---\n",
+            "job: demo-verify-0\n",
+            "status: done\n",
+            "branch: job/demo\n",
+            "commits: [\"abc1234\"]\n",
+            "tests: \"cargo test -p vowp-core --lib verify_prompt: 2 passed\"\n",
+            "verdict: fail\n",
+            "findings:\n",
+            "  - \"crates/vowp-core/src/loops/l3_verify.rs: `cargo test --lib verify_prompt` expected 1 passed, actual 0\"\n",
+            "---\n",
+            "judged\n",
+        );
+        let report = Report::parse(sample).expect("a string finding must parse through the report gate");
+        assert_eq!(report.front_matter.findings.len(), 1);
+        assert!(report.front_matter.findings[0].contains("crates/vowp-core/src/loops/l3_verify.rs"));
+    }
+
+    #[test]
+    fn verify_prompt_requires_tests_shape() {
+        let job = sample_verify_job();
+
+        let prompt = verify_prompt(
+            &job,
+            ".vowp/jobs/demo-verify-0/brief.md",
+            &[],
+            "git diff main...job/demo",
+        );
+
+        assert!(
+            prompt.contains("`tests:` must be a single string"),
+            "prompt must require a single string for tests: {prompt}"
+        );
+        assert!(
+            prompt.contains("or a map with `command`, `passed` and `failed`"),
+            "prompt must allow the map form for tests: {prompt}"
+        );
+        assert!(
+            prompt.contains("Never write `tests:` as a YAML list"),
+            "prompt must forbid a YAML list for tests: {prompt}"
+        );
+        assert!(
+            prompt.contains("put them all in the one string"),
+            "prompt must say to combine multiple commands in one string: {prompt}"
+        );
+        assert!(
+            prompt.contains("put the rest in the report body"),
+            "prompt must say to put other commands in the report body: {prompt}"
+        );
+
+        let sample = concat!(
+            "---\n",
+            "job: demo-verify-0\n",
+            "status: done\n",
+            "branch: job/demo\n",
+            "commits: [\"abc1234\"]\n",
+            "tests: \"cargo test: 1 passed\"\n",
+            "verdict: pass\n",
+            "findings: []\n",
+            "---\n",
+            "judged\n",
+        );
+        let report = Report::parse(sample).expect("the instructed tests string must parse");
+        assert_eq!(
+            report.front_matter.tests,
+            Some(TestsField::Text("cargo test: 1 passed".to_owned()))
+        );
+
+        let list_sample = sample.replace(
+            "tests: \"cargo test: 1 passed\"",
+            "tests:\n  - \"cargo test: 1 passed\"",
+        );
+        assert!(
+            Report::parse(&list_sample).is_err(),
+            "a YAML list for tests must be rejected"
+        );
+    }
+
+    #[test]
+    fn create_verify_job_brief_names_the_verify_report_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let deps = test_deps(&tmp.path().join("node"));
+        let project = ProjectName::parse("demo").expect("project");
+        let now = deps.clock.now();
+        let store = Store::open(&deps.paths).expect("store");
+        store
+            .upsert_project(&Project {
+                name: project.clone(),
+                path: tmp.path().join("repo").display().to_string(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .expect("project row");
+        let worktree = tmp.path().join("worktrees/demo");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let original = store
+            .insert_job(
+                &project,
+                &NewJob {
+                    id: JobId::parse("demo").expect("id"),
+                    title: "demo".to_owned(),
+                    kind: JobKind::Build,
+                    role: Role::Worker,
+                    profile: Some("worker".to_owned()),
+                    needs: Vec::new(),
+                    owns: vec!["src/**".to_owned()],
+                    reads: Vec::new(),
+                    gates: None,
+                    priority: None,
+                    loop_: None,
+                    brief_text: Some("Do the work.\n".to_owned()),
+                },
+                "test",
+            )
+            .expect("original");
+        store
+            .set_job_workspace(&original.id, Some("job/demo"), Some(worktree.to_str().expect("utf8")))
+            .expect("workspace");
+        let original = store.require_job(&original.id).expect("original");
+
+        let verify = create_verify_job_with_suffix(&store, &deps, &original, &[], "", "").expect("verify job");
+        assert_eq!(verify.id.as_str(), "demo-verify-0");
+
+        let brief_path = worktree.join(&verify.brief);
+        let text = std::fs::read_to_string(&brief_path).expect("brief");
+        let brief = vowp_protocol::Brief::parse(&text).expect("brief parse");
+        assert_eq!(brief.front_matter.job, verify.id);
+
+        let verify_report = format!("{}/.vowp/jobs/demo-verify-0/report.md", worktree.display());
+        assert!(
+            brief.body.contains(&verify_report),
+            "brief must name the verify job's report path: {}",
+            brief.body
+        );
+        assert!(
+            !brief
+                .body
+                .contains(&format!("{}/.vowp/jobs/demo/report.md", worktree.display())),
+            "brief must not name the reviewed job's report path: {}",
+            brief.body
+        );
     }
 }
