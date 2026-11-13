@@ -29,7 +29,7 @@ another node makes it readable there after a reindex. The origin session is neve
 
 ## One log, many surfaces
 
-In v0.2 the same session can be open in the opencode desktop app, a Claude app, a phone over SSH or
+In VOWP 0.3 the same session can be open in the opencode desktop app, a Claude app, a phone over SSH or
 `vowp chat`. Only one of them may write at a time. A **surface** registers once and takes a **lease**;
 it heartbeats every 5 seconds, and a lease without a heartbeat for 60 seconds is free. A surface without
 the current token can read in **follow mode** and cannot write.
@@ -143,8 +143,8 @@ name for a generic CLI. A profile is an ordered ladder of executors; rung 0 is p
 | **Claude Remote Control** | Claude Code on the home, driven by the Claude apps where a claude.ai login exists | the app's own session | transcript mirrored at host create/resume and supervisor startup; limits are not parsed from the host yet |
 
 Adapters spawn stock binaries exactly as a user would. They do not read login files, spoof clients or
-forward tokens. The harness never sees tmux; the tmux window only follows the event log. The ACP adapter
-is a deferred design note, not part of v0.2 delivery.
+forward tokens. The harness never sees tmux; the tmux window only follows the event log. The ACP
+adapter ships in v0.3.
 
 The transcript mirror runs when the orchestrator is created, resumed, or resumed by the supervisor at
 startup: it appends the app's new entries to the VOWP log once and writes the `mirror.json` cursor. It
@@ -237,7 +237,7 @@ never dials it.
 
 ## Export and import
 
-Sessions stay on the home in v0.2, and a switch to another executor node no longer copies the session
+Sessions stay on the home in v0.3, and a switch to another executor node no longer copies the session
 directory. Export/import remains an explicit file copy for a backup, a test fixture or a deliberate
 sibling session:
 

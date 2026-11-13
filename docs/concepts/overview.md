@@ -1,25 +1,27 @@
 # Concepts overview
 
-VOWP is a supervisor for AI coding agents. It turns a goal into a graph of small jobs, gives each job
-one git worktree and one agent session, checks the result with instrumented gates and an independent
-verifier, merges through a single queue, and can promote the merged result through guarded
-environments.
+VOWP is a VPS framework for AI agents to work on projects. It turns one Linux VPS into the home that
+owns the work, then turns a goal into a graph of small jobs, gives each job one git worktree and one
+agent session, checks the result with instrumented gates and an independent verifier, merges through a
+single queue, and can promote the merged result through guarded environments.
 
 It is **not** a harness: it does not embed a model, replace Claude Code or opencode, or hold anyone's
 login. It is closer to a build system and foreman for agents. The harnesses stay stock; VOWP supplies the
-home, the graph, the state machine, the evidence and the handoff format.
+home, the graph, the state machine, the evidence and the handoff format. For the one-page view, see
+[What is VOWP](what-is-vowp.md).
 
-> **Status: current.** VOWP v0.2 is implemented on `main`. The pages in this directory describe that
-> code. The binding, implementable specification is
-> [`docs/design/v0.2/home-and-surfaces.md`](../design/v0.2/home-and-surfaces.md).
+> **Status: current.** VOWP v0.3.0 is implemented on `main`. The pages in this directory describe
+> that code. The binding home and surface specification is
+> [`docs/design/v0.2/home-and-surfaces.md`](../design/v0.2/home-and-surfaces.md); v0.3 adds the
+> loopback API, the window and session pull.
 
-## The shape of v0.2
+## The shape of v0.3
 
-v0.2 has three kinds of place:
+v0.3 has three kinds of place:
 
-- **The home** is the authority. It is normally a Linux VPS that stays on. One `vowp` supervisor runs
-  there for every active project; it owns the global database, one database per project, the session
-  logs, the snapshot, the capacity sampler and the tmux windows.
+- **The home** is the authority. VOWP is VPS-first: the home is normally a Linux VPS that stays on.
+  One `vowp` supervisor runs there for every active project; it owns the global database, one database
+  per project, the session logs, the snapshot, the capacity sampler and the tmux windows.
 - **Control machines** are where people talk to the home: a laptop, a desktop app, or a phone with an
   SSH client. They hold no truth. They cache a snapshot, open SSH tunnels and run a surface.
 - **Executor nodes** run a turn's harness. The home is the default executor node; a laptop can be
@@ -79,10 +81,10 @@ nothing else.
 
 | Term | Meaning |
 |---|---|
-| **Home** | The machine that owns the global DB, the project DBs, the session logs, the snapshot and the one node supervisor. One per installation in v0.2. |
+| **Home** | The machine that owns the global DB, the project DBs, the session logs, the snapshot and the one node supervisor. One per installation in v0.3. |
 | **Control machine** | A computer or phone that talks to the home. It holds no truth; it may cache a snapshot. |
 | **Node** | A machine name in the `nodes` registry. The home is the only node that writes; a laptop can be an executor node. |
-| **Project** | One git repository registered on the home. v0.2 runs every active project under one supervisor. |
+| **Project** | One git repository registered on the home. v0.3 runs every active project under one supervisor. |
 | **Harness** | An agent program: Claude Code, opencode, Codex, Gemini CLI, … |
 | **Adapter** | VOWP code that drives one harness headlessly and turns its output into canonical events. |
 | **Session** | A universal, harness-neutral conversation with a stable id and an append-only event log on the home. |
@@ -192,7 +194,7 @@ an index that `vowp reindex` can rebuild. Deleting the database never loses sess
 session directory does. A full backup now includes the session content as well as both database types;
 see [data lifecycle](data-lifecycle.md).
 
-## What v0.2 includes
+## What v0.3 includes
 
 - One node supervisor for every active project, with project pause/resume/archive and a broken project
   parked alone.
@@ -205,14 +207,15 @@ see [data lifecycle](data-lifecycle.md).
 - Sessions on every surface: leases, takeover, follow mode, remote execution with a durable spool,
   opencode and Claude app hosts, the MCP server, `vowp chat` and orchestrator sessions.
 - Control machines: vowp `control init`, snapshot cache, SSH tunnels, and phone access with an SSH app.
+- The v0.3 loopback HTTP/SSE daemon, web/PWA window and phone-friendly board, plus the ACP adapter
+  and explicit session pull between nodes.
 - Secrets in basic or vault-user mode, injected by name, with exact-value redaction in session logs, capsules, report artifacts and the snapshot.
 - Lifecycle classes, vowp `gc`, closed-session compaction, backup/restore and the nightly GC schedule.
 - AI-first setup: vowp `setup plan`, vowp `setup home` and vowp `setup control`.
 
 ## What is deliberately deferred
 
-- The HTTP+SSE daemon, web window and phone browser board (`v0.3`).
-- The ACP adapter and the browser cost dashboard: design notes only, not v0.2 delivery.
+- The browser cost dashboard.
 - More than one home, replication, leader election and multi-VPS scheduling.
 - Multi-user accounts, quotas, roles or audit.
 - Windows support and a native VOWP desktop app.

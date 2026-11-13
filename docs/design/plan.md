@@ -1,6 +1,6 @@
 # VOWP — Virtual Open Work-to-Production
 
-VOWP is an open-source framework for running AI coding agents on your own machines — a laptop, a server, or both — as a team. Each agent can be Claude Code, opencode or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between harnesses, models and machines without losing its context. Finished work moves from **Work to Production** only through guarded, reversible promotions.
+VOWP is a VPS framework for AI agents to work on projects. One Linux VPS is the **home**: it owns the global database, one database per project, every session log and the supervisor. You talk to it from a laptop, desktop or phone; a registered executor node can run a turn where the work needs local context. Each agent can be Claude Code, opencode, Codex or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between harnesses, models and nodes without losing its context. Finished work moves from **Work to Production** only through guarded, reversible promotions.
 
 This document describes how VOWP works. The imperative spec for each crate is in the neighbouring files; `decisions.md` records the places where that spec tightens or clarifies this design.
 

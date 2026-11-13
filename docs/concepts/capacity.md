@@ -221,7 +221,7 @@ Capacity and provider failover answer different questions:
 - **Failover** asks which executor a session should use after a provider limit. It follows the profile
   ladder and writes capsules; see [providers and failover](providers-and-failover.md).
 - **Cost** reports receipts, price-table estimates and unknowns. It is not fed into admission as a
-  budget, and there is no hard spending cap in v0.2.
+  budget, and there is no hard spending cap in v0.3.
 
 The provider's `max_concurrent` is part of the advised target, and a limited provider produces a
 `provider` wait or brake. Credits exhausted and expired auth remain human actions: VOWP parks the

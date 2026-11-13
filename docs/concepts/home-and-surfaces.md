@@ -1,12 +1,14 @@
 # Home and surfaces
 
-v0.2 moves VOWP from "one supervisor per project on a machine" to **one home that owns the truth and
-many surfaces that talk to it**. The home runs one supervisor for every active project. People reach it
-from the apps they already use, from a terminal fallback, or from a phone over SSH. Every session has
-one log on the home; only the surface holding the lease can write to it.
+VOWP is **VPS-first**: one **home** on a Linux VPS owns the truth, and many **surfaces** talk to it.
+The home runs one supervisor for every active project. People reach it from the apps they already use,
+from a terminal fallback, or from a phone over SSH. Every session has one log on the home; only the
+surface holding the lease can write to it.
 
 > **Status: current.** The commands and behaviour on this page are implemented on `main`. The binding
-> specification is [`docs/design/v0.2/home-and-surfaces.md`](../design/v0.2/home-and-surfaces.md).
+> home and surface specification is
+> [`docs/design/v0.2/home-and-surfaces.md`](../design/v0.2/home-and-surfaces.md); v0.3 adds the
+> loopback API, the window and session pull.
 
 ## The home owns the truth
 
@@ -389,12 +391,12 @@ looks like:
 The desktop joins through the `join.desktop` instructions printed by vowp `orchestrator new`; the
 phone uses `join.phone`; `join.chat` is the fallback. Setup never asks for a secret value in the chat.
 
-## Limits of v0.2
+## Limits of v0.3
 
 - **One home.** There is no replication, leader election or multi-home scheduling. A second home is a
   separate installation.
-- **No public API or page.** There is no HTTP+SSE daemon, web window or phone browser board. The
-  opencode app server and the secret page are loopback-only and reached through SSH.
+- **No public API or page.** The v0.3 daemon and window bind loopback and are reached through SSH;
+  there is no public listener.
 - **Apps keep their own limits.** VOWP can configure and host an app; it cannot close another vendor's
   window or force an app build to expose MCP tools.
 - **SSH is the transport.** A control machine needs key-based, batch-mode SSH to the home. A phone needs

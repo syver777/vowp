@@ -1,8 +1,8 @@
 # Roadmap
 
-Status: current for the v0.2 feature set; a planning note for contributors.
+Status: current for the v0.3 feature set; a planning note for contributors.
 
-This page records what the current tree ships, what is deliberately **not** in v0.2, and the design
+This page records what the current tree ships, what is deliberately **not** in v0.3, and the design
 order for v0.3 and later. It promises no dates. The authoritative proof for every claim is the
 linked document or the code itself.
 
@@ -39,15 +39,14 @@ The home is the only writer. A control machine, app or MCP server sends commands
 it never opens a database over the network. The only listeners are loopback-only: the opencode app
 server joined through an SSH tunnel and the one-time secret paste page.
 
-## What is deliberately not in v0.2
+## What is deliberately not in v0.3
 
 - **One home.** There is no replication, leader election or multi-home scheduler. A second home is a
   separate installation.
-- **No public HTTP or SSE API.** The planned daemon API, web window and phone browser board are
-  design notes for v0.3; v0.2 has no listening public port.
-- **No ACP adapter or cost dashboard.** Both remain deferred design notes under `design/v0.2/`.
-- **No cross-node live sync.** The session stays on the home; only the executor moves. Export/import
-  bundles remain the explicit way to copy a session.
+- **No public HTTP or SSE API.** The v0.3 daemon API binds loopback and is reached through SSH; there
+  is no public listener.
+- **No cost dashboard.** The ACP adapter ships in v0.3; the cost dashboard remains deferred.
+- **No cross-node live sync.** v0.3 adds explicit session pull; there is no automatic directory sync.
 - **No multi-user accounts, quotas, roles or audit.** One operator per home is the supported shape.
 - **No VPS metrics history, parallel fan-out policies or hosted relay.** These need identity,
   policy or infrastructure that v0.2 does not provide.
@@ -66,8 +65,8 @@ described. Follow-ups suitable for a first contribution are below.
 
 ## v0.3 — the API, the window and the reach
 
-These items need transport, identity or infrastructure that v0.2 does not provide. They are **not**
-started in v0.2.
+These items were the v0.3 plan. The API, window, phone board, ACP adapter and explicit session pull
+ship in 0.3.0; the remaining rows are deferred.
 
 | Item | What it adds | Design note |
 |---|---|---|
@@ -85,12 +84,24 @@ started in v0.2.
 The order above is the recommended dependency order, not a schedule. The API and its wire contract
 come first because the window, phone board and cost dashboard all consume it.
 
+## v0.4 — local surface and local node
+
+This is a design direction, not a commitment. 0.3 keeps the VPS as the only home. The 0.4 work asks
+how the owner can run the orchestrator on their own machine with local context while the VPS stays
+the only writer:
+
+- a **local surface** — the app runs locally, the session log and lease stay on the home;
+- a **local node** — an outbound-only agent that executes offloaded jobs with per-node path mapping.
+
+The home remains the source of truth; the local machine is a surface and an executor, not a second
+home. The first deliverable is a design note, not code.
+
 ## Ideas / help wanted
 
 These are useful but unscoped. They are not commitments.
 
 - Native adapters for more harnesses (the generic CLI mapping adapter already covers many).
-- Phone/push notifications through ntfy or a similar hook; v0.2 has no `[notify]` config key.
+- Phone/push notifications through ntfy or a similar hook; v0.3 has no `[notify]` config key.
 - IANA time zones for schedules and limit reset parsing.
 - Shell completions for `vowp`.
 - Full-text search over session events and a sidecar tail index for very large logs.

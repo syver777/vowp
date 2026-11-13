@@ -1,8 +1,32 @@
 # VOWP — Virtual Open Work-to-Production
 
-**VOWP is an open-source (MIT) supervisor for AI coding agents.** It runs the harnesses you already
-use as a small engineering team on a home machine you own: one supervisor for every project, an
-append-only session log, measured capacity and a single merge queue.
+**VOWP is a VPS framework for AI agents to work on projects.** It turns one Linux VPS into the
+always-on **home** for a fleet of agents: a global database, one database per project, append-only
+session logs, a deterministic supervisor, job graphs, loops, cron schedules, measured capacity and a
+single merge queue. You talk to it from the apps you already use; the VPS owns the truth.
+
+VOWP is not another agent harness and not a model. It drives the harnesses you already run — Claude
+Code, opencode, Codex and other CLI agents — through their documented headless interfaces, keeps
+their logins out of the loop, and gives them a shared home, history and delivery process. It is MIT
+licensed.
+
+## What you get
+
+| Capability | What it means |
+|---|---|
+| **One home on a VPS** | The VPS owns the global DB, one DB per project, every session log, the supervisor and the snapshot. |
+| **Interchangeable sessions** | A session is a harness-neutral append-only log. Switch model, harness, node or surface with a capsule; the history stays. |
+| **A built-in session database** | SQLite is the truth for decisions: jobs, gates, runs, costs, leases, capacity, schedules and inbox. Content stays in plain files. |
+| **Fleet and worker tracking** | Register executor nodes, track workers and see the whole fleet in one snapshot. |
+| **Systematic execution** | Jobs form a DAG; deterministic L1–L9 loops keep it moving; cron and interval schedules make the work orderly. |
+| **Harness and provider freedom** | Claude Code, opencode, Codex/generic CLI; profile ladders, provider limits and failover. Stock harnesses, no forks. |
+| **Any surface** | opencode desktop, Claude app, `vowp chat` or MCP; SSH tunnels and no public port. |
+| **Guarded delivery** | Evidence gates, an independent verifier, one merge queue and reversible Work → Production. |
+
+A laptop sleeps, changes networks and carries your local context. A VPS stays on, has one address and
+one database. VOWP puts the fleet there, so sessions, jobs, workers, schedules and history survive a
+closed laptop, and any surface can reconnect to the same session. Your Mac, desktop or phone is the
+control surface; it holds no truth.
 
 ## Set up VOWP 0.3.0
 
@@ -162,8 +186,10 @@ name, URL and expiry. The AI sees `NAME saved, ends in …last4`, never the valu
 
 The [security model](docs/security.md) states the full coverage and the remaining gaps.
 
-## Why VOWP
+## Why a VPS framework
 
+- **One VPS, not one laptop.** The home stays on; sessions, jobs, workers, schedules and history
+  survive a closed lid, and any surface can reconnect to the same session.
 - **Stock harnesses, no forks.** Claude Code and opencode are driven through their documented
   headless modes. VOWP never scrapes a TUI, sends keystrokes to answer a dialog, or reads and forwards
   login tokens.
@@ -185,6 +211,7 @@ The [security model](docs/security.md) states the full coverage and the remainin
 
 | Start here | What it covers |
 |---|---|
+| [What is VOWP](docs/concepts/what-is-vowp.md) | The VPS framework in one page: home, sessions, database, fleet, graphs, schedules and harnesses. |
 | [Setup contract](docs/setup/agent-setup.md) | The exact prompt contract: ask once, show the plan once, run it, stop at hand-offs, verify, report. |
 | [Concepts overview](docs/concepts/overview.md) | The vocabulary, the moving parts and where state lives. |
 | [Home and surfaces](docs/concepts/home-and-surfaces.md) | One supervisor for many projects, leases, takeover, remote execution, app hosts, MCP and chat. |
@@ -210,6 +237,9 @@ the [CLI reference](docs/reference/cli.md) and the [roadmap](docs/roadmap.md).
 ## Limits of v0.3
 
 - **One home.** There is no replication, leader election or multi-home scheduling.
+- **Local execution is remote.** A control machine is a surface, not the home. A registered executor
+  node can run a turn where local files are needed, but the VPS remains the only writer. The
+  local-surface/local-node design is 0.4 work.
 - **Loopback window, separate daemon.** The web window and HTTP/SSE API are served by `vowp-daemon`
   on `127.0.0.1` only. The archives and npm package install `vowp` only, so install the daemon
   separately for the window; without it the supervisor runs without a window.

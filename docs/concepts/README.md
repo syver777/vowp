@@ -1,11 +1,12 @@
 # Concepts
 
-These pages explain how VOWP is put together and why. They describe the v0.2 home model and the
-implementation on `main`; every command shown is implemented. The binding specification is in
-[`docs/design/v0.2/home-and-surfaces.md`](../design/v0.2/home-and-surfaces.md).
+These pages explain how VOWP is put together and why. They describe the current v0.3 home model and
+the implementation on `main`; every command shown is implemented. The binding home and surface
+specification is the v0.2 document, and v0.3 adds the loopback API, the window and session pull.
 
 | Page | Read it for |
 |---|---|
+| [What is VOWP](what-is-vowp.md) | The VPS framework in one page: home, sessions, database, fleet, graphs, schedules and harnesses. |
 | [Overview](overview.md) | The vocabulary, the home and control machine, the components and where state lives. |
 | [Home and surfaces](home-and-surfaces.md) | One supervisor for many projects, leases, takeover, remote execution, app hosts, orchestrators and MCP. |
 | [Capacity](capacity.md) | Measured host and run usage, admission, brakes, targets and the advisor. |

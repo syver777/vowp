@@ -1,6 +1,6 @@
 # Control machines and extra nodes
 
-VOWP 0.2 has one **home** that owns the truth. Every other machine is either a **control machine**
+VOWP 0.3 has one **home** on a Linux VPS that owns the truth. Every other machine is either a **control machine**
 that talks to it or an **executor node** that runs work the home schedules. No control machine opens
 a database; no second machine is authoritative.
 
@@ -145,7 +145,7 @@ vowp session switch <id> --to <executor> --node <node-name>
 
 `export` writes a `vowp-bundle-v1` file with a capsule, the last events and a checksum. `import`
 validates it and creates a **child** session; the origin is never modified. A cross-node switch
-exports, imports and switches on the target, recording the node transition. In v0.2 this is for
+exports, imports and switches on the target, recording the node transition. In v0.3 this is for
 copying or archiving; the normal multi-device path is one home with several surfaces.
 
 ## Remote execution and SSH drops

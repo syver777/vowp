@@ -170,7 +170,7 @@ Useful flags:
 - `--reason user|limit|crash|failover|context|probe_back` records why the switch happened. The
   default is `user`.
 - `--node <name>` switches to an executor on another node. The session is exported and imported on
-  the target, and both sides record the node transition. In v0.2 the normal multi-device path is one
+  the target, and both sides record the node transition. In v0.3 the normal multi-device path is one
   home with several surfaces; the bundle path is for a copy or archive.
 - `--force` allows a switch while a turn is running. Without it, an active turn is a conflict (exit
   4). The drain phase is used by automatic switches (failover and context pressure) and by a forced

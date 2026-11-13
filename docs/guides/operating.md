@@ -21,7 +21,7 @@ vowp down --force                # send SIGTERM after the wait
 ```
 
 `vowp up` exits 4 if a supervisor is already running for the home. There is no per-project
-supervisor in v0.2. Each tick runs the node steps once (capacity sample, capacity advice, lease
+supervisor in v0.3. Each tick runs the node steps once (capacity sample, capacity advice, lease
 sweep, lifecycle, node requests) and then every active project in round-robin order, followed by the
 snapshot and the heartbeat. A project that fails to start or tick is parked with a reason and does
 not stop the others.

@@ -1,10 +1,10 @@
 # Running a home on a VPS
 
-VOWP 0.2 is VPS-first. One Linux server is the **home**: it owns the global database, one database per
-project, every session log and the single node supervisor. A laptop, desktop or phone is a **control
-machine**: it talks to the home, caches the last snapshot and opens tunnels, but holds no truth. This
-guide takes a fresh server to a supervised fleet and, where useful, points at the control-machine
-side.
+VOWP 0.3 is VPS-first: **the VPS is the framework's home.** One Linux server owns the global database,
+one database per project, every session log and the single node supervisor. A laptop, desktop or phone
+is a **control machine**: it talks to the home, caches the last snapshot and opens tunnels, but holds
+no truth. This guide takes a fresh server to a supervised fleet and, where useful, points at the
+control-machine side.
 
 > **Status: current.** The home, project, fleet, capacity, secret, backup and lifecycle commands on
 > this page are implemented. `vowp setup home` installs the same pieces as the manual steps below.
@@ -435,7 +435,7 @@ secrets. The supervisor creates a nightly `gc-nightly` schedule in each project.
 
 ## Multiple projects and worker capacity
 
-v0.2 runs several projects in one home. There is no separate `VOWP_HOME` per project and no second
+v0.3 runs several projects in one home. There is no separate `VOWP_HOME` per project and no second
 supervisor:
 
 ```sh
@@ -451,7 +451,7 @@ capacity admission and the project weight decide who runs next. A broken project
 opens an inbox notice without stopping the others. `vowp project pause` stops new dispatch while
 running work finishes.
 
-The old "one project per `VOWP_HOME`" workaround belongs to v0.1. Do not use it on a v0.2 home.
+The old "one project per `VOWP_HOME`" workaround belongs to v0.1. Do not use it on a v0.3 home.
 
 ## Multiple nodes and the control machine
 

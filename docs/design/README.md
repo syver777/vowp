@@ -1,6 +1,6 @@
 # VOWP design specification — index
 
-Status: current for v0.2.
+Status: current for v0.3 (the v0.2 home and surface specification remains the binding base).
 
 This directory describes how VOWP works: architecture, types, database schema, behavioural contracts
 and the command line. The **v0.1 implementation spec** is still the base; the **v0.2 spec** in
