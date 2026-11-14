@@ -26,7 +26,7 @@ ladder = ["opencode:provider/model#max"]
 ladder = ["opencode:provider/model#max"]
 ```
 
-The four role names `planner`, `keeper`, `worker` and `verifier` must exist after project and node
+The four role names `planner`, `keeper`, `worker` and `verifier` must exist after project and machine
 configuration are merged. A job's `profile` field selects its ladder; by default it is its role name.
 
 `on_quota` controls what a quota limit means:
@@ -50,7 +50,7 @@ dispatch skips a limited provider. The follow-up action is **project-local** in 
 - a `quota` limit moves the session that hit it, and dispatch in every project skips that provider
   until the reset.
 
-Node-wide parking and a shared concurrency cap are code follow-ups. Job cost stays attached to its
+Machine-wide parking and a shared concurrency cap are code follow-ups. Job cost stays attached to its
 project and run; the limit row is the shared fact.
 
 ### Executor grammar
@@ -91,7 +91,7 @@ provider with no limit classification mark that provider `unavailable` for 15 mi
 3. The session is switched to the next rung whose provider is not limited, using the normal
    [switch protocol](sessions-and-switching.md#switching): freeze, drain, capsule, detach, start, record.
 4. A job run that was interrupted continues on the new rung with `StartRun{Continue}`. The switch
-   records the target node, probes it over SSH when it is remote, and only then detaches the source.
+   records the target machine, probes it over SSH when it is remote, and only then detaches the source.
 5. When the reset arrives, a probe runs a tiny prompt (`Reply with the single word: ok`) on the limited
    provider in a scratch directory, with a 60-second timeout. Its cost is recorded like any other run.
 6. A successful probe deletes the limit row. Planner and keeper sessions switch back to rung 0 with a
@@ -132,7 +132,7 @@ It does not choose a provider or a model. Failover is what moves a session to an
 an admission input: VOWP reports it but does not enforce a spending budget. See [capacity](capacity.md)
 for the measured target, brakes and waiting reasons.
 
-`[node].max_workers` is a per-project preference, not a hard cap: it seeds the advised target and the
+`[node].max_workers` is a per-machine preference, not a hard cap: it seeds the advised target and the
 worker-slot bookkeeping, while admission uses the capacity target. `max_verifiers` still bounds the
 verifier share of the slots.
 

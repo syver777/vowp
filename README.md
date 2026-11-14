@@ -15,9 +15,9 @@ licensed.
 | Capability | What it means |
 |---|---|
 | **One home on a VPS** | The VPS owns the global DB, one DB per project, every session log, the supervisor and the snapshot. |
-| **Interchangeable sessions** | A session is a harness-neutral append-only log. Switch model, harness, node or surface with a capsule; the history stays. |
+| **Interchangeable sessions** | A session is a harness-neutral append-only log. Switch model, harness, machine or surface with a capsule; the history stays. |
 | **A built-in session database** | SQLite is the truth for decisions: jobs, gates, runs, costs, leases, capacity, schedules and inbox. Content stays in plain files. |
-| **Fleet and worker tracking** | Register executor nodes, track workers and see the whole fleet in one snapshot. |
+| **Fleet and worker tracking** | Register executor machines, track workers and see the whole fleet in one snapshot. |
 | **Systematic execution** | Jobs form a DAG; deterministic L1–L9 loops keep it moving; cron and interval schedules make the work orderly. |
 | **Harness and provider freedom** | Claude Code, opencode, Codex/generic CLI; profile ladders, provider limits and failover. Stock harnesses, no forks. |
 | **Any surface** | opencode desktop, Claude app, `vowp chat` or MCP; SSH tunnels and no public port. |
@@ -27,6 +27,11 @@ A laptop sleeps, changes networks and carries your local context. A VPS stays on
 one database. VOWP puts the fleet there, so sessions, jobs, workers, schedules and history survive a
 closed laptop, and any surface can reconnect to the same session. Your Mac, desktop or phone is the
 control surface; it holds no truth.
+
+**Vocabulary:** a **machine** is a registered execution host — the VPS home, your Mac, a laptop. A
+**job** is one unit of work; when talking about the graph, it is a **job node**. A **slot** is a
+concurrency place, and a **window** is a tmux view. The CLI command `vowp node` still manages machines
+until the v0.4 rename.
 
 ## Set up VOWP 0.3.0
 
@@ -227,7 +232,7 @@ The [security model](docs/security.md) states the full coverage and the remainin
 | [Operating a home](docs/guides/operating.md) | `up`/`down`, fleet views, capacity, logs, backup, `gc` and migration. |
 | [Sessions](docs/guides/sessions.md) | Chat, takeover, switch, capsule, export/import and `session watch`. |
 | [Running a home on a VPS](docs/guides/vps.md) | The server account, harnesses, systemd, SSH and firewalls. |
-| [Control machines and extra nodes](docs/guides/multi-node.md) | Routing, snapshot cache, tunnels, executor nodes and cross-node sessions. |
+| [Control machines and extra machines](docs/guides/multi-node.md) | Routing, snapshot cache, tunnels, executor machines and cross-machine sessions. |
 | [Schedules](docs/guides/schedules.md) | Cron and interval schedules, missed runs, pause and resume. |
 
 Also: [security model](docs/security.md), [troubleshooting](docs/troubleshooting.md),
@@ -238,8 +243,8 @@ the [CLI reference](docs/reference/cli.md) and the [roadmap](docs/roadmap.md).
 
 - **One home.** There is no replication, leader election or multi-home scheduling.
 - **Local execution is remote.** A control machine is a surface, not the home. A registered executor
-  node can run a turn where local files are needed, but the VPS remains the only writer. The
-  local-surface/local-node design is 0.4 work.
+  machine can run a turn where local files are needed, but the VPS remains the only writer. The
+  local-surface/local-machine design is 0.4 work.
 - **Loopback window, separate daemon.** The web window and HTTP/SSE API are served by `vowp-daemon`
   on `127.0.0.1` only. The archives and npm package install `vowp` only, so install the daemon
   separately for the window; without it the supervisor runs without a window.

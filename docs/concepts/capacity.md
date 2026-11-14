@@ -34,8 +34,8 @@ it is shown as an override and the brakes still apply.
 
 ### Host samples
 
-While the supervisor runs, each node tick reads the host once and writes a `host_samples` row. The
-node tick is 60 seconds by default; the row's fixed `interval_secs=5` label is not a separate 5-second
+While the supervisor runs, each machine tick reads the host once and writes a `host_samples` row. The
+machine tick is 60 seconds by default; the row's fixed `interval_secs=5` label is not a separate 5-second
 thread. The sample contains:
 
 - memory total, available and swap used, from `/proc/meminfo` on Linux;
@@ -51,7 +51,7 @@ checks and uses the owner's fixed target when one is set, otherwise 1. The disk 
 vowp `capacity show` prints `capacity: fallback (no /proc), target <n>` so the degradation is visible.
 Auto capacity never silently claims a measured number on such a host.
 
-Samples are written once per node tick (60 seconds by default) and kept for 24 hours. The pruner can
+Samples are written once per machine tick (60 seconds by default) and kept for 24 hours. The pruner can
 also retain one-minute rows for 30 days if they exist, but the sampler does not create them in this
 build; a minute rollup is still a follow-up. The GC pass prunes expired rows (see
 [data lifecycle](data-lifecycle.md)).
@@ -65,7 +65,7 @@ systemd user scope (`systemd-run --user --scope`) and reads cgroup v2 `memory.pe
 RSS and CPU deltas. If neither works, it records a labelled default.
 
 The fallback is honest but less exact: the process-tree walk overcounts warm shared RSS by about
-31 % and undercounts short-lived CPU by 15–36 % in measurement. It is for keeping a node limping,
+31 % and undercounts short-lived CPU by 15–36 % in measurement. It is for keeping a machine limping,
 not for precise estimates.
 
 One `run_usage` row is written per finished run with the peak and sampled memory, CPU use, duration,
@@ -107,13 +107,13 @@ A `Wait` leaves the job exactly where it was — `ready` or `pending` — writes
 note (`waiting: RAM 1.2 GB short`) and to the snapshot's queue card. It never changes job state and
 never starts a partial run.
 
-Admission is **node-wide**. The manager opens each active project database in turn, sums the open runs
-and their estimated CPU, and compares the total with the node target. A project handle never decides
-the node's capacity from its own runs alone.
+Admission is **machine-wide**. The manager opens each active project database in turn, sums the open runs
+and their estimated CPU, and compares the total with the machine target. A project handle never decides
+the machine's capacity from its own runs alone.
 
 ### Fairness
 
-Every active project gets one L1 tick per node tick. The node supervisor orders projects by **fairness
+Every active project gets one L1 tick per machine tick. The supervisor orders projects by **fairness
 weight**, highest first. Inside one weight the project admitted last moves to the back of its group, so
 the next project in the rotation goes first; when no project in a group was admitted last, a per-tick
 rotating offset starts that group. A registry read failure falls back to plain name order with the same
@@ -139,7 +139,7 @@ trips on measured conditions and clears after two clean samples:
 
 vowp `capacity show` prints the active reason and its start time, for example
 `brake: memory pressure (avg10 14.2)`. A kernel OOM kill is recorded on the run, the job is parked with
-a node-inbox notice, and its estimate's p90 is raised for the next admission. The run itself is not
+a machine-inbox notice, and its estimate's p90 is raised for the next admission. The run itself is not
 retried by the brake; the normal job retry path decides.
 
 ## Targets and advice
@@ -174,7 +174,7 @@ Every 30 minutes, and on events (a new project, a brake trip, an OOM kill, susta
 advisor reads the same report as vowp `capacity report --json` and writes:
 
 - one `capacity_advice` row with the current and proposed target, mode, reasons and expected effect;
-- one node-inbox `decision` item titled `Capacity: <n> workers (advised <a>)` with the options
+- one machine-inbox `decision` item titled `Capacity: <n> workers (advised <a>)` with the options
   `apply` and `keep`.
 
 The advisor **never changes the target itself**. Applying a proposal is the owner's

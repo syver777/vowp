@@ -30,15 +30,22 @@ evidence.
   and opens tunnels. It holds no truth.
 - **Surface.** Where a person talks to a session now: the opencode desktop app, a Claude app,
   `vowp chat`, or an MCP server. One surface holds the lease; the rest follow read-only.
-- **Executor node.** A registered machine that runs a turn. The home is the default; a laptop can be
+- **Executor machine.** A registered machine that runs a turn. The home is the default; a laptop can be
   an executor when the work needs its local files, browser or tunnels.
+
+## Vocabulary
+
+A **machine** is a registered execution host: the VPS home, a Mac, a laptop. A **job** is one unit of
+work; when talking about the graph, it is a **job node**. A **slot** is a concurrency place, and a
+**window** is a tmux view. The CLI command `vowp node` and the `nodes` table keep the old name for
+compatibility until the v0.4 rename.
 
 ## Five things that make it a framework
 
 ### 1. Interchangeable sessions
 
 Every conversation is a universal, harness-neutral session with a stable id and an append-only
-`log.jsonl` on the home. A session can move between models, harnesses, nodes and surfaces; a capsule
+`log.jsonl` on the home. A session can move between models, harnesses, machines and surfaces; a capsule
 carries the context and the lease rules prevent two writers. The history does not belong to the
 harness.
 
@@ -48,9 +55,9 @@ SQLite holds the decisions: the project registry, jobs and edges, gates and evid
 worker slots, leases, capacity, schedules and inbox. Content stays in plain files: briefs, reports,
 session logs and blobs. Kill every process, restart, and the supervisor reconciles.
 
-### 3. A fleet of workers on nodes
+### 3. A fleet of workers on machines
 
-One supervisor ticks every active project in fairness order. Nodes are registered and tracked; the
+One supervisor ticks every active project in fairness order. Machines are registered and tracked; the
 snapshot shows projects, jobs, workers, capacity, provider limits, inbox and orchestrators. A broken
 project parks alone. Capacity is measured, not guessed; brakes stop new runs and never kill running
 work.
@@ -74,7 +81,7 @@ does not fork a harness, scrape a TUI, or read a login token.
 |---|---|---|
 | VPS home | supervisor, jobs, worktrees, harnesses, schedules | all truth |
 | Control machine | app, `vowp chat`, `vowp mcp`, tunnels | snapshot cache, spool, surface state |
-| Executor node | a turn's harness | its own checkout and login |
+| Executor machine | a turn's harness | its own checkout and login |
 | Surface | the conversation | a lease, never the log |
 
 ## What it is not
@@ -99,6 +106,6 @@ does not fork a harness, scrape a TUI, or read a login token.
 ## 0.4 direction
 
 0.3 keeps the VPS as the only home. The 0.4 design work explores a **local surface** and a **local
-node**: the orchestrator app can run on your Mac with local context while the session log stays on
-the VPS, and an outbound-only node agent can run offloaded jobs on the Mac. The VPS remains the only
+machine**: the orchestrator app can run on your Mac with local context while the session log stays on
+the VPS, and an outbound-only machine agent can run offloaded jobs on the Mac. The VPS remains the only
 writer; the local machine is a surface and an executor, not a second home.

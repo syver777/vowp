@@ -81,7 +81,7 @@ In a chat, each line is a user turn. Assistant text streams, and tool calls are 
 | Command | Effect |
 |---|---|
 | `/switch <executor>` | Run the switch protocol to another harness or model. |
-| `/status` | Show the session, executor, node and lease state. |
+| `/status` | Show the session, executor, machine and lease state. |
 | `/takeover` | Take the lease from another live surface in an interactive chat. After `/follow`, reopen with `vowp chat <id> --takeover`. |
 | `/follow` | Release the lease and follow read-only. |
 | `/capsule` | Write a capsule now and print its id. |
@@ -169,9 +169,10 @@ Useful flags:
 
 - `--reason user|limit|crash|failover|context|probe_back` records why the switch happened. The
   default is `user`.
-- `--node <name>` switches to an executor on another node. The session is exported and imported on
-  the target, and both sides record the node transition. In v0.3 the normal multi-device path is one
-  home with several surfaces; the bundle path is for a copy or archive.
+- `--node <name>` switches to an executor on another machine. The session is exported and imported on
+  the target, and both sides record the machine transition. In v0.3 the normal multi-device path is one
+  home with several surfaces; the bundle path is for a copy or archive. The flag is still spelled
+  `--node`; it selects a **machine**.
 - `--force` allows a switch while a turn is running. Without it, an active turn is a conflict (exit
   4). The drain phase is used by automatic switches (failover and context pressure) and by a forced
   manual switch.
@@ -211,7 +212,7 @@ fresh capsule, the last 20 replayable events (up to 500 with `--tail`), the swit
 blobs inlined and a sha256 checksum.
 
 `import` validates the format, protocol version and checksum before changing anything, then creates a
-**child** session on the importing node with `parent_session_id` set to the origin. The first turn on
+**child** session on the importing machine with `parent_session_id` set to the origin. The first turn on
 the child is seeded with the bundle capsule and tail. Importing the same bundle twice creates two
 independent children; the origin is never modified. A compacted origin exports its capsule with an
 empty event tail and says so.
@@ -236,7 +237,7 @@ Common rejections:
 | `bundle too new` | `protocol_version` is newer than this binary. |
 | `checksum mismatch` | The JSON was edited or truncated. Nothing was created. |
 
-## Pull from another node
+## Pull from another machine
 
 ```sh
 vowp session pull <node> <session>
@@ -247,7 +248,7 @@ vowp session pull --full vps 01KA1V0Z7A0000000000000000
 vowp --json session pull --full vps 01KA1V0Z7A0000000000000000
 ```
 
-`pull` exports the bundle from the named node over the existing SSH transport, stages it in a
+`pull` exports the bundle from the named machine over the existing SSH transport, stages it in a
 private temporary directory, verifies the format, protocol version and sha256 checksum locally,
 then imports it as a child session. It prints the source id and the new child id; `--json` prints
 `{"node","source_session","child_session"}`. The child follows the same rules as `session import`:
@@ -295,7 +296,7 @@ The choice is manual and the pull itself writes nothing locally: delete or expor
 pull again. There is no force flag and no merge. Both pull modes are one-way snapshots and no live
 lease is migrated. A bundle export writes its usual export capsule on the source; the directory
 export and head read are read-only and take no lock. For `--full`, leave the source lease released
-or quiescent while it runs and run the same build on both nodes. A failed ssh/remote read,
+or quiescent while it runs and run the same build on both machines. A failed ssh/remote read,
 truncated stream or checksum mismatch leaves the local home unchanged. Push, bidirectional
 sync/merge, live lease migration and an offline retry queue remain out of scope. For a local file
 copy use `session export` and `session import`.
@@ -311,7 +312,7 @@ vowp session watch --once --claude-dir ~/.claude
 `session watch` is an optional importer. It scans `*.jsonl` files under `--claude-dir`
 (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) and records user text, assistant text and tool
 calls; other line types are skipped. It reads transcripts read-only and never writes to Claude's
-files. The importer stores a byte cursor (offset plus the last complete line's id) in the node
+files. The importer stores a byte cursor (offset plus the last complete line's id) in the home
 database under `watch:<native session id>`, so a later pass imports only newly completed lines. A
 partial final line waits for its newline, and a transcript that shrank below the cursor restarts at
 zero. One Claude native uuid maps to one canonical VOWP session (`role=user`, title from the first
@@ -339,4 +340,4 @@ lineage. What does not: the harness's native tool-call history and reasoning. Th
 replaying a native session into a different harness is not reliable, and VOWP never fakes it.
 
 Next: [Using your phone](phone.md) for the SSH surface, or
-[Control machines and extra nodes](multi-node.md) for the machine-to-machine side.
+[Control machines and extra machines](multi-node.md) for the machine-to-machine side.

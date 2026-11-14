@@ -1,20 +1,20 @@
-# Control machines and extra nodes
+# Control machines and extra machines
 
 VOWP 0.3 has one **home** on a Linux VPS that owns the truth. Every other machine is either a **control machine**
-that talks to it or an **executor node** that runs work the home schedules. No control machine opens
+that talks to it or an **executor machine** that runs work the home schedules. No control machine opens
 a database; no second machine is authoritative.
 
 > **Status: current.** `vowp control`, `vowp tunnel`, `vowp fleet`, `vowp node`, the `--node` redirect
-> and cross-node session export/import/switch are implemented. Remote execution uses the home's
+> and cross-machine session export/import/switch are implemented. Remote execution uses the home's
 > session service; the same session is never written by two machines.
 
 ## What each machine is
 
 | Machine | Role | Holds |
 |---|---|---|
-| **home** | The VPS. Runs the one node supervisor, owns the global and project databases, session logs, leases and snapshot. | All truth. |
+| **home** | The VPS. Runs the one supervisor, owns the global and project databases, session logs, leases and snapshot. | All truth. |
 | **control machine** | A laptop or desktop. Reads the snapshot, opens tunnels, runs the app or `vowp chat`, sends writes to the home. | `~/.vowp-control/`: config, snapshot cache, spool, surface state and tunnel records. |
-| **executor node** | A registered machine that can run a turn. It can also be surface-only (`node add <name> -`) because it dials the home; the home never dials it. | Its own working copy and harness login. |
+| **executor machine** | A registered machine that can run a turn. It can also be surface-only (`node add <name> -`) because it dials the home; the home never dials it. | Its own working copy and harness login. |
 
 The phone is a control surface with no installation: an SSH app plus the owner's key, running
 `vowp chat` on the home. See [Using your phone](phone.md).
@@ -43,9 +43,9 @@ vowp fleet status
 ```
 
 `control init` probes the home, writes `~/.vowp-control/control.json` (0600), creates the spool, the
-surface state and the tunnel table, and records the home in `nodes.json`. It refuses to overwrite an
-existing configuration without `--force`; a failed probe is a warning unless `--strict` is passed.
-The setup path does the same thing:
+surface state and the tunnel table, and records the home in the machine registry (`nodes.json`). It
+refuses to overwrite an existing configuration without `--force`; a failed probe is a warning unless
+`--strict` is passed. The setup path does the same thing:
 
 ```sh
 vowp setup control --apply
@@ -91,9 +91,9 @@ removes records whose process died. There is no `close --all`: close what you op
 A tunnel is opened from the machine that will use it. On the home, `vowp tunnel` exits 5. Ports and
 pids are local to the control machine and never written to the snapshot or the session log.
 
-## Register executor nodes
+## Register executor machines
 
-The home's registry is the `nodes` table. On the home:
+The machine registry is the `nodes` table. On the home:
 
 ```sh
 vowp node add <node-name> <executor-ssh-target>
@@ -102,18 +102,18 @@ vowp node ls
 vowp node rm <node-name>
 ```
 
-`node add` probes `ssh -o BatchMode=yes <target> vowp --version` and stores the result in the node's
-capabilities. A failed probe is a warning unless `--strict` is passed; a surface-only node is
-registered without a probe because the home will never dial it. `node rm` refuses the local node.
+`node add` probes `ssh -o BatchMode=yes <target> vowp --version` and stores the result in the machine's
+capabilities. A failed probe is a warning unless `--strict` is passed; a surface-only machine is
+registered without a probe because the home will never dial it. `node rm` refuses the local machine.
 
 On a control machine, `node add/ls/rm` edit the control machine's `nodes.json` mirror rather than a
-home database. Add the home once with `control init` or `setup control`; add other nodes only when
+home database. Add the home once with `control init` or `setup control`; add other machines only when
 you need to address them from the laptop.
 
-## Use `--node`
+## Use `--node` (machine selector)
 
 `--node` is the v0.1 remote-command flag and still works. It re-executes the command over SSH on the
-target node:
+target machine:
 
 ```sh
 vowp --node <node-name> status
@@ -132,7 +132,7 @@ On a control machine, `--node home` addresses the configured home directly; othe
 `nodes.json`. `--node` is not a second database and does not make the remote authoritative: the home
 still owns the session logs and the supervisor.
 
-## Move a session between nodes
+## Move a session between machines
 
 The same session normally stays on the home while you change the surface. If you need a copy on a
 different machine, the v0.1 bundle path still works:
@@ -144,8 +144,8 @@ vowp session switch <id> --to <executor> --node <node-name>
 ```
 
 `export` writes a `vowp-bundle-v1` file with a capsule, the last events and a checksum. `import`
-validates it and creates a **child** session; the origin is never modified. A cross-node switch
-exports, imports and switches on the target, recording the node transition. In v0.3 this is for
+validates it and creates a **child** session; the origin is never modified. A cross-machine switch
+exports, imports and switches on the target, recording the machine transition. In v0.3 this is for
 copying or archiving; the normal multi-device path is one home with several surfaces.
 
 ## Remote execution and SSH drops

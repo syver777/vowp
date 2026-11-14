@@ -14,15 +14,15 @@ machines read that snapshot and send writes back to the home.
 vowp up                          # ensure tmux windows, detach the supervisor
 vowp up --foreground             # run the loop in this process (what systemd runs)
 vowp up --no-tmux                # skip the initial layout; jobs still use tmux windows
-vowp up --once                   # exactly one node tick, then exit
+vowp up --once                   # exactly one home tick, then exit
 vowp down                        # stop, wait up to 30 s
 vowp down --kill-windows         # also close this home's tmux windows
 vowp down --force                # send SIGTERM after the wait
 ```
 
 `vowp up` exits 4 if a supervisor is already running for the home. There is no per-project
-supervisor in v0.3. Each tick runs the node steps once (capacity sample, capacity advice, lease
-sweep, lifecycle, node requests) and then every active project in round-robin order, followed by the
+supervisor in v0.3. Each tick runs the machine steps once (capacity sample, capacity advice, lease
+sweep, lifecycle, machine requests) and then every active project in round-robin order, followed by the
 snapshot and the heartbeat. A project that fails to start or tick is parked with a reason and does
 not stop the others.
 
@@ -60,7 +60,7 @@ the watchdog contract: exit 1 means the heartbeat is stale.
 On a control machine it fetches the home's snapshot and caches it; when the home is unreachable it
 prints the cached answer with an `as of` time and `stale` marker. `fleet queue` lists queued jobs
 with their waiting reason (`waiting: RAM 1.2 GB short`, `waiting: provider deepseek 429`), and
-`fleet inbox` aggregates open node and project items.
+`fleet inbox` aggregates open machine and project items.
 
 `vowp board` is the refreshing view. With one project registered and selected it prints the v0.1 project
 board; with several projects, or no project selected, it prints the fleet board with a project column.
@@ -123,7 +123,7 @@ changes the target itself. The owner answers, and the orchestrator applies it wi
 `vowp capacity set`. If a run is OOM-killed, the supervisor records it, parks that job with a notice
 and raises its estimate; it does not kill other work.
 
-`[node].max_workers` and `[node].max_verifiers` in `vowp.toml` are per-project preferences. The node
+`[node].max_workers` and `[node].max_verifiers` in `vowp.toml` are per-machine preferences. The machine
 capacity manager decides actual admission; a target above the advice is honoured but the brakes still
 apply.
 
@@ -141,7 +141,7 @@ built-in rotation for the supervisor log, so use your normal log rotation.
 
 | Path | What it is |
 |---|---|
-| `~/.vowp/vowp.db` | Global database: nodes, projects, sessions, surfaces, leases, capacity, limits, catalog, node inbox and ledger. |
+| `~/.vowp/vowp.db` | Global database: machines (`nodes` table), projects, sessions, surfaces, leases, capacity, limits, catalog, machine inbox and ledger. |
 | `~/.vowp/projects/<name>/project.db` | Per-project database: jobs, edges, runs, gates, workers, loops, schedules, inbox, ledger, releases. |
 | `~/.vowp/sessions/<id>/log.jsonl` | Authoritative session content. |
 | `~/.vowp/snapshot.json` | Last fleet snapshot, replaced atomically every tick. |
@@ -198,7 +198,7 @@ action three times without new evidence stops and escalates rather than spinning
 
 Schedules are per-project rows; see the [schedules guide](schedules.md). `vowp schedule --all ls`
 lists every project's rows. A schedule can create a job, trigger a loop or run a command. Missed runs
-while the node was down either run once (`run_once`) or are skipped (`skip`); they never replay N
+while the machine was down either run once (`run_once`) or are skipped (`skip`); they never replay N
 times. The supervisor creates the nightly `gc-nightly` interval schedule in each project the first
 time lifecycle runs there.
 
@@ -309,7 +309,7 @@ keeper log (`keeper.log`) and the keeper pid (`keeper.pid`). `new` starts the ap
 supports it (an opencode server that binds loopback, or Claude Remote Control, which opens no local
 port and connects outbound to claude.ai) and prints desktop, phone and `vowp chat` join
 instructions. `stop` stops the host and releases the lease; the session stays. `resume` starts it
-again. A host that cannot start is marked `degraded` and does not stop the node supervisor.
+again. A host that cannot start is marked `degraded` and does not stop the supervisor.
 
 The join instructions use generic `<home-ssh-target>` and `<session>` placeholders; the control
 machine supplies the concrete target. The fallback is always `vowp chat <session-id>`.

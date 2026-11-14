@@ -4,7 +4,7 @@ VOWP 0.3 has two roles:
 
 | Role | What it is | What it owns |
 |---|---|---|
-| **home** | One Linux VPS. | The global database, every project database, all session logs and the one node supervisor. |
+| **home** | One Linux VPS. | The global database, every project database, all session logs and the one supervisor. |
 | **control machine** | A laptop, desktop or phone that talks to the home. | A snapshot cache, SSH tunnels and the local app configuration. It holds no truth. |
 
 Most people set up the home first, then make the computer they already use the control machine. The
@@ -55,7 +55,7 @@ cleanly at a hand-off instead of guessing:
 | `preflight` | Checks SSH, OS/architecture, disk, `git`, `tmux` and `curl`; reads no secret. |
 | `user` | Creates a non-root `vowp` user when sudo allows it; otherwise records no-sudo mode. |
 | `install` | Installs the pinned binary and verifies the version. |
-| `home` | Creates the home, the global database and the node registry, then runs `vowp doctor`. |
+| `home` | Creates the home, the global database and the machine registry, then runs `vowp doctor`. |
 | `service` | Installs the user unit `vowp.service`, enables linger and starts it. |
 | `vault` | Creates the vault user when sudo allows it, otherwise uses basic secret mode. It never stores a value. |
 | `projects` | Registers the repositories the owner named. A repository must already have `vowp.toml`; `vowp init` is offered, not forced. |
@@ -177,7 +177,7 @@ The install script does not run `vowp init` for you. Run it once per checkout, o
 
 | Path | Contents |
 |---|---|
-| `~/.vowp/vowp.db` | The global database: nodes, the project registry, sessions, surfaces, leases, capacity, limits and the catalog. The fleet snapshot is a separate file. |
+| `~/.vowp/vowp.db` | The global database: machines (`nodes` table), the project registry, sessions, surfaces, leases, capacity, limits and the catalog. The fleet snapshot is a separate file. |
 | `~/.vowp/projects/<name>/project.db` | One database per project: jobs, edges, runs, gates, workers, loops, schedules, inbox, ledger and releases. |
 | `~/.vowp/sessions/<id>/log.jsonl` | Authoritative conversation content. Append-only; never edited by hand. |
 | `~/.vowp/snapshot.json` | Last fleet snapshot, written every tick. |

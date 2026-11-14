@@ -15,11 +15,11 @@ surface holding the lease can write to it.
 The home is normally a Linux VPS that stays on. It owns:
 
 - the **global database**, `~/.vowp/vowp.db`, with the project registry, the session index, surfaces and
-  leases, provider limits, capacity history, the lifecycle catalog and the node inbox and ledger;
+  leases, provider limits, capacity history, the lifecycle catalog and the machine inbox and ledger;
 - **one database per project**, `~/.vowp/projects/<name>/project.db`, with that project's jobs, edges,
   runs, gate results, loops, schedules, inbox, ledger and releases;
 - every **session log** under `~/.vowp/sessions/<id>/`, including capsules and blobs;
-- the **node supervisor**, the capacity sampler, the tmux windows and `snapshot.json`.
+- the **supervisor**, the capacity sampler, the tmux windows and `snapshot.json`.
 
 A `Store` handle is bound to the global database plus exactly one project database. The supervisor
 holds one handle per active project and never attaches two project databases to one connection. Keep
@@ -55,8 +55,8 @@ registry commands are:
 
 A paused project still gets maintenance work — requests, reconcile, harvest, stalls, state changes,
 gates, verify, merge and the board — but no dispatch, triggers or work-creating schedules. An archived
-project gets no tick. If a project's step fails three ticks in a row, the node supervisor pauses only
-that project with a `broken: <error>` reason and writes a node-inbox notice; every other project keeps
+project gets no tick. If a project's step fails three ticks in a row, the supervisor pauses only
+that project with a `broken: <error>` reason and writes a machine-inbox notice; every other project keeps
 running.
 
 ## One supervisor, many projects
@@ -65,11 +65,11 @@ running.
 `~/.vowp/supervisor.lock`; a second `vowp up` exits 4. `vowp up` on a control machine refuses with exit
 5 because the control machine has no truth to run.
 
-Each tick does a node pass, then every active project's L1–L9 steps in fairness order:
+Each tick does a machine pass, then every active project's L1–L9 steps in fairness order:
 
 ```text
-0. node sample        capacity sample, stale-lease sweep, lifecycle tick
-1. global             apply drained node requests
+0. machine sample        capacity sample, stale-lease sweep, lifecycle tick
+1. global             apply drained machine requests
 2. projects           each active project in fairness order, each isolated by catch_unwind
 3. snapshot           write snapshot.json after the project steps
 4. board              write board.json for one active project, or the only paused project
@@ -80,9 +80,9 @@ The order comes from the fairness weight and the last admission. Higher-weight p
 within one weight the project admitted last moves to the back of its group, so a project that just got
 work does not stay first. A group with no recorded last admission starts from a per-tick rotating offset,
 and an unreadable registry falls back to name order with that offset. Every active project gets one L1
-tick per node tick. Within a project, job priority decides dispatch order.
+tick per home tick. Within a project, job priority decides dispatch order.
 
-`vowp up --once` runs startup plus exactly one node tick, which is useful for a cron check and for
+`vowp up --once` runs startup plus exactly one home tick, which is useful for a cron check and for
 tests. `vowp down` writes the stop file and waits; `--force` signals the supervisor and
 `--kill-windows` also removes the tmux windows. A systemd user unit with linger keeps the home alive
 across reboots.
@@ -163,9 +163,9 @@ Read commands:
 
 | Command | What it shows |
 |---|---|
-| vowp `fleet status [--refresh] [--cached]` | The node summary and snapshot wrapper. On a control machine it can fall back to the cache. |
+| vowp `fleet status [--refresh] [--cached]` | The machine summary and snapshot wrapper. On a control machine it can fall back to the cache. |
 | vowp `fleet queue [--project] [--state]` | Every queued job with its waiting reason. |
-| vowp `fleet inbox [--project] [--all]` | Node and project inbox items, oldest first. |
+| vowp `fleet inbox [--project] [--all]` | Machine and project inbox items, oldest first. |
 | vowp `fleet capacity` | The snapshot capacity card: target, advised target, run count, brake and `measured` (currently none). Use vowp `capacity show` for the full measured report. |
 | vowp `status` | The compact v0.1-compatible status plus the home and project rows. |
 | vowp `board [--once]` | The refreshing terminal board. With one project the output stays byte-compatible with v0.1. |
@@ -220,7 +220,7 @@ It works in a narrow terminal with no colour and supports:
 | `/quit` | Leaves, releasing the lease. |
 
 `vowp chat --follow` starts read-only. `--takeover` takes the lease before the first turn.
-`--executor` and `--node` choose where the first turn runs.
+`--executor` and `--node` choose the executor and the machine where the first turn runs.
 
 ### Remote execution
 
@@ -229,7 +229,7 @@ A turn may run on the surface's own machine instead of the home. The home remain
 1. the surface asks the home to begin a turn, with the lease token in a request document rather than on
    the command line;
 2. the home writes the framing events and a `runs` row, then returns a grant with the run id, prompt,
-   executor, node, environment **names**, lease token and tail sequence;
+   executor, machine, environment **names**, lease token and tail sequence;
 3. the client runs vowp `__exec --grant <file>` on its own machine; the grant file is mode 0600 and the
    token is never in argv or `ps`;
 4. the adapter writes every event to a local spool **before** sending it, then streams JSON lines to
@@ -240,8 +240,8 @@ A turn may run on the surface's own machine instead of the home. The home remain
 6. the client keeps a bounded in-flight window and replays from the first unacked event after an SSH
    drop. The spool survives a killed client, not just a killed SSH connection.
 
-The executor node owns its harness binary and any secret it injects; the home never sends a secret
-value over the wire, only environment-variable names. The run row and snapshot name the executor node.
+The executor machine owns its harness binary and any secret it injects; the home never sends a secret
+value over the wire, only environment-variable names. The run row and snapshot name the executor machine.
 A laptop that dials the home is registered once with vowp `node add <name> -`; the home never dials it.
 
 ## App surfaces and orchestrators
@@ -286,7 +286,7 @@ project. vowp `orchestrator new [--name] [--project] --app opencode|claude-code|
    the desktop, the phone and `vowp chat`.
 
 vowp `orchestrator ls` lists cards; vowp `orchestrator stop` stops the host and releases the lease (the session
-stays); vowp `orchestrator resume` starts it again. The node supervisor resumes orchestrators by itself
+stays); vowp `orchestrator resume` starts it again. The supervisor resumes orchestrators by itself
 after a home restart: startup starts every orchestrator whose state file says `running`. A live host
 whose token still owns the lease is reused; a live host that lost its lease (another surface may hold
 it) is left alone and logged. A host that cannot start is recorded as `degraded`, its error is logged,

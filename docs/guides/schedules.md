@@ -32,7 +32,7 @@ Options:
 |---|---|
 | `--name <name>` | Stable schedule name; unique per project. |
 | `--tz <UTC\|+HH:MM>` | Evaluation timezone. VOWP supports `UTC` and fixed offsets only. |
-| `--missed run_once\|skip` | What to do when a run was missed while the node was down. |
+| `--missed run_once\|skip` | What to do when a run was missed while the machine was down. |
 | `--template-file <path>` | `NewJob` JSON for `job-template`. |
 
 The command validates the cron/interval, computes and prints the next run, and stores the row. A bad
@@ -80,7 +80,7 @@ planner heartbeat is not a schedule; it is L4's own 30-minute heartbeat.
 
 ## Missed runs and idempotency
 
-The node may be down at the scheduled time. When a schedule is due:
+The machine may be down at the scheduled time. When a schedule is due:
 
 - If it is at most two ticks late, it fires normally.
 - With `run_once`, it fires **once** for the earliest missed occurrence, never N times.

@@ -24,7 +24,7 @@ v0.3 has three kinds of place:
   per project, the session logs, the snapshot, the capacity sampler and the tmux windows.
 - **Control machines** are where people talk to the home: a laptop, a desktop app, or a phone with an
   SSH client. They hold no truth. They cache a snapshot, open SSH tunnels and run a surface.
-- **Executor nodes** run a turn's harness. The home is the default executor node; a laptop can be
+- **Executor machines** run a turn's harness. The home is the default executor machine; a laptop can be
   registered as an executor so its own files, browser and tunnels are available to the session.
 
 A **surface** is where a person is talking to a session right now: the opencode desktop app, a Claude
@@ -81,22 +81,22 @@ nothing else.
 
 | Term | Meaning |
 |---|---|
-| **Home** | The machine that owns the global DB, the project DBs, the session logs, the snapshot and the one node supervisor. One per installation in v0.3. |
+| **Home** | The machine that owns the global DB, the project DBs, the session logs, the snapshot and the one supervisor. One per installation in v0.3. |
 | **Control machine** | A computer or phone that talks to the home. It holds no truth; it may cache a snapshot. |
-| **Node** | A machine name in the `nodes` registry. The home is the only node that writes; a laptop can be an executor node. |
+| **Machine** | A registered execution host: the VPS home, a laptop, a desktop. The home is the only machine that writes; a laptop can be an executor machine. The CLI command `vowp node` and the `nodes` table keep the old name for compatibility. |
 | **Project** | One git repository registered on the home. v0.3 runs every active project under one supervisor. |
 | **Harness** | An agent program: Claude Code, opencode, Codex, Gemini CLI, … |
 | **Adapter** | VOWP code that drives one harness headlessly and turns its output into canonical events. |
 | **Session** | A universal, harness-neutral conversation with a stable id and an append-only event log on the home. |
 | **Surface** | Where a person talks to a session now: an app, `vowp chat` or an MCP server. |
 | **Lease** | The right of one surface to send input to one session. A lease without a heartbeat for 60 s is free. |
-| **Executor** | One concrete way to run a model: `harness:model[@effort][#variant]`, plus the node that runs it. |
+| **Executor** | One concrete way to run a model: `harness:model[@effort][#variant]`, plus the machine that runs it. |
 | **Profile** | A role's ordered ladder of executors (rung 0 is preferred). |
-| **Capsule** | A structured handoff written when a session switches harness, model, node or surface. |
+| **Capsule** | A structured handoff written when a session switches harness, model, machine or surface. |
 | **Switch** | Moving a session to another executor, recorded as lineage. |
 | **Window** | Only a tmux view onto live work. A window is never a surface. |
 | **Orchestrator** | The long-lived session that reads the fleet snapshot, proposes changes and asks the owner before applying them. |
-| **Job** | A graph node: one unit of work with a brief, owned paths, gates and a report. |
+| **Job** | One unit of work with a brief, owned paths, gates and a report; a **job node** in the graph. |
 | **Edge** | A relation between jobs: `needs`, `verifies`, `fixes`, `escalates`, `blocks`. |
 | **Graph** | Jobs plus edges. A DAG except for bounded `fixes` loop edges. |
 | **Gate** | A machine-checkable condition with recorded evidence. |
@@ -104,10 +104,10 @@ nothing else.
 | **Supervisor** | The deterministic program that runs the loops (`vowp up`). |
 | **Role** | `planner`, `keeper`, `worker`, `verifier` or `orchestrator`. |
 | **Slot** | A concurrent worker place, also a tmux window. |
-| **Inbox** | Questions, notices and approvals waiting for a human. Project items live in the project DB; node items in the global DB. |
+| **Inbox** | Questions, notices and approvals waiting for a human. Project items live in the project DB; machine items in the global DB. |
 | **Ledger** | Append-only record of dispatches, gate results, merges, costs and switches. |
 | **Snapshot** | `~/.vowp/snapshot.json`, the derived read model written every tick. |
-| **Capacity target** | The number of concurrent runs the node admits, set by measurement (`auto`) or the owner (`fixed`). |
+| **Capacity target** | The number of concurrent runs the machine admits, set by measurement (`auto`) or the owner (`fixed`). |
 | **Lifecycle class** | What a file is and whether it may ever be deleted: production, truth, open work, secrets, or a disposable class. |
 | **Environment** | Where code runs: `work` (staging) and `prod`, each with its own checkout and guards. |
 | **Promotion** | Moving a verified change to an environment through guards, with a snapshot and rollback. |
@@ -118,7 +118,7 @@ nothing else.
    its `needs` edges, and writes the brief. The planner can do the same through the CLI.
 2. **Ready.** The project's L1 loop sees that every `needs` job is `done` and moves the job from
    `pending` to `ready`.
-3. **Admitted.** Before a worker slot is used, the node capacity manager checks the brake, the provider,
+3. **Admitted.** Before a worker slot is used, the machine capacity manager checks the brake, the provider,
    the worker target, RAM, CPU and disk. A job that cannot start stays `ready` and shows the reason
    (`waiting: RAM 1.2 GB short`) in the queue and the snapshot.
 4. **Dispatched.** When capacity is available, the job's owned paths do not overlap another running job,
@@ -148,7 +148,7 @@ directory.
 ```
 ~/.vowp/
 ├─ vowp.db                     global DB: registry, sessions index, surfaces/leases,
-│                              limits, capacity, catalog, node inbox and ledger
+│                              limits, capacity, catalog, machine inbox and ledger
 ├─ projects/<name>/project.db  one DB per project: jobs, edges, runs, gates, loops,
 │                              schedules, project inbox and ledger, releases
 ├─ sessions/<sessionId>/
@@ -159,7 +159,7 @@ directory.
 │    └─ adapters.json          harness-side session ids
 ├─ orchestrators/<name>/       project-local app config, lease token and host state
 ├─ secrets/                    basic-mode secret files (0700/0600); never backed up
-├─ snapshot.json               node read model, rewritten atomically every tick
+├─ snapshot.json               machine read model, rewritten atomically every tick
 ├─ board.json                  v0.1 copy for one active project (or the only paused one)
 ├─ migration.json              present only while a v0.1 → v0.2 migration is in flight
 ├─ archive/projects/<name>-<ts>/  vowp `project rm` archive
@@ -175,7 +175,7 @@ A control machine keeps only derived state:
 ```
 ~/.vowp-control/
 ├─ control.json                role, home name, SSH target, remote home (0600)
-├─ nodes.json                  node registry mirror
+├─ nodes.json                  machine registry mirror
 ├─ snapshot.json               last snapshot from the home
 ├─ snapshot.meta.json          when it was fetched and from where
 ├─ spool/<session>/<run>/       unacked remote events and their ack file
@@ -196,7 +196,7 @@ see [data lifecycle](data-lifecycle.md).
 
 ## What v0.3 includes
 
-- One node supervisor for every active project, with project pause/resume/archive and a broken project
+- One supervisor for every active project, with project pause/resume/archive and a broken project
   parked alone.
 - The global + per-project database split, the v0.1 → v0.2 migration, and a per-project archive
   directory.
@@ -208,7 +208,7 @@ see [data lifecycle](data-lifecycle.md).
   opencode and Claude app hosts, the MCP server, `vowp chat` and orchestrator sessions.
 - Control machines: vowp `control init`, snapshot cache, SSH tunnels, and phone access with an SSH app.
 - The v0.3 loopback HTTP/SSE daemon, web/PWA window and phone-friendly board, plus the ACP adapter
-  and explicit session pull between nodes.
+  and explicit session pull between machines.
 - Secrets in basic or vault-user mode, injected by name, with exact-value redaction in session logs, capsules, report artifacts and the snapshot.
 - Lifecycle classes, vowp `gc`, closed-session compaction, backup/restore and the nightly GC schedule.
 - AI-first setup: vowp `setup plan`, vowp `setup home` and vowp `setup control`.

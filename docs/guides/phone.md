@@ -77,7 +77,7 @@ and tool calls appear as `· tool: <name>`.
 
 | Slash command | Use it when |
 |---|---|
-| `/status` | You want the session, executor, node and lease state. |
+| `/status` | You want the session, executor, machine and lease state. |
 | `/takeover` | The laptop still holds the session and you want it on the phone (not in follow mode; reopen with `--takeover` instead). |
 | `/follow` | You only want to read and not take the lease. |
 | `/switch <executor>` | The current provider is limited or you want another model. |
@@ -141,4 +141,4 @@ with a tunnel. Never paste a key into the chat, a report or an issue. The honest
 | The phone is lost | Revoke its key in `~/.ssh/authorized_keys` on the home and remove the app's stored key. The session is unchanged. |
 
 Next: [Sessions and surfaces](sessions.md) for the full lease and switch rules, or
-[Control machines and extra nodes](multi-node.md) for tunnels and `--node`.
+[Control machines and extra machines](multi-node.md) for tunnels and `--node`.

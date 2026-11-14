@@ -1,11 +1,11 @@
 # Graph and loops
 
-The graph is the plan; the loops are what keep it moving. A job is a node in the graph, a role is who
+The graph is the plan; the loops are what keep it moving. A job is a **job node** in the graph, a role is who
 does it, and a gate is how the result is checked. The supervisor is a deterministic program that walks
 the graph every tick, starts work, records evidence and moves states. Models are asked for judgment only.
 
 > **Status: current.** The graph engine and the `vowp job`/`vowp graph` commands are implemented. One
-> node supervisor (`vowp up`) runs the loops for every active project on the home, in fairness order.
+> supervisor (`vowp up`) runs the loops for every active project on the home, in fairness order.
 
 ## Jobs
 
@@ -100,7 +100,7 @@ These commands are implemented today, including the supervisor commands (`vowp u
 1. **Only `ready` jobs are dispatched**, by priority and then age, after capacity admission succeeds.
 2. **Ownership locks.** No two running jobs may have overlapping `owns` globs. Conflicts wait. A fix job
    and the job it fixes are treated as one holder, so the fix does not deadlock the original.
-3. **Measured capacity, provider concurrency and ordering.** The node capacity manager checks the brake,
+3. **Measured capacity, provider concurrency and ordering.** The machine capacity manager checks the brake,
    the provider limit, the worker target, RAM, CPU and disk before a job is dispatched; a wait leaves the
    job `ready` with a reason. Planner and keeper turns start when due outside this path, and the merge
    queue bypasses it. Projects tick by fairness weight, highest first; inside one weight the project
@@ -132,7 +132,7 @@ These commands are implemented today, including the supervisor commands (`vowp u
 
 ### The L1 tick
 
-A node tick first samples capacity, sweeps stale leases and runs the lifecycle tick, then runs each
+A machine tick first samples capacity, sweeps stale leases and runs the lifecycle tick, then runs each
 active project's L1 steps in fairness order. Within one project, each tick is wrapped so one failing
 step never aborts the rest. The order is:
 
@@ -232,7 +232,7 @@ at their parent and hand control back.
 
 ## The job contract: brief and report
 
-A brief is the job's contract. The generated front-matter comes from the graph node; the body is written
+A brief is the job's contract. The generated front-matter comes from the job node; the body is written
 by the planner or the person creating the job.
 
 ```markdown

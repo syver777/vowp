@@ -1,7 +1,7 @@
 # Running a home on a VPS
 
 VOWP 0.3 is VPS-first: **the VPS is the framework's home.** One Linux server owns the global database,
-one database per project, every session log and the single node supervisor. A laptop, desktop or phone
+one database per project, every session log and the single supervisor. A laptop, desktop or phone
 is a **control machine**: it talks to the home, caches the last snapshot and opens tunnels, but holds
 no truth. This guide takes a fresh server to a supervised fleet and, where useful, points at the
 control-machine side.
@@ -111,7 +111,7 @@ vowp init --name <your-project>
 ```
 
 `vowp init` writes `vowp.toml`, the framework files, `.vowp/jobs` and `.vowp/checkpoints`, creates
-`~/.vowp/vowp.db` and `~/.vowp/projects/<your-project>/project.db`, registers the local node and the
+`~/.vowp/vowp.db` and `~/.vowp/projects/<your-project>/project.db`, registers the local machine and the
 project, and seeds the default loops. Commit the generated files before the first run:
 
 ```sh
@@ -161,8 +161,8 @@ the home.
 For `claude-code` or `opencode`:
 
 ```toml
-[node]
-max_workers = 4          # a per-project preference; capacity decides admission
+[node]                  # machine settings; the key keeps the old name
+max_workers = 4          # a per-machine preference; capacity decides admission
 max_verifiers = 2
 
 [profiles.planner]
@@ -252,13 +252,13 @@ dispatched job still needs a window.
 vowp up                          # ensure the tmux layout, detach the supervisor
 vowp up --foreground             # run the loop in this process (what systemd runs)
 vowp up --no-tmux                # skip windows; jobs still need tmux
-vowp up --once                   # exactly one node tick, then exit
+vowp up --once                   # exactly one home tick, then exit
 ```
 
 There is **one supervisor for every active project**. `up` creates a `vowp-home` tmux session with
 `board` and `capacity`, plus one `vowp-<project>` session for every non-archived project (including
-paused ones). `--once` is useful as a smoke test; it runs the node steps, every project in
-round-robin order and the snapshot write. `up` exits 4 if a supervisor already holds the node lock;
+paused ones). `--once` is useful as a smoke test; it runs the machine steps, every project in
+round-robin order and the snapshot write. `up` exits 4 if a supervisor already holds the home lock;
 `vowp status` shows the pid.
 
 `up` runs the v0.1-to-v0.2 migration automatically for an old home, after taking a backup. Pass
@@ -349,7 +349,7 @@ vowp capacity set --mode auto
   never kill running work.
 - A queued job shows its reason, such as `waiting: RAM 1.2 GB short` or `waiting: provider deepseek
   429`.
-- `[node].max_workers` and `max_verifiers` are per-project preferences, not a product-imposed cap.
+- `[node].max_workers` and `max_verifiers` are per-machine preferences, not a product-imposed cap.
 
 The full model is in [Operating a home](operating.md#capacity) and the
 [capacity specification](../design/v0.2/home-and-surfaces.md#6-capacity-measured-admitted-braked-advised).
@@ -445,7 +445,7 @@ vowp project ls
 vowp up
 ```
 
-Each project has its own `projects/<name>/project.db`, its own tmux session and its own jobs. The node
+Each project has its own `projects/<name>/project.db`, its own tmux session and its own jobs. The home
 supervisor ticks them round-robin, sharing the home's CPU, memory, harness logins and provider limits;
 capacity admission and the project weight decide who runs next. A broken project parks itself and
 opens an inbox notice without stopping the others. `vowp project pause` stops new dispatch while
@@ -453,7 +453,7 @@ running work finishes.
 
 The old "one project per `VOWP_HOME`" workaround belongs to v0.1. Do not use it on a v0.3 home.
 
-## Multiple nodes and the control machine
+## Multiple machines and the control machine
 
 A laptop or phone does not need its own supervisor. Configure it as a control machine, then read and
 write through the home:
@@ -466,8 +466,8 @@ vowp fleet status
 
 Every project/fleet command on the control machine routes to the home over SSH; `vowp up`, `down` and
 `board` refuse there because they need local truth. The rest of the machine-to-machine details,
-including tunnels and executor nodes, are in
-[Control machines and extra nodes](multi-node.md).
+including tunnels and executor machines, are in
+[Control machines and extra machines](multi-node.md).
 
 ## Upgrade and migration
 
@@ -527,5 +527,5 @@ outbound access to the git remote and to the harness's provider.
 | `MigrationRequired` | Stop the supervisor and run `vowp migrate --dry-run`, then `vowp migrate --yes`. |
 
 The [troubleshooting guide](../troubleshooting.md) covers exit codes, gates, capacity, sessions and
-remote failures. Next: [Control machines and extra nodes](multi-node.md), or
+remote failures. Next: [Control machines and extra machines](multi-node.md), or
 [Sessions and surfaces](sessions.md) for the app and phone side.

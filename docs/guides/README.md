@@ -18,7 +18,7 @@ always-on VPS, and the control machine is only a surface.
 | [Sessions and surfaces](sessions.md) | Chat, take a session over from another device, switch model or harness, export/import. |
 | [Using your phone](phone.md) | Reach the home from an SSH app and continue the same session. |
 | [Running a home on a VPS](vps.md) | Prepare the server, register projects, run under systemd and lock down SSH. |
-| [Control machines and extra nodes](multi-node.md) | Set up the laptop or phone side, open tunnels and use `--node`. |
+| [Control machines and extra machines](multi-node.md) | Set up the laptop or phone side, open tunnels and use `--node`. |
 | [Schedules](schedules.md) | Run a job, loop or command on a cron or interval schedule. |
 
 The vocabulary is the one in the [v0.2 home and surface specification](../design/v0.2/home-and-surfaces.md):

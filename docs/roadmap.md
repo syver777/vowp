@@ -20,7 +20,7 @@ the code under `crates/`.
 
 | Capability | What ships in one line | Proof |
 |---|---|---|
-| One home | A global DB plus one DB per project, one node supervisor for every active project, project registry, migration from v0.1 with row-count checks and rollback. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md), [`docs/design/v0.2/home-and-surfaces.md`](design/v0.2/home-and-surfaces.md) |
+| One home | A global DB plus one DB per project, one supervisor for every active project, project registry, migration from v0.1 with row-count checks and rollback. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md), [`docs/design/v0.2/home-and-surfaces.md`](design/v0.2/home-and-surfaces.md) |
 | Fleet read model | `snapshot.json` every tick, `vowp fleet status\|queue\|inbox\|capacity`, `vowp schema snapshot`, a board that shows every project. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md#the-read-model) |
 | Measured capacity | Host sampler, per-run measurement, p50/p90 estimates, admission with waiting reasons, brakes that never kill, owner targets and override, AI advice through the inbox. | [`docs/concepts/capacity.md`](concepts/capacity.md) |
 | Sessions on surfaces | One append-only log on the home; leases with heartbeat and takeover; read-only follow mode; `vowp chat`. | [`docs/concepts/sessions-and-switching.md`](concepts/sessions-and-switching.md), [`docs/design/sessions.md`](design/sessions.md) |
@@ -46,7 +46,7 @@ server joined through an SSH tunnel and the one-time secret paste page.
 - **No public HTTP or SSE API.** The v0.3 daemon API binds loopback and is reached through SSH; there
   is no public listener.
 - **No cost dashboard.** The ACP adapter ships in v0.3; the cost dashboard remains deferred.
-- **No cross-node live sync.** v0.3 adds explicit session pull; there is no automatic directory sync.
+- **No cross-machine live sync.** v0.3 adds explicit session pull; there is no automatic directory sync.
 - **No multi-user accounts, quotas, roles or audit.** One operator per home is the supported shape.
 - **No VPS metrics history, parallel fan-out policies or hosted relay.** These need identity,
   policy or infrastructure that v0.2 does not provide.
@@ -71,27 +71,27 @@ ship in 0.3.0; the remaining rows are deferred.
 | Item | What it adds | Design note |
 |---|---|---|
 | Daemon HTTP + SSE API | A loopback REST API and an event stream for jobs, sessions, events, board, inbox and cost. | [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
-| Web / PWA window | Nodes, sessions, a session view with an executor switcher and capsule view, and the board. | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
+| Web / PWA window | Machines, sessions, a session view with an executor switcher and capsule view, and the board. | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
 | Phone-friendly board | A mobile-first board page that installs as a PWA and shows the same snapshot as `vowp fleet status --json`. | [`design/v0.3/phone-board.md`](design/v0.3/phone-board.md) |
 | ACP adapter | One adapter for Agent Client Protocol servers, with richer events and a permission flow. | [`design/v0.2/acp-adapter.md`](design/v0.2/acp-adapter.md) |
 | Cost dashboard | Spend by day, job, role, provider and model; receipts, price-table estimates and unknown costs stay separate. | [`design/v0.2/cost-dashboard.md`](design/v0.2/cost-dashboard.md) |
-| Cross-node session sync | Directory-level sync or same-id continuation beyond the v0.2 remote executor. | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
+| Cross-machine session sync | Directory-level sync or same-id continuation beyond the v0.2 remote executor. | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
 | Multi-user and quotas | Accounts, per-user projects, role-based permissions, spend quotas and an audit trail. | — |
-| VPS metrics | CPU, memory, disk, load and process health per node, with alerts and history. | — |
+| VPS metrics | CPU, memory, disk, load and process health per machine, with alerts and history. | — |
 | Parallel fan-out | Split one job into several candidates under a bounded budget, compare evidence and pick a winner. | — |
-| Hosted relay | Connect nodes behind NAT without SSH, with authentication, end-to-end encryption and abuse/cost controls. | — |
+| Hosted relay | Connect machines behind NAT without SSH, with authentication, end-to-end encryption and abuse/cost controls. | — |
 
 The order above is the recommended dependency order, not a schedule. The API and its wire contract
 come first because the window, phone board and cost dashboard all consume it.
 
-## v0.4 — local surface and local node
+## v0.4 — local surface and local machine
 
 This is a design direction, not a commitment. 0.3 keeps the VPS as the only home. The 0.4 work asks
 how the owner can run the orchestrator on their own machine with local context while the VPS stays
 the only writer:
 
 - a **local surface** — the app runs locally, the session log and lease stay on the home;
-- a **local node** — an outbound-only agent that executes offloaded jobs with per-node path mapping.
+- a **local machine** — an outbound-only agent that executes offloaded jobs with per-machine path mapping.
 
 The home remains the source of truth; the local machine is a surface and an executor, not a second
 home. The first deliverable is a design note, not code.

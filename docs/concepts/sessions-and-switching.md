@@ -18,14 +18,14 @@ sessions as attachments:
 | `~/.vowp/sessions/<id>/log.jsonl` | Canonical conversation content. Append-only, one event per line. |
 | `~/.vowp/vowp.db` (`sessions`, `session_events`, `session_natives`, `capsules`) | Rebuildable index for session history and the board. |
 | `~/.vowp/vowp.db` (`surfaces`, `leases`) | Live surface and lease state; not rebuilt from the logs. |
-| `sessions/<id>/adapters.json` | Harness-side session ids per node, append-only. |
+| `sessions/<id>/adapters.json` | Harness-side session ids per machine, append-only. |
 | `sessions/<id>/blobs/<sha256>` | Content-addressed tool output, diffs and attachments. |
 | `sessions/<id>/capsules/*.json` | Handoff documents. |
 | `~/.vowp/orchestrators/<name>/` | Project-local app config, lease token and host state for an orchestrator. |
 
 Deleting `vowp.db` loses no conversation content; `vowp reindex` rebuilds the session index from the
 logs. Live surface and lease rows are recreated as surfaces reconnect. Copying a session directory to
-another node makes it readable there after a reindex. The origin session is never modified by an import.
+another machine makes it readable there after a reindex. The origin session is never modified by an import.
 
 ## One log, many surfaces
 
@@ -161,7 +161,7 @@ schema, stored both as a file and in the global database.
 - **When:** an explicit switch, a takeover, a provider limit, context pressure, a manual request, a job
   end, or an export. Debounced to one capsule per session per 120 seconds, except for switch, takeover,
   manual, export and limit triggers. A turn end does not write a capsule by itself.
-- **Who writes it:** the cheapest capable executor on the node, by default the last rung of the `keeper`
+- **Who writes it:** the cheapest capable executor on the machine, by default the last rung of the `keeper`
   profile. The capsule run gets its own throwaway session so it never pollutes the log it summarises.
 - **Input:** the previous capsule plus replayable events after its `at_seq`. Tool results are dropped
   first, then long assistant messages are truncated, then the oldest events are dropped, always keeping
@@ -180,7 +180,7 @@ another executor. The same protocol runs automatically for failover and context 
 |---|---|
 | 1. Freeze | Refuse if already switching; reject new input. |
 | 2. Plan | Insert a `switches` row (`started`) with source, target, reason and last seq. |
-| 3. Probe | Run the target adapter's local `probe()`. A remote target node is probed over SSH; a failed or timed-out probe aborts before the source is touched. |
+| 3. Probe | Run the target adapter's local `probe()`. A remote target machine is probed over SSH; a failed or timed-out probe aborts before the source is touched. |
 | 4. Drain | Wait up to 5 seconds for the current turn. On timeout it interrupts and stops the run, then continues the switch. The later waits for the runner to finish and release the log are also bounded; if one of those expires, the switch aborts and restores the source. |
 | 5. Capsule | Write a switch capsule (never debounced). Use the previous one if repair fails. |
 | 6. Detach | Stop the source and append `session.executor{detach}`. |
@@ -220,7 +220,7 @@ session while the home remains the only writer:
 
 1. the surface asks the home to begin a turn; the lease token is in a request document, not on the
    command line;
-2. the home writes the framing events and a `runs` row with the executor node, then returns a grant;
+2. the home writes the framing events and a `runs` row with the executor machine, then returns a grant;
 3. the client runs vowp `__exec --grant <file>` on its own machine; the grant file is mode 0600 and the
    token is never in argv or `ps`;
 4. the adapter writes every event to a local spool **before** sending it, then streams JSON lines to
@@ -231,13 +231,13 @@ session while the home remains the only writer:
 6. the client keeps a bounded in-flight window and replays from the first unacked event after an SSH
    drop. The spool survives a killed client, not only a killed SSH connection.
 
-The executor node owns its harness binary and any secret it injects; the home sends environment-variable
+The executor machine owns its harness binary and any secret it injects; the home sends environment-variable
 names, never values. A laptop that dials the home is registered once with vowp `node add <name> -`; the home
 never dials it.
 
 ## Export and import
 
-Sessions stay on the home in v0.3, and a switch to another executor node no longer copies the session
+Sessions stay on the home in v0.3, and a switch to another executor machine no longer copies the session
 directory. Export/import remains an explicit file copy for a backup, a test fixture or a deliberate
 sibling session:
 
@@ -255,12 +255,12 @@ origin session is never modified, and importing the same bundle twice creates tw
 
 ## Windows
 
-`vowp up` ensures one `vowp-home` session for the node and one `vowp-<project>` session per active
+`vowp up` ensures one `vowp-home` session for the home and one `vowp-<project>` session per active
 project. All windows are views:
 
 | Session | Window | Contents |
 |---|---|---|
-| `vowp-home` | `board` | The node board with every project. |
+| `vowp-home` | `board` | The home board with every project. |
 | `vowp-home` | `capacity` | The capacity report, redrawn on a TTY. |
 | `vowp-<project>` | `board` | The project dashboard. |
 | `vowp-<project>` | `supervisor` | `~/.vowp/logs/supervisor.log`. |
@@ -279,7 +279,7 @@ the session id for `vowp session tail <session-id> --pretty --follow`.
 The optional `vowp session watch` importer records interactive Claude Code transcripts into canonical
 sessions without running the harness. `vowp session watch --once` scans the transcript JSONL under
 `$CLAUDE_CONFIG_DIR` or `~/.claude` with read-only opens, maps user/assistant text and tool calls to
-events, and never writes to Claude's files. It stores the processed line count in the node database
+events, and never writes to Claude's files. It stores the processed line count in the home database
 under `watch:<native session id>`; a later scan imports only the new lines and skips a transcript that
 is shorter or unchanged. Continuous following is not available: without `--once`, a terminal run exits
 2 with a message to use `--once`.
