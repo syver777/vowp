@@ -24,15 +24,164 @@ licensed.
 | **Work where the files are** | An outbound Mac or Linux **agent node** can run a local chat or opencode surface and opt-in offloaded jobs; the VPS stays the only home. |
 | **Guarded delivery** | Evidence gates, an independent verifier, one merge queue and reversible Work → Production. |
 
-A laptop sleeps, changes networks and carries your local context. A VPS stays on, has one address and
-one database. VOWP puts the fleet there, so sessions, jobs, workers, schedules and history survive a
-closed laptop, and any surface can reconnect to the same session. Your Mac, desktop or phone is the
-control surface; it holds no truth.
-
 **Vocabulary:** a **machine** is a registered execution host — the VPS home, your Mac, a laptop. A
 **job** is one unit of work; when talking about the graph, it is a **job node**. A **slot** is a
 concurrency place, and a **window** is a tmux view. The CLI command `vowp node` manages SSH machines;
 `vowp agent` manages the local agent node.
+
+## How VOWP works
+
+[![The whole picture: you steer from any device, the VPS home runs the supervisor, databases, job graphs, the verify/fix loop and the universal session log, and workers or an agent node do the work](docs/images/vowp-overview.png)](docs/media/vowp-explainer.mp4)
+
+**▶ [Watch the two-minute pixel explainer](docs/media/vowp-explainer.mp4)** (1080p, no sound). Every
+picture on this page is a frame of that video; both are drawn by code in
+[`docs/media/src`](docs/media/README.md), so they can be regenerated when VOWP changes.
+
+In one paragraph: you give VOWP a goal from whatever app you are in. The **home** — an always-on
+VPS — stores it in a project database, a planner turns it into a **job graph**, and a deterministic
+**supervisor** starts workers (stock Claude Code, opencode or Codex CLI runs) on the ready job nodes,
+each in its own git worktree. Every result is checked by **gates** and an independent **verifier**;
+a failure gets a bounded **fix loop**, and if two fixes fail the job is parked with an explanation in
+your **inbox** while everything else keeps going. Passing work goes through a single **merge queue**.
+All of it is written to the home's databases and append-only **session logs**, so the work survives a
+closed laptop, a crash or a provider limit and can run for days.
+
+### 1 · The always-on machine is the home
+
+![Why a VPS: a laptop sleeps, changes networks and stops its agents; a VPS is always on with one address and one database](docs/images/vowp-why.png)
+
+A laptop sleeps, changes networks and carries local state. A VPS stays on, has one address and one
+database. VOWP puts the fleet there and makes it the **home**: the only writer and the single source of
+truth. Your Mac, desktop and phone become **control surfaces** — they send commands over key-only SSH
+and keep nothing but a cached snapshot.
+
+![The home: control surfaces connect over SSH to one VPS that runs the supervisor, the global DB, one DB per project, the session logs, the snapshot and the workers](docs/images/vowp-home.png)
+
+| On the home (`~/.vowp`) | What it is |
+|---|---|
+| **Supervisor** | One deterministic process. Ticks every 60 s for every active project, runs loops L1–L9, never "decides to stop". A watchdog restarts it. |
+| **Global DB** `vowp.db` | The fleet: project registry, session index, surfaces and leases, machines and workers, capacity, provider limits, the machine inbox and secret *names*. |
+| **Project DBs** `projects/<p>/project.db` | One per project: jobs and edges, runs, gate results, loops, schedules, the project inbox, ledger and releases. |
+| **Session logs** `sessions/<id>/log.jsonl` | The conversation itself, append-only and harness-neutral, plus blobs, capsules and summaries. |
+| **Snapshot** `snapshot.json` | The read model every surface shows, rewritten atomically each tick. |
+| **Workers** | Stock harnesses in tmux windows and git worktrees. VOWP drives their documented headless modes and never touches their logins. |
+
+The home opens **no public port**. App servers and the one-time secret page listen on `127.0.0.1` and
+are reached through SSH tunnels.
+
+### 2 · Sessions are universal
+
+![One session log with user, assistant, tool, capsule, switch and lease events; the harness, machine and surface can all change while the log continues](docs/images/vowp-sessions.png)
+
+A session is one append-only event log owned by the home, not by a harness. The same session can
+start in Claude Code, continue in opencode, move from the VPS to your Mac and be picked up from your
+phone. A switch writes a **capsule** (a handoff document) into the log, so the next harness or model
+starts with the full context. Exactly one surface holds the **write lease**; a takeover moves it and
+the old surface keeps following read-only. Sessions export and import as a native bundle or an ASIF
+package.
+
+### 3 · Orchestrate on the VPS or on your own machine
+
+![Two ways to orchestrate: on the VPS through an SSH tunnel, or on your machine as an outbound agent node; both read and write the same home](docs/images/vowp-orchestrate.png)
+
+- **On the VPS:** the orchestrator runs on the home — an opencode server on `127.0.0.1` or the Claude
+  app through VOWP's MCP server. Attach from any device through a tunnel; close the lid and it keeps
+  going.
+- **On your machine:** enroll your Mac or Linux box as an **agent node**. It dials *out* to the home,
+  runs a local chat or opencode surface where your files are, and can take opt-in offloaded jobs that
+  return committed work. It has its own harness login and keys; home-only secrets never leave the home.
+
+Either way it is the same session, the same databases and the same inbox, and you can switch between
+them per task.
+
+### 4 · A global database and one database per project
+
+![The global database holds the fleet; each project database holds its queue as pending, ready, running, review and done jobs, plus runs, gates, schedules and the inbox](docs/images/vowp-databases.png)
+
+SQLite is the truth for **decisions**; plain files are the truth for **content** (briefs, reports,
+logs). The global DB knows the fleet; each project DB knows its own queue — what is pending, ready,
+running, in review and done — plus every run, gate result, schedule and inbox item. Projects tick in
+fairness order and are isolated: one can be paused or broken while the rest keep running. Kill
+everything, restart, and the supervisor reconciles from the databases, the logs and git.
+
+### 5 · Goals become a job graph
+
+![A job graph: plan, spec, three parallel build and docs jobs run by different workers, then an end-to-end test and the merge into main](docs/images/vowp-graph.png)
+
+A **job node** is one unit of work with a contract: a brief, the paths it **owns**, the jobs it
+**needs** and the **gates** that decide when it is done. Edges are `needs`, `verifies`, `fixes`,
+`escalates` and `blocks`. The supervisor dispatches only `ready` nodes, by priority then age, after
+checking measured capacity, provider limits and ownership locks — no two running jobs may own the same
+paths. Each job gets its own worktree and branch `job/<id>`, and only the merge queue writes `main`.
+
+| Worker role | Does |
+|---|---|
+| `planner` | Turns goals into jobs, reprioritises, reviews reports. |
+| `worker` | Builds, tests, writes docs — runs a job from its brief. |
+| `verifier` | Independently checks a report, diff and evidence; returns pass or findings. |
+| `keeper` | Diagnoses stalls and failures: nudge, restart, replan, park or fail. |
+
+### 6 · Verify → fix → inbox
+
+![The verify/fix loop: a build fails verification, fix #1 and fix #2 run in the same worktree and fail, the job escalates to a decision and an inbox item explains why with evidence and options](docs/images/vowp-loop.png)
+
+![Animated verify/fix loop](docs/media/vowp-loop.gif)
+
+1. A worker finishes and writes a report. **Gates** run in the job's worktree: the report, commands
+   such as `cargo test`, `owns_respected` and `secret_scan`. A gate must *run* the thing — `test -f`
+   style checks are rejected.
+2. An independent **verifier** reads the brief, diff and evidence and returns pass or concrete findings.
+3. On a failure a **fix job** runs in the *same* worktree with every finding at once, then the job goes
+   back to gating. This is bounded: `max_attempts` defaults to **2** fix rounds.
+4. When both fixes fail, `on_exhausted = escalate` creates a **decision job** and an **inbox item**:
+   why it failed, the gate tails, the verifier's findings and your options (answer and retry, replan,
+   park, cancel). The same happens when one action repeats three times without new evidence.
+5. Only that job and the jobs that need it wait. Every other job and project keeps running. Your answer
+   unparks it.
+
+### 7 · Long-horizon work, for days
+
+![A week on the home: thousands of ticks, merged jobs, fix loops, provider handoffs and a few inbox answers, with crashes, limits and brakes handled automatically](docs/images/vowp-long-horizon.png)
+
+Because the home is always on and nothing important lives only in memory, VOWP can work on one goal
+for days:
+
+- **Lid closed?** Sessions and jobs keep running on the VPS.
+- **Provider limit?** L6 failover writes a capsule and hands off to the next rung of the profile
+  ladder, then probes the limited provider after its reset. It never moves work to an unlisted paid
+  provider.
+- **Crash or reboot?** The watchdog restarts the supervisor when the heartbeat is older than 180 s, and
+  the next tick reconciles runs, jobs and leases.
+- **Machine under pressure?** Capacity is measured every tick; a brake stops *new* runs on memory, swap,
+  disk or provider pressure and never kills a running job.
+- **Recurring work?** Cron and interval schedules create jobs, trigger loops or run commands; missed runs
+  collapse to one.
+- **Housekeeping?** A nightly `gc --apply` and backups keep the disk bounded without ever deleting
+  production, truth, open work or secrets.
+
+You check in from your phone, answer the few inbox items that need a human and come back to merged
+work.
+
+### 8 · Secrets by name
+
+![Secrets: set through a hidden prompt or a one-time loopback page, stored in a vault, injected into a worker by name; the model only sees the name and last four characters](docs/images/vowp-secrets.png)
+
+You enter a value through a hidden prompt (`vowp secret set NAME`) or a one-time page on `127.0.0.1`
+that expires in ten minutes (`vowp secret request NAME`). The database stores only the name and last
+four characters. A worker gets the value injected by **name** through its harness's `env_pass` list;
+the model sees `NAME saved, ends in …4f2a`. Values are redacted from the snapshot, session events,
+capsules and reports, blocked by the `secret_scan` gate and the merge queue, and never backed up. The
+honest limit is stated [below](#secrets-honestly).
+
+### 9 · One merge queue and guarded Work → Production
+
+![Delivery: one merge queue rebases, runs repository checks, scans for secrets and fast-forwards main; promotion runs guards, banks the live version, diffs, waits for your approval, deploys, probes and records a rollback](docs/images/vowp-delivery.png)
+
+A job is done when its gates pass with recorded evidence, not when an agent says so. One merge runs at a
+time per project: rebase onto `main`, run the repository checks, scan the diff for secrets,
+fast-forward and push. A conflict becomes a merge job in the same worktree. Shipping is a separate step:
+`vowp promote` runs guards, snapshots what is live, checks the diff is exactly the intended change,
+waits for your approval in the inbox, deploys, probes and records the rollback command.
 
 ## Set up VOWP 0.4.0
 
@@ -70,32 +219,6 @@ What you need before you paste it:
 > loopback window, outbound agent nodes, local surfaces, opt-in offload and the hardening work, is
 > implemented. The ASIF interchange is a review draft (below). The release process owns the 0.4.0
 > tag and published binaries. The [roadmap](docs/roadmap.md) lists what is deliberately deferred.
-
-## How it fits together
-
-```text
- control machine(s)                              home (the authority)
- laptop / desktop / phone                        one Linux VPS
- ┌──────────────────────────────┐                ┌──────────────────────────────────────────────┐
- │ opencode desktop / Claude    │                │ one vowp supervisor                          │
- │ vowp chat / vowp mcp         │   ssh (key)    │  global DB   ~/.vowp/vowp.db                 │
- │ snapshot cache, SSH tunnels  │ ─────────────► │  project DBs ~/.vowp/projects/<p>/project.db │
- └──────────────────────────────┘                │  sessions/<id>/log.jsonl                     │
-                                                 │  snapshot.json every tick                    │
-                                                 │  tmux views, capacity sampler                │
-                                                 │  workers / verifiers → stock harnesses       │
-                                                 └──────────────────────────────────────────────┘
-```
-
-The **home** is the only writer. It owns the global database, one database per project, every session
-log, the supervisor and the snapshot. A **control machine** sends commands to the home over SSH and
-keeps only derived state. A **surface** is where a person is talking to a session now — an app, the
-terminal chat fallback, or the MCP server the app calls. Every session has one append-only log and at
-most one surface with the lease to write to it; every other surface follows read-only.
-
-The home opens no public port. The opencode app server and the one-time secret page listen on
-loopback and are reached through an SSH tunnel. A phone needs an SSH app and the owner's key, nothing
-else. See [Home and surfaces](docs/concepts/home-and-surfaces.md) for the full model.
 
 ## What the supervisor does
 
@@ -234,6 +357,8 @@ The [security model](docs/security.md) states the full coverage and the remainin
 
 | Start here | What it covers |
 |---|---|
+| [Explainer video and diagrams](docs/media/README.md) | The two-minute pixel video, every diagram on this page and the code that draws them. |
+| [Wiki](https://github.com/syver777/vowp/wiki) | The same walkthrough as this README, one page per idea. |
 | [What is VOWP](docs/concepts/what-is-vowp.md) | The VPS framework in one page: home, sessions, database, fleet, graphs, schedules and harnesses. |
 | [Setup contract](docs/setup/agent-setup.md) | The exact prompt contract: ask once, show the plan once, run it, stop at hand-offs, verify, report. |
 | [Concepts overview](docs/concepts/overview.md) | The vocabulary, the moving parts and where state lives. |
@@ -295,6 +420,7 @@ the [CLI reference](docs/reference/cli.md) and the [roadmap](docs/roadmap.md).
 | `examples/` | Runnable examples, including the three-job `hello-vowp` graph. |
 | `scripts/` | Per-user install, systemd unit, watchdog, uninstall and their tests. |
 | `docs/` | User concepts and guides, the setup contract, reference and design specs. |
+| `docs/images/`, `docs/media/` | The README diagrams, the explainer video and the Python code that draws both. |
 
 ## License
 
