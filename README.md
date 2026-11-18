@@ -33,8 +33,8 @@ concurrency place, and a **window** is a tmux view. The CLI command `vowp node` 
 
 [![The whole picture: you steer from any device, the VPS home runs the supervisor, databases, job graphs, the verify/fix loop and the universal session log, and workers or an agent node do the work](docs/images/vowp-overview.png)](docs/media/vowp-explainer.mp4)
 
-**▶ [Watch the two-minute pixel explainer](docs/media/vowp-explainer.mp4)** (1080p, no sound). Every
-picture on this page is a frame of that video; both are drawn by code in
+**▶ [Watch the two-minute pixel explainer](docs/media/vowp-explainer.mp4)** (1080p, with a chiptune soundtrack). Every
+picture on this page is a frame of that video; the pictures, the music and the sound effects are made by code in
 [`docs/media/src`](docs/media/README.md), so they can be regenerated when VOWP changes.
 
 In one paragraph: you give VOWP a goal from whatever app you are in. The **home** — an always-on
