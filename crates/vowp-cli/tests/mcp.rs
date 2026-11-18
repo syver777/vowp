@@ -8,9 +8,14 @@
 // fixture below is deliberately self-contained so both compilation modes see the same
 // tests.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -115,13 +120,7 @@ impl TestEnv {
 }
 
 /// Runs the MCP server in-process with scripted stdin and returns `(code, stdout, stderr)`.
-fn run_mcp(
-    env: &TestEnv,
-    session: &str,
-    surface: &str,
-    token_file: &Path,
-    input: &str,
-) -> (i32, String, String) {
+fn run_mcp(env: &TestEnv, session: &str, surface: &str, token_file: &Path, input: &str) -> (i32, String, String) {
     let args = vec![
         "vowp".to_owned(),
         "--home".to_owned(),
@@ -139,6 +138,92 @@ fn run_mcp(
     let mut io = BufferIo::new(input);
     let code = vowp_cli::run(args, &mut io);
     (code, io.stdout(), io.stderr())
+}
+
+/// A valid 26-character surface ULID for proxy tests.
+const PROXY_SURFACE: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+/// Runs the local MCP proxy in-process against a temporary home with no database.
+fn run_mcp_proxy(home: &Path, socket: &Path, surface: &str, input: &str) -> (i32, String, String) {
+    let args = vec![
+        "vowp".to_owned(),
+        "--home".to_owned(),
+        home.display().to_string(),
+        "mcp".to_owned(),
+        "--agent-socket".to_owned(),
+        socket.display().to_string(),
+        "--surface".to_owned(),
+        surface.to_owned(),
+    ];
+    let mut io = BufferIo::new(input);
+    let code = vowp_cli::run(args, &mut io);
+    (code, io.stdout(), io.stderr())
+}
+
+/// Writes the `surfaces/<id>/session` binding the proxy reads next to the socket.
+fn bind_surface_session(state_dir: &Path, surface: &str, session: &SessionId) {
+    let dir = state_dir.join("surfaces").join(surface);
+    std::fs::create_dir_all(&dir).expect("surface dir");
+    std::fs::write(dir.join("session"), session.to_string()).expect("session binding");
+}
+
+/// Binds a private fake agent socket.
+fn bind_fake_agent_socket(path: &Path) -> UnixListener {
+    let listener = UnixListener::bind(path).expect("bind fake agent socket");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("socket mode");
+    listener
+}
+
+/// Serves one tool call with `respond`, then watches briefly for a retry.
+///
+/// Returns the request the proxy sent and the number of accepted connections.
+fn serve_one_call(
+    listener: UnixListener,
+    respond: impl FnOnce(Value) -> Value + Send + 'static,
+) -> (std::thread::JoinHandle<Value>, Arc<AtomicUsize>) {
+    listener.set_nonblocking(true).expect("nonblocking listener");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the proxy did not connect to the fake agent socket"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("fake agent socket accept failed: {error}"),
+            }
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read socket request");
+        let request: Value = serde_json::from_str(&line).expect("socket request JSON");
+        let mut bytes = serde_json::to_vec(&respond(request.clone())).expect("response JSON");
+        bytes.push(b'\n');
+        stream.write_all(&bytes).expect("write socket response");
+        stream.flush().expect("flush socket response");
+        // A write must never be retried; give an immediate retry a chance to show up.
+        let grace = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < grace {
+            match listener.accept() {
+                Ok(_) => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+        request
+    });
+    (handle, hits)
 }
 
 /// One JSON-RPC request line.
@@ -420,11 +505,7 @@ exit 0
             .env("TMUX_TMPDIR", self.root.path().join("tmux"))
             .env(
                 "PATH",
-                format!(
-                    "{}:{}",
-                    self.bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
+                format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap_or_default()),
             )
             .env("FAKE_SSH_ARGS", &self.args)
             .env("FAKE_SSH_STDIN", &self.stdin)
@@ -643,9 +724,7 @@ fn mcp_write_tool_checks_lease_and_records_actor() {
     );
 
     let store = env.store();
-    let rows = store
-        .ledger_since(&LedgerFilter::default())
-        .expect("ledger rows");
+    let rows = store.ledger_since(&LedgerFilter::default()).expect("ledger rows");
     let row = rows
         .iter()
         .find(|entry| entry.summary == "mcp set capacity target 2")
@@ -720,9 +799,7 @@ fn mcp_job_tools_add_pause_and_retry() {
     assert_eq!(added["id"], "job-mcp");
     assert_eq!(added["state"], "pending");
     assert!(
-        env.project_path()
-            .join(".vowp/jobs/job-mcp/brief.md")
-            .is_file(),
+        env.project_path().join(".vowp/jobs/job-mcp/brief.md").is_file(),
         "job_add must write the brief"
     );
 
@@ -749,9 +826,7 @@ fn mcp_session_resume_returns_context_and_keeps_token_private() {
     assert_eq!(context["session"]["id"], session);
     assert_eq!(context["lease"]["holder"], "laptop");
     assert!(
-        context["tail"]
-            .as_array()
-            .is_some_and(|events| !events.is_empty()),
+        context["tail"].as_array().is_some_and(|events| !events.is_empty()),
         "{context}"
     );
     let text = result["result"]["content"][0]["text"].as_str().unwrap_or_default();
@@ -779,7 +854,11 @@ fn mcp_session_resume_returns_the_last_events() {
         .as_array()
         .unwrap_or_else(|| panic!("resume tail must be an array: {context}"))
         .iter()
-        .map(|event| event["seq"].as_u64().unwrap_or_else(|| panic!("event without seq: {event}")))
+        .map(|event| {
+            event["seq"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("event without seq: {event}"))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         seqs,
@@ -811,7 +890,11 @@ fn mcp_session_resume_returns_the_last_events_after_a_capsule() {
         .as_array()
         .unwrap_or_else(|| panic!("resume tail must be an array: {context}"))
         .iter()
-        .map(|event| event["seq"].as_u64().unwrap_or_else(|| panic!("event without seq: {event}")))
+        .map(|event| {
+            event["seq"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("event without seq: {event}"))
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         seqs,
@@ -1021,7 +1104,10 @@ fn mcp_control_secret_request_routes_and_returns_local_url() {
     assert_eq!(tunnels[0]["name"], "secret-DEEPSEEK_API_KEY");
     assert_eq!(tunnels[0]["remote_port"], 45555);
 
-    let input = format!("{}\n", tool_call(1, "tunnel_close", json!({"name": "secret-DEEPSEEK_API_KEY"})));
+    let input = format!(
+        "{}\n",
+        tool_call(1, "tunnel_close", json!({"name": "secret-DEEPSEEK_API_KEY"}))
+    );
     let (code, stdout, stderr) = control.mcp(&input);
     assert_eq!(code, 0, "{stderr}");
     let values = responses(&stdout);
@@ -1085,4 +1171,240 @@ fn mcp_control_tunnel_open_and_close_record_actor() {
         "the close audit must name tunnel_close: {}",
         control.ssh_stdin()
     );
+}
+
+#[test]
+fn mcp_proxy_serves_initialize_list_and_ping_without_a_home() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let input = format!(
+        "{}\n{}\n{}\n",
+        request(
+            1,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {}})
+        ),
+        request(2, "ping", json!({})),
+        request(3, "tools/list", json!({})),
+    );
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &input);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "the proxy writes errors to stdout: {stderr}");
+    let values = responses(&stdout);
+    let init = response(&values, 1);
+    assert_eq!(init["result"]["serverInfo"]["name"], "vowp");
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(response(&values, 2)["result"], json!({}));
+    let tools = response(&values, 3)["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tools.contains(&"fleet_status"), "read tools: {tools:?}");
+    assert!(tools.contains(&"session_tail"), "read tools: {tools:?}");
+    for name in [
+        "tunnel_open",
+        "tunnel_close",
+        "secret_request",
+        "node_enroll",
+        "node_revoke",
+        "surface_pair",
+        "offload_policy_set",
+    ] {
+        assert!(!tools.contains(&name), "the proxy must not advertise {name}: {tools:?}");
+    }
+    assert!(
+        std::fs::read_dir(home.path()).expect("home entries").next().is_none(),
+        "the proxy must not create a home store"
+    );
+}
+
+#[test]
+fn mcp_proxy_forwards_a_tool_call_and_returns_the_result() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let session = SessionId::new();
+    bind_surface_session(home.path(), PROXY_SURFACE, &session);
+    let listener = bind_fake_agent_socket(&socket);
+    let expected_session = session.to_string();
+    let (handle, hits) = serve_one_call(listener, move |request| {
+        assert_eq!(request["kind"], "tool_call", "{request}");
+        assert_eq!(request["surface"], PROXY_SURFACE, "{request}");
+        assert_eq!(request["session"], expected_session, "{request}");
+        assert_eq!(request["tool"], "fleet_status", "{request}");
+        assert_eq!(request["arguments"], json!({"project": "demo"}), "{request}");
+        let request_id = request["request_id"].as_str().expect("request id");
+        json!({
+            "kind": "tool_result",
+            "request_id": request_id,
+            "result": {
+                "content": [{"type": "text", "text": "{\"project\":\"demo\"}"}],
+                "isError": false,
+            },
+        })
+    });
+    let input = format!("{}\n", tool_call(1, "fleet_status", json!({"project": "demo"})));
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &input);
+    handle.join().expect("fake agent socket thread");
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let values = responses(&stdout);
+    let result = response(&values, 1);
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert_eq!(result["result"]["content"][0]["text"], "{\"project\":\"demo\"}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "the proxy must connect exactly once");
+    assert!(
+        !stdout.contains(&socket.display().to_string()),
+        "the socket path must never be printed: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_proxy_passes_a_lease_revoked_error_through() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let session = SessionId::new();
+    bind_surface_session(home.path(), PROXY_SURFACE, &session);
+    let listener = bind_fake_agent_socket(&socket);
+    let (handle, hits) = serve_one_call(listener, |request| {
+        let request_id = request["request_id"].as_str().expect("request id");
+        json!({
+            "kind": "tool_result",
+            "request_id": request_id,
+            "error": {
+                "code": "lease_revoked",
+                "message": "another surface holds the session lease",
+                "retryable": true,
+            },
+        })
+    });
+    let input = format!(
+        "{}\n",
+        tool_call(1, "inbox_answer", json!({"id": "i-1", "answer": "yes"}))
+    );
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &input);
+    handle.join().expect("fake agent socket thread");
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let result = response(&values, 1);
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert_eq!(result["result"]["code"], "lease_revoked", "{result}");
+    assert_eq!(result["result"]["retryable"], true, "{result}");
+    assert!(
+        result["result"]["content"][0]["text"]
+            .as_str()
+            .expect("error text")
+            .contains("lease_revoked"),
+        "{result}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a revoked write must not be retried");
+}
+
+#[test]
+fn mcp_proxy_refuses_tunnel_and_secret_tools_without_touching_the_socket() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let listener = bind_fake_agent_socket(&socket);
+    listener.set_nonblocking(true).expect("nonblocking listener");
+    let refused = [
+        ("tunnel_open", json!({"name": "web", "remote_port": 8080})),
+        ("tunnel_close", json!({"name": "web"})),
+        ("secret_request", json!({"name": "TOKEN"})),
+        ("node_enroll", json!({})),
+        ("node_revoke", json!({})),
+        ("surface_pair", json!({})),
+        ("offload_policy_set", json!({})),
+    ];
+    let input = refused
+        .iter()
+        .enumerate()
+        .map(|(index, (name, arguments))| tool_call(index as u64 + 1, name, arguments.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &format!("{input}\n"));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let values = responses(&stdout);
+    for (index, (name, _)) in refused.iter().enumerate() {
+        let result = response(&values, index as u64 + 1);
+        assert_eq!(result["result"]["isError"], true, "{name}: {result}");
+        assert_eq!(result["result"]["code"], "refused", "{name}: {result}");
+        assert_eq!(result["result"]["retryable"], false, "{name}: {result}");
+        assert!(
+            result["result"]["content"][0]["text"]
+                .as_str()
+                .expect("refusal text")
+                .contains(name),
+            "{name}: {result}"
+        );
+    }
+    match listener.accept() {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("a refused tool call touched the agent socket"),
+        Err(error) => panic!("fake agent socket accept failed: {error}"),
+    }
+}
+
+#[test]
+fn mcp_proxy_returns_home_offline_when_the_socket_is_absent() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let session = SessionId::new();
+    bind_surface_session(home.path(), PROXY_SURFACE, &session);
+    let (code, stdout, stderr) = run_mcp_proxy(
+        home.path(),
+        &socket,
+        PROXY_SURFACE,
+        &format!("{}\n", tool_call(1, "fleet_status", json!({}))),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let values = responses(&stdout);
+    let result = response(&values, 1);
+    assert_eq!(result["result"]["isError"], true, "{result}");
+    assert_eq!(result["result"]["code"], "home_offline", "{result}");
+    assert_eq!(result["result"]["retryable"], true, "{result}");
+    assert!(
+        !stdout.contains(&socket.display().to_string()),
+        "the socket path must never be printed: {stdout}"
+    );
+}
+
+#[test]
+fn mcp_proxy_never_prints_arguments_or_the_socket_path() {
+    let home = tempfile::tempdir().expect("temp home");
+    let socket = home.path().join("agent.sock");
+    let marker = "proxy-argument-marker-4b1e";
+    let arguments = json!({"project": marker});
+    let input = format!("{}\n", tool_call(1, "fleet_status", arguments.clone()));
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &input);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stdout.contains(marker), "stdout printed an argument: {stdout}");
+    assert!(!stderr.contains(marker), "stderr printed an argument: {stderr}");
+    let root = home.path().display().to_string();
+    assert!(!stdout.contains(&root), "stdout printed the state path: {stdout}");
+    assert!(!stderr.contains(&root), "stderr printed the state path: {stderr}");
+
+    let session = SessionId::new();
+    bind_surface_session(home.path(), PROXY_SURFACE, &session);
+    let listener = bind_fake_agent_socket(&socket);
+    let response_marker = marker.to_owned();
+    let (handle, hits) = serve_one_call(listener, move |_| {
+        json!({
+            "kind": "tool_result",
+            "request_id": "not-the-id",
+            "result": {"echo": response_marker},
+        })
+    });
+    let (code, stdout, stderr) = run_mcp_proxy(home.path(), &socket, PROXY_SURFACE, &input);
+    handle.join().expect("fake agent socket thread");
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let result = response(&values, 1);
+    assert_eq!(result["result"]["code"], "invalid_response", "{result}");
+    assert!(!stdout.contains(marker), "stdout printed a payload: {stdout}");
+    assert!(!stderr.contains(marker), "stderr printed a payload: {stderr}");
+    assert!(!stdout.contains(&root), "stdout printed the state path: {stdout}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }

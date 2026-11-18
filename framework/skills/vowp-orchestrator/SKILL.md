@@ -42,8 +42,10 @@ events and the lease; the app is only the surface the owner is using right now.
   Use the commands and tools.
 - Never read, print, log or commit a secret value, token, key or `.env` file. Refer to secrets by
   name only.
-- Never push, publish, deploy or change repository visibility. The supervisor merges; the owner
-  publishes.
+- Push, publish, deploy or change repository visibility only after explicit owner confirmation in
+  the current turn. State the repository/remote, branch/tag, files and expected effect, then wait
+  for a clear yes. Do not rely on standing or previous approval. Report the result after acting.
+  The supervisor still merges worker branches; workers do not push directly.
 - Do not claim a job, gate, tunnel or app join is working without the command output or a real
   check.
 - A refused action is reported to the owner, never worked around.

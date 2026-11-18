@@ -19,23 +19,29 @@ use super::scope::{ProcFs, SystemProcFs};
 /// The production sampling interval.
 pub const SAMPLE_INTERVAL_SECS: u64 = 5;
 
-/// Samples the node and stores one row.
+/// Samples the node, writes the previous bucket's rollup and prunes old history.
+///
+/// Raw samples live for 48 hours and capacity rollups for 30 days. The rollup covers the
+/// previous completed 5-minute bucket, so the current bucket is never written half-full.
 pub fn sample(deps: &Deps, store: &Store, now: Timestamp) -> Result<Option<HostSample>, CoreError> {
     if let Err(error) = super::usage::import_sidecars(deps, store) {
         log(deps, Level::Warn, &format!("could not import adapter usage: {error}"));
     }
     let sample = sample_host(deps)?;
     store.insert_host_sample(&sample)?;
-    store.prune_host_samples(
-        now.minus(Duration::from_secs(24 * 60 * 60)),
-        now.minus(Duration::from_secs(30 * 24 * 60 * 60)),
-    )?;
+    super::history::record_rollup(store, now)?;
+    store.prune_host_samples(now.minus(Duration::from_secs(super::history::RAW_RETENTION_SECS)))?;
+    store.prune_capacity_rollups(now.minus(Duration::from_secs(super::history::ROLLUP_RETENTION_SECS)))?;
     Ok(Some(sample))
 }
 
 /// Reads one host sample without storing it.
 pub fn sample_host(deps: &Deps) -> Result<HostSample, CoreError> {
-    let worktrees = deps.config.project.worktree_root.as_deref().map(PathBuf::from);
+    let worktrees = super::reload::effective_config(deps)
+        .project
+        .worktree_root
+        .as_deref()
+        .map(PathBuf::from);
     sample_with(
         &SystemProcFs,
         &deps.paths,

@@ -1,11 +1,13 @@
 //! The axum application: state, routes and request handlers.
 //!
 //! Read requests open their own read-only [`vowp_store::Store`] against the served home. The
-//! two writes, `POST /api/v1/inbox/{id}/answer` and `POST /api/v1/sessions/{id}/switch`,
-//! open the same home with [`vowp_store::Store::open_writable`], which never creates or
-//! migrates it. The store handle is `Send` but not `Sync`, so a shared handle would serialize
-//! requests or require a lock; opening per request also gives each request a fresh WAL view.
-//! The blocking SQLite and JSONL work runs on `tokio::task::spawn_blocking`.
+//! writes, `POST /api/v1/inbox/{id}/answer`, `POST /api/v1/sessions/{id}/switch` and the job
+//! action routes
+//! `POST /api/v1/jobs/{id}/retry|park|cancel|nudge|restart|replan|fail`, open the same home
+//! with [`vowp_store::Store::open_writable`], which never creates or migrates it. The store
+//! handle is `Send` but not `Sync`, so a shared handle would serialize requests or require a
+//! lock; opening per request also gives each request a fresh WAL view. The blocking SQLite and
+//! JSONL work runs on `tokio::task::spawn_blocking`.
 //!
 //! The switch runs the same [`SessionService::switch_with_store`] protocol as
 //! `vowp session switch`; the daemon builds one real [`Deps`] at startup and shares it in
@@ -19,27 +21,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, Sse};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::Stream;
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use vowp_core::deps::SystemRng;
 use vowp_core::ledger::BoardSnapshot;
 use vowp_core::requests::{self, Request};
+use vowp_core::session::asif::MAX_ASIF_ARCHIVE_BYTES;
 use vowp_core::session::service::SessionService;
 use vowp_core::{AdapterRegistry, CoreError, Deps, SystemGit, SystemRunner};
+use vowp_graph::{JobEvent, transition};
 use vowp_protocol::api::{
     ApiError, ApiErrorBody, Board, BoardLimit, BoardRun, CostReport, CostRow as ApiCostRow, CostTotal, EventPage,
-    Health, InboxAnswerRequest, InboxPage, JobPage, MAX_LINEAGE, NodePage, SessionDetail, SessionPage,
-    SessionSwitchRequest,
+    GateResultPage, Health, InboxAnswerRequest, InboxPage, JobAction, JobActionResponse, JobPage, MAX_LINEAGE,
+    NodePage, RunPage, SessionDetail, SessionPage, SessionSwitchRequest,
 };
 use vowp_protocol::{
-    Capsule, CapsuleId, ErrorKind, Executor, ExecutorRef, InboxId, InboxItem, InboxState, NodeName, ProjectName,
-    Session, SessionId, SessionState, Switch, SwitchReason, SwitchRequest, SystemClock, Timestamp, VowpConfig,
+    Capsule, CapsuleId, ErrorKind, Executor, ExecutorRef, InboxId, InboxItem, InboxState, Job, JobId, JobState,
+    NodeName, ProjectName, Session, SessionId, SessionState, Switch, SwitchReason, SwitchRequest, SystemClock,
+    Timestamp, VowpConfig,
 };
 use vowp_store::session_log::SessionLog;
 use vowp_store::{CostQuery, CostRow as StoreCostRow, JobFilter, NodePaths, SessionFilter, Store, StoreError};
@@ -54,6 +60,12 @@ use crate::stream;
 /// Largest accepted answer text, in UTF-8 bytes after trimming.
 const MAX_ANSWER_BYTES: usize = 10_000;
 
+/// Largest accepted job action reason, in UTF-8 bytes after trimming.
+const MAX_JOB_REASON_BYTES: usize = 10_000;
+
+/// Park reason used when the web request omits or blanks one.
+const DEFAULT_PARK_REASON: &str = "parked from the web";
+
 /// State shared by every request handler.
 #[derive(Clone)]
 pub struct ApiState {
@@ -66,6 +78,7 @@ pub struct ApiState {
     board_poll: Duration,
     write_token: Option<ApiToken>,
     session_deps: Option<Arc<Deps>>,
+    upload_limit: u64,
 }
 
 impl fmt::Debug for ApiState {
@@ -94,6 +107,7 @@ impl ApiState {
             board_poll: stream::BOARD_POLL_INTERVAL,
             write_token: None,
             session_deps: None,
+            upload_limit: MAX_ASIF_ARCHIVE_BYTES,
         }
     }
 
@@ -135,9 +149,29 @@ impl ApiState {
         self
     }
 
+    /// Returns this state with the raw ASIF upload limit replaced.
+    ///
+    /// The binary keeps the adapter's 272 MiB archive cap. Integration tests use a small
+    /// cap so an over-limit upload is visible without moving hundreds of megabytes
+    /// through loopback.
+    pub fn with_upload_limit(mut self, limit: u64) -> Self {
+        self.upload_limit = limit;
+        self
+    }
+
     /// Returns the served home.
     pub(crate) fn paths(&self) -> &NodePaths {
         &self.paths
+    }
+
+    /// Returns the served project's name.
+    pub(crate) fn project_name(&self) -> ProjectName {
+        self.project.clone()
+    }
+
+    /// Returns the raw upload byte cap.
+    pub(crate) fn upload_limit(&self) -> u64 {
+        self.upload_limit
     }
 
     /// Returns the interval between SSE log polls.
@@ -156,12 +190,12 @@ impl ApiState {
     }
 
     /// Opens the served project read-only, mapping failures onto a path-free 500.
-    fn open(&self) -> Result<Store, ApiFailure> {
+    pub(crate) fn open(&self) -> Result<Store, ApiFailure> {
         Store::open_read_only(&self.paths, Some(&self.project)).map_err(|_| store_failure())
     }
 
     /// Opens the served project writable without creating or migrating the home.
-    fn open_writable(&self) -> Result<Store, ApiFailure> {
+    pub(crate) fn open_writable(&self) -> Result<Store, ApiFailure> {
         Store::open_writable(&self.paths, Some(&self.project)).map_err(|_| store_write_failure())
     }
 
@@ -248,6 +282,96 @@ impl ApiState {
             .map_err(switch_failure)
     }
 
+    /// Queues one job action for the supervisor without changing the job row.
+    ///
+    /// The action mapping mirrors the CLI: retry maps `failed` to `Retry`, `stalled` to
+    /// `KeeperRestart` and `parked` to `Resolved`; park and cancel accept any non-terminal
+    /// state; nudge, restart, replan and fail queue the CLI's keeper request. The chosen
+    /// event is validated by [`vowp_graph::transition`], so the daemon does not duplicate
+    /// the state table. The matching `vowp_core::requests::Request` is written on a
+    /// writable, non-creating store; the supervisor applies it on its next tick. The job
+    /// row is never written here.
+    fn queue_job_action(
+        &self,
+        id: &JobId,
+        action: JobAction,
+        reason: Option<&str>,
+    ) -> Result<JobActionResponse, ApiFailure> {
+        let store = self.open_writable()?;
+        let job = store
+            .job(id)
+            .map_err(|_| store_failure())?
+            .ok_or_else(|| ApiFailure::not_found(format!("job {id} not found")))?;
+        let (event, request) = match action {
+            JobAction::Retry => match job.state {
+                JobState::Failed => (JobEvent::Retry, Request::RetryJob { job: id.clone() }),
+                JobState::Stalled => (JobEvent::KeeperRestart, Request::RetryJob { job: id.clone() }),
+                JobState::Parked => (JobEvent::Resolved, Request::ResolveJob { job: id.clone() }),
+                other => {
+                    return Err(ApiFailure::conflict(format!(
+                        "job {id} is {} and cannot be retried",
+                        other.as_str()
+                    )));
+                }
+            },
+            JobAction::Park => {
+                if job.state.is_terminal() {
+                    return Err(ApiFailure::conflict(format!(
+                        "job {id} is {} and cannot be parked",
+                        job.state.as_str()
+                    )));
+                }
+                (
+                    JobEvent::HumanPark,
+                    Request::ParkJob {
+                        job: id.clone(),
+                        reason: reason.unwrap_or(DEFAULT_PARK_REASON).to_owned(),
+                    },
+                )
+            }
+            JobAction::Cancel => {
+                if job.state.is_terminal() {
+                    return Err(ApiFailure::conflict(format!(
+                        "job {id} is {} and cannot be cancelled",
+                        job.state.as_str()
+                    )));
+                }
+                (JobEvent::Cancel, Request::CancelJob { job: id.clone() })
+            }
+            JobAction::Nudge => (
+                JobEvent::KeeperNudge { text: None },
+                Request::NudgeJob { job: id.clone() },
+            ),
+            JobAction::Restart => (JobEvent::KeeperRestart, Request::RestartJob { job: id.clone() }),
+            JobAction::Replan => (JobEvent::KeeperReplan, Request::ReplanJob { job: id.clone() }),
+            JobAction::Fail => {
+                let reason = reason.ok_or_else(|| ApiFailure::invalid("reason is required"))?;
+                (
+                    JobEvent::KeeperFail,
+                    Request::FailJob {
+                        job: id.clone(),
+                        reason: reason.to_owned(),
+                    },
+                )
+            }
+        };
+        // The graph owns the transition table. This second check keeps a future CLI
+        // mapping change from queuing a request the state machine would reject.
+        transition(&job, &event).map_err(|_| {
+            ApiFailure::conflict(format!(
+                "job {id} is {} and cannot be {}",
+                job.state.as_str(),
+                action_refusal(action)
+            ))
+        })?;
+        let request_id = requests::push(&store, &request).map_err(|_| job_request_write_failure())?;
+        Ok(JobActionResponse {
+            job: id.clone(),
+            action,
+            request: request_id.0,
+        })
+    }
+
     /// Returns the jobs matching `filter`.
     fn jobs(&self, filter: &JobFilter) -> Result<JobPage, ApiFailure> {
         let store = self.open()?;
@@ -255,6 +379,54 @@ impl ApiState {
         Ok(JobPage {
             total: usize_to_u64(jobs.len()),
             items: jobs,
+            next: None,
+        })
+    }
+
+    /// Returns one stored job by id.
+    ///
+    /// The response is the exact stored `Job`; the web page decides which fields to render.
+    /// An unknown job is a `404` and a store failure is a path-free `500`.
+    fn job_detail(&self, id: &JobId) -> Result<Job, ApiFailure> {
+        let store = self.open()?;
+        store
+            .job(id)
+            .map_err(|_| store_failure())?
+            .ok_or_else(|| ApiFailure::not_found(format!("job {id} not found")))
+    }
+
+    /// Returns one job's runs in the store's order, oldest first (`started_at`, then `id`).
+    ///
+    /// The list is unpaginated, so `next` is always `null` and `total` counts the returned
+    /// items. An unknown job is a `404` before the run query, so a missing job never answers
+    /// an empty page; a store failure is a path-free `500`.
+    fn job_runs(&self, id: &JobId) -> Result<RunPage, ApiFailure> {
+        let store = self.open()?;
+        if store.job(id).map_err(|_| store_failure())?.is_none() {
+            return Err(ApiFailure::not_found(format!("job {id} not found")));
+        }
+        let runs = store.runs_of_job(id).map_err(|_| store_failure())?;
+        Ok(RunPage {
+            total: usize_to_u64(runs.len()),
+            items: runs,
+            next: None,
+        })
+    }
+
+    /// Returns the gate results of one job's newest attempt, ordered by gate index then row id.
+    ///
+    /// The list is unpaginated, so `next` is always `null` and `total` counts the returned
+    /// items. An unknown job is a `404` before the gate query, so a missing job never answers
+    /// an empty page; a store failure is a path-free `500`.
+    fn job_gates(&self, id: &JobId) -> Result<GateResultPage, ApiFailure> {
+        let store = self.open()?;
+        if store.job(id).map_err(|_| store_failure())?.is_none() {
+            return Err(ApiFailure::not_found(format!("job {id} not found")));
+        }
+        let gates = store.latest_gate_results(id).map_err(|_| store_failure())?;
+        Ok(GateResultPage {
+            total: usize_to_u64(gates.len()),
+            items: gates,
             next: None,
         })
     }
@@ -445,6 +617,22 @@ impl ApiState {
     }
 }
 
+/// Returns the CLI's refusal participle for one job action.
+///
+/// The daemon reports a refused state as `job <id> is <state> and cannot be <participle>`,
+/// matching `vowp job retry|park|cancel|nudge|restart|replan|fail`.
+fn action_refusal(action: JobAction) -> &'static str {
+    match action {
+        JobAction::Retry => "retried",
+        JobAction::Park => "parked",
+        JobAction::Cancel => "cancelled",
+        JobAction::Nudge => "nudged",
+        JobAction::Restart => "restarted",
+        JobAction::Replan => "replanned",
+        JobAction::Fail => "failed",
+    }
+}
+
 /// Builds the real session dependencies for the selected home and project.
 ///
 /// This mirrors the CLI context construction without depending on the CLI crate: the real
@@ -517,10 +705,11 @@ fn lineage(store: &Store, session: &Session) -> Result<Vec<SessionId>, ApiFailur
 
 /// Builds the router: the static board page at `/` and its phone alias `/board`, the static
 /// session pages at `/sessions` and `/sessions/{id}`, the static capsule page at
-/// `/sessions/{id}/capsules/{capsule_id}`, the static cost, inbox and nodes pages at `/cost`,
-/// `/inbox` and `/nodes`, the PWA manifest, icon and service worker, plus the API under
-/// `/api/v1`. The only non-GET API routes are the token-gated inbox answer and session switch
-/// writes.
+/// `/sessions/{id}/capsules/{capsule_id}`, the static cost, inbox, nodes, jobs and job-detail
+/// pages at `/cost`, `/inbox`, `/nodes`, `/jobs` and `/jobs/{id}`, the static ASIF import
+/// page at `/import`, the PWA manifest, icon and service worker, plus the API under
+/// `/api/v1`. The only non-GET API routes are the token-gated inbox answer, session switch,
+/// ASIF import and job retry/park/cancel/nudge/restart/replan/fail writes.
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(board_page))
@@ -531,6 +720,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/cost", get(cost_page))
         .route("/inbox", get(inbox_page))
         .route("/nodes", get(nodes_page))
+        .route("/jobs", get(jobs_page))
+        .route("/jobs/{id}", get(job_page))
+        .route("/import", get(import_page))
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
         .route("/icon.svg", get(icon))
@@ -538,11 +730,28 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/board", get(board))
         .route("/api/v1/board/stream", get(board_stream))
         .route("/api/v1/jobs", get(jobs))
+        .route("/api/v1/jobs/{id}", get(job_detail))
+        .route("/api/v1/jobs/{id}/runs", get(job_runs))
+        .route("/api/v1/jobs/{id}/gates", get(job_gates))
+        .route("/api/v1/jobs/{id}/retry", post(retry_job))
+        .route("/api/v1/jobs/{id}/park", post(park_job))
+        .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/v1/jobs/{id}/nudge", post(nudge_job))
+        .route("/api/v1/jobs/{id}/restart", post(restart_job))
+        .route("/api/v1/jobs/{id}/replan", post(replan_job))
+        .route("/api/v1/jobs/{id}/fail", post(fail_job))
         .route("/api/v1/sessions", get(sessions))
+        .route(
+            "/api/v1/sessions/import/asif",
+            post(crate::asif::import_session).layer(DefaultBodyLimit::max(
+                usize::try_from(MAX_ASIF_ARCHIVE_BYTES + 1).unwrap_or(usize::MAX),
+            )),
+        )
         .route("/api/v1/sessions/{id}", get(session_detail))
         .route("/api/v1/sessions/{id}/capsules/{capsule_id}", get(session_capsule))
         .route("/api/v1/sessions/{id}/events", get(session_events))
         .route("/api/v1/sessions/{id}/events/stream", get(session_events_stream))
+        .route("/api/v1/sessions/{id}/export/asif", get(crate::asif::export_session))
         .route("/api/v1/sessions/{id}/switch", post(switch_session))
         .route("/api/v1/inbox", get(inbox))
         .route("/api/v1/inbox/{id}/answer", post(answer_inbox))
@@ -643,6 +852,49 @@ async fn nodes_page() -> Html<&'static str> {
     Html(NODES_PAGE)
 }
 
+/// The embedded static jobs shell, served at `/jobs`.
+const JOBS_PAGE: &str = include_str!("../web/jobs.html");
+
+/// Serves the static jobs shell; it fetches `/api/v1/jobs` on load and every five seconds.
+///
+/// The page renders each job's id, state, kind, role, priority, needs, attempts, updated
+/// time and note. Reads stay token-free. Retry, park and cancel appear only after the daemon
+/// write token is stored in `sessionStorage`; they post to the existing token-gated
+/// `/api/v1/jobs/{id}/retry|park|cancel` routes and refresh the list on `202`. Each job id
+/// links to the read-only `/jobs/{id}` detail page.
+async fn jobs_page() -> Html<&'static str> {
+    Html(JOBS_PAGE)
+}
+
+/// The embedded static job-detail shell, served read-only at `/jobs/{id}`.
+const JOB_PAGE: &str = include_str!("../web/job.html");
+
+/// Serves the static job-detail shell.
+///
+/// The page reads the id from its own path and fetches `/api/v1/jobs/{id}`,
+/// `/api/v1/jobs/{id}/runs` and `/api/v1/jobs/{id}/gates` on load. It carries the shared
+/// `sessionStorage` unlock panel and posts the token-gated keeper actions (`nudge`,
+/// `restart`, `replan`, `fail`) only in the states the graph accepts, refreshing all three
+/// reads on `202`. An unknown job is the API's `404`, which the page shows as a not-found
+/// line while keeping its nav and back link.
+async fn job_page() -> Html<&'static str> {
+    Html(JOB_PAGE)
+}
+
+/// The embedded static ASIF import shell, served at `/import`.
+const IMPORT_PAGE: &str = include_str!("../web/import.html");
+
+/// Serves the static ASIF import page.
+///
+/// The page keeps the daemon write token in `sessionStorage`, never in the URL. It posts
+/// one raw `.asif.zip` file with an explicit zip `Content-Type` and a Bearer header to
+/// `/api/v1/sessions/import/asif?branch=`, then shows the new session link, the event and
+/// loss counts and the "not continued automatically" note. It performs the file-size
+/// check in the browser so an oversized archive is refused before it is sent.
+async fn import_page() -> Html<&'static str> {
+    Html(IMPORT_PAGE)
+}
+
 /// The embedded PWA manifest.
 const MANIFEST: &str = include_str!("../web/manifest.webmanifest");
 
@@ -710,6 +962,221 @@ async fn jobs(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Resul
     let filter = filters::job_filter(query.as_deref()).map_err(ApiFailure::invalid)?;
     let page = blocking(move || state.jobs(&filter)).await?;
     Ok(Json(page))
+}
+
+/// Returns one job.
+///
+/// An invalid id is `400`, an unknown job is `404`, and a store failure is a path-free
+/// `500`. The route is read-only and token-free.
+async fn job_detail(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<Job>, ApiFailure> {
+    let id = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
+    let job = blocking(move || state.job_detail(&id)).await?;
+    Ok(Json(job))
+}
+
+/// Returns one job's runs in the store's order, oldest first (`started_at`, then `id`).
+///
+/// An invalid id is `400`, an unknown job is `404`, and a store failure is a path-free
+/// `500`. The list is unpaginated: `next` is always `null`.
+async fn job_runs(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<RunPage>, ApiFailure> {
+    let id = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
+    let page = blocking(move || state.job_runs(&id)).await?;
+    Ok(Json(page))
+}
+
+/// Returns the gate results of one job's newest attempt, ordered by gate index then row id.
+///
+/// An invalid id is `400`, an unknown job is `404`, and a store failure is a path-free
+/// `500`. The list is unpaginated: `next` is always `null`.
+async fn job_gates(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<GateResultPage>, ApiFailure> {
+    let id = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
+    let page = blocking(move || state.job_gates(&id)).await?;
+    Ok(Json(page))
+}
+
+/// Retries a failed, stalled or parked job by queueing the CLI's request.
+///
+/// The bearer token is checked before the id or store is read. A daemon without
+/// `VOWP_API_TOKEN` answers `503`; a missing or wrong token is `401`. An invalid id is
+/// `400`, an unknown job is `404`, a state the CLI would refuse is `409`, and a store or
+/// request failure is a path-free `500`. The job row is not changed here.
+async fn retry_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Retry, Bytes::new()).await
+}
+
+/// Parks a non-terminal job by queueing the CLI's `park_job` request.
+///
+/// The body is optional: an empty body or an absent, blank `reason` uses the web default.
+/// A malformed body or a reason over 10,000 UTF-8 bytes is `400`. The guards and status
+/// mappings match [`retry_job`].
+async fn park_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Park, body).await
+}
+
+/// Cancels a non-terminal job by queueing the CLI's `cancel_job` request.
+///
+/// The guards and status mappings match [`retry_job`].
+async fn cancel_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Cancel, Bytes::new()).await
+}
+
+/// Nudges a stalled job by queueing the CLI's `nudge_job` request.
+///
+/// The bearer token is checked before the id is read. A daemon without `VOWP_API_TOKEN`
+/// answers `503`; a missing or wrong token is `401`. An invalid id is `400`, an unknown job
+/// is `404`, a state other than `stalled` is `409`, and a store or request failure is a
+/// path-free `500`. The job row is not changed here.
+async fn nudge_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Nudge, Bytes::new()).await
+}
+
+/// Restarts a stalled job by queueing the CLI's `restart_job` request.
+///
+/// The guards and status mappings match [`nudge_job`]; only `stalled` is accepted.
+async fn restart_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Restart, Bytes::new()).await
+}
+
+/// Replans a stalled, parked or failed job by queueing the CLI's `replan_job` request.
+///
+/// The guards and status mappings match [`nudge_job`]; `stalled`, `parked` and `failed`
+/// are accepted.
+async fn replan_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Replan, Bytes::new()).await
+}
+
+/// Fails a stalled job by queueing the CLI's `fail_job` request with a required reason.
+///
+/// The body is `{"reason":"<text>"}`; a missing, empty, malformed or oversized body is
+/// `400`. The guards and status mappings match [`nudge_job`]; only `stalled` is accepted.
+async fn fail_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    job_action(state, id, headers, JobAction::Fail, body).await
+}
+
+/// Shared handler for the seven job actions: authorize, parse the id and optional reason,
+/// then queue the request off the async reactor.
+async fn job_action(
+    state: ApiState,
+    id: String,
+    headers: HeaderMap,
+    action: JobAction,
+    body: Bytes,
+) -> Result<(StatusCode, Json<JobActionResponse>), ApiFailure> {
+    authorize(&state, &headers)?;
+    let job = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
+    let reason = match action {
+        JobAction::Park => Some(park_reason(&body)?),
+        JobAction::Fail => Some(fail_reason(&body)?),
+        JobAction::Retry | JobAction::Cancel | JobAction::Nudge | JobAction::Restart | JobAction::Replan => None,
+    };
+    let response = blocking(move || state.queue_job_action(&job, action, reason.as_deref())).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// The optional JSON body of `POST /api/v1/jobs/{id}/park`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ParkRequest {
+    /// Why the job is parked; absent or blank uses the web default.
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Parses the optional park body into the stored reason.
+///
+/// An empty body or an absent, blank reason uses [`DEFAULT_PARK_REASON`]; a non-empty
+/// reason is trimmed. A malformed body or a reason over [`MAX_JOB_REASON_BYTES`] is `400`.
+fn park_reason(body: &Bytes) -> Result<String, ApiFailure> {
+    let reason = if body.is_empty() {
+        None
+    } else {
+        // `serde` accepts a struct from a JSON sequence as well as a map, so reject a
+        // non-object body explicitly instead of silently treating `[]` as no reason.
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|_| ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"} or empty"))?;
+        if !value.is_object() {
+            return Err(ApiFailure::invalid(
+                "the request body must be {\"reason\":\"<text>\"} or empty",
+            ));
+        }
+        let request: ParkRequest = serde_json::from_value(value)
+            .map_err(|_| ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"} or empty"))?;
+        request.reason
+    };
+    let reason = reason.unwrap_or_default().trim().to_owned();
+    if reason.len() > MAX_JOB_REASON_BYTES {
+        return Err(ApiFailure::invalid("reason must be at most 10000 bytes"));
+    }
+    Ok(if reason.is_empty() {
+        DEFAULT_PARK_REASON.to_owned()
+    } else {
+        reason
+    })
+}
+
+/// The required JSON body of `POST /api/v1/jobs/{id}/fail`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailRequest {
+    /// Why the job failed; trimmed and stored on the request.
+    reason: String,
+}
+
+/// Parses the required fail body into the stored reason.
+///
+/// A missing, empty, malformed, non-object or unknown-field body is `400`. The reason is
+/// trimmed, must not be empty, and must be at most [`MAX_JOB_REASON_BYTES`] UTF-8 bytes.
+fn fail_reason(body: &Bytes) -> Result<String, ApiFailure> {
+    if body.is_empty() {
+        return Err(ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"}"));
+    }
+    // `serde` accepts a struct from a JSON sequence as well as a map, so reject a
+    // non-object body explicitly.
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|_| ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"}"))?;
+    if !value.is_object() {
+        return Err(ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"}"));
+    }
+    let request: FailRequest = serde_json::from_value(value)
+        .map_err(|_| ApiFailure::invalid("the request body must be {\"reason\":\"<text>\"}"))?;
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err(ApiFailure::invalid("reason must not be empty"));
+    }
+    if reason.len() > MAX_JOB_REASON_BYTES {
+        return Err(ApiFailure::invalid("reason must be at most 10000 bytes"));
+    }
+    Ok(reason)
 }
 
 /// Lists sessions matching the query filters.
@@ -808,7 +1275,7 @@ async fn switch_session(
 ///
 /// The comparison is constant-time over the candidate and the configured token is never
 /// echoed. A daemon with no token answers `503`; a missing or wrong token is `401`.
-fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiFailure> {
+pub(crate) fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiFailure> {
     let Some(token) = &state.write_token else {
         return Err(ApiFailure::writes_disabled());
     };
@@ -865,7 +1332,7 @@ async fn unknown_endpoint() -> ApiFailure {
 }
 
 /// Runs blocking store or log work off the async reactor.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ApiFailure> + Send + 'static,
 ) -> Result<T, ApiFailure> {
     tokio::task::spawn_blocking(work)
@@ -881,7 +1348,7 @@ pub(crate) struct ApiFailure {
 
 impl ApiFailure {
     /// Builds a failure with no hint.
-    fn new(status: StatusCode, kind: ErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             status,
             body: ApiError {
@@ -895,17 +1362,17 @@ impl ApiFailure {
     }
 
     /// A `400` for an invalid filter, id or query value.
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorKind::InvalidInput, message)
     }
 
     /// A `404` for an unknown session or inbox item.
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, ErrorKind::NotFound, message)
     }
 
     /// A `409` for an item that is no longer open.
-    fn conflict(message: impl Into<String>) -> Self {
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, ErrorKind::Conflict, message)
     }
 
@@ -937,7 +1404,7 @@ impl IntoResponse for ApiFailure {
 }
 
 /// A path-free `500` for every store failure.
-fn store_failure() -> ApiFailure {
+pub(crate) fn store_failure() -> ApiFailure {
     ApiFailure::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         ErrorKind::Db,
@@ -1005,6 +1472,15 @@ fn request_write_failure() -> ApiFailure {
         StatusCode::INTERNAL_SERVER_ERROR,
         ErrorKind::Db,
         "the answer was stored but the supervisor request could not be queued",
+    )
+}
+
+/// A path-free `500` for a job action request that could not be queued.
+fn job_request_write_failure() -> ApiFailure {
+    ApiFailure::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorKind::Db,
+        "the job action could not be queued",
     )
 }
 

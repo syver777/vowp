@@ -197,7 +197,7 @@ A pass moves the original to `merging`. A fail creates a fix job with the findin
 the original's `owns` and worktree; the original moves to `fixing` and later re-runs its command gates.
 A fail without findings is treated as `partial`: the verifier is retried once, then the original is
 parked with a question. If the verifier itself fails or cannot produce a verdict, the original is
-parked, never merged. Fix rounds are bounded by `max_attempts` (default 3); exhaustion applies
+parked, never merged. Fix rounds are bounded by `max_attempts` (default 2); exhaustion applies
 `on_exhausted`.
 
 ## The merge queue

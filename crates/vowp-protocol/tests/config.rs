@@ -4,8 +4,11 @@
 
 use pretty_assertions::assert_eq;
 
-use vowp_protocol::config::{Approval, CapsuleConfig, MergeConfig, NodeConfig, NodeFile, ProjectConfig, VowpConfig};
-use vowp_protocol::{CmdGate, Executor, Gate, ProtocolError};
+use vowp_protocol::config::{
+    Approval, CapsuleConfig, IngressConfig, MergeConfig, NodeConfig, NodeFile, OffloadConfig, ProjectConfig,
+    ResultTransport, VowpConfig, WssIngressConfig,
+};
+use vowp_protocol::{CmdGate, Executor, Gate, JobKind, Placement, ProtocolError};
 
 /// A minimal valid project configuration; tests append tables to it.
 const BASE: &str = r#"
@@ -388,6 +391,115 @@ tail_turns = 4
 }
 
 #[test]
+fn node_file_accepts_the_ingress_wss_table() {
+    let node = NodeFile::from_toml(
+        r#"
+[ingress.wss]
+enabled = false
+listen = "127.0.0.1:8743"
+path = "/agent/v1"
+max_connections = 64
+max_frame_bytes = 1048576
+handshake_timeout_secs = 10
+"#,
+    )
+    .expect("the ingress table parses");
+
+    assert_eq!(node.ingress.wss, WssIngressConfig::default());
+    assert!(!node.ingress.wss.enabled);
+    assert_eq!(node.ingress.wss.listen, "127.0.0.1:8743");
+    assert_eq!(
+        node.ingress.wss.listen_addr().expect("loopback").to_string(),
+        "127.0.0.1:8743"
+    );
+    assert_eq!(node.ingress.wss.path, "/agent/v1");
+    assert_eq!(node.ingress.wss.max_connections, 64);
+    assert_eq!(node.ingress.wss.max_frame_bytes, 1_048_576);
+    assert_eq!(node.ingress.wss.handshake_timeout_secs, 10);
+    node.ingress.wss.validate().expect("the documented table validates");
+
+    // The table is optional and defaults to off; an empty node file has no ingress.
+    assert_eq!(
+        NodeFile::from_toml("").expect("empty node file").ingress,
+        IngressConfig::default()
+    );
+    let enabled = NodeFile::from_toml("[ingress.wss]\nenabled = true\n").expect("minimal ingress table");
+    assert!(
+        enabled.ingress.wss.enabled,
+        "an enabled table needs no other key to parse"
+    );
+    assert_eq!(enabled.ingress.wss.listen, "127.0.0.1:8743");
+    enabled.ingress.wss.validate().expect("defaults validate");
+
+    // A round trip keeps the table and its defaults.
+    let text = toml::to_string_pretty(&node).expect("serialise node file");
+    let reparsed = NodeFile::from_toml(&text).expect("reparse node file");
+    assert_eq!(reparsed, node);
+}
+
+#[test]
+fn node_file_refuses_an_unknown_ingress_field() {
+    let error = NodeFile::from_toml("[ingress.wss]\nnot_a_key = 1\n").expect_err("unknown ingress keys are errors");
+    assert!(error.to_string().contains("not_a_key"), "{error}");
+    let error = NodeFile::from_toml("[ingress]\nnot_a_key = 1\n").expect_err("unknown ingress tables are errors");
+    assert!(error.to_string().contains("not_a_key"), "{error}");
+}
+
+#[test]
+fn ingress_wss_refuses_a_non_loopback_listen() {
+    for listen in ["0.0.0.0:8743", "192.0.2.10:8743", "[::]:8743"] {
+        let table = WssIngressConfig {
+            listen: listen.to_owned(),
+            ..WssIngressConfig::default()
+        };
+        let error = table.validate().expect_err("a non-loopback listen is refused");
+        assert!(error.to_string().contains("loopback"), "{error}");
+    }
+    for listen in ["127.0.0.1:0", "127.0.0.1:8743", "[::1]:8743"] {
+        let table = WssIngressConfig {
+            listen: listen.to_owned(),
+            ..WssIngressConfig::default()
+        };
+        table.validate().expect("loopback listens are accepted");
+    }
+    let not_an_address = WssIngressConfig {
+        listen: "localhost:8743".to_owned(),
+        ..WssIngressConfig::default()
+    };
+    assert!(
+        not_an_address.validate().is_err(),
+        "the listen field is a socket address, not a name"
+    );
+}
+
+#[test]
+fn ingress_wss_refuses_a_second_route_or_a_zero_limit() {
+    let other_path = WssIngressConfig {
+        path: "/health".to_owned(),
+        ..WssIngressConfig::default()
+    };
+    assert!(other_path.validate().is_err(), "there is exactly one route");
+
+    let no_connections = WssIngressConfig {
+        max_connections: 0,
+        ..WssIngressConfig::default()
+    };
+    assert!(no_connections.validate().is_err());
+
+    let no_frames = WssIngressConfig {
+        max_frame_bytes: 0,
+        ..WssIngressConfig::default()
+    };
+    assert!(no_frames.validate().is_err());
+
+    let no_handshake = WssIngressConfig {
+        handshake_timeout_secs: 0,
+        ..WssIngressConfig::default()
+    };
+    assert!(no_handshake.validate().is_err());
+}
+
+#[test]
 fn with_node_defaults_fills_missing_entries_and_scalars() {
     let project = parse(&format!("{BASE}\n[node]\nname = \"project-node\"\nmax_workers = 8\n"));
     let node = NodeFile::from_toml(
@@ -512,4 +624,116 @@ fn with_defaults_for_tests_is_valid() {
     config.validate().expect("the test defaults must validate");
     assert_eq!(config.project.name.as_str(), "test");
     assert_eq!(config.profiles.len(), 4);
+}
+
+#[test]
+fn offload_defaults_disable_offload_and_force_every_job_home() {
+    let config = parse(BASE);
+    assert_eq!(config.offload, OffloadConfig::default());
+    assert!(!config.offload.enabled);
+    assert_eq!(config.offload.default, Placement::Home);
+    assert_eq!(config.offload.max_remote_runs, 2);
+    assert_eq!(config.offload.grace_secs, 600);
+    assert_eq!(config.offload.result_transport, ResultTransport::Push);
+    assert!(!config.offload.pause_on_home_brake);
+    assert!(config.offload.require_clean_base);
+    assert_eq!(config.offload.min_disk_bytes, 5_368_709_120);
+    assert!(config.offload.projects.is_empty());
+    assert!(config.offload.nodes.is_empty());
+
+    let project = config.offload.project_policy(&config.project.name);
+    assert_eq!(project.placement, None);
+    assert!(!project.home_only);
+    assert_eq!(
+        project.allow_kinds,
+        [
+            JobKind::Build,
+            JobKind::Test,
+            JobKind::Docs,
+            JobKind::Fix,
+            JobKind::Verify
+        ]
+    );
+    assert_eq!(project.deny_kinds, [JobKind::Merge, JobKind::Promote, JobKind::Release]);
+    assert!(project.allow_secrets.is_empty());
+
+    let node = config
+        .offload
+        .node_policy(&vowp_protocol::NodeName::parse("mac-studio").expect("node slug"));
+    assert_eq!(node.max_workers, None);
+    assert!(!node.allow_battery);
+    assert!(node.labels.is_empty());
+}
+
+#[test]
+fn offload_policy_parses_projects_nodes_and_rejects_bad_values() {
+    let config = parse(&format!(
+        "{BASE}\n[offload]\nenabled = true\ndefault = \"home\"\nmax_remote_runs = 3\ngrace_secs = 120\nresult_transport = \"push\"\npause_on_home_brake = true\nrequire_clean_base = false\nmin_disk_bytes = 1024\n\n[offload.projects.vowp]\nplacement = \"any\"\nallow_kinds = [\"build\", \"test\"]\ndeny_kinds = [\"merge\"]\nallow_secrets = [\"CARGO_REGISTRY_TOKEN\"]\n\n[offload.projects.secret-app]\nhome_only = true\n\n[offload.nodes.mac-studio]\nmax_workers = 2\nallow_battery = true\nlabels = [\"darwin-arm64\", \"xcode\"]\n"
+    ));
+    assert!(config.offload.enabled);
+    assert_eq!(config.offload.default, Placement::Home);
+    assert_eq!(config.offload.max_remote_runs, 3);
+    assert_eq!(config.offload.grace_secs, 120);
+    assert!(config.offload.pause_on_home_brake);
+    assert!(!config.offload.require_clean_base);
+    assert_eq!(config.offload.min_disk_bytes, 1024);
+
+    let project = &config.offload.projects[&config.project.name];
+    assert_eq!(project.placement, Some(Placement::Any));
+    assert_eq!(project.allow_kinds, [JobKind::Build, JobKind::Test]);
+    assert_eq!(project.deny_kinds, [JobKind::Merge]);
+    assert_eq!(project.allow_secrets.len(), 1);
+    assert_eq!(project.allow_secrets[0].as_str(), "CARGO_REGISTRY_TOKEN");
+
+    let secret_app = config
+        .offload
+        .project_policy(&vowp_protocol::ProjectName::parse("secret-app").expect("project slug"));
+    assert!(secret_app.home_only);
+    assert_eq!(secret_app.placement, None);
+
+    let node = config
+        .offload
+        .node_policy(&vowp_protocol::NodeName::parse("mac-studio").expect("node slug"));
+    assert_eq!(node.max_workers, Some(2));
+    assert!(node.allow_battery);
+    assert_eq!(node.labels, ["darwin-arm64", "xcode"]);
+
+    // The documented validation refusals.
+    reject(&format!("{BASE}\n[offload]\nmax_remote_runs = 0\n"));
+    reject(&format!("{BASE}\n[offload]\nmin_disk_bytes = 0\n"));
+    reject(&format!("{BASE}\n[offload]\ndefault = \"\"\n"));
+    reject(&format!("{BASE}\n[offload]\ndefault = \"node:mac-studio\"\n"));
+    reject(&format!(
+        "{BASE}\n[offload.projects.vowp]\nhome_only = true\nplacement = \"any\"\n"
+    ));
+    reject(&format!("{BASE}\n[offload]\nnot_a_key = true\n"));
+    reject(&format!("{BASE}\n[offload.projects.vowp]\nnot_a_key = true\n"));
+    reject(&format!("{BASE}\n[offload.nodes.mac-studio]\nnot_a_key = true\n"));
+
+    // A home_only project with no placement is valid, as is `default = "any"`.
+    let config = parse(&format!(
+        "{BASE}\n[offload]\ndefault = \"any\"\n[offload.projects.vowp]\nhome_only = true\n"
+    ));
+    assert_eq!(config.offload.default, Placement::Any);
+}
+
+#[test]
+fn offload_accepts_the_bundle_and_push_transports() {
+    let config = parse(&format!("{BASE}\n[offload]\nresult_transport = \"bundle\"\n"));
+    assert_eq!(config.offload.result_transport, ResultTransport::Bundle);
+    assert_eq!(
+        ResultTransport::default(),
+        ResultTransport::Push,
+        "push stays the default"
+    );
+
+    let config = parse(&format!("{BASE}\n[offload]\nresult_transport = \"push\"\n"));
+    assert_eq!(config.offload.result_transport, ResultTransport::Push);
+
+    let err = VowpConfig::from_toml(&format!("{BASE}\n[offload]\nresult_transport = \"carrier-pigeon\"\n"))
+        .expect_err("an unknown transport must be a Config error");
+    assert!(
+        err.to_string().contains("carrier-pigeon"),
+        "error names the value: {err}"
+    );
 }

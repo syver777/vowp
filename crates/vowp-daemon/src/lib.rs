@@ -3,12 +3,13 @@
 //! The v0.3 slice serves the static board page at `GET /` and `GET /board`, the static
 //! session list and detail pages at `GET /sessions` and `GET /sessions/{id}`, the static
 //! capsule page at `GET /sessions/{id}/capsules/{capsule_id}`, the static cost, inbox and nodes
-//! pages at `GET /cost`, `GET /inbox` and `GET /nodes`, and the API endpoints
+//! pages at `GET /cost`, `GET /inbox` and `GET /nodes`, the static ASIF import page at
+//! `GET /import`, and the API endpoints
 //! `GET /api/v1/health`, `/api/v1/board`, `/api/v1/board/stream`, `/api/v1/jobs`,
 //! `/api/v1/sessions`, `/api/v1/sessions/{id}`, `/api/v1/sessions/{id}/capsules/{capsuleId}`,
 //! `/api/v1/sessions/{id}/events`, `/api/v1/sessions/{id}/events/stream`,
-//! `/api/v1/sessions/{id}/switch`, `/api/v1/inbox`, `/api/v1/nodes` and `/api/v1/cost` with
-//! the same `vowp-protocol` objects the CLI prints.
+//! `/api/v1/sessions/{id}/export/asif`, `/api/v1/sessions/{id}/switch`, `/api/v1/inbox`,
+//! `/api/v1/nodes` and `/api/v1/cost` with the same `vowp-protocol` objects the CLI prints.
 //! The session detail
 //! contains the exact `Session`, its latest capsule and at most 32 parent links, nearest
 //! parent first; the capsule route answers only for a capsule belonging to that session.
@@ -30,9 +31,20 @@
 //! browser writes. The nodes page fetches the stored nodes from `/api/v1/nodes` on load and
 //! every five seconds and renders them read-only, with no add, remove or probe path.
 //!
-//! Reads are token-free. `POST /api/v1/inbox/{id}/answer` and
-//! `POST /api/v1/sessions/{id}/switch` require `Authorization: Bearer <VOWP_API_TOKEN>` and
-//! answer `503` when the daemon was started without a token. The answer handler opens the
+//! ASIF download and import are the v0.4 slice. The session detail page links to the
+//! token-free `GET /api/v1/sessions/{id}/export/asif`, which streams a deterministic
+//! `.asif.zip` from a private temporary file and removes it when the response ends; the same
+//! route with `?report=1` returns the `AsifReport` summary and the page's preview button
+//! calls it. `POST /api/v1/sessions/import/asif?branch=<id>` requires the write token, streams
+//! the raw zip to a private `0600` upload file under `<home>/tmp`, imports one new idle
+//! session through the core ASIF facade and answers `201 Created` with
+//! `AsifImportResponse`. The static `/import` page performs the token unlock, the browser-side
+//! size check and the upload; it never puts the token or a filename in a URL.
+//!
+//! Reads are token-free. `POST /api/v1/inbox/{id}/answer`,
+//! `POST /api/v1/sessions/{id}/switch` and `POST /api/v1/sessions/import/asif` require
+//! `Authorization: Bearer <VOWP_API_TOKEN>` and answer `503` when the daemon was started
+//! without a token. The answer handler opens the
 //! home writable with [`vowp_store::Store::open_writable`], writes the same item update and
 //! `answer_inbox` request row as `vowp inbox answer`, and leaves job state to the supervisor.
 //! The switch handler runs the same `SessionService` switch as `vowp session switch` over a
@@ -47,6 +59,7 @@
 #![warn(missing_docs)]
 
 mod app;
+mod asif;
 mod auth;
 mod config;
 mod error;

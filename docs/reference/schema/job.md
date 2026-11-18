@@ -260,7 +260,7 @@ Exported by `vowp schema Job` and generated from the protocol types in
       "description": "A job's bounded fix loop.",
       "properties": {
         "max_attempts": {
-          "default": 3,
+          "default": 2,
           "description": "Maximum fix rounds before `on_exhausted` applies.",
           "format": "uint32",
           "minimum": 0,

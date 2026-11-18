@@ -15,9 +15,46 @@ CREATE TABLE nodes (                    -- home and known executor nodes
   capabilities TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(capabilities)),
   last_seen_at TEXT,
   created_at   TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'ssh' CHECK (kind IN ('home','ssh','agent')),
+  status       TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('pending','active','revoked')),
+  labels_json  TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(labels_json)),
+  agent_version TEXT,
+  protocol      TEXT,
+  last_error    TEXT NOT NULL DEFAULT '',
   CHECK ((is_local = 1 AND ssh_target IS NULL) OR is_local = 0)
 ) STRICT;
 CREATE UNIQUE INDEX nodes_one_local ON nodes(is_local) WHERE is_local = 1;
+
+CREATE TABLE node_credentials (         -- public keys an enrolled node may authenticate with
+  node         TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE,
+  key_id       TEXT NOT NULL,
+  public_key   TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  last_used_at TEXT,
+  revoked_at   TEXT,
+  PRIMARY KEY (node, key_id)
+) STRICT;
+
+CREATE TABLE enrollment_codes (         -- one-time node and surface codes; only the hash is stored
+  code_hash  TEXT PRIMARY KEY,
+  node       TEXT NOT NULL,
+  kind       TEXT NOT NULL CHECK (kind IN ('node','surface')),
+  surface_id TEXT,
+  expires_at TEXT NOT NULL,
+  used_at    TEXT,
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE node_paths (               -- the last path map an agent reported; home-only, redacted
+  node          TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  local_root    TEXT NOT NULL,
+  worktree_root TEXT NOT NULL,
+  allow_json    TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(allow_json)),
+  updated_at    TEXT NOT NULL,
+  PRIMARY KEY (node, project)
+) STRICT;
 
 CREATE TABLE projects (                 -- the registry (plan §3 rule 5)
   name           TEXT PRIMARY KEY,
@@ -144,6 +181,36 @@ CREATE TABLE limits (                   -- per provider, node-wide (all projects
   updated_at        TEXT NOT NULL
 ) STRICT;
 
+-- ---------------------------------------------------------------- offload state (§6.3, §7.1, §11.1)
+CREATE TABLE agent_assignments (        -- the durable dispatch queue and reconnect record
+  id           TEXT PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  session_id   TEXT NOT NULL,
+  project      TEXT NOT NULL,
+  node         TEXT NOT NULL,
+  epoch        INTEGER NOT NULL,
+  state        TEXT NOT NULL CHECK (state IN
+                 ('queued','sent','accepted','running','disconnected',
+                  'finished','lost','cancelled','rejected')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  created_at   TEXT NOT NULL,
+  claimed_at   TEXT,
+  expires_at   TEXT,
+  detail       TEXT NOT NULL DEFAULT ''
+) STRICT;
+CREATE INDEX agent_assignments_node ON agent_assignments(node, state);
+
+CREATE TABLE node_limits (              -- a provider limit as seen from one executor node
+  provider    TEXT NOT NULL,
+  node        TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE,
+  kind        TEXT NOT NULL CHECK (kind IN ('quota','credits','rate','context','auth','unavailable')),
+  resets_at   TEXT,
+  detail      TEXT NOT NULL DEFAULT '',
+  since       TEXT NOT NULL,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (provider, node)
+) STRICT;
+
 -- ---------------------------------------------------------------- node-level inbox / ledger (renamed)
 CREATE TABLE node_inbox (               -- node-wide questions/notices; project inboxes live per project
   id           TEXT PRIMARY KEY,
@@ -198,12 +265,15 @@ CREATE TRIGGER node_ledger_no_delete BEFORE DELETE ON node_ledger
 -- ---------------------------------------------------------------- surfaces and leases (§7.3)
 CREATE TABLE surfaces (
   id            TEXT PRIMARY KEY,        -- ULID
-  kind          TEXT NOT NULL CHECK (kind IN ('chat','opencode','claude-code','mcp','mirror','api')),
+  kind          TEXT NOT NULL CHECK (kind IN ('chat','opencode','claude-code','mcp','mirror','api','agent')),
   node          TEXT NOT NULL,
   holder        TEXT NOT NULL,           -- human-visible: 'laptop', 'phone', 'mac opencode'
   app           TEXT,                    -- 'opencode-desktop', 'claude-code', ...
   cwd           TEXT,
   metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+  state         TEXT NOT NULL DEFAULT 'attached'
+                  CHECK (state IN ('pending','attached','revoked')),
+  revoked_at    TEXT,
   created_at    TEXT NOT NULL,
   last_seen_at  TEXT NOT NULL
 ) STRICT;
@@ -211,15 +281,30 @@ CREATE TABLE surfaces (
 CREATE TABLE leases (
   session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   surface_id   TEXT REFERENCES surfaces(id) ON DELETE SET NULL,
-  surface_kind TEXT NOT NULL CHECK (surface_kind IN ('chat','opencode','claude-code','mcp','mirror','api')),
+  surface_kind TEXT NOT NULL CHECK (surface_kind IN ('chat','opencode','claude-code','mcp','mirror','api','agent')),
   node         TEXT NOT NULL,
   holder       TEXT NOT NULL,
-  token        TEXT NOT NULL,            -- 52 chars: two ULIDs; never logged
+  token_hash   TEXT NOT NULL
+                 CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+                 -- lowercase hex SHA-256; never the plaintext
   acquired_at  TEXT NOT NULL,
-  heartbeat_at TEXT NOT NULL,
-  CHECK (length(token) = 52)
+  heartbeat_at TEXT NOT NULL
 ) STRICT;
 CREATE INDEX leases_heartbeat ON leases(heartbeat_at);
+
+-- A surface token is stored only as SHA-256 plus a short display prefix (§4.6).
+CREATE TABLE surface_tokens (
+  id           TEXT PRIMARY KEY,
+  surface_id   TEXT NOT NULL REFERENCES surfaces(id) ON DELETE CASCADE,
+  token_hash   TEXT NOT NULL,
+  prefix       TEXT NOT NULL,
+  scopes_json  TEXT NOT NULL CHECK (json_valid(scopes_json)),
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT,
+  revoked_at   TEXT,
+  last_used_at TEXT
+) STRICT;
+CREATE UNIQUE INDEX surface_tokens_hash ON surface_tokens(token_hash);
 
 -- ---------------------------------------------------------------- catalog (§10)
 CREATE TABLE catalog (
@@ -263,6 +348,20 @@ CREATE TABLE host_samples (
   source                  TEXT NOT NULL CHECK (source IN ('proc','fallback'))
 ) STRICT;
 CREATE INDEX host_samples_at ON host_samples(at);
+
+CREATE TABLE capacity_rollups (         -- one 5-minute aggregate of host_samples; kept 30 days
+  bucket                  TEXT NOT NULL,      -- RFC 3339 UTC bucket start
+  bucket_secs             INTEGER NOT NULL,   -- 300 (5 minutes)
+  samples                 INTEGER NOT NULL,
+  mem_available_min_bytes INTEGER NOT NULL,
+  mem_available_avg_bytes INTEGER NOT NULL,
+  mem_available_max_bytes INTEGER NOT NULL,
+  load1_avg               REAL NOT NULL,
+  disk_free_home_min_bytes INTEGER NOT NULL,
+  source                  TEXT NOT NULL CHECK (source IN ('proc','fallback','mixed')),
+  PRIMARY KEY (bucket, bucket_secs)
+) STRICT;
+CREATE INDEX capacity_rollups_bucket ON capacity_rollups(bucket);
 
 CREATE TABLE run_usage (                -- one row per finished run (§6.1)
   run_id          TEXT PRIMARY KEY,
@@ -348,4 +447,4 @@ CREATE TABLE secret_index (
   updated_at TEXT NOT NULL
 ) STRICT;
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 7;

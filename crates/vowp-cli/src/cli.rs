@@ -4,9 +4,11 @@
 //! This file fixes every v0.2 top-level command, subcommand and flag; each command's
 //! handler and its `Args` struct live in `cmd/<name>.rs`.
 
+use std::cell::Cell;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use crate::cmd::capacity::CapacityArgs;
 use crate::cmd::control::ControlArgs;
@@ -45,12 +47,26 @@ pub const V0_2_COMMANDS: &[&str] = &[
     "orchestrator",
     "migrate",
     "mcp",
+    "agent",
+    "surface",
+    "offload",
     "__exec",
     "__vault-exec",
     "__vault-admin",
 ];
 
 /// The parsed command line.
+#[derive(Debug)]
+pub struct Cli {
+    /// Global flags accepted before or after the command.
+    pub global: Global,
+    /// Command to run.
+    pub command: Command,
+}
+
+// The clap-generated parser behind `Cli`. The public type carries the same two fields.
+// This mirror lets `Cli` override `Parser::try_parse_from` for the agent chat spelling
+// while every other parser method keeps clap's generated behaviour.
 #[derive(Debug, Parser)]
 #[command(
     name = "vowp",
@@ -58,13 +74,148 @@ pub const V0_2_COMMANDS: &[&str] = &[
     about = "VOWP: local-first supervisor for AI coding agents",
     disable_help_subcommand = true
 )]
-pub struct Cli {
-    /// Global flags accepted before or after the command.
+struct ParsedCli {
     #[command(flatten)]
-    pub global: Global,
-    /// Command to run.
+    global: Global,
     #[command(subcommand)]
-    pub command: Command,
+    command: Command,
+}
+
+impl CommandFactory for Cli {
+    fn command() -> clap::Command {
+        ParsedCli::command()
+    }
+
+    fn command_for_update() -> clap::Command {
+        ParsedCli::command_for_update()
+    }
+}
+
+impl FromArgMatches for Cli {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let parsed = ParsedCli::from_arg_matches(matches)?;
+        Ok(Self {
+            global: parsed.global,
+            command: parsed.command,
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        let parsed = ParsedCli::from_arg_matches(matches)?;
+        self.global = parsed.global;
+        self.command = parsed.command;
+        Ok(())
+    }
+}
+
+impl Parser for Cli {
+    /// Parses a command line, filling an agent chat's positional id from `--session`.
+    ///
+    /// `vowp chat --agent --session <id>` spells the session as a flag while the home
+    /// `vowp chat` keeps a required positional `<ID>`; inserting the value before clap
+    /// parses lets both spellings share one definition, so the home usage, help tree and
+    /// missing-id error stay unchanged. Every other command line is untouched.
+    fn try_parse_from<I, T>(itr: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let mut args: Vec<OsString> = itr.into_iter().map(Into::into).collect();
+        record_agent_chat(false);
+        inject_agent_chat_id(&mut args);
+        ParsedCli::try_parse_from(args).map(|mut parsed| {
+            // `orchestrator new --node <name>` names the node that runs the app, not an
+            // SSH redirect. Move the global value into the subcommand before
+            // `remote::maybe_run` sees it; every other command keeps the global meaning.
+            let node = parsed.global.node.take();
+            if let Command::Orchestrator(args) = &mut parsed.command {
+                parsed.global.node = args.take_new_node(node);
+            } else {
+                parsed.global.node = node;
+            }
+            Self {
+                global: parsed.global,
+                command: parsed.command,
+            }
+        })
+    }
+}
+
+/// Inserts an agent chat's `--session` value as the required positional id.
+fn inject_agent_chat_id(args: &mut Vec<OsString>) {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return;
+    }
+    let Some(chat) = chat_position(args) else {
+        return;
+    };
+    let mut agent = false;
+    let mut session = None;
+    let mut has_id = false;
+    let rest = args[chat + 1..].to_vec();
+    let mut index = 0;
+    while index < rest.len() {
+        let arg = rest[index].to_string_lossy();
+        match arg.as_ref() {
+            "--agent" => agent = true,
+            "--session" => {
+                if let Some(value) = rest.get(index + 1) {
+                    session = Some(value.clone());
+                    index += 1;
+                }
+            }
+            "--executor" | "--node" => index += 1,
+            "--" => {
+                has_id = index + 1 < rest.len();
+                break;
+            }
+            value if value.starts_with("--session=") => {
+                session = Some(OsString::from(&value["--session=".len()..]));
+            }
+            value if value.starts_with('-') => {}
+            _ => has_id = true,
+        }
+        index += 1;
+    }
+    if agent
+        && !has_id
+        && let Some(session) = session
+    {
+        args.push(session);
+    }
+}
+
+/// Returns the index of the `chat` command token, including `session chat`.
+fn chat_position(args: &[OsString]) -> Option<usize> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        if matches!(arg.as_ref(), "--home" | "--project" | "--node") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if arg == "chat" {
+            return Some(index);
+        }
+        if arg == "session" {
+            let mut next = index + 1;
+            while next < args.len() {
+                let value = args[next].to_string_lossy();
+                if value.starts_with('-') {
+                    next += 1;
+                    continue;
+                }
+                return (value == "chat").then_some(next);
+            }
+            return None;
+        }
+        return None;
+    }
+    None
 }
 
 /// Global flags accepted by every command.
@@ -142,6 +293,8 @@ pub enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Show the effective offload policy or the offload read model.
+    Offload(OffloadArgs),
     /// List or pause supervisor loops.
     Loops(LoopsArgs),
     /// Manage scheduled actions.
@@ -162,7 +315,7 @@ pub enum Command {
     Project(ProjectArgs),
     /// Read the node snapshot, queue and inbox.
     Fleet(FleetArgs),
-    /// Show or change measured capacity.
+    /// Show, change or reload measured capacity.
     Capacity(CapacityArgs),
     /// Set, list, remove or request secrets.
     Secret(SecretArgs),
@@ -178,8 +331,21 @@ pub enum Command {
     Orchestrator(OrchestratorArgs),
     /// Migrate a v0.1 home to the v0.2 layout.
     Migrate(MigrateArgs),
-    /// Run the stdio MCP server.
+    /// Run the stdio MCP server or the Mac-side proxy.
     Mcp(McpArgs),
+    /// Enroll, run or inspect the Mac-side agent.
+    Agent {
+        /// The agent subcommand.
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Create, list or revoke a paired local surface; `--node` names the surface's node.
+    #[command(after_help = "For `surface`, --node <name> names the node the surface runs on, not an SSH redirect.")]
+    Surface {
+        /// The surface subcommand.
+        #[command(subcommand)]
+        command: SurfaceCommand,
+    },
     /// Print the binary version.
     Version,
     /// Hidden: what the tmux windows run.
@@ -232,11 +398,17 @@ pub struct UpArgs {
     /// Run exactly one supervisor tick and exit.
     #[arg(long)]
     pub once: bool,
+    /// Drain a running supervisor, apply pending migrations and start this binary.
+    #[arg(long)]
+    pub replace: bool,
 }
 
 /// Arguments for `vowp down`.
 #[derive(Debug, Clone, Args)]
 pub struct DownArgs {
+    /// Let active runs and gate tasks finish; admit no new work.
+    #[arg(long)]
+    pub drain: bool,
     /// Send SIGTERM if the supervisor does not stop by itself.
     #[arg(long)]
     pub force: bool,
@@ -346,6 +518,9 @@ pub struct JobAddArgs {
     /// Read the brief body from stdin (`-`).
     #[arg(long, value_name = "PATH|-", conflicts_with = "brief_file")]
     pub brief: Option<String>,
+    /// Offload placement: `home`, `any`, `node:<name>` or `node:<name>+home`.
+    #[arg(long, value_name = "PLACEMENT")]
+    pub placement: Option<String>,
 }
 
 /// Arguments for `vowp job update`.
@@ -484,12 +659,14 @@ pub enum SessionCommand {
     Switch(SessionSwitchArgs),
     /// Write a capsule now.
     Capsule(SessionCapsuleArgs),
-    /// Export a session bundle.
+    /// Export a session bundle or ASIF package.
     Export(SessionExportArgs),
-    /// Import a session bundle.
+    /// Import a session bundle or ASIF package.
     Import(SessionImportArgs),
     /// Pull a session from another node.
     Pull(SessionPullArgs),
+    /// Push a session to another node.
+    Push(SessionPushArgs),
     /// Hidden: stream a full session directory snapshot.
     #[command(name = "dir-export", hide = true)]
     DirExport(SessionDirExportArgs),
@@ -562,22 +739,109 @@ pub struct SessionNewArgs {
 }
 
 /// Arguments for `vowp session chat` and `vowp chat`.
-#[derive(Debug, Clone, Args)]
+///
+/// `--session` is the agent spelling and the positional id the home spelling. Both name
+/// the same session: [`Cli::try_parse_from`] fills the required positional from
+/// `--session` for an agent command, so the home usage, help tree and missing-id error
+/// stay unchanged. [`agent_chat_requested`] lets the owned `chat` module dispatch the
+/// agent bridge before the home lease path.
+#[derive(Debug, Clone)]
 pub struct ChatArgs {
     /// Session id or unique prefix.
     pub id: String,
     /// Switch to this executor before the first turn.
-    #[arg(long, value_name = "EXECUTOR")]
     pub executor: Option<String>,
     /// Node that runs the turn; defaults to this surface's machine.
-    #[arg(long, value_name = "NAME")]
     pub node: Option<String>,
     /// Follow the log read-only, without taking the lease.
-    #[arg(long)]
     pub follow: bool,
     /// Take the lease from a live surface before the first turn.
-    #[arg(long)]
     pub takeover: bool,
+    /// Run the local agent chat bridge instead of the home surface.
+    pub agent: bool,
+    /// Session id for `--agent`; equivalent to the positional id.
+    pub session: Option<String>,
+}
+
+/// The clap field set behind [`ChatArgs`].
+#[derive(Debug, Clone, Args)]
+struct ChatArgsFields {
+    /// Session id or unique prefix.
+    #[arg(value_name = "ID")]
+    id: String,
+    /// Switch to this executor before the first turn.
+    #[arg(long, value_name = "EXECUTOR")]
+    executor: Option<String>,
+    /// Node that runs the turn; defaults to this surface's machine.
+    #[arg(long, value_name = "NAME")]
+    node: Option<String>,
+    /// Follow the log read-only, without taking the lease.
+    #[arg(long)]
+    follow: bool,
+    /// Take the lease from a live surface before the first turn.
+    #[arg(long)]
+    takeover: bool,
+    /// Run the local agent chat bridge instead of the home surface.
+    #[arg(long)]
+    agent: bool,
+    /// Session id for `--agent`; equivalent to the positional id.
+    #[arg(long, value_name = "ID")]
+    session: Option<String>,
+}
+
+thread_local! {
+    /// Whether the last chat command parsed on this thread asked for `--agent`.
+    static AGENT_CHAT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Records whether one parsed chat command asked for `--agent`.
+fn record_agent_chat(agent: bool) {
+    AGENT_CHAT.with(|flag| flag.set(agent));
+}
+
+/// Returns whether this thread last parsed a `chat --agent` command.
+pub fn agent_chat_requested() -> bool {
+    AGENT_CHAT.with(Cell::get)
+}
+
+impl Args for ChatArgs {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        ChatArgsFields::augment_args(command)
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        ChatArgsFields::augment_args_for_update(command)
+    }
+}
+
+impl FromArgMatches for ChatArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        let fields = ChatArgsFields::from_arg_matches(matches)?;
+        let id = fields.session.clone().unwrap_or_else(|| fields.id.clone());
+        record_agent_chat(fields.agent);
+        Ok(Self {
+            id,
+            executor: fields.executor,
+            node: fields.node,
+            follow: fields.follow,
+            takeover: fields.takeover,
+            agent: fields.agent,
+            session: fields.session,
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        let fields = ChatArgsFields::from_arg_matches(matches)?;
+        self.id = fields.session.clone().unwrap_or_else(|| fields.id.clone());
+        record_agent_chat(fields.agent);
+        self.executor = fields.executor;
+        self.node = fields.node;
+        self.follow = fields.follow;
+        self.takeover = fields.takeover;
+        self.agent = fields.agent;
+        self.session = fields.session;
+        Ok(())
+    }
 }
 
 /// Arguments for `vowp session switch`.
@@ -609,36 +873,85 @@ pub struct SessionCapsuleArgs {
     pub print: bool,
 }
 
+/// Session interchange format for `vowp session export` and `vowp session import`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SessionFormat {
+    /// Native `vowp-bundle-v1` JSON. The default for both commands.
+    Bundle,
+    /// ASIF 0.4 (review draft) package. Semantic interchange with declared losses.
+    Asif,
+}
+
 /// Arguments for `vowp session export`.
 #[derive(Debug, Clone, Args)]
 pub struct SessionExportArgs {
     /// Session id or unique prefix.
     pub id: String,
-    /// Output file (default `./<id>.vowp-bundle.json`).
-    #[arg(long, short = 'o', value_name = "FILE")]
+    /// Interchange format.
+    #[arg(long, value_enum, default_value = "bundle", value_name = "FORMAT")]
+    pub format: SessionFormat,
+    /// Output file (default `./<id>.vowp-bundle.json`, or `./<id>.asif.zip` for ASIF);
+    /// `-` writes to stdout.
+    #[arg(long, short = 'o', value_name = "FILE|-")]
     pub out: Option<PathBuf>,
-    /// Number of tail events to include.
+    /// Number of tail events to include (bundle only).
     #[arg(long, value_name = "N")]
     pub tail: Option<usize>,
+    /// Replace this exact literal with `<redacted>` (ASIF only, repeatable).
+    #[arg(long, value_name = "LITERAL")]
+    pub redact: Vec<String>,
+    /// Read exact redaction literals from a local file, one per line (ASIF only).
+    #[arg(long, value_name = "FILE")]
+    pub redact_file: Vec<PathBuf>,
+    /// Keep host-path-looking strings in a trusted local export (ASIF only).
+    #[arg(long)]
+    pub keep_host_paths: bool,
+    /// Keep the full `vowp-asif-report-v1` document at this file (ASIF only).
+    #[arg(long, value_name = "FILE")]
+    pub report: Option<PathBuf>,
+    /// Refuse `Blocking` and `Integrity` ASIF losses (ASIF only).
+    #[arg(long, conflicts_with = "allow_loss")]
+    pub strict: bool,
+    /// Let recoverable ASIF integrity/ambiguity problems become declared losses (ASIF only).
+    #[arg(long)]
+    pub allow_loss: bool,
+    /// Hidden: write one stream envelope line and the package bytes (ASIF only).
+    #[arg(long, hide = true)]
+    pub asif_stream: bool,
 }
 
 /// Arguments for `vowp session import`.
 #[derive(Debug, Clone, Args)]
 pub struct SessionImportArgs {
-    /// Bundle file, or `-` for stdin.
+    /// Bundle/package file, document, directory, or `-` for stdin.
     pub file: String,
+    /// Interchange format.
+    #[arg(long, value_enum, default_value = "bundle", value_name = "FORMAT")]
+    pub format: SessionFormat,
     /// Node to import on.
     #[arg(long, value_name = "NAME")]
     pub node: Option<String>,
-    /// Executor for the child session.
+    /// Executor for the child session (bundle only).
     #[arg(long, value_name = "EXECUTOR")]
     pub executor: Option<String>,
     /// Working directory.
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<PathBuf>,
-    /// Keep the bundle's session id; refuse when it already exists locally.
+    /// Keep the bundle's session id; refuse when it already exists locally (bundle only).
     #[arg(long)]
     pub same_id: bool,
+    /// Select one ASIF branch when the document has more than one (ASIF only).
+    #[arg(long, value_name = "ID")]
+    pub branch: Option<String>,
+    /// Keep the full `vowp-asif-report-v1` document at this file (ASIF only).
+    #[arg(long, value_name = "FILE")]
+    pub report: Option<PathBuf>,
+    /// Refuse `Blocking` and `Integrity` ASIF losses (ASIF only).
+    #[arg(long, conflicts_with = "allow_loss")]
+    pub strict: bool,
+    /// Let recoverable ASIF integrity/ambiguity problems become declared losses (ASIF only).
+    #[arg(long)]
+    pub allow_loss: bool,
 }
 
 /// Arguments for `vowp session pull`.
@@ -654,6 +967,18 @@ pub struct SessionPullArgs {
     /// Copy the full session directory (log, blobs, capsules, adapters.json).
     #[arg(long, conflicts_with = "same_id")]
     pub full: bool,
+}
+
+/// Arguments for `vowp session push`.
+#[derive(Debug, Clone, Args)]
+pub struct SessionPushArgs {
+    /// Node that receives the session.
+    pub node: String,
+    /// Local session id or unique prefix.
+    pub session: String,
+    /// Keep the source session id; refuse when it already exists on the node.
+    #[arg(long)]
+    pub same_id: bool,
 }
 
 /// Arguments for the hidden `vowp session dir-export` stream.
@@ -825,6 +1150,12 @@ pub enum NodeCommand {
     Ls,
     /// Remove a node.
     Rm(NodeRmArgs),
+    /// Create a pending local-agent node and a one-time enrollment code.
+    Enroll(NodeEnrollArgs),
+    /// Revoke a node's credentials.
+    Revoke(NodeRevokeArgs),
+    /// Show the redacted node card.
+    Show(NodeShowArgs),
 }
 
 /// Arguments for `vowp node add`.
@@ -844,6 +1175,370 @@ pub struct NodeAddArgs {
 pub struct NodeRmArgs {
     /// Node name.
     pub name: String,
+    /// Remove without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Arguments for `vowp node enroll`.
+#[derive(Debug, Clone, Args)]
+pub struct NodeEnrollArgs {
+    /// Node name slug.
+    pub name: String,
+    /// Owner-assigned label; repeat for several labels.
+    #[arg(long, value_name = "LABEL")]
+    pub label: Vec<String>,
+    /// Rotate a pending node's one-time code in one transaction.
+    #[arg(long)]
+    pub replace: bool,
+}
+
+/// Arguments for `vowp node revoke`.
+#[derive(Debug, Clone, Args)]
+pub struct NodeRevokeArgs {
+    /// Node name.
+    pub name: String,
+    /// Revoke without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Arguments for `vowp node show`.
+#[derive(Debug, Clone, Args)]
+pub struct NodeShowArgs {
+    /// Node name.
+    pub name: String,
+}
+
+/// Arguments for `vowp offload`.
+#[derive(Debug, Clone, Args)]
+pub struct OffloadArgs {
+    /// The offload subcommand.
+    #[command(subcommand)]
+    pub command: OffloadCommand,
+}
+
+/// The `vowp offload` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum OffloadCommand {
+    /// Show the effective offload policy.
+    Policy(OffloadPolicyArgs),
+    /// Show nodes, live assignments and waiting jobs.
+    Status(OffloadStatusArgs),
+}
+
+/// Arguments for `vowp offload policy`.
+///
+/// The project selector is the global `--project <name|path>` flag; the selected
+/// `vowp.toml` supplies the policy document. [`OffloadPolicyArgs::project_explicit`]
+/// records whether that flag was passed, because clap does not expose global-flag
+/// presence through [`crate::Ctx`].
+#[derive(Debug, Clone, Default)]
+pub struct OffloadPolicyArgs {
+    /// Whether the global `--project` flag was passed.
+    pub project_explicit: bool,
+}
+
+/// The clap field set behind [`OffloadPolicyArgs`]; it defines no arguments of its own.
+#[derive(Debug, Clone, Args)]
+struct OffloadPolicyArgsFields {}
+
+impl Args for OffloadPolicyArgs {
+    fn augment_args(command: clap::Command) -> clap::Command {
+        OffloadPolicyArgsFields::augment_args(command)
+    }
+
+    fn augment_args_for_update(command: clap::Command) -> clap::Command {
+        OffloadPolicyArgsFields::augment_args_for_update(command)
+    }
+}
+
+impl FromArgMatches for OffloadPolicyArgs {
+    fn from_arg_matches(matches: &clap::ArgMatches) -> Result<Self, clap::Error> {
+        OffloadPolicyArgsFields::from_arg_matches(matches)?;
+        Ok(Self {
+            project_explicit: matches.get_one::<String>("project").is_some(),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &clap::ArgMatches) -> Result<(), clap::Error> {
+        OffloadPolicyArgsFields::from_arg_matches(matches)?;
+        self.project_explicit = matches.get_one::<String>("project").is_some();
+        Ok(())
+    }
+}
+
+/// Arguments for `vowp offload status`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct OffloadStatusArgs {}
+
+/// `vowp agent` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentCommand {
+    /// Enroll this Mac with a one-time code.
+    Enroll(AgentEnrollArgs),
+    /// Add, remove or list the local project path map.
+    Paths(AgentPathsArgs),
+    /// Redeem a home surface pairing code and store the token.
+    Pair(AgentPairArgs),
+    /// Run the agent client until revoked or superseded.
+    Run(AgentRunArgs),
+    /// Show the last local agent status.
+    Status(AgentStatusArgs),
+    /// Install, remove or inspect the launchd or systemd-user service.
+    Service(AgentServiceArgs),
+    /// Report local agent warnings without failing on them.
+    Doctor(AgentDoctorArgs),
+    /// Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band.
+    Trust(AgentTrustArgs),
+    /// Hidden: serve the home side of one agent stdio or WebSocket connection.
+    #[command(hide = true)]
+    Gateway(AgentGatewayArgs),
+}
+
+/// Arguments for `vowp agent enroll`.
+///
+/// `--target` names the SSH home. `--wss` instead stores a WSS transport; the target is then
+/// optional because the proxy URL carries the route.
+#[derive(Debug, Clone, Args)]
+pub struct AgentEnrollArgs {
+    /// ssh destination of the home.
+    #[arg(long, value_name = "SSH-TARGET")]
+    pub target: Option<String>,
+    /// File holding the one-time code, or `-` for stdin.
+    #[arg(long, value_name = "PATH|-")]
+    pub code_file: String,
+    /// Map a local project checkout; repeat for more projects.
+    #[arg(long, value_name = "PATH")]
+    pub project: Vec<String>,
+    /// Worktree root for every --project; defaults to `<checkout>/.vowp/worktrees`.
+    #[arg(long, value_name = "PATH")]
+    pub worktree_root: Option<PathBuf>,
+    /// Reach the home through a WSS proxy URL instead of SSH.
+    #[arg(long, value_name = "URL")]
+    pub wss: Option<String>,
+    /// Hard-pin the proxy certificate (`sha256:<hex>`); only with --wss.
+    #[arg(long, value_name = "SHA256:HEX", requires = "wss")]
+    pub tls_fingerprint: Option<String>,
+}
+
+/// Arguments for `vowp agent paths`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentPathsArgs {
+    /// The path-map subcommand.
+    #[command(subcommand)]
+    pub command: AgentPathsCommand,
+}
+
+/// `vowp agent paths` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentPathsCommand {
+    /// Add or update one project checkout.
+    Add(AgentPathsAddArgs),
+    /// Remove one project from the map.
+    Rm(AgentPathsRmArgs),
+    /// List the local project path map.
+    Ls(AgentPathsLsArgs),
+}
+
+/// Arguments for `vowp agent paths add`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentPathsAddArgs {
+    /// Local project checkout to map.
+    #[arg(long, value_name = "PATH")]
+    pub project: String,
+    /// Project name override; defaults to `[project].name` in its `vowp.toml`.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+    /// Worktree root; defaults to `<checkout>/.vowp/worktrees`.
+    #[arg(long, value_name = "PATH")]
+    pub worktree_root: Option<PathBuf>,
+    /// Allowed relative path below the checkout; repeat for more.
+    #[arg(long, value_name = "REL")]
+    pub allow: Vec<String>,
+}
+
+/// Arguments for `vowp agent paths rm`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentPathsRmArgs {
+    /// Project name slug to remove.
+    #[arg(value_name = "PROJECT")]
+    pub project_name: String,
+}
+
+/// Arguments for `vowp agent paths ls`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentPathsLsArgs {}
+
+/// Arguments for `vowp agent pair`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentPairArgs {
+    /// File holding the one-time pairing code, or `-` for stdin.
+    #[arg(long, value_name = "PATH|-")]
+    pub code_file: String,
+    /// Surface id printed by `vowp surface pair`.
+    #[arg(long, value_name = "ID")]
+    pub surface: String,
+    /// Session id printed by `vowp surface pair`.
+    #[arg(long, value_name = "ID")]
+    pub session: String,
+    /// Application name; defaults to `agent` when the home did not bind one.
+    #[arg(long, value_name = "APP")]
+    pub app: Option<String>,
+}
+
+/// Arguments for `vowp agent run`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentRunArgs {
+    /// Keep the process in the terminal (the Phase 0 default).
+    #[arg(long)]
+    pub foreground: bool,
+    /// Agent role: `surface`, `executor` or `both`.
+    #[arg(long, value_name = "ROLE")]
+    pub role: Option<String>,
+    /// Run under the service manager: write the `run` marker and drain on SIGTERM.
+    #[arg(long)]
+    pub service: bool,
+}
+
+/// Arguments for `vowp agent status`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentStatusArgs {}
+
+/// Arguments for the hidden `vowp agent gateway`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentGatewayArgs {
+    /// Serve one JSON frame per line on stdin/stdout.
+    #[arg(long, conflicts_with = "listen")]
+    pub stdio: bool,
+    /// Serve one gateway connection per WebSocket on this loopback address.
+    #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
+    pub listen: Option<String>,
+}
+
+/// Arguments for `vowp agent service`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentServiceArgs {
+    /// The service subcommand.
+    #[command(subcommand)]
+    pub command: AgentServiceCommand,
+}
+
+/// `vowp agent service` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentServiceCommand {
+    /// Write exactly one launchd plist or systemd user unit.
+    Install(AgentServiceInstallArgs),
+    /// Stop the unit and remove only a VOWP-generated file.
+    Uninstall(AgentServiceUninstallArgs),
+    /// Show the unit path and the manager's reported state.
+    Status(AgentServiceStatusArgs),
+}
+
+/// Arguments for `vowp agent service install`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentServiceInstallArgs {
+    /// Print the unit text and commands without writing or invoking the manager.
+    #[arg(long)]
+    pub print: bool,
+    /// Replace a file at the unit path that VOWP did not generate.
+    #[arg(long)]
+    pub force: bool,
+    /// Run the current-user manager commands after writing the unit.
+    #[arg(long)]
+    pub now: bool,
+}
+
+/// Arguments for `vowp agent service uninstall`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentServiceUninstallArgs {
+    /// Remove the unit without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Arguments for `vowp agent service status`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentServiceStatusArgs {}
+
+/// Arguments for `vowp agent doctor`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct AgentDoctorArgs {}
+
+/// Arguments for `vowp agent trust`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentTrustArgs {
+    /// New leaf fingerprint (`sha256:<64 lowercase hex>`), verified through a trusted channel.
+    #[arg(long, value_name = "SHA256:HEX")]
+    pub fingerprint: String,
+}
+
+/// `vowp surface` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum SurfaceCommand {
+    /// Create a pending surface and print its one-time pairing code.
+    Pair(SurfacePairArgs),
+    /// List surfaces, their scopes and token expiry.
+    Ls(SurfaceLsArgs),
+    /// Revoke a surface and every token it holds.
+    Revoke(SurfaceRevokeArgs),
+    /// Rotate a surface token, keeping the old token for a ten-minute overlap.
+    Rotate(SurfaceRotateArgs),
+}
+
+/// Arguments for `vowp surface pair`.
+///
+/// The target node comes from the global `--node <name>` flag: for this command it names
+/// the node the surface runs on, not an SSH redirect.
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "For this command --node <name> names the node the surface runs on, not an SSH redirect.")]
+pub struct SurfacePairArgs {
+    /// Session the surface will mirror.
+    #[arg(long, value_name = "ID")]
+    pub session: String,
+    /// Surface kind: `opencode` or `chat`.
+    #[arg(long, value_name = "KIND")]
+    pub kind: String,
+    /// Application name carried into the token scopes.
+    #[arg(long, value_name = "APP")]
+    pub app: Option<String>,
+    /// Revoke this surface and create the replacement pending surface in one transaction.
+    #[arg(long, value_name = "SURFACE-ID")]
+    pub replace: Option<String>,
+}
+
+/// Arguments for `vowp surface ls`.
+///
+/// The optional node filter comes from the global `--node <name>` flag.
+#[derive(Debug, Clone, Default, Args)]
+#[command(after_help = "For this command --node <name> filters by the surface's node, not an SSH redirect.")]
+pub struct SurfaceLsArgs {}
+
+/// Arguments for `vowp surface revoke`.
+#[derive(Debug, Clone, Args)]
+pub struct SurfaceRevokeArgs {
+    /// Surface id.
+    pub id: String,
+    /// Revoke without asking for confirmation.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+/// Arguments for `vowp surface rotate`.
+///
+/// The optional node check comes from the global `--node <name>` flag: for this command it
+/// names the node the surface runs on, not an SSH redirect.
+#[derive(Debug, Clone, Args)]
+#[command(after_help = "For this command --node <name> names the node the surface runs on, not an SSH redirect.")]
+pub struct SurfaceRotateArgs {
+    /// Surface id printed by `vowp surface pair`.
+    pub id: String,
+    /// Poll the outbox for this long and exit 7 with `rotation_pending` if still queued.
+    #[arg(long, value_name = "DURATION")]
+    pub wait: Option<String>,
+    /// Shorten the old tokens to `now + grace` instead of the ten-minute default (max 24 h).
+    #[arg(long, value_name = "DURATION")]
+    pub grace: Option<String>,
 }
 
 /// Arguments for `vowp loops`.

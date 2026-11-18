@@ -288,6 +288,7 @@ fn run_switch_inner(
                 Some(previous) => {
                     let log = SessionLog::open(&deps.paths, &req.session_id, deps.clock.clone())?;
                     append_event(
+                        deps,
                         store,
                         &log,
                         HarnessKind::Vowp,
@@ -326,6 +327,7 @@ fn run_switch_inner(
         let log = SessionLog::open(&deps.paths, &req.session_id, deps.clock.clone())?;
         if let Some(source) = &previous_executor {
             append_event(
+                deps,
                 store,
                 &log,
                 source.harness,
@@ -376,6 +378,7 @@ fn run_switch_inner(
             }
             None => {
                 append_event(
+                    deps,
                     store,
                     &log,
                     req.to.executor.harness,
@@ -395,6 +398,7 @@ fn run_switch_inner(
         }
 
         append_event(
+            deps,
             store,
             &log,
             req.to.executor.harness,
@@ -563,6 +567,7 @@ fn drain(
                     .saturating_add(1) as u32
             });
         append_event(
+            deps,
             store,
             &log,
             HarnessKind::Vowp,
@@ -839,6 +844,7 @@ fn abort(
     };
     if let Some(log) = &log {
         if let Err(error) = append_event(
+            deps,
             store,
             log,
             HarnessKind::Vowp,
@@ -862,6 +868,7 @@ fn abort(
             Some(executor) => {
                 if let Some(log) = &log {
                     if let Err(error) = append_event(
+                        deps,
                         store,
                         log,
                         executor.harness,
@@ -968,6 +975,7 @@ fn run_target_turn(
         detail: String::new(),
     };
     let attach = append_event(
+        deps,
         store,
         log,
         executor.harness,
@@ -984,6 +992,7 @@ fn run_target_turn(
     )?;
     let attach_seq = attach.envelope.seq;
     append_event(
+        deps,
         store,
         log,
         executor.harness,
@@ -992,6 +1001,7 @@ fn run_target_turn(
         None,
     )?;
     append_event(
+        deps,
         store,
         log,
         executor.harness,
@@ -1023,6 +1033,7 @@ fn run_target_turn(
         Ok(adapter_run) => adapter_run,
         Err(error) => {
             append_event(
+                deps,
                 store,
                 log,
                 executor.harness,
@@ -1035,6 +1046,7 @@ fn run_target_turn(
                 None,
             )?;
             append_event(
+                deps,
                 store,
                 log,
                 executor.harness,
@@ -1047,6 +1059,7 @@ fn run_target_turn(
                 None,
             )?;
             append_event(
+                deps,
                 store,
                 log,
                 executor.harness,
@@ -1096,7 +1109,7 @@ fn run_target_turn(
                     }
                     _ => {}
                 }
-                append_harness(store, log, &event, &executor, &node)?;
+                append_harness(deps, store, log, &event, &executor, &node)?;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -1110,6 +1123,7 @@ fn run_target_turn(
             // adapter had already emitted `turn.ended`, do not duplicate it.
             if terminal.is_none() {
                 append_event(
+                    deps,
                     store,
                     log,
                     executor.harness,
@@ -1123,6 +1137,7 @@ fn run_target_turn(
                 )?;
             }
             append_event(
+                deps,
                 store,
                 log,
                 executor.harness,
@@ -1155,6 +1170,7 @@ fn run_target_turn(
     };
     if summary.cost.usd.is_some() && !emitted_cost {
         append_event(
+            deps,
             store,
             log,
             executor.harness,
@@ -1170,6 +1186,7 @@ fn run_target_turn(
         && !emitted_limit
     {
         append_event(
+            deps,
             store,
             log,
             executor.harness,
@@ -1179,6 +1196,7 @@ fn run_target_turn(
         )?;
     } else if !emitted_error && matches!(summary.outcome, RunOutcome::Error | RunOutcome::Crash) {
         append_event(
+            deps,
             store,
             log,
             executor.harness,
@@ -1203,6 +1221,7 @@ fn run_target_turn(
         _ => (None, None),
     };
     append_ts_event(
+        deps,
         store,
         log,
         executor.harness,
@@ -1216,6 +1235,7 @@ fn run_target_turn(
         summary.native_session_id.clone(),
     )?;
     append_event(
+        deps,
         store,
         log,
         executor.harness,
@@ -1292,6 +1312,7 @@ fn run_target_turn(
 
 /// Appends one event with the canonical actor and indexes it.
 fn append_event(
+    deps: &Deps,
     store: &Store,
     log: &SessionLog,
     harness: HarnessKind,
@@ -1299,11 +1320,13 @@ fn append_event(
     node: Option<NodeName>,
     native: Option<String>,
 ) -> Result<AppendedEvent, CoreError> {
-    append_ts_event(store, log, harness, body, None, node, native)
+    append_ts_event(deps, store, log, harness, body, None, node, native)
 }
 
 /// Appends one event with an optional harness timestamp and indexes it.
+#[allow(clippy::too_many_arguments)]
 fn append_ts_event(
+    deps: &Deps,
     store: &Store,
     log: &SessionLog,
     harness: HarnessKind,
@@ -1312,42 +1335,55 @@ fn append_ts_event(
     node: Option<NodeName>,
     native: Option<String>,
 ) -> Result<AppendedEvent, CoreError> {
-    let appended = log.append(NewEvent {
-        actor: actor_for(&body),
-        source: EventSource {
-            harness,
-            model: None,
-            node,
-            native_session_id: native,
-        },
-        body,
-        raw: None,
-        ts,
-    })?;
+    let appended = log.append(
+        // Redact exact values before the log line is written.
+        crate::vault::redact_event(
+            deps,
+            NewEvent {
+                actor: actor_for(&body),
+                source: EventSource {
+                    harness,
+                    model: None,
+                    node,
+                    native_session_id: native,
+                },
+                body,
+                raw: None,
+                ts,
+            },
+        )?,
+    )?;
     store.index_event(&index_row(&appended))?;
     Ok(appended)
 }
 
 /// Forwards one adapter event.
 fn append_harness(
+    deps: &Deps,
     store: &Store,
     log: &SessionLog,
     event: &vowp_protocol::HarnessEvent,
     executor: &Executor,
     node: &NodeName,
 ) -> Result<(), CoreError> {
-    let appended = log.append(NewEvent {
-        actor: event.actor,
-        source: EventSource {
-            harness: executor.harness,
-            model: Some(executor.model.clone()),
-            node: Some(node.clone()),
-            native_session_id: None,
-        },
-        body: event.body.clone(),
-        raw: event.raw.clone(),
-        ts: event.ts,
-    })?;
+    let appended = log.append(
+        // Redact exact values before the log line is written.
+        crate::vault::redact_event(
+            deps,
+            NewEvent {
+                actor: event.actor,
+                source: EventSource {
+                    harness: executor.harness,
+                    model: Some(executor.model.clone()),
+                    node: Some(node.clone()),
+                    native_session_id: None,
+                },
+                body: event.body.clone(),
+                raw: event.raw.clone(),
+                ts: event.ts,
+            },
+        )?,
+    )?;
     store.index_event(&index_row(&appended))?;
     Ok(())
 }

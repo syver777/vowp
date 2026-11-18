@@ -6,10 +6,10 @@ mod h;
 
 use h::*;
 use vowp_core::loops::merge_queue::{MergeQueue, MergeStep};
-use vowp_protocol::{JobKind, JobState, LedgerKind, Role};
+use vowp_protocol::{Job, JobKind, JobState, LedgerEntry, LedgerKind, Role};
 use vowp_store::LedgerFilter;
 
-fn merging_job(node: &TestNode, id: &str) -> vowp_protocol::Job {
+fn merging_job(node: &TestNode, id: &str) -> Job {
     let job = node.insert_job(id, JobKind::Build, Role::Worker, Some(vec![]));
     let worktree = node.worktree_with_file(&job, "src/lib.rs", &format!("pub fn {id}() {{}}\n"));
     let text = report_markdown(id, &format!("job/{id}"), "done", None, &[]);
@@ -18,6 +18,40 @@ fn merging_job(node: &TestNode, id: &str) -> vowp_protocol::Job {
     std::fs::write(&report, text).expect("report");
     node.force_state(&job, JobState::Merging);
     node.store().require_job(&job.id).expect("job")
+}
+
+/// Commits `file` on the local `main` without pushing it, and returns the new head.
+fn commit_local_main(node: &TestNode, file: &str, content: &str) -> String {
+    node.commit_file(&node.main_repo, file, content);
+    node.git(&node.main_repo, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// Adds and pushes one commit to the bare origin's `main` from a second clone.
+fn push_remote_commit(node: &TestNode, file: &str, content: &str) -> String {
+    let origin = node.tmp.path().join("origin.git");
+    let other = node.tmp.path().join("other");
+    node.git(
+        node.tmp.path(),
+        &["clone", &origin.to_string_lossy(), &other.to_string_lossy()],
+    );
+    node.git(&other, &["config", "user.name", "test"]);
+    node.git(&other, &["config", "user.email", "test@example.com"]);
+    std::fs::write(other.join(file), content).expect("remote file");
+    node.git(&other, &["add", "-A"]);
+    node.git(&other, &["commit", "-m", "remote change"]);
+    node.git(&other, &["push", "origin", "main"]);
+    node.git(&other, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+/// Returns the merge ledger rows of one job.
+fn merge_ledger(node: &TestNode, job: &Job) -> Vec<LedgerEntry> {
+    node.store()
+        .ledger_since(&LedgerFilter {
+            kind: Some(LedgerKind::Merge),
+            job_id: Some(job.id.clone()),
+            ..LedgerFilter::default()
+        })
+        .expect("merge ledger")
 }
 
 #[test]
@@ -43,6 +77,105 @@ fn merge_queue_happy_path_ff_push_to_local_bare_origin() {
     assert_eq!(
         ledger[0].detail.get("lockfile_refreshed"),
         Some(&serde_json::Value::Bool(false))
+    );
+}
+
+#[test]
+fn merge_queue_local_main_ahead_of_origin_still_merges() {
+    let node = TestNode::new_real_git();
+    // The job branch is cut from main, then local main advances while the job is verified.
+    // This is the real race: the branch does not contain the newer local commit.
+    let job = merging_job(&node, "local-ahead");
+    let local_head = commit_local_main(&node, "local.txt", "local only\n");
+    let queue = MergeQueue::new(node.deps.clone());
+    let step = queue.step(&node.store()).expect("merge step");
+    assert_eq!(
+        step,
+        MergeStep::Merged(job.id.clone()),
+        "the queue must merge onto the local default branch even when it is ahead of origin"
+    );
+
+    let origin = node.tmp.path().join("origin.git");
+    assert_eq!(node.git(&origin, &["show", "main:local.txt"]), "local only\n");
+    assert!(
+        node.git(&origin, &["show", "main:src/lib.rs"])
+            .contains("pub fn local-ahead"),
+        "the job commit reached the origin"
+    );
+    // The local commit is an ancestor of the pushed origin/main, so it was pushed too.
+    node.git(&origin, &["merge-base", "--is-ancestor", &local_head, "main"]);
+
+    let ledger = merge_ledger(&node, &job);
+    let row = ledger.last().expect("merge row");
+    assert_eq!(
+        row.detail.get("main_before"),
+        Some(&serde_json::Value::String(local_head)),
+        "main_before is the local base head the queue merged onto"
+    );
+}
+
+#[test]
+fn merge_queue_remote_ahead_fast_forwards_local_base_first() {
+    let node = TestNode::new_real_git();
+    let remote_head = push_remote_commit(&node, "remote.txt", "remote only\n");
+    let job = merging_job(&node, "remote-ahead");
+    let local_before = node.git(&node.main_repo, &["rev-parse", "main"]).trim().to_owned();
+    assert_ne!(local_before, remote_head, "the local base starts behind the remote");
+
+    let queue = MergeQueue::new(node.deps.clone());
+    let step = queue.step(&node.store()).expect("merge step");
+    assert_eq!(step, MergeStep::Merged(job.id.clone()));
+
+    let local_after = node.git(&node.main_repo, &["rev-parse", "main"]).trim().to_owned();
+    node.git(
+        &node.main_repo,
+        &["merge-base", "--is-ancestor", &remote_head, &local_after],
+    );
+    let origin = node.tmp.path().join("origin.git");
+    assert_eq!(node.git(&origin, &["show", "main:remote.txt"]), "remote only\n");
+    assert!(
+        node.git(&origin, &["show", "main:src/lib.rs"])
+            .contains("pub fn remote-ahead"),
+        "the job commit reached the origin"
+    );
+
+    let ledger = merge_ledger(&node, &job);
+    let row = ledger.last().expect("merge row");
+    assert_eq!(
+        row.detail.get("main_before"),
+        Some(&serde_json::Value::String(remote_head)),
+        "main_before is the fast-forwarded local base"
+    );
+}
+
+#[test]
+fn merge_queue_diverged_bases_refuse_without_moving_main() {
+    let node = TestNode::new_real_git();
+    let local_head = commit_local_main(&node, "local.txt", "local only\n");
+    let remote_head = push_remote_commit(&node, "remote.txt", "remote only\n");
+    assert_ne!(local_head, remote_head);
+    let job = merging_job(&node, "diverged");
+    let main_before = node.git(&node.main_repo, &["rev-parse", "main"]).trim().to_owned();
+    assert_eq!(main_before, local_head);
+
+    let queue = MergeQueue::new(node.deps.clone());
+    let step = queue.step(&node.store()).expect("merge step");
+    let MergeStep::Manual { job: refused, detail } = step else {
+        panic!("diverged bases must be refused manually: {step:?}");
+    };
+    assert_eq!(refused, job.id);
+    assert!(detail.contains(&local_head), "detail names the local head: {detail}");
+    assert!(detail.contains(&remote_head), "detail names the remote head: {detail}");
+    assert_eq!(
+        node.git(&node.main_repo, &["rev-parse", "main"]).trim(),
+        main_before.as_str(),
+        "main must not move on divergence"
+    );
+
+    let ledger = merge_ledger(&node, &job);
+    assert!(
+        ledger.iter().any(|entry| entry.detail.get("failure").is_some()),
+        "the refusal is recorded as a merge failure: {ledger:?}"
     );
 }
 

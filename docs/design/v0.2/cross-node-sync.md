@@ -29,16 +29,17 @@ not move it; you move the executor. The bundle is the escape hatch, not the ever
 
 ## What remains for v0.3
 
-- **`session push <node> <session>`** as the remaining convenience wrapper around the existing
-  bundle and `--node` transport, for two-home or offline use. `session pull <node> <session>` landed
-  in the first slice below.
+- **`session push <node> <session>`** as the reverse convenience wrapper around the existing bundle
+  and SSH transport, for two-home or offline use. It landed in the fifth slice below; `session pull
+  <node> <session>` landed in the first slice.
 - **Directory copy.** Landed in the third slice below as `session pull <node> <session> --full`:
   it copies `sessions/<id>/` (log, blobs, capsules, `adapters.json`) with a manifest, checksums and
   a 1 GiB cap, then runs `vowp reindex`; the full log is preserved rather than the bundle's capsule
   + tail.
-- **Divergence reporting, never a silent merge.** Landed in the fourth slice below for
-  `--same-id` and `--full`: if both sides advanced the same session, report the two heads and
-  require an explicit choice. Automatic merge and a force flag remain out of scope.
+- **Divergence reporting, never a silent merge.** Landed in the fourth slice below for pull
+  `--same-id` and `--full`, and in the fifth for push `--same-id`: if the same session id exists on
+  both sides, report the two heads and require an explicit choice. Automatic merge and a force flag
+  remain out of scope.
 - **Daemon transport.** The optional second transport after the v0.3 HTTP API exists. SSH stays the
   only v0.2/v0.3 transport until then.
 
@@ -67,8 +68,9 @@ not move it; you move the executor. The bundle is the escape hatch, not the ever
    duplicate, and treats a `reindex` event-id collision as a conflict. The fourth slice reports the
    two heads on a duplicate instead of a bare refusal. An automatic choice between the two modes
    is still open.
-2. **Direction.** Explicit `pull`/`push` first; a bidirectional `session sync` only with a visible
-   divergence report (now implemented for explicit pulls, fourth slice). Never guess a merge.
+2. **Direction.** Explicit `pull` and `push` now exist (first and fifth slices); a bidirectional
+   `session sync` only with a visible divergence report (implemented for explicit pulls and pushes).
+   Never guess a merge.
 3. **Blobs.** The full pull refuses a session whose declared file sizes exceed the 1 GiB limit
    before copying anything; there is no partial copy and no "blob unavailable" placeholder. A
    progress display and a configurable limit remain open.
@@ -194,6 +196,39 @@ Tests: `session_pull_same_id_reports_divergence_without_mutating_it`,
 empty-local and default-child tests. Store tests cover `SessionLogReader::head`; the core test
 covers the bundle head and its compacted-bundle case.
 
-Still out of scope: automatic merge, a force/overwrite flag, bidirectional sync, `session push`,
-live lease migration, a daemon transport, offline queueing, a progress display, blob deduplication
-and a configurable size limit.
+Still out of scope for this slice: automatic merge, a force/overwrite flag, bidirectional sync,
+`session push` (landed in the fifth slice below), live lease migration, a daemon transport, offline
+queueing, a progress display, blob deduplication and a configurable size limit.
+
+## Fifth v0.3 slice (implemented)
+
+`vowp session push <node> <session> [--same-id]` is the reverse of the bundle pull. It resolves the
+local session by id or unique prefix, exports one `vowp-bundle-v1` into memory (the same capsule as
+`session export`; no temporary bundle file is written) and streams it to the remote
+`vowp --project <project> --json session import -` over the existing SSH argv/capture path. The
+default creates a child on the remote whose `parent_session_id` is the local id. `--same-id` keeps
+the origin id only when it is absent on the remote; the push asks the remote's read-only
+`session show --json --events 1` first, treats remote exit 3 as absent, and otherwise reports the
+same `session_divergence` document as a pull (both heads plus
+`choose which side advances; no merge performed`) and exits 4. A divergent push exports, imports or
+mutates nothing on either side.
+
+The push runs locally, like the pull: the positional node is the destination and a global
+`--node` does not redirect the command. A local node is refused with exit 2 and the
+`session export`/`session import` hint; an unknown local session is exit 3 before any ssh. A failed
+local export or remote import relays the existing exit code and output and prints no success line.
+The human output is `pushed session <local> to <node> as child <remote-child>` (JSON
+`{"node","source_session","child_session"}`) or
+`pushed session <local> to <node> with same id <id>` (JSON
+`{"node","source_session","same_id_session"}`), mirroring the pull field names.
+
+Tests: `session_push_imports_a_child_on_the_remote`,
+`session_push_same_id_keeps_the_origin_id_on_the_remote`,
+`session_push_same_id_reports_divergence_without_writing`, `session_push_refuses_a_local_node`,
+`session_push_reports_a_missing_local_session_without_ssh` and
+`session_push_relays_a_failed_remote_import`. The divergence test proves the write-nothing property
+by comparing both logs, both session counts and both rows after the refused push.
+
+Still out of scope: `session push --full`, a directory import on the remote, bidirectional
+`session sync`, automatic merge, a force/overwrite flag, live lease migration, a daemon transport
+and an offline/retry queue.

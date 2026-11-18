@@ -3,14 +3,14 @@
 //!
 //! Spec: `docs/design/v0.2/home-and-surfaces.md` §7.5 and the transcript mirror tests in §15.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 mod support;
@@ -20,7 +20,7 @@ use tempfile::{TempDir, tempdir};
 use vowp_core::session::importer::{import_file, scan_file};
 use vowp_core::session::service::SessionService;
 use vowp_core::surface::mirror::{
-    MirrorCursor, mirror_from_host, mirror_once, read_cursor, resume_context, write_cursor,
+    MirrorCursor, MirrorReport, mirror_from_host, mirror_once, read_cursor, resume_context, write_cursor,
 };
 use vowp_core::surface::native::{
     AppHandle, AppHost, HostHealth, HostRequest, TranscriptBatch, TranscriptEntry, TranscriptKind,
@@ -29,14 +29,15 @@ use vowp_core::surface::new_lease_token;
 use vowp_core::surface::opencode_host::{
     OpencodeHost, entries_from_api_event, entries_from_api_events, parse_message_list,
 };
-use vowp_core::{AdapterRegistry, Deps};
+use vowp_core::{AdapterRegistry, CoreError, Deps};
 use vowp_protocol::{
     Actor, AssistantMessage, CAPSULE_VERSION, Capsule, CapsuleId, CapsuleState, CapsuleTelemetry, CapsuleTrigger,
-    EventBody, EventSource, EventType, Executor, ExecutorRef, FakeClock, HarnessKind, Lease, MemoryLog, NewSession,
-    NodeName, OrchestratorApp, SessionId, SessionRole, SurfaceKind, Timestamp, TurnEnded, TurnStarted, UserMessage,
+    EventBody, EventEnvelope, EventSource, EventType, Executor, ExecutorRef, FakeClock, HarnessKind, Lease, MemoryLog,
+    NewSession, NodeName, OrchestratorApp, SessionId, SessionRole, SurfaceKind, Timestamp, TurnEnded, TurnStarted,
+    UserMessage,
 };
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
-use vowp_store::{NodePaths, Store};
+use vowp_store::{NodePaths, Store, hash_lease_token};
 use vowp_tmux::fake::FakeWindows;
 
 fn ts() -> Timestamp {
@@ -444,9 +445,60 @@ fn mirror_reads_api_event_and_backfills_export() {
         workdir: workdir.clone(),
     };
     let mut cursor = empty_cursor();
-    let first = mirror_from_host(&deps, &store, &session, &host, &host_handle, &mut cursor).expect("first mirror");
-    assert_eq!(first.events, 3, "user, assistant and cost from the export: {first:?}");
+    let poll = MirrorPoll {
+        deps: &deps,
+        store: &store,
+        session: &session,
+        host: &host,
+        handle: &host_handle,
+    };
+    // The first pass backfills the export. A single loopback request can be interrupted
+    // under parallel load, so run passes until the three export entries are actually in
+    // the session log; a mirror that never writes them still fails at the deadline.
+    let (backfilled, first) = poll.until(
+        &mut cursor,
+        "the export backfill",
+        |events| {
+            events.iter().any(
+                |event| matches!(event.body(), Ok(EventBody::UserMessage(message)) if message.text == "hello"),
+            ) && events.iter().any(
+                |event| matches!(event.body(), Ok(EventBody::AssistantMessage(message)) if message.text == "hi"),
+            ) && events.iter().any(
+                |event| matches!(event.body(), Ok(EventBody::Cost(cost)) if cost.cost.tokens.input == 3 && cost.cost.tokens.output == 4),
+            )
+        },
+    );
+    assert_eq!(backfilled, 3, "user, assistant and cost from the export: {first:?}");
     assert_eq!(cursor.last_native_id.as_deref(), Some("cost:m2"));
+    let events = events_of(&deps, &session);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == EventType::UserMessage)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == EventType::AssistantMessage)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == EventType::Cost)
+            .count(),
+        1
+    );
+    const EXPORT: &str = "/api/experimental/session/ses_fake/export";
+    let exports_after_backfill = server.seen().iter().filter(|path| path.as_str() == EXPORT).count();
+    assert!(
+        exports_after_backfill >= 1,
+        "backfill did not read the export: {:?}",
+        server.seen()
+    );
 
     // The first transcript read starts the persistent listener. Wait until it is connected
     // before adding events: `/api/event` is subscription-only and does not replay history.
@@ -471,14 +523,23 @@ fn mirror_reads_api_event_and_backfills_export() {
         "data": {"sessionID": "ses_other", "cost": 9.0, "tokens": {"input": 900, "output": 900}}
     }));
 
-    let live = wait_for_kind(&host, &host_handle, &cursor, TranscriptKind::TurnEnded);
+    // Wait for the complete turn, including its text, before mirroring it. Waiting only
+    // for one boundary would let the pass run on a partially delivered batch.
+    let live = transcript_until(&host, &host_handle, &cursor, "the first live turn", |entries| {
+        entries.iter().any(|entry| entry.kind == TranscriptKind::TurnStarted)
+            && entries.iter().any(|entry| entry.kind == TranscriptKind::TurnEnded)
+            && entries.iter().any(|entry| entry.text.as_deref() == Some("hi"))
+    });
     assert!(
         live.iter().any(|entry| entry.kind == TranscriptKind::TurnStarted),
         "the persistent listener missed the turn start: {live:?}"
     );
 
-    let second = mirror_from_host(&deps, &store, &session, &host, &host_handle, &mut cursor).expect("second mirror");
-    assert_eq!(second.events, 2, "only the live turn boundaries are new: {second:?}");
+    let (live_events, second) = poll.until(&mut cursor, "the live turn boundaries", |events| {
+        events.iter().any(|event| event.event_type == EventType::TurnStarted)
+            && events.iter().any(|event| event.event_type == EventType::TurnEnded)
+    });
+    assert_eq!(live_events, 2, "only the live turn boundaries are new: {second:?}");
     assert_eq!(cursor.last_native_id, second.cursor.last_native_id);
     let events = events_of(&deps, &session);
     assert_eq!(
@@ -510,14 +571,6 @@ fn mirror_reads_api_event_and_backfills_export() {
             .iter()
             .any(|event| matches!(event.body(), Ok(EventBody::UserMessage(message)) if message.text == "foreign")),
         "another opencode session leaked into this VOWP session"
-    );
-    assert!(
-        server
-            .seen()
-            .iter()
-            .any(|path| path == "/api/experimental/session/ses_fake/export"),
-        "backfill did not read the export: {:?}",
-        server.seen()
     );
     assert!(
         server.seen().iter().any(|path| path == "/api/event"),
@@ -574,13 +627,34 @@ fn mirror_reads_api_event_and_backfills_export() {
         "data": {"sessionID": "ses_fake"}, "durable": {"seq": 11}
     }));
 
-    let pending = wait_for_text(&host, &host_handle, &cursor, "later");
+    // The assistant text arrives at `step.ended`, but the cost is only complete after the
+    // following `usage.updated`. Wait for both before the pass; otherwise the third mirror
+    // can run on the first observation of the text and miss the cost.
+    let pending = transcript_until(
+        &host,
+        &host_handle,
+        &cursor,
+        "the between-pass text and cost",
+        |entries| {
+            entries.iter().any(|entry| entry.text.as_deref() == Some("later"))
+                && entries.iter().any(|entry| {
+                    entry.kind == TranscriptKind::Cost && entry.tokens.is_some_and(|tokens| tokens.input == 1)
+                })
+        },
+    );
     assert!(
         pending.iter().any(|entry| entry.text.as_deref() == Some("later")),
         "the event that happened between passes was lost"
     );
-    let third = mirror_from_host(&deps, &store, &session, &host, &host_handle, &mut cursor).expect("third mirror");
-    assert!(third.events >= 4, "{third:?}");
+    let (between_events, third) = poll.until(&mut cursor, "the between-pass assistant and cost", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event.body(), Ok(EventBody::AssistantMessage(message)) if message.text == "later"))
+            && events
+                .iter()
+                .any(|event| matches!(event.body(), Ok(EventBody::Cost(cost)) if cost.cost.tokens.input == 1))
+    });
+    assert!(between_events >= 4, "{third:?}");
     let events = events_of(&deps, &session);
     let later = events
         .iter()
@@ -601,12 +675,8 @@ fn mirror_reads_api_event_and_backfills_export() {
         "the live cost lost the step's model"
     );
     assert_eq!(
-        server
-            .seen()
-            .iter()
-            .filter(|path| path.as_str() == "/api/experimental/session/ses_fake/export")
-            .count(),
-        1,
+        server.seen().iter().filter(|path| path.as_str() == EXPORT).count(),
+        exports_after_backfill,
         "a later pass backfilled again instead of using its cursor"
     );
 }
@@ -658,33 +728,93 @@ fn first_turn_events() -> Vec<Value> {
     ]
 }
 
-/// Polls the transcript until an entry of `kind` appears, or panics after two seconds.
-fn wait_for_kind(
+/// How long a mirror or transcript poll may take while other test threads load the host.
+const MIRROR_WAIT: Duration = Duration::from_secs(10);
+
+/// True for an interrupted loopback I/O operation caused by parallel test load.
+///
+/// Every other error is real and must fail at once, so retrying never hides a broken host.
+fn transient_io(error: &CoreError) -> bool {
+    matches!(error, CoreError::Io { source, .. } if source.kind() == ErrorKind::Interrupted)
+}
+
+/// Polls the host transcript until `ready` sees the expected entries.
+///
+/// The deadline keeps a listener that never delivers the event failing the test instead
+/// of skipping the assertion; interrupted loopback reads are retried.
+fn transcript_until(
     host: &OpencodeHost,
     handle: &AppHandle,
     cursor: &MirrorCursor,
-    kind: TranscriptKind,
+    what: &str,
+    mut ready: impl FnMut(&[TranscriptEntry]) -> bool,
 ) -> Vec<TranscriptEntry> {
-    for _ in 0..100 {
-        let batch = host.transcript_since(handle, cursor).expect("transcript while waiting");
-        if batch.entries.iter().any(|entry| entry.kind == kind) {
-            return batch.entries;
+    let deadline = Instant::now() + MIRROR_WAIT;
+    loop {
+        match host.transcript_since(handle, cursor) {
+            Ok(batch) => {
+                if ready(&batch.entries) {
+                    return batch.entries;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}; transcript: {:?}",
+                    batch.entries
+                );
+            }
+            Err(error) if transient_io(&error) => {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}: {error}");
+            }
+            Err(error) => panic!("transcript while waiting for {what}: {error}"),
         }
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("timed out waiting for {kind:?}");
 }
 
-/// Polls the transcript until an entry with `text` appears, or panics after two seconds.
-fn wait_for_text(host: &OpencodeHost, handle: &AppHandle, cursor: &MirrorCursor, text: &str) -> Vec<TranscriptEntry> {
-    for _ in 0..100 {
-        let batch = host.transcript_since(handle, cursor).expect("transcript while waiting");
-        if batch.entries.iter().any(|entry| entry.text.as_deref() == Some(text)) {
-            return batch.entries;
+/// The inputs shared by the polling mirror passes in this test.
+struct MirrorPoll<'a> {
+    deps: &'a Deps,
+    store: &'a Store,
+    session: &'a SessionId,
+    host: &'a OpencodeHost,
+    handle: &'a AppHandle,
+}
+
+impl MirrorPoll<'_> {
+    /// Runs mirror passes until `present` sees the expected state in the session log.
+    ///
+    /// Returns the events written across the passes and the last report. A mirror that
+    /// never writes the expected state still fails at the deadline instead of being
+    /// skipped.
+    fn until(
+        &self,
+        cursor: &mut MirrorCursor,
+        what: &str,
+        mut present: impl FnMut(&[EventEnvelope]) -> bool,
+    ) -> (u64, MirrorReport) {
+        let deadline = Instant::now() + MIRROR_WAIT;
+        let mut written = 0;
+        loop {
+            match mirror_from_host(self.deps, self.store, self.session, self.host, self.handle, cursor) {
+                Ok(report) => {
+                    written += report.events;
+                    let events = events_of(self.deps, self.session);
+                    if present(&events) {
+                        return (written, report);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for {what}; session events: {events:?}"
+                    );
+                }
+                Err(error) if transient_io(&error) => {
+                    assert!(Instant::now() < deadline, "timed out waiting for {what}: {error}");
+                }
+                Err(error) => panic!("mirror while waiting for {what}: {error}"),
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        thread::sleep(Duration::from_millis(20));
     }
-    panic!("timed out waiting for {text:?}");
 }
 
 #[test]
@@ -1115,7 +1245,10 @@ fn resume_context_builds_capsule_and_tail() {
         context.capsule.as_ref().map(|capsule| capsule.capsule_id.clone()),
         Some(capsule.capsule_id)
     );
-    assert_eq!(context.lease.as_ref().map(|lease| lease.token.clone()), Some(token));
+    assert_eq!(
+        context.lease.as_ref().map(|lease| lease.token.clone()),
+        Some(hash_lease_token(&token))
+    );
     assert_eq!(context.tail.len(), 4, "{:?}", context.tail);
     assert_eq!(context.tail[0].event_type, EventType::TurnStarted);
     let EventBody::TurnStarted(start) = context.tail[0].body().expect("turn body") else {
@@ -1245,13 +1378,14 @@ impl MiniOpencode {
 
     /// Waits until the host listener has subscribed to `/api/event`.
     fn wait_for_subscriber(&self) {
-        for _ in 0..200 {
-            if *self.subscribers.lock().expect("subscribers") > 0 {
-                return;
-            }
+        let deadline = Instant::now() + MIRROR_WAIT;
+        while *self.subscribers.lock().expect("subscribers") == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "no /api/event subscriber connected within {MIRROR_WAIT:?}"
+            );
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("no /api/event subscriber connected");
     }
 
     fn seen(&self) -> Vec<String> {
@@ -1280,13 +1414,18 @@ fn mini_handle(
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut raw = Vec::new();
     let mut chunk = [0u8; 2048];
-    while let Ok(read) = stream.read(&mut chunk) {
-        if read == 0 {
-            break;
-        }
-        raw.extend_from_slice(&chunk[..read]);
-        if raw.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                raw.extend_from_slice(&chunk[..read]);
+                if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // A parallel test can interrupt a loopback read; that is not a bad request.
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
     }
     let text = String::from_utf8_lossy(&raw);

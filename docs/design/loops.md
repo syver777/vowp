@@ -69,7 +69,7 @@ Loop rows created on first `vowp up` (`name`, `kind`, `interval_secs`): `l1-supe
 
 ## 2. The job state machine (`vowp_graph::transition` implements this table exactly)
 
-Defaults: `MAX_CONTINUES=2` (per attempt), `MAX_HANG_RESTARTS=3`, `max_attempts = job.loop.max_attempts` (3). L1 reads the first two from
+Defaults: `MAX_CONTINUES=2` (per attempt), `MAX_HANG_RESTARTS=3`, `max_attempts = job.loop.max_attempts` (2). L1 reads the first two from
 `LoopBounds.max_continues` / `max_hang_restarts` (these defaults when unset); `attempts` counts **fix rounds started**;
 `continues` is reset to 0 whenever a new attempt or a retry begins. "Counter effects" are applied by the caller when the effect is listed; guards read the **current** job row.
 Every transition also writes one ledger row (`kind=state`, summary `"<job>: <from> -> <to> (<event>)"`) — not listed as an effect.
@@ -151,7 +151,7 @@ Their `gates` = `[report, cmd gates of the original]` (no `review`, no `owns_res
    {findings as a numbered list: gate name, command, exit code, last 40 lines of output / verifier findings}
    Fix exactly these problems in the same worktree, re-run the failing commands, commit, and update {report_path}. Do not widen scope.
    ```
-4. **Bounds.** Continues ≤ 2 per attempt (`jobs.continues`); then the job is `stalled` and the keeper (L5) is woken. Hung-before-first-output restarts ≤ 3 (`hang_restarts`). Fix rounds ≤ `loop.max_attempts` (3).
+4. **Bounds.** Continues ≤ 2 per attempt (`jobs.continues`); then the job is `stalled` and the keeper (L5) is woken. Hung-before-first-output restarts ≤ 3 (`hang_restarts`). Fix rounds ≤ `loop.max_attempts` (2).
 5. **After a worker run ends** (step 2 of the tick): if `report_path` exists in the worktree and parses (`Report::parse`) with `status ∈ {done, partial, blocked}`: `status=blocked` → `Blocked{Question}` (questions_for_owner → inbox body) else `ReportReady`. Report missing or unparsable → `RunEndedNoReport`.
 6. A **report that predates the current attempt** (mtime < run start of this attempt) is ignored; fix attempts require the report be rewritten.
 
@@ -198,22 +198,26 @@ A hit stores `{path, line, rule}` only. `vowp_core::gates::secret_scan::rules()`
 
 ### 5.2 Result
 4. Verify job reaches `done` (T14), then its report is parsed: `verdict: pass` → `VerifyPassed` for the original. `verdict: fail` (≥1 finding required; a fail without findings is treated as `partial` → the verify job is retried once, then `Blocked{Question}`) → `VerifyFailed`.
-5. Fix creation (T20): job `<id>-fix-<attempt>` (`kind=fix`, role/profile/owns copied, `needs=[]`, edge `fix fixes original`, brief = fix prompt + findings). Fix job `done` ⇒ `FixDone{Fix}` to the original (T22).
-6. Bound: `attempts` ≤ `loop.max_attempts` (3). Exhausted → `on_exhausted` (§2): **escalate** creates `<id>-decision` (`kind=decision`, edge `decision escalates original`, `decision blocks <dependents>` for every job that `needs` the original) and an inbox item (kind `decision`, options `["retry","replan","cancel"]`).
+5. Fix creation (T20): job `<id>-fix-<attempt>` (`kind=fix`, role/profile/owns copied, `needs=[]`, edge `fix fixes original`, brief = fix prompt + findings). Fix job `done` ⇒ `FixDone{Fix}` to the original (T22). If recovery finds a terminal child from an earlier round at that id, it allocates a fresh `<id>-fix-<attempt>-rN` child and starts that, rather than sending `NeedsSatisfied` to the finished one.
+6. Bound: `attempts` ≤ `loop.max_attempts` (2). Exhausted → `on_exhausted` (§2): **escalate** creates `<id>-decision` (`kind=decision`, edge `decision escalates original`, `decision blocks <dependents>` for every job that `needs` the original) and an inbox item (kind `decision`, options `["retry","replan","cancel"]`).
 7. A verify job that itself ends `stalled` is handled by the same L2/keeper rules (T4–T13); when it ends `failed` the original gets `VerifierFailed` (T37); a verifier provider limit goes through L6.
 
 ## 6. Merge queue (step 7)
 
 One merge at a time per project (`workers`-independent; runs on a runner thread). Input: job in `merging` (never a fix/merge/verify job: those go `done` at T14).
 
-1. `git fetch <remote>`; record `main_before = rev-parse <remote>/<default_branch>`.
-2. In the job worktree: `git rebase <remote>/<default_branch>` (if `merge.rebase=false`: skip, require ff-ability).
+1. `git fetch <remote>`; resolve the **local** `<default_branch>` head and the fetched `<remote>/<default_branch>` head. The merge base is the local branch the queue is about to fast-forward and push:
+   - The remote base is an ancestor of the local base (including equal): keep the local base. A local branch **ahead of the remote is the normal case** while the GitHub push is parked, not an error.
+   - The local base is an ancestor of the remote base: fast-forward the local base to `<remote>/<default_branch>` (`git merge --ff-only <remote>/<default_branch>`), then use it as the base.
+   - The two bases **diverged**: record a ledger `merge` failure naming both heads, open an inbox notice and park the job `Manual`. Never reset or force: a human reconciles the branches.
+   `main_before` is the local base head used for the merge; it is also the reset target when a push race is retried.
+2. In the job worktree: `git rebase <default_branch>` (if `merge.rebase=false`: skip, require ff-ability).
    - **Conflict** (rebase exits ≠ 0): `git rebase --abort`; list conflicted files; emit `MergeConflict` (T26). The merge job's brief lists the files and tells the agent to `git rebase origin/main`, resolve, `git add`, `git rebase --continue`, rerun gates. It runs **in the same worktree** with the original's `owns` plus the conflicted files.
-   - **Lockfile only** (every conflicted path is in `project.lock_files`, e.g. `Cargo.lock`): no merge job. Take the main version (`git checkout <remote>/<default_branch> -- <file>`), `git add`, `git rebase --continue`; after the rebase regenerate with `cargo update -w` (never `generate-lockfile`, which bumps versions) and, if the file changed, commit `chore: refresh lockfile (merge queue)` with the job's trailer. These are the only commits the supervisor authors; the ledger `merge` row records `lockfile_refreshed=true`.
+   - **Lockfile only** (every conflicted path is in `project.lock_files`, e.g. `Cargo.lock`): no merge job. Take the local base version (`git checkout <default_branch> -- <file>`), `git add`, `git rebase --continue`; after the rebase regenerate with `cargo update -w` (never `generate-lockfile`, which bumps versions) and, if the file changed, commit `chore: refresh lockfile (merge queue)` with the job's trailer. These are the only commits the supervisor authors; the ledger `merge` row records `lockfile_refreshed=true`.
 3. Re-run the **repo-wide checks**: `merge.check_cmds` (falls back to `project.check_cmds`, e.g. `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`), each with `merge.timeout_secs` (2700) total budget. A failure → `MergeChecksFailed` (T27); evidence `Cmd` rows with `gate_index=-1`.
 4. If `merge.secret_scan`: run the `secret_scan` gate over `<remote>/<default_branch>...job/<id>`; hits → `MergeChecksFailed`, and the job is **never pushed**.
 5. Fast-forward: in the main checkout `git merge --ff-only job/<id>` (the main checkout is clean by invariant; if not, abort, write a ledger `merge` failure and park the job `Manual` with an inbox notice).
-6. `git push <remote> <default_branch>` (if `project.push`); a rejected push (remote moved) → `git reset --hard <main_before>` in the main checkout and restart from step 1 (≤ 3 times, then `MergeChecksFailed`).
+6. `git push <remote> <default_branch>` (if `project.push`); a rejected push (remote moved) → `git reset --hard <main_before>` in the main checkout, fetch again, recompute the local and remote bases and restart from step 1 (≤ 3 times, then `MergeChecksFailed`).
 7. Delete branch `job/<id>` remote+local only if it was pushed by us; `git worktree remove <worktree>`; window `job-<id>` killed (tagged windows only).
 8. Ledger `merge` row: job, `main_before`, `main_after`, files changed count, durations of each step. Emit `MergeSucceeded` (T25) → `UnblockDependents` → dependents may become `ready` on the next tick.
 
@@ -308,7 +312,7 @@ the table or are fixed v0.1 constants.
 | Hung before first output (0 bytes) | 8 min (`silent_minutes`) | `LoopBounds.silent_minutes` (D7) |
 | Automatic continues per attempt | 2 (`max_continues`) | `LoopBounds.max_continues` (L2) |
 | Hang restarts | 3 (`max_hang_restarts`) | `LoopBounds.max_hang_restarts` (D6) |
-| Fix rounds (`attempts`) | 3 = `job.loop.max_attempts` | per job (`JobLoop`, not `LoopBounds`); L3 |
+| Fix rounds (`attempts`) | 2 = `job.loop.max_attempts` | per job (`JobLoop`, not `LoopBounds`); L3 |
 | Same action repeated without new evidence | 3 (`RepeatGuard`) → stop the loop, escalate (`NotifyInbox(Decision)`) | `LoopBounds.same_action_max` |
 | Planner heartbeat / keeper heartbeat | 30 min / 20 min | `[loops.l4-planner].interval_secs` / `[loops.l5-keeper].interval_secs`; L4/L5 |
 | Min gap between planner/keeper turns | 5 min | `LoopBounds.planner_min_gap_minutes` |

@@ -11,6 +11,7 @@ use vowp_protocol::api::{
     ApiError, ApiErrorBody, Board, BoardLimit, BoardRun, CostReport, CostRow, CostTotal, EventPage, Health,
     InboxAnswerRequest, InboxPage, JobPage, NodePage, Page, SessionDetail, SessionPage, SessionSwitchRequest,
 };
+use vowp_protocol::asif::{AsifCounts, AsifImportResponse, AsifLoss, AsifReport};
 use vowp_protocol::schema::schema_for_name;
 use vowp_protocol::{
     ErrorKind, InboxId, InboxItem, InboxKind, InboxState, JobId, LimitRowKind, NodeName, ProjectName, Session,
@@ -658,4 +659,208 @@ fn api_documents_are_exported_schemas() {
         let schema: Value = schema_for_name(name).unwrap_or_else(|| panic!("{name} is not exported"));
         assert!(schema.is_object(), "{name} schema must be a JSON object");
     }
+}
+
+/// One report summary covering a loss with and without a coverage scope.
+fn asif_report() -> AsifReport {
+    AsifReport {
+        adapter_version: "0.1.1".to_owned(),
+        asif_version: "0.4".to_owned(),
+        asif_pin: "652d9e23ddbe5656b9ceea311df7e09e93c1cd2f".to_owned(),
+        source_session: Some("01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned()),
+        target_session: None,
+        counts: AsifCounts {
+            events_in: 42,
+            events_out: 42,
+            resources: 3,
+            capsules: 1,
+        },
+        loss_count: 2,
+        losses: vec![
+            AsifLoss {
+                kind: "cwd-omitted".to_owned(),
+                stage: "translation".to_owned(),
+                scope: Some("environment".to_owned()),
+                message: "The absolute cwd is not emitted.".to_owned(),
+            },
+            AsifLoss {
+                kind: "call-id-disambiguated".to_owned(),
+                stage: "translation".to_owned(),
+                scope: None,
+                message: "A repeated tool call id was given a suffix.".to_owned(),
+            },
+        ],
+        unsupported: vec!["vowp.jobs".to_owned(), "vowp.gates".to_owned()],
+    }
+}
+
+#[test]
+fn asif_report_matches_the_documented_json_shape() {
+    let report = asif_report();
+    let value = serde_json::to_value(&report).expect("report JSON");
+    assert_eq!(
+        value,
+        json!({
+            "adapter_version": "0.1.1",
+            "asif_version": "0.4",
+            "asif_pin": "652d9e23ddbe5656b9ceea311df7e09e93c1cd2f",
+            "source_session": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "target_session": null,
+            "counts": {
+                "events_in": 42,
+                "events_out": 42,
+                "resources": 3,
+                "capsules": 1,
+            },
+            "loss_count": 2,
+            "losses": [
+                {
+                    "kind": "cwd-omitted",
+                    "stage": "translation",
+                    "scope": "environment",
+                    "message": "The absolute cwd is not emitted.",
+                },
+                {
+                    "kind": "call-id-disambiguated",
+                    "stage": "translation",
+                    "scope": null,
+                    "message": "A repeated tool call id was given a suffix.",
+                },
+            ],
+            "unsupported": ["vowp.jobs", "vowp.gates"],
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<AsifReport>(value.clone()).expect("report roundtrip"),
+        report
+    );
+
+    let schema = schema_for_name("AsifReport").expect("AsifReport is exported");
+    for field in [
+        "adapter_version",
+        "asif_version",
+        "asif_pin",
+        "source_session",
+        "target_session",
+        "counts",
+        "loss_count",
+        "losses",
+        "unsupported",
+    ] {
+        assert!(
+            schema["properties"].get(field).is_some(),
+            "AsifReport schema has no {field} property: {schema}"
+        );
+    }
+    for field in [
+        "adapter_version",
+        "asif_version",
+        "asif_pin",
+        "counts",
+        "loss_count",
+        "losses",
+        "unsupported",
+    ] {
+        assert!(
+            schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "AsifReport schema does not require {field}: {schema}"
+        );
+    }
+    for field in ["source_session", "target_session"] {
+        assert!(
+            !schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "AsifReport schema must keep {field} optional: {schema}"
+        );
+    }
+    let counts = schema_for_name("AsifCounts").expect("AsifCounts is exported");
+    for field in ["events_in", "events_out", "resources", "capsules"] {
+        assert!(
+            counts["properties"].get(field).is_some(),
+            "AsifCounts schema has no {field} property: {counts}"
+        );
+        assert!(
+            counts["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "AsifCounts schema does not require {field}: {counts}"
+        );
+    }
+    let loss = schema_for_name("AsifLoss").expect("AsifLoss is exported");
+    for field in ["kind", "stage", "scope", "message"] {
+        assert!(
+            loss["properties"].get(field).is_some(),
+            "AsifLoss schema has no {field} property: {loss}"
+        );
+    }
+    for field in ["kind", "stage", "message"] {
+        assert!(
+            loss["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "AsifLoss schema does not require {field}: {loss}"
+        );
+    }
+}
+
+#[test]
+fn asif_import_response_wraps_the_session_report_and_warnings() {
+    let session = Session {
+        id: SessionId::new(),
+        project: Some(ProjectName::parse("vowp").expect("project")),
+        job_id: None,
+        role: None,
+        title: "imported".to_owned(),
+        parent_session_id: None,
+        node: NodeName::parse("local").expect("node"),
+        cwd: "/work/vowp".to_owned(),
+        state: SessionState::Idle,
+        executor: None,
+        last_seq: 3,
+        last_capsule_id: None,
+        log_bytes: 512,
+        created_at: epoch(),
+        updated_at: epoch(),
+    };
+    let response = AsifImportResponse {
+        session: session.clone(),
+        report: asif_report(),
+        warnings: vec!["session imported: project source is not in the database; left null".to_owned()],
+    };
+    let value = serde_json::to_value(&response).expect("import response JSON");
+    assert_eq!(value["session"]["id"], json!(session.id.as_str()));
+    assert_eq!(value["session"]["state"], json!("idle"));
+    assert_eq!(value["report"]["adapter_version"], json!("0.1.1"));
+    assert_eq!(
+        value["warnings"],
+        json!(["session imported: project source is not in the database; left null"])
+    );
+    assert_eq!(
+        serde_json::from_value::<AsifImportResponse>(value).expect("import response roundtrip"),
+        response
+    );
+
+    let schema = schema_for_name("AsifImportResponse").expect("AsifImportResponse is exported");
+    for field in ["session", "report", "warnings"] {
+        assert!(
+            schema["properties"].get(field).is_some(),
+            "AsifImportResponse schema has no {field} property: {schema}"
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(field))),
+            "AsifImportResponse schema does not require {field}: {schema}"
+        );
+    }
+    let session_schema = &schema["properties"]["session"];
+    assert!(
+        session_schema["$ref"]
+            .as_str()
+            .is_some_and(|target| target.contains("Session")),
+        "AsifImportResponse.session must reference the Session schema: {session_schema}"
+    );
 }

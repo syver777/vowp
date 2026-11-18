@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use vowp_core::requests::{self, Request};
 use vowp_graph::{Graph, JobEvent, transition};
 use vowp_protocol::{
-    EdgeKind, Gate, GateResult, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Role, default_gates,
+    EdgeKind, Gate, GateResult, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Placement, Role,
+    default_gates,
 };
 use vowp_store::{JobFilter, Store};
 
@@ -60,6 +61,12 @@ fn add(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobAddArgs) -> Result<i32, CliE
     if args.max_attempts == Some(0) {
         return Err(CliError::Invalid("--max-attempts must be at least 1".to_owned()));
     }
+    let placement = args.placement.as_deref().map(Placement::parse).transpose()?;
+    if matches!(&placement, Some(Placement::Node { .. })) && !ctx.config().offload.enabled {
+        return Err(CliError::Guard(
+            "offload is disabled; a node:<name> placement is refused (enable [offload] first)".to_owned(),
+        ));
+    }
     let needs = parse_job_ids(&args.needs)?;
     for need in &needs {
         if need == &id {
@@ -97,14 +104,23 @@ fn add(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobAddArgs) -> Result<i32, CliE
     let body = brief_body(args, io)?;
     let brief = render_brief(&new, &body);
     let job = store.insert_job(ctx.project(), &new, "cli")?;
+    if let Some(placement) = &placement
+        && let Err(error) = store.set_job_placement(&job.id, placement.clone(), ctx.clock().now())
+    {
+        // The job row and its placement are one success path: a failed placement write
+        // removes the just-inserted row so the caller sees no half-added job.
+        let _ = store.delete_job(&job.id);
+        return Err(error.into());
+    }
     if let Err(error) = write_brief(ctx, &job, &brief) {
         // The job is still pending, so this rolls the row back when the brief cannot be
-        // written. Validation/read failures happen before the insert and leave nothing.
+        // written. The placement row cascades with it. Validation/read failures happen
+        // before the insert and leave nothing.
         let _ = store.delete_job(&job.id);
         return Err(error);
     }
     if ctx.json() {
-        print_json(io, &job)?;
+        print_job_json(io, &job, placement.as_ref())?;
     } else {
         writeln!(io.out(), "added job {} ({})", job.id, job.state.as_str())?;
     }
@@ -291,6 +307,7 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, Cl
     let store = ctx.store()?;
     let id = JobId::parse(&args.id)?;
     let job = store.require_job(&id)?;
+    let placement = store.job_placement(&id)?;
 
     if args.brief || args.report {
         let relative = if args.brief { &job.brief } else { &job.report };
@@ -304,7 +321,7 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, Cl
     }
 
     if ctx.json() {
-        print_json(io, &job)?;
+        print_job_json(io, &job, placement.as_ref())?;
         return Ok(0);
     }
 
@@ -320,6 +337,9 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, Cl
         job.state.as_str(),
         job.priority
     )?;
+    if let Some(placement) = &placement {
+        writeln!(io.out(), "  placement: {placement}")?;
+    }
     writeln!(io.out(), "  needs: {}", join_ids(&job.needs))?;
     writeln!(io.out(), "  owns: {}", job.owns.join(", "))?;
     writeln!(io.out(), "  reads: {}", job.reads.join(", "))?;
@@ -570,6 +590,18 @@ fn wait_for_state(store: &Store, job_id: &JobId, expected: &[JobState], timeout:
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Prints one job, adding the side-table placement when the job has one.
+///
+/// `placement` is omitted from the JSON when the job has no row, keeping the existing
+/// `Job` shape and every v0.2 client source-compatible. `job ls` never calls this.
+fn print_job_json(io: &mut dyn IoStreams, job: &Job, placement: Option<&Placement>) -> Result<(), CliError> {
+    let mut value = serde_json::to_value(job).map_err(vowp_protocol::ProtocolError::from)?;
+    if let (Some(placement), Some(object)) = (placement, value.as_object_mut()) {
+        object.insert("placement".to_owned(), serde_json::Value::String(placement.to_string()));
+    }
+    print_json(io, &value)
 }
 
 /// Prints the job after a mutation, or one human summary line.

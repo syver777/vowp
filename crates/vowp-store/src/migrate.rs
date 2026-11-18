@@ -10,14 +10,147 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use vowp_protocol::{ProjectName, Timestamp};
 
-use crate::db::PROJECT_SCHEMA;
+use crate::db::{GLOBAL_SCHEMA_SQL, GLOBAL_SCHEMA_VERSION, PROJECT_SCHEMA, PROJECT_SCHEMA_VERSION};
 use crate::error::StoreError;
 use crate::paths::NodePaths;
 use crate::session_log::{pid_alive, valid_pid};
+
+/// Every table in the v2 global schema, in copy and count order.
+const V02_GLOBAL_TABLES: [&str; 21] = [
+    "kv",
+    "nodes",
+    "projects",
+    "sessions",
+    "session_events",
+    "session_natives",
+    "native_events",
+    "capsules",
+    "switches",
+    "limits",
+    "node_inbox",
+    "node_ledger",
+    "surfaces",
+    "leases",
+    "catalog",
+    "host_samples",
+    "run_usage",
+    "usage_estimates",
+    "capacity_targets",
+    "capacity_advice",
+    "secret_index",
+];
+
+/// The tables added by the v3 global schema; a migrated v2 home starts with none.
+const V03_NEW_TABLES: [&str; 3] = ["node_credentials", "enrollment_codes", "node_paths"];
+
+/// Every table in the v3 global schema, in copy and count order.
+const V03_GLOBAL_TABLES: [&str; 24] = [
+    "kv",
+    "nodes",
+    "node_credentials",
+    "enrollment_codes",
+    "node_paths",
+    "projects",
+    "sessions",
+    "session_events",
+    "session_natives",
+    "native_events",
+    "capsules",
+    "switches",
+    "limits",
+    "node_inbox",
+    "node_ledger",
+    "surfaces",
+    "leases",
+    "catalog",
+    "host_samples",
+    "run_usage",
+    "usage_estimates",
+    "capacity_targets",
+    "capacity_advice",
+    "secret_index",
+];
+
+/// The tables added by the v4 global schema; a migrated v3 home starts with none.
+const V04_NEW_TABLES: [&str; 1] = ["surface_tokens"];
+
+/// Every table in the v4 global schema, in copy and count order.
+const V04_GLOBAL_TABLES: [&str; 25] = [
+    "kv",
+    "nodes",
+    "node_credentials",
+    "enrollment_codes",
+    "node_paths",
+    "projects",
+    "sessions",
+    "session_events",
+    "session_natives",
+    "native_events",
+    "capsules",
+    "switches",
+    "limits",
+    "node_inbox",
+    "node_ledger",
+    "surfaces",
+    "leases",
+    "surface_tokens",
+    "catalog",
+    "host_samples",
+    "run_usage",
+    "usage_estimates",
+    "capacity_targets",
+    "capacity_advice",
+    "secret_index",
+];
+
+/// Every table in the v5 global schema, in copy and count order.
+const V05_GLOBAL_TABLES: [&str; 25] = V04_GLOBAL_TABLES;
+
+/// The tables added by the v6 global schema; a migrated v5 home starts with none.
+const V06_NEW_TABLES: [&str; 2] = ["agent_assignments", "node_limits"];
+
+/// The tables added by the v7 global schema; a migrated v6 home starts with none.
+const V07_NEW_TABLES: [&str; 1] = ["capacity_rollups"];
+
+/// Schema version written by the v2 → v3 migration.
+const V03_SCHEMA_VERSION: i64 = 3;
+
+/// Schema version written by the v3 → v4 migration.
+const V04_SCHEMA_VERSION: i64 = 4;
+
+/// Schema version written by the v4 → v5 migration.
+const V05_SCHEMA_VERSION: i64 = 5;
+
+/// Schema version written by the v5 → v6 migration.
+const V06_SCHEMA_VERSION: i64 = 6;
+
+/// Schema version written by the v6 → v7 migration.
+const V07_SCHEMA_VERSION: i64 = 7;
+
+/// Every table in the project v1 schema; all must exist before the v2 upgrade.
+const PROJECT_V1_TABLES: [&str; 10] = [
+    "jobs",
+    "edges",
+    "runs",
+    "gate_results",
+    "workers",
+    "loops",
+    "schedules",
+    "inbox",
+    "ledger",
+    "releases",
+];
+
+/// The one table added by the project v1 → v2 migration.
+const PROJECT_V2_DDL: &str = "CREATE TABLE job_placement (
+  job        TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  placement  TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;";
 
 /// Old and new row counts for one table or table family.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +297,1222 @@ pub fn migrate_v01_dry_run(paths: &NodePaths) -> Result<MigrationReport, StoreEr
     })
 }
 
+/// Migrates an existing v2 global database to the v3 local-node schema.
+///
+/// The project databases and session logs are untouched. The migration builds a fresh v3 file
+/// in `tmp/`, copies every global row into it, verifies counts, integrity and foreign keys,
+/// writes a backup of the original file and then swaps the staged file into place. A manifest
+/// in `<home>/migration.json` makes an interrupted swap restartable.
+pub fn migrate_v02(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    let version = db_version(&paths.db_path())?;
+    match version {
+        Some(version) if version >= V03_SCHEMA_VERSION => {
+            return Ok(MigrationReport {
+                from_version: version,
+                to_version: version,
+                backup: String::new(),
+                projects: Vec::new(),
+                tables: BTreeMap::new(),
+                verified: true,
+                dry_run: false,
+                dropped_workers: 0,
+                dropped_worker_rows: Vec::new(),
+                primary_runs: Vec::new(),
+                node_wide_loops: Vec::new(),
+                node_wide_schedules: Vec::new(),
+                warnings: vec![format!(
+                    "the global database is already at schema version {version}, not v2"
+                )],
+            });
+        }
+        Some(2) => {}
+        Some(1) => return Err(StoreError::MigrationRequired),
+        Some(found) => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: V03_SCHEMA_VERSION,
+            });
+        }
+        None => {
+            return Err(StoreError::not_found(
+                "v0.2 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    validate_v02_source(paths)?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.3-{}.db", Timestamp::now().unix_millis()));
+    let stage = paths.tmp_dir().join(format!("migrate-v3-{}", ulid::Ulid::generate()));
+    write_manifest(
+        paths,
+        &Manifest {
+            from: 2,
+            to: 3,
+            backup: backup.display().to_string(),
+            stage: stage.display().to_string(),
+            state: "copying".to_owned(),
+        },
+    )?;
+
+    let result = (|| {
+        backup_global(paths, &backup)?;
+        let tables = create_v02_stage(&stage, paths)?;
+        write_manifest(
+            paths,
+            &Manifest {
+                from: 2,
+                to: 3,
+                backup: backup.display().to_string(),
+                stage: stage.display().to_string(),
+                state: "swapping".to_owned(),
+            },
+        )?;
+        swap_global_from_stage(paths, &stage)?;
+        let _ = std::fs::remove_file(paths.migration_manifest_path());
+        Ok(MigrationReport {
+            from_version: 2,
+            to_version: 3,
+            backup: backup.display().to_string(),
+            projects: Vec::new(),
+            tables,
+            verified: true,
+            dry_run: false,
+            dropped_workers: 0,
+            dropped_worker_rows: Vec::new(),
+            primary_runs: Vec::new(),
+            node_wide_loops: Vec::new(),
+            node_wide_schedules: Vec::new(),
+            warnings: Vec::new(),
+        })
+    })();
+
+    if result.is_err() {
+        let swapping = std::fs::read(paths.migration_manifest_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+            .is_some_and(|manifest| manifest.state == "swapping");
+        if !swapping {
+            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_file(paths.migration_manifest_path());
+        }
+    }
+    result
+}
+
+/// Runs [`migrate_v02`] when an existing home still has the v2 global schema.
+///
+/// A v0.1 file is left for [`migrate_v01`] to handle; a future version is left for the normal
+/// open path to refuse with [`StoreError::SchemaTooNew`].
+pub(crate) fn migrate_v02_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(2) {
+        migrate_v02(paths)?;
+    }
+    Ok(())
+}
+
+/// Migrates an existing v3 global database to the v4 surface-token schema.
+///
+/// The project databases and session logs are untouched. The migration builds a fresh v4 file
+/// in `tmp/`, copies every v3 global row into it (rebuilding `surfaces` to add `state` and
+/// `revoked_at`), verifies counts, integrity and foreign keys, writes a backup of the original
+/// file and then swaps the staged file into place. A manifest in `<home>/migration.json` makes
+/// an interrupted swap restartable.
+pub fn migrate_v03(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    let version = db_version(&paths.db_path())?;
+    match version {
+        Some(GLOBAL_SCHEMA_VERSION) => {
+            return Ok(MigrationReport {
+                from_version: GLOBAL_SCHEMA_VERSION,
+                to_version: GLOBAL_SCHEMA_VERSION,
+                backup: String::new(),
+                projects: Vec::new(),
+                tables: BTreeMap::new(),
+                verified: true,
+                dry_run: false,
+                dropped_workers: 0,
+                dropped_worker_rows: Vec::new(),
+                primary_runs: Vec::new(),
+                node_wide_loops: Vec::new(),
+                node_wide_schedules: Vec::new(),
+                warnings: vec![format!(
+                    "the global database is already at schema version {GLOBAL_SCHEMA_VERSION}"
+                )],
+            });
+        }
+        Some(V03_SCHEMA_VERSION) => {}
+        Some(found) if found > GLOBAL_SCHEMA_VERSION => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: GLOBAL_SCHEMA_VERSION,
+            });
+        }
+        Some(_) => return Err(StoreError::MigrationRequired),
+        None => {
+            return Err(StoreError::not_found(
+                "v0.3 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    validate_v03_source(paths)?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.4-{}.db", Timestamp::now().unix_millis()));
+    let stage = paths.tmp_dir().join(format!("migrate-v4-{}", ulid::Ulid::generate()));
+    write_manifest(
+        paths,
+        &Manifest {
+            from: 3,
+            to: 4,
+            backup: backup.display().to_string(),
+            stage: stage.display().to_string(),
+            state: "copying".to_owned(),
+        },
+    )?;
+
+    let result = (|| {
+        backup_global(paths, &backup)?;
+        let tables = create_v03_stage(&stage, paths)?;
+        write_manifest(
+            paths,
+            &Manifest {
+                from: 3,
+                to: 4,
+                backup: backup.display().to_string(),
+                stage: stage.display().to_string(),
+                state: "swapping".to_owned(),
+            },
+        )?;
+        swap_global_from_stage(paths, &stage)?;
+        let _ = std::fs::remove_file(paths.migration_manifest_path());
+        Ok(MigrationReport {
+            from_version: 3,
+            to_version: 4,
+            backup: backup.display().to_string(),
+            projects: Vec::new(),
+            tables,
+            verified: true,
+            dry_run: false,
+            dropped_workers: 0,
+            dropped_worker_rows: Vec::new(),
+            primary_runs: Vec::new(),
+            node_wide_loops: Vec::new(),
+            node_wide_schedules: Vec::new(),
+            warnings: Vec::new(),
+        })
+    })();
+
+    if result.is_err() {
+        let swapping = std::fs::read(paths.migration_manifest_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+            .is_some_and(|manifest| manifest.state == "swapping");
+        if !swapping {
+            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_file(paths.migration_manifest_path());
+        }
+    }
+    result
+}
+
+/// Runs [`migrate_v03`] when an existing home still has the v3 global schema.
+///
+/// A v0.1 or v0.2 file is handled by the earlier migrations before this check. A future
+/// version is left for the normal open path to refuse with [`StoreError::SchemaTooNew`].
+pub(crate) fn migrate_v03_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(V03_SCHEMA_VERSION) {
+        migrate_v03(paths)?;
+    }
+    Ok(())
+}
+
+/// Migrates an existing v4 global database to the v5 lease-hash schema.
+///
+/// The project databases and session logs are untouched. The migration builds a fresh v5
+/// file in `tmp/`, copies every v4 global row except `leases`, verifies counts, integrity
+/// and foreign keys, writes a backup of the original file and then swaps the staged file
+/// into place. Leases are cleared because a v4 row holds a plaintext token and every lease
+/// is stale within 60 seconds; surfaces and every other row are preserved. A manifest in
+/// `<home>/migration.json` makes an interrupted swap restartable.
+pub fn migrate_v04(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    let version = db_version(&paths.db_path())?;
+    match version {
+        Some(GLOBAL_SCHEMA_VERSION) => {
+            return Ok(MigrationReport {
+                from_version: GLOBAL_SCHEMA_VERSION,
+                to_version: GLOBAL_SCHEMA_VERSION,
+                backup: String::new(),
+                projects: Vec::new(),
+                tables: BTreeMap::new(),
+                verified: true,
+                dry_run: false,
+                dropped_workers: 0,
+                dropped_worker_rows: Vec::new(),
+                primary_runs: Vec::new(),
+                node_wide_loops: Vec::new(),
+                node_wide_schedules: Vec::new(),
+                warnings: vec![format!(
+                    "the global database is already at schema version {GLOBAL_SCHEMA_VERSION}"
+                )],
+            });
+        }
+        Some(V04_SCHEMA_VERSION) => {}
+        Some(found) if found > GLOBAL_SCHEMA_VERSION => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: GLOBAL_SCHEMA_VERSION,
+            });
+        }
+        Some(_) => return Err(StoreError::MigrationRequired),
+        None => {
+            return Err(StoreError::not_found(
+                "v0.4 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    validate_v04_source(paths)?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.5-{}.db", Timestamp::now().unix_millis()));
+    let stage = paths.tmp_dir().join(format!("migrate-v5-{}", ulid::Ulid::generate()));
+    write_manifest(
+        paths,
+        &Manifest {
+            from: 4,
+            to: 5,
+            backup: backup.display().to_string(),
+            stage: stage.display().to_string(),
+            state: "copying".to_owned(),
+        },
+    )?;
+
+    let result = (|| {
+        backup_global(paths, &backup)?;
+        let tables = create_v04_stage(&stage, paths)?;
+        write_manifest(
+            paths,
+            &Manifest {
+                from: 4,
+                to: 5,
+                backup: backup.display().to_string(),
+                stage: stage.display().to_string(),
+                state: "swapping".to_owned(),
+            },
+        )?;
+        swap_global_from_stage(paths, &stage)?;
+        let _ = std::fs::remove_file(paths.migration_manifest_path());
+        let mut warnings = Vec::new();
+        if let Some(count) = tables.get("global:leases")
+            && count.before > 0
+        {
+            warnings.push(format!(
+                "cleared {} ephemeral lease(s); surfaces re-acquire on their next frame",
+                count.before
+            ));
+        }
+        Ok(MigrationReport {
+            from_version: 4,
+            to_version: 5,
+            backup: backup.display().to_string(),
+            projects: Vec::new(),
+            tables,
+            verified: true,
+            dry_run: false,
+            dropped_workers: 0,
+            dropped_worker_rows: Vec::new(),
+            primary_runs: Vec::new(),
+            node_wide_loops: Vec::new(),
+            node_wide_schedules: Vec::new(),
+            warnings,
+        })
+    })();
+
+    if result.is_err() {
+        let swapping = std::fs::read(paths.migration_manifest_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+            .is_some_and(|manifest| manifest.state == "swapping");
+        if !swapping {
+            let _ = std::fs::remove_dir_all(&stage);
+            let _ = std::fs::remove_file(paths.migration_manifest_path());
+        }
+    }
+    result
+}
+
+/// Runs [`migrate_v04`] when an existing home still has the v4 global schema.
+///
+/// Earlier versions are handled by the previous migrations before this check. A future
+/// version is left for the normal open path to refuse with [`StoreError::SchemaTooNew`].
+pub(crate) fn migrate_v04_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(V04_SCHEMA_VERSION) {
+        migrate_v04(paths)?;
+    }
+    Ok(())
+}
+
+/// Migrates an existing v5 global database to the v6 offload schema.
+///
+/// The upgrade is additive: `agent_assignments`, its node index and `node_limits` are created
+/// in one transaction, after the original file is copied to `backups/pre-0.6-<ms>.db`. Every
+/// existing table's rows are counted before and after, and integrity and foreign keys are
+/// checked before `user_version = 6` commits; a failure rolls the whole transaction back and
+/// leaves the v5 file readable.
+pub fn migrate_v05(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    let version = db_version(&paths.db_path())?;
+    match version {
+        Some(version) if (V06_SCHEMA_VERSION..=GLOBAL_SCHEMA_VERSION).contains(&version) => {
+            return Ok(MigrationReport {
+                from_version: version,
+                to_version: version,
+                backup: String::new(),
+                projects: Vec::new(),
+                tables: BTreeMap::new(),
+                verified: true,
+                dry_run: false,
+                dropped_workers: 0,
+                dropped_worker_rows: Vec::new(),
+                primary_runs: Vec::new(),
+                node_wide_loops: Vec::new(),
+                node_wide_schedules: Vec::new(),
+                warnings: vec![format!(
+                    "the global database is already at schema version {version}, not v5"
+                )],
+            });
+        }
+        Some(V05_SCHEMA_VERSION) => {}
+        Some(1..=4) => return Err(StoreError::MigrationRequired),
+        Some(found) => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: GLOBAL_SCHEMA_VERSION,
+            });
+        }
+        None => {
+            return Err(StoreError::not_found(
+                "v0.5 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    validate_v05_source(paths)?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.6-{}.db", Timestamp::now().unix_millis()));
+    backup_global(paths, &backup)?;
+
+    let conn = Connection::open(paths.db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    let before = table_counts(&tx, "main")?;
+    tx.execute_batch(
+        "CREATE TABLE agent_assignments (
+           id           TEXT PRIMARY KEY,
+           run_id       TEXT NOT NULL,
+           session_id   TEXT NOT NULL,
+           project      TEXT NOT NULL,
+           node         TEXT NOT NULL,
+           epoch        INTEGER NOT NULL,
+           state        TEXT NOT NULL CHECK (state IN
+                          ('queued','sent','accepted','running','disconnected',
+                           'finished','lost','cancelled','rejected')),
+           payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+           created_at   TEXT NOT NULL,
+           claimed_at   TEXT,
+           expires_at   TEXT,
+           detail       TEXT NOT NULL DEFAULT ''
+         ) STRICT;
+         CREATE INDEX agent_assignments_node ON agent_assignments(node, state);
+         CREATE TABLE node_limits (
+           provider    TEXT NOT NULL,
+           node        TEXT NOT NULL REFERENCES nodes(name) ON DELETE CASCADE,
+           kind        TEXT NOT NULL CHECK (kind IN ('quota','credits','rate','context','auth','unavailable')),
+           resets_at   TEXT,
+           detail      TEXT NOT NULL DEFAULT '',
+           since       TEXT NOT NULL,
+           updated_at  TEXT NOT NULL,
+           PRIMARY KEY (provider, node)
+         ) STRICT;",
+    )?;
+    tx.pragma_update(None, "user_version", V06_SCHEMA_VERSION)?;
+
+    let after = table_counts(&tx, "main")?;
+    let mut tables = BTreeMap::new();
+    for (table, before_rows) in &before {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: format!("stage/global.db:{table}"),
+            line: None,
+            reason: "existing table disappeared during the v6 migration".to_owned(),
+        })?;
+        if after_rows != *before_rows {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before_rows}, after {after_rows}"),
+            });
+        }
+        tables.insert(
+            format!("global:{table}"),
+            MigrationCount {
+                before: *before_rows,
+                after: after_rows,
+            },
+        );
+    }
+    for table in V06_NEW_TABLES {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: format!("stage/global.db:{table}"),
+            line: None,
+            reason: "new table is missing after the v6 migration".to_owned(),
+        })?;
+        if after_rows != 0 {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("new table is not empty: {after_rows} rows"),
+            });
+        }
+        tables.insert(
+            format!("global:{table}"),
+            MigrationCount {
+                before: 0,
+                after: after_rows,
+            },
+        );
+    }
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: "global.db:integrity_check".to_owned(),
+            line: None,
+            reason: integrity,
+        });
+    }
+    {
+        let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
+        if statement.query([])?.next()?.is_some() {
+            return Err(StoreError::Corrupt {
+                path: "global.db:foreign_key_check".to_owned(),
+                line: None,
+                reason: "foreign key violations".to_owned(),
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(MigrationReport {
+        from_version: 5,
+        to_version: 6,
+        backup: backup.display().to_string(),
+        projects: Vec::new(),
+        tables,
+        verified: true,
+        dry_run: false,
+        dropped_workers: 0,
+        dropped_worker_rows: Vec::new(),
+        primary_runs: Vec::new(),
+        node_wide_loops: Vec::new(),
+        node_wide_schedules: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+/// Runs [`migrate_v05`] when an existing home still has the v5 global schema.
+///
+/// Earlier versions are handled by the previous migrations before this check. A future
+/// version is left for the normal open path to refuse with [`StoreError::SchemaTooNew`].
+pub(crate) fn migrate_v05_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(V05_SCHEMA_VERSION) {
+        migrate_v05(paths)?;
+    }
+    Ok(())
+}
+
+/// Migrates an existing v6 global database to the v7 capacity-history schema.
+///
+/// The upgrade is additive: `capacity_rollups` and its bucket index are created in one
+/// immediate transaction, after the original file is copied to `backups/pre-0.7-<ms>.db`.
+/// Every existing table's rows are counted before and after, and integrity and foreign keys
+/// are checked before `user_version = 7` commits; a failure rolls the whole transaction back
+/// and leaves the v6 file readable. Calling it again on a v7 home is a no-op.
+pub fn migrate_v06(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    let version = db_version(&paths.db_path())?;
+    match version {
+        Some(V07_SCHEMA_VERSION) => {
+            return Ok(MigrationReport {
+                from_version: V07_SCHEMA_VERSION,
+                to_version: V07_SCHEMA_VERSION,
+                backup: String::new(),
+                projects: Vec::new(),
+                tables: BTreeMap::new(),
+                verified: true,
+                dry_run: false,
+                dropped_workers: 0,
+                dropped_worker_rows: Vec::new(),
+                primary_runs: Vec::new(),
+                node_wide_loops: Vec::new(),
+                node_wide_schedules: Vec::new(),
+                warnings: vec![format!(
+                    "the global database is already at schema version {V07_SCHEMA_VERSION}, not v6"
+                )],
+            });
+        }
+        Some(V06_SCHEMA_VERSION) => {}
+        Some(1..=5) => return Err(StoreError::MigrationRequired),
+        Some(found) => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: V07_SCHEMA_VERSION,
+            });
+        }
+        None => {
+            return Err(StoreError::not_found(
+                "v0.6 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    validate_v06_source(paths)?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.7-{}.db", Timestamp::now().unix_millis()));
+    backup_global(paths, &backup)?;
+
+    let conn = Connection::open(paths.db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    let before = table_counts(&tx, "main")?;
+    tx.execute_batch(
+        "CREATE TABLE capacity_rollups (
+           bucket                   TEXT NOT NULL,
+           bucket_secs              INTEGER NOT NULL,
+           samples                  INTEGER NOT NULL,
+           mem_available_min_bytes  INTEGER NOT NULL,
+           mem_available_avg_bytes  INTEGER NOT NULL,
+           mem_available_max_bytes  INTEGER NOT NULL,
+           load1_avg                REAL NOT NULL,
+           disk_free_home_min_bytes INTEGER NOT NULL,
+           source                   TEXT NOT NULL CHECK (source IN ('proc','fallback','mixed')),
+           PRIMARY KEY (bucket, bucket_secs)
+         ) STRICT;
+         CREATE INDEX capacity_rollups_bucket ON capacity_rollups(bucket);",
+    )?;
+    tx.pragma_update(None, "user_version", V07_SCHEMA_VERSION)?;
+
+    let after = table_counts(&tx, "main")?;
+    let mut tables = BTreeMap::new();
+    for (table, before_rows) in &before {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: format!("stage/global.db:{table}"),
+            line: None,
+            reason: "existing table disappeared during the v7 migration".to_owned(),
+        })?;
+        if after_rows != *before_rows {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before_rows}, after {after_rows}"),
+            });
+        }
+        tables.insert(
+            format!("global:{table}"),
+            MigrationCount {
+                before: *before_rows,
+                after: after_rows,
+            },
+        );
+    }
+    for table in V07_NEW_TABLES {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: format!("stage/global.db:{table}"),
+            line: None,
+            reason: "new table is missing after the v7 migration".to_owned(),
+        })?;
+        if after_rows != 0 {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("new table is not empty: {after_rows} rows"),
+            });
+        }
+        tables.insert(
+            format!("global:{table}"),
+            MigrationCount {
+                before: 0,
+                after: after_rows,
+            },
+        );
+    }
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: "global.db:integrity_check".to_owned(),
+            line: None,
+            reason: integrity,
+        });
+    }
+    {
+        let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
+        if statement.query([])?.next()?.is_some() {
+            return Err(StoreError::Corrupt {
+                path: "global.db:foreign_key_check".to_owned(),
+                line: None,
+                reason: "foreign key violations".to_owned(),
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(MigrationReport {
+        from_version: 6,
+        to_version: 7,
+        backup: backup.display().to_string(),
+        projects: Vec::new(),
+        tables,
+        verified: true,
+        dry_run: false,
+        dropped_workers: 0,
+        dropped_worker_rows: Vec::new(),
+        primary_runs: Vec::new(),
+        node_wide_loops: Vec::new(),
+        node_wide_schedules: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+/// Runs [`migrate_v06`] when an existing home still has the v6 global schema.
+///
+/// Earlier versions are handled by the previous migrations before this check. A future
+/// version is left for the normal open path to refuse with [`StoreError::SchemaTooNew`].
+pub(crate) fn migrate_v06_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(V06_SCHEMA_VERSION) {
+        migrate_v06(paths)?;
+    }
+    Ok(())
+}
+
+/// Checks that the source really is a healthy v2 global database.
+fn validate_v02_source(paths: &NodePaths) -> Result<(), StoreError> {
+    validate_global_source(paths, 2, &V02_GLOBAL_TABLES, "v2")
+}
+
+/// Checks that the source really is a healthy v3 global database.
+fn validate_v03_source(paths: &NodePaths) -> Result<(), StoreError> {
+    validate_global_source(paths, V03_SCHEMA_VERSION, &V03_GLOBAL_TABLES, "v3")
+}
+
+/// Checks that the source really is a healthy v4 global database.
+fn validate_v04_source(paths: &NodePaths) -> Result<(), StoreError> {
+    validate_global_source(paths, V04_SCHEMA_VERSION, &V04_GLOBAL_TABLES, "v4")
+}
+
+/// Checks that the source really is a healthy v5 global database.
+fn validate_v05_source(paths: &NodePaths) -> Result<(), StoreError> {
+    validate_global_source(paths, V05_SCHEMA_VERSION, &V05_GLOBAL_TABLES, "v5")
+}
+
+/// Checks that the source really is a healthy v6 global database.
+fn validate_v06_source(paths: &NodePaths) -> Result<(), StoreError> {
+    let mut tables: Vec<&str> = V05_GLOBAL_TABLES.to_vec();
+    tables.extend(V06_NEW_TABLES);
+    validate_global_source(paths, V06_SCHEMA_VERSION, &tables, "v6")
+}
+
+/// Migrates one project database from v1 to v2 in place.
+///
+/// The caller holds an open read-write connection to the project file. The file is copied to
+/// `backups/project-<name>-pre-0.6-<ms>.db` first; `job_placement` is then created and
+/// `user_version = 2` set in one transaction. Every existing table's row count is verified
+/// before the commit, so a failure rolls back and leaves the v1 file readable.
+pub(crate) fn migrate_project_v1_to_v2(
+    paths: &NodePaths,
+    project: &ProjectName,
+    conn: &Connection,
+) -> Result<(), StoreError> {
+    let db_path = paths.project_db_path(project);
+    validate_project_v1_source(conn, &db_path)?;
+    let backup = paths.backups_dir().join(format!(
+        "project-{}-pre-0.6-{}.db",
+        project.as_str(),
+        Timestamp::now().unix_millis()
+    ));
+    std::fs::create_dir_all(paths.backups_dir()).map_err(|err| StoreError::io(paths.backups_dir().display(), err))?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.backup(rusqlite::MAIN_DB, &backup, None)?;
+    sync_dir(&paths.backups_dir())?;
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let before = table_counts(&tx, "main")?;
+    tx.execute_batch(PROJECT_V2_DDL)?;
+    tx.pragma_update(None, "user_version", PROJECT_SCHEMA_VERSION)?;
+    let after = table_counts(&tx, "main")?;
+    for (table, before_rows) in &before {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("existing table {table} disappeared during the v2 migration"),
+        })?;
+        if after_rows != *before_rows {
+            return Err(StoreError::Corrupt {
+                path: db_path.display().to_string(),
+                line: None,
+                reason: format!("{table} row count changed: before {before_rows}, after {after_rows}"),
+            });
+        }
+    }
+    let placement_rows = after.get("job_placement").copied().ok_or_else(|| StoreError::Corrupt {
+        path: db_path.display().to_string(),
+        line: None,
+        reason: "job_placement is missing after the v2 migration".to_owned(),
+    })?;
+    if placement_rows != 0 {
+        return Err(StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("new job_placement table is not empty: {placement_rows} rows"),
+        });
+    }
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("integrity_check: {integrity}"),
+        });
+    }
+    {
+        let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
+        if statement.query([])?.next()?.is_some() {
+            return Err(StoreError::Corrupt {
+                path: db_path.display().to_string(),
+                line: None,
+                reason: "foreign key violations".to_owned(),
+            });
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Checks that a project file really is a healthy v1 database.
+fn validate_project_v1_source(conn: &Connection, path: &Path) -> Result<(), StoreError> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 1 {
+        return Err(StoreError::InvalidInput(format!(
+            "project migration source has schema version {version}, expected 1"
+        )));
+    }
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: path.display().to_string(),
+            line: None,
+            reason: format!("integrity_check: {integrity}"),
+        });
+    }
+    for table in PROJECT_V1_TABLES {
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if found == 0 {
+            return Err(StoreError::Corrupt {
+                path: path.display().to_string(),
+                line: None,
+                reason: format!("v1 project schema is missing table {table}"),
+            });
+        }
+    }
+    let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(StoreError::Corrupt {
+            path: path.display().to_string(),
+            line: None,
+            reason: "foreign key violations in the v1 project database".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Checks a global file's version, integrity, WAL mode, tables and foreign keys.
+fn validate_global_source(paths: &NodePaths, expected: i64, tables: &[&str], label: &str) -> Result<(), StoreError> {
+    let db_path = paths.db_path();
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != expected {
+        return Err(StoreError::InvalidInput(format!(
+            "migration source has schema version {version}, expected {expected}"
+        )));
+    }
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("integrity_check: {integrity}"),
+        });
+    }
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err(StoreError::InvalidInput(format!(
+            "migration requires journal_mode=WAL, found {journal}"
+        )));
+    }
+    let mut missing = Vec::new();
+    for table in tables {
+        let found: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )?;
+        if found == 0 {
+            missing.push(*table);
+        }
+    }
+    if !missing.is_empty() {
+        return Err(StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("{label} schema is missing tables: {}", missing.join(", ")),
+        });
+    }
+    let mut statement = conn.prepare("PRAGMA foreign_key_check")?;
+    if statement.query([])?.next()?.is_some() {
+        return Err(StoreError::Corrupt {
+            path: db_path.display().to_string(),
+            line: None,
+            reason: format!("foreign key violations in the {label} database"),
+        });
+    }
+    Ok(())
+}
+
+/// Copies a global file to the backup path and fsyncs the directory.
+fn backup_global(paths: &NodePaths, backup: &Path) -> Result<(), StoreError> {
+    std::fs::create_dir_all(paths.backups_dir()).map_err(|err| StoreError::io(paths.backups_dir().display(), err))?;
+    let conn = Connection::open(paths.db_path())?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    conn.backup(rusqlite::MAIN_DB, backup, None)?;
+    sync_dir(&paths.backups_dir())
+}
+
+/// Builds the staged v3 database and returns per-table counts.
+///
+/// The embedded schema is v7, so the stage is first shaped back to the v3 `surfaces`
+/// definition (no `state`/`revoked_at`, no `agent` kind, no `surface_tokens`) and the newer
+/// tables are dropped. The v2 rows then copy with their original column lists and the next
+/// migration brings the stage to v4.
+fn create_v02_stage(stage: &Path, paths: &NodePaths) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    std::fs::create_dir_all(stage).map_err(|err| StoreError::io(stage.display(), err))?;
+    let stage_db = stage.join("global.db");
+    let conn = Connection::open(&stage_db)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(GLOBAL_SCHEMA_SQL)?;
+    conn.execute_batch(
+        "DROP TABLE agent_assignments;
+         DROP TABLE node_limits;
+         DROP TABLE capacity_rollups;
+         DROP TABLE surface_tokens;
+         CREATE TABLE surfaces_v3 (
+           id            TEXT PRIMARY KEY,
+           kind          TEXT NOT NULL CHECK (kind IN ('chat','opencode','claude-code','mcp','mirror','api')),
+           node          TEXT NOT NULL,
+           holder        TEXT NOT NULL,
+           app           TEXT,
+           cwd           TEXT,
+           metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+           created_at    TEXT NOT NULL,
+           last_seen_at  TEXT NOT NULL
+         ) STRICT;
+         DROP TABLE surfaces;
+         ALTER TABLE surfaces_v3 RENAME TO surfaces;
+         DROP TABLE leases;
+         CREATE TABLE leases (
+           session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+           surface_id   TEXT REFERENCES surfaces(id) ON DELETE SET NULL,
+           surface_kind TEXT NOT NULL CHECK (surface_kind IN ('chat','opencode','claude-code','mcp','mirror','api')),
+           node         TEXT NOT NULL,
+           holder       TEXT NOT NULL,
+           token        TEXT NOT NULL,
+           acquired_at  TEXT NOT NULL,
+           heartbeat_at TEXT NOT NULL,
+           CHECK (length(token) = 52)
+         ) STRICT;
+         CREATE INDEX leases_heartbeat ON leases(heartbeat_at);",
+    )?;
+    conn.pragma_update(None, "user_version", V03_SCHEMA_VERSION)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS old",
+        [paths.db_path().to_string_lossy().as_ref()],
+    )?;
+    let tables = copy_v02_global(&conn)?;
+    conn.execute_batch("DETACH DATABASE old")?;
+    verify_global(&conn)?;
+    sync_dir(stage)?;
+    Ok(tables)
+}
+
+/// Copies every v2 global row into the staged v3 file and checks counts.
+fn copy_v02_global(conn: &Connection) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at, kind)
+           SELECT name, ssh_target, is_local, capabilities, last_seen_at, created_at,
+                  CASE WHEN is_local = 1 THEN 'home' ELSE 'ssh' END
+           FROM old.nodes;",
+    )?;
+    for table in V02_GLOBAL_TABLES.iter().filter(|table| **table != "nodes") {
+        conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM old.{table}"), [])?;
+    }
+    conn.execute_batch("COMMIT")?;
+
+    let mut counts = BTreeMap::new();
+    for table in V02_GLOBAL_TABLES {
+        let before = count_sql(conn, &format!("SELECT COUNT(*) FROM old.{table}"))?;
+        let after = count_sql(conn, &format!("SELECT COUNT(*) FROM main.{table}"))?;
+        if before != after {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before}, after {after}"),
+            });
+        }
+        counts.insert(format!("global:{table}"), MigrationCount { before, after });
+    }
+    for table in V03_NEW_TABLES {
+        let after = count_sql(conn, &format!("SELECT COUNT(*) FROM main.{table}"))?;
+        if after != 0 {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("new table is not empty: {after} rows"),
+            });
+        }
+        counts.insert(format!("global:{table}"), MigrationCount { before: 0, after });
+    }
+    let local_wrong = count_sql(
+        conn,
+        "SELECT COUNT(*) FROM main.nodes WHERE is_local = 1 AND kind <> 'home'",
+    )?;
+    if local_wrong > 0 {
+        return Err(StoreError::Corrupt {
+            path: "stage/global.db:nodes.kind".to_owned(),
+            line: None,
+            reason: format!("{local_wrong} local rows are not kind 'home'"),
+        });
+    }
+    Ok(counts)
+}
+
+/// Builds the staged v4 database and returns per-table counts.
+fn create_v03_stage(stage: &Path, paths: &NodePaths) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    std::fs::create_dir_all(stage).map_err(|err| StoreError::io(stage.display(), err))?;
+    let stage_db = stage.join("global.db");
+    let conn = Connection::open(&stage_db)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(GLOBAL_SCHEMA_SQL)?;
+    conn.execute_batch(
+        "DROP TABLE agent_assignments;
+         DROP TABLE node_limits;
+         DROP TABLE capacity_rollups;
+         DROP TABLE leases;
+         CREATE TABLE leases (
+           session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+           surface_id   TEXT REFERENCES surfaces(id) ON DELETE SET NULL,
+           surface_kind TEXT NOT NULL CHECK (surface_kind IN ('chat','opencode','claude-code','mcp','mirror','api')),
+           node         TEXT NOT NULL,
+           holder       TEXT NOT NULL,
+           token        TEXT NOT NULL,
+           acquired_at  TEXT NOT NULL,
+           heartbeat_at TEXT NOT NULL,
+           CHECK (length(token) = 52)
+         ) STRICT;
+         CREATE INDEX leases_heartbeat ON leases(heartbeat_at);",
+    )?;
+    conn.pragma_update(None, "user_version", V04_SCHEMA_VERSION)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS old",
+        [paths.db_path().to_string_lossy().as_ref()],
+    )?;
+    let tables = copy_v03_global(&conn)?;
+    conn.execute_batch("DETACH DATABASE old")?;
+    verify_global(&conn)?;
+    sync_dir(stage)?;
+    Ok(tables)
+}
+
+/// Copies every v3 global row into the staged v4 file and checks counts.
+///
+/// Only `surfaces` needs an explicit column list: the v4 table adds `state` and `revoked_at`.
+/// Every other v3 table keeps its definition, so `INSERT ... SELECT *` is exact.
+fn copy_v03_global(conn: &Connection) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    for table in V03_GLOBAL_TABLES {
+        if table == "surfaces" {
+            conn.execute(
+                "INSERT INTO main.surfaces
+                   (id, kind, node, holder, app, cwd, metadata_json, created_at, last_seen_at)
+                 SELECT id, kind, node, holder, app, cwd, metadata_json, created_at, last_seen_at
+                 FROM old.surfaces",
+                [],
+            )?;
+        } else {
+            conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM old.{table}"), [])?;
+        }
+    }
+    conn.execute_batch("COMMIT")?;
+
+    let mut counts = BTreeMap::new();
+    for table in V03_GLOBAL_TABLES {
+        let before = count_sql(conn, &format!("SELECT COUNT(*) FROM old.{table}"))?;
+        let after = count_sql(conn, &format!("SELECT COUNT(*) FROM main.{table}"))?;
+        if before != after {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before}, after {after}"),
+            });
+        }
+        counts.insert(format!("global:{table}"), MigrationCount { before, after });
+    }
+    for table in V04_NEW_TABLES {
+        let after = count_sql(conn, &format!("SELECT COUNT(*) FROM main.{table}"))?;
+        if after != 0 {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("new table is not empty: {after} rows"),
+            });
+        }
+        counts.insert(format!("global:{table}"), MigrationCount { before: 0, after });
+    }
+    let unexpected_state = count_sql(
+        conn,
+        "SELECT COUNT(*) FROM main.surfaces WHERE state <> 'attached' OR revoked_at IS NOT NULL",
+    )?;
+    if unexpected_state > 0 {
+        return Err(StoreError::Corrupt {
+            path: "stage/global.db:surfaces.state".to_owned(),
+            line: None,
+            reason: format!("{unexpected_state} migrated rows are not attached"),
+        });
+    }
+    Ok(counts)
+}
+
+/// Builds the staged v5 database and returns per-table counts.
+///
+/// The embedded schema is v7, so the stage first drops the v6-only and v7-only tables and sets
+/// `user_version = 5`. Every v4 row is copied except `leases`: a v4 lease token is plaintext
+/// and leases are ephemeral, so the upgrade clears them and lets surfaces re-acquire.
+fn create_v04_stage(stage: &Path, paths: &NodePaths) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    std::fs::create_dir_all(stage).map_err(|err| StoreError::io(stage.display(), err))?;
+    let stage_db = stage.join("global.db");
+    let conn = Connection::open(&stage_db)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.execute_batch(GLOBAL_SCHEMA_SQL)?;
+    conn.execute_batch(
+        "DROP TABLE agent_assignments;
+         DROP TABLE node_limits;
+         DROP TABLE capacity_rollups;",
+    )?;
+    conn.pragma_update(None, "user_version", V05_SCHEMA_VERSION)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS old",
+        [paths.db_path().to_string_lossy().as_ref()],
+    )?;
+    let tables = copy_v04_global(&conn)?;
+    conn.execute_batch("DETACH DATABASE old")?;
+    verify_global(&conn)?;
+    sync_dir(stage)?;
+    Ok(tables)
+}
+
+/// Copies every v4 global row except leases into the staged v5 file and checks counts.
+fn copy_v04_global(conn: &Connection) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    for table in V04_GLOBAL_TABLES.iter().filter(|table| **table != "leases") {
+        conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM old.{table}"), [])?;
+    }
+    conn.execute_batch("COMMIT")?;
+
+    let mut counts = BTreeMap::new();
+    for table in V04_GLOBAL_TABLES {
+        let before = count_sql(conn, &format!("SELECT COUNT(*) FROM old.{table}"))?;
+        let after = count_sql(conn, &format!("SELECT COUNT(*) FROM main.{table}"))?;
+        if table == "leases" {
+            if after != 0 {
+                return Err(StoreError::Corrupt {
+                    path: "stage/global.db:leases".to_owned(),
+                    line: None,
+                    reason: format!("cleared lease table is not empty: {after} rows"),
+                });
+            }
+        } else if before != after {
+            return Err(StoreError::Corrupt {
+                path: format!("stage/global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before}, after {after}"),
+            });
+        }
+        counts.insert(format!("global:{table}"), MigrationCount { before, after });
+    }
+    let plaintext = count_sql(
+        conn,
+        "SELECT COUNT(*) FROM pragma_table_info('leases') WHERE name = 'token'",
+    )?;
+    if plaintext != 0 {
+        return Err(StoreError::Corrupt {
+            path: "stage/global.db:leases".to_owned(),
+            line: None,
+            reason: "leases still declares a plaintext token column".to_owned(),
+        });
+    }
+    Ok(counts)
+}
+
+fn swap_global_from_stage(paths: &NodePaths, stage: &Path) -> Result<(), StoreError> {
+    let staged_global = stage.join("global.db");
+    if !staged_global.is_file() {
+        return Err(StoreError::Corrupt {
+            path: staged_global.display().to_string(),
+            line: None,
+            reason: "staged v3 database is missing".to_owned(),
+        });
+    }
+    if paths.db_path().is_file() {
+        let old = stage.join("old.db");
+        std::fs::rename(paths.db_path(), &old).map_err(|err| StoreError::io(old.display(), err))?;
+    }
+    // A stale WAL must never be replayed into the new file; the backup copy already captured
+    // every committed page before the swap.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", paths.db_path().display()));
+        let _ = std::fs::remove_file(sidecar);
+    }
+    std::fs::rename(&staged_global, paths.db_path()).map_err(|err| StoreError::io(paths.db_path().display(), err))?;
+    sync_dir(paths.root())?;
+    let _ = std::fs::remove_dir_all(stage);
+    Ok(())
+}
+
 /// Rolls a split home back to the v0.1 backup produced by [`migrate_v01`].
 pub fn migrate_rollback(paths: &NodePaths, backup: &Path) -> Result<MigrationReport, StoreError> {
     refuse_live_supervisor(paths)?;
@@ -224,7 +1573,15 @@ pub fn resume_migration(paths: &NodePaths) -> Result<(), StoreError> {
         }
         "swapping" => {
             let version = db_version(&paths.db_path())?;
-            if version == Some(2) {
+            if manifest.to >= 3 {
+                if version == Some(manifest.to) {
+                    let _ = std::fs::remove_dir_all(&stage);
+                } else {
+                    swap_global_from_stage(paths, &stage)?;
+                }
+            } else if version.is_some_and(|version| version >= 2) {
+                // The v0.1 migration writes the current embedded schema, so a completed swap
+                // may already report a later version here.
                 finish_swap(paths, &stage)?;
             } else {
                 swap_from_stage(paths, &stage, Path::new(&manifest.backup))?;
@@ -305,18 +1662,26 @@ fn preflight(paths: &NodePaths) -> Result<Source, StoreError> {
     })
 }
 
-/// Refuses to migrate while a live supervisor holds the home.
-fn refuse_live_supervisor(paths: &NodePaths) -> Result<(), StoreError> {
+/// Returns the live supervisor pid recorded in `<home>/supervisor.lock`.
+///
+/// A missing lock, an unparsable first line or a pid that is no longer alive all mean no
+/// supervisor holds the home. The caller decides whether this process *is* that supervisor.
+pub(crate) fn live_supervisor_pid(paths: &NodePaths) -> Result<Option<u32>, StoreError> {
     let path = paths.supervisor_lock_path();
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(StoreError::io(path.display(), err)),
     };
-    if let Some(pid) = text.lines().next().and_then(|line| line.trim().parse::<u32>().ok())
-        && valid_pid(pid)
-        && pid_alive(pid)
-    {
+    let Some(pid) = text.lines().next().and_then(|line| line.trim().parse::<u32>().ok()) else {
+        return Ok(None);
+    };
+    Ok((valid_pid(pid) && pid_alive(pid)).then_some(pid))
+}
+
+/// Refuses to migrate while a live supervisor holds the home.
+fn refuse_live_supervisor(paths: &NodePaths) -> Result<(), StoreError> {
+    if let Some(pid) = live_supervisor_pid(paths)? {
         return Err(StoreError::Conflict(format!(
             "supervisor pid {pid} is running; stop it before migrating"
         )));
@@ -746,8 +2111,9 @@ fn copy_global(conn: &Connection, _source: &Source, paths: &NodePaths) -> Result
     conn.execute_batch(
         "BEGIN IMMEDIATE;
          INSERT INTO main.kv (key, value, updated_at) SELECT key, value, updated_at FROM old.kv;
-         INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at)
-           SELECT name, ssh_target, is_local, capabilities, last_seen_at, created_at FROM old.nodes;
+         INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at, kind)
+           SELECT name, ssh_target, is_local, capabilities, last_seen_at, created_at,
+                  CASE WHEN is_local = 1 THEN 'home' ELSE 'ssh' END FROM old.nodes;
          INSERT INTO main.projects (name, path, remote_url, default_branch, config_json,
                                     state, weight, paused_reason, archived_at, created_at, updated_at)
            SELECT name, path, remote_url, default_branch, config_json,
@@ -1120,6 +2486,29 @@ fn string_column(conn: &Connection, sql: &str) -> Result<Vec<String>, StoreError
 fn count_sql(conn: &Connection, sql: &str) -> Result<u64, StoreError> {
     let value: i64 = conn.query_row(sql, [], |row| row.get(0))?;
     Ok(u64::try_from(value).unwrap_or(0))
+}
+
+/// Counts every application table in one attached schema, keyed by table name.
+fn table_counts(conn: &Connection, schema: &str) -> Result<BTreeMap<String, u64>, StoreError> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT name FROM {schema}.sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row?);
+    }
+    drop(statement);
+    let mut counts = BTreeMap::new();
+    for name in names {
+        let quoted = name.replace('"', "\"\"");
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {schema}.\"{quoted}\""), [], |row| {
+            row.get(0)
+        })?;
+        counts.insert(name, u64::try_from(count).unwrap_or(0));
+    }
+    Ok(counts)
 }
 
 /// Reads `PRAGMA user_version` from a file, returning `None` when the file is absent.

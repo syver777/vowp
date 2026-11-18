@@ -51,9 +51,10 @@ python3 docs/reference/check-reference.py
 | [`vowp session chat`](#vowp-session-chat) | Chat with a session |
 | [`vowp session switch`](#vowp-session-switch) | Switch a session to another executor |
 | [`vowp session capsule`](#vowp-session-capsule) | Write a capsule now |
-| [`vowp session export`](#vowp-session-export) | Export a session bundle |
-| [`vowp session import`](#vowp-session-import) | Import a session bundle |
+| [`vowp session export`](#vowp-session-export) | Export a session bundle or ASIF package |
+| [`vowp session import`](#vowp-session-import) | Import a session bundle or ASIF package |
 | [`vowp session pull`](#vowp-session-pull) | Pull a session from another node |
+| [`vowp session push`](#vowp-session-push) | Push a session to another node |
 | [`vowp session watch`](#vowp-session-watch) | Record interactive Claude Code transcripts |
 | [`vowp session tail`](#vowp-session-tail) | Print a session's event log |
 | [`vowp session turn-begin`](#vowp-session-turn-begin) | Hidden: begin a remote turn and print its grant |
@@ -72,6 +73,9 @@ python3 docs/reference/check-reference.py
 | [`vowp node add`](#vowp-node-add) | Add a node and probe it |
 | [`vowp node ls`](#vowp-node-ls) | List nodes |
 | [`vowp node rm`](#vowp-node-rm) | Remove a node |
+| [`vowp node enroll`](#vowp-node-enroll) | Create a pending local-agent node and a one-time enrollment code |
+| [`vowp node revoke`](#vowp-node-revoke) | Revoke a node's credentials |
+| [`vowp node show`](#vowp-node-show) | Show the redacted node card |
 | [`vowp loops`](#vowp-loops) | List or pause supervisor loops |
 | [`vowp loops pause`](#vowp-loops-pause) | Pause a loop |
 | [`vowp loops resume`](#vowp-loops-resume) | Resume a loop |
@@ -105,10 +109,12 @@ python3 docs/reference/check-reference.py
 | [`vowp fleet queue`](#vowp-fleet-queue) | List queued jobs across projects |
 | [`vowp fleet inbox`](#vowp-fleet-inbox) | List open inbox items across the node and its projects |
 | [`vowp fleet capacity`](#vowp-fleet-capacity) | Alias of `vowp capacity show` |
-| [`vowp capacity`](#vowp-capacity) | Show or change measured capacity |
+| [`vowp capacity`](#vowp-capacity) | Show, change or reload measured capacity |
 | [`vowp capacity show`](#vowp-capacity-show) | Show the current capacity report |
 | [`vowp capacity report`](#vowp-capacity-report) | Show the report used by the advisor |
 | [`vowp capacity set`](#vowp-capacity-set) | Write one capacity target row |
+| [`vowp capacity reload`](#vowp-capacity-reload) | Validate or apply the on-disk provider caps and target without a restart |
+| [`vowp capacity history`](#vowp-capacity-history) | Read the bounded capacity rollup history |
 | [`vowp secret`](#vowp-secret) | Set, list, remove or request secrets |
 | [`vowp secret set`](#vowp-secret-set) | Store a secret through a hidden prompt |
 | [`vowp secret ls`](#vowp-secret-ls) | List secret names and their last four characters |
@@ -136,7 +142,30 @@ python3 docs/reference/check-reference.py
 | [`vowp orchestrator resume`](#vowp-orchestrator-resume) | Start an orchestrator's host again |
 | [`vowp orchestrator __keepalive`](#vowp-orchestrator-__keepalive) | Hidden: keep one orchestrator's lease alive after the CLI exits |
 | [`vowp migrate`](#vowp-migrate) | Migrate a v0.1 home to the v0.2 layout |
-| [`vowp mcp`](#vowp-mcp) | Run the stdio MCP server |
+| [`vowp mcp`](#vowp-mcp) | Run the stdio MCP server or the Mac-side proxy |
+| [`vowp agent`](#vowp-agent) | Enroll, run or inspect the Mac-side agent |
+| [`vowp agent enroll`](#vowp-agent-enroll) | Enroll this Mac with a one-time code |
+| [`vowp agent paths`](#vowp-agent-paths) | Add, remove or list the local project path map |
+| [`vowp agent paths add`](#vowp-agent-paths-add) | Add or update one project checkout |
+| [`vowp agent paths rm`](#vowp-agent-paths-rm) | Remove one project from the map |
+| [`vowp agent paths ls`](#vowp-agent-paths-ls) | List the local project path map |
+| [`vowp agent pair`](#vowp-agent-pair) | Redeem a home surface pairing code and store the token |
+| [`vowp agent run`](#vowp-agent-run) | Run the agent client until revoked or superseded |
+| [`vowp agent status`](#vowp-agent-status) | Show the last local agent status |
+| [`vowp agent service`](#vowp-agent-service) | Install, remove or inspect the launchd or systemd-user service |
+| [`vowp agent service install`](#vowp-agent-service-install) | Write exactly one launchd plist or systemd user unit |
+| [`vowp agent service uninstall`](#vowp-agent-service-uninstall) | Stop the unit and remove only a VOWP-generated file |
+| [`vowp agent service status`](#vowp-agent-service-status) | Show the unit path and the manager's reported state |
+| [`vowp agent doctor`](#vowp-agent-doctor) | Report local agent warnings without failing on them |
+| [`vowp agent trust`](#vowp-agent-trust) | Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band |
+| [`vowp surface`](#vowp-surface) | Create, list or revoke a paired local surface; `--node` names the surface's node |
+| [`vowp surface pair`](#vowp-surface-pair) | Create a pending surface and print its one-time pairing code |
+| [`vowp surface ls`](#vowp-surface-ls) | List surfaces, their scopes and token expiry |
+| [`vowp surface revoke`](#vowp-surface-revoke) | Revoke a surface and every token it holds |
+| [`vowp surface rotate`](#vowp-surface-rotate) | Rotate a surface token, keeping the old token for a ten-minute overlap |
+| [`vowp offload`](#vowp-offload) | Show the effective offload policy or the offload read model |
+| [`vowp offload policy`](#vowp-offload-policy) | Show the effective offload policy |
+| [`vowp offload status`](#vowp-offload-status) | Show nodes, live assignments and waiting jobs |
 | [`vowp __exec`](#vowp-__exec) | Hidden: remote executor client |
 | [`vowp __vault-exec`](#vowp-__vault-exec) | Hidden: vault read/inject helper |
 | [`vowp __vault-admin`](#vowp-__vault-admin) | Hidden: vault write helper |
@@ -167,6 +196,7 @@ Commands:
   inbox         List and answer inbox items
   cost          Show cost totals
   node          Add, list or remove nodes
+  offload       Show the effective offload policy or the offload read model
   loops         List or pause supervisor loops
   schedule      Manage scheduled actions
   promote       Promote a change to an environment
@@ -177,7 +207,7 @@ Commands:
   schema        Print one exported JSON Schema
   project       Register, list, pause or archive projects
   fleet         Read the node snapshot, queue and inbox
-  capacity      Show or change measured capacity
+  capacity      Show, change or reload measured capacity
   secret        Set, list, remove or request secrets
   gc            List lifecycle classes and collect garbage
   tunnel        Open, list or close control-machine SSH tunnels
@@ -185,7 +215,9 @@ Commands:
   control       Configure this machine as the control machine
   orchestrator  Create and manage orchestrator sessions
   migrate       Migrate a v0.1 home to the v0.2 layout
-  mcp           Run the stdio MCP server
+  mcp           Run the stdio MCP server or the Mac-side proxy
+  agent         Enroll, run or inspect the Mac-side agent
+  surface       Create, list or revoke a paired local surface; `--node` names the surface's node
   version       Print the binary version
 
 Options:
@@ -258,6 +290,7 @@ Options:
       --no-color             Disable colour even when stdout is a terminal
       --once                 Run exactly one supervisor tick and exit
   -q, --quiet                Suppress non-essential human output
+      --replace              Drain a running supervisor, apply pending migrations and start this binary
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
 ```
@@ -270,10 +303,11 @@ Stop the supervisor
 Usage: vowp down [OPTIONS]
 
 Options:
-      --force                Send SIGTERM if the supervisor does not stop by itself
+      --drain                Let active runs and gate tasks finish; admit no new work
       --json                 Print one machine-readable JSON document on stdout
-      --kill-windows         Kill the tmux windows too
+      --force                Send SIGTERM if the supervisor does not stop by itself
       --node <NAME>          Run the command on that node over ssh
+      --kill-windows         Kill the tmux windows too
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
@@ -403,6 +437,7 @@ Options:
       --max-attempts <N>       Maximum fix rounds
       --brief-file <PATH>      Read the brief body from this file
       --brief <PATH|->         Read the brief body from stdin (`-`)
+      --placement <PLACEMENT>  Offload placement: `home`, `any`, `node:<name>` or `node:<name>+home`
   -h, --help                   Print help
 ```
 
@@ -689,9 +724,10 @@ Commands:
   chat     Chat with a session
   switch   Switch a session to another executor
   capsule  Write a capsule now
-  export   Export a session bundle
-  import   Import a session bundle
+  export   Export a session bundle or ASIF package
+  import   Import a session bundle or ASIF package
   pull     Pull a session from another node
+  push     Push a session to another node
   watch    Record interactive Claude Code transcripts
   tail     Print a session's event log
 
@@ -790,8 +826,10 @@ Options:
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --takeover             Take the lease from a live surface before the first turn
+      --agent                Run the local agent chat bridge instead of the home surface
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
+      --session <ID>         Session id for `--agent`; equivalent to the positional id
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
 ```
@@ -845,48 +883,138 @@ Options:
 #### `vowp session export`
 
 ```text
-Export a session bundle
+Export a session bundle or ASIF package
 
 Usage: vowp session export [OPTIONS] <ID>
 
 Arguments:
-  <ID>  Session id or unique prefix
+  <ID>
+          Session id or unique prefix
 
 Options:
-      --json                 Print one machine-readable JSON document on stdout
-  -o, --out <FILE>           Output file (default `./<id>.vowp-bundle.json`)
-      --node <NAME>          Run the command on that node over ssh
-      --tail <N>             Number of tail events to include
-      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
-      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
-      --no-color             Disable colour even when stdout is a terminal
-  -q, --quiet                Suppress non-essential human output
-  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
-  -h, --help                 Print help
+      --format <FORMAT>
+          Interchange format
+
+          Possible values:
+          - bundle: Native `vowp-bundle-v1` JSON. The default for both commands
+          - asif:   ASIF 0.4 (review draft) package. Semantic interchange with declared losses
+          
+          [default: bundle]
+
+      --json
+          Print one machine-readable JSON document on stdout
+
+      --node <NAME>
+          Run the command on that node over ssh
+
+  -o, --out <FILE|->
+          Output file (default `./<id>.vowp-bundle.json`, or `./<id>.asif.zip` for ASIF); `-` writes to stdout
+
+      --project <NAME|PATH>
+          Project name or path; defaults to the nearest ancestor with `vowp.toml`
+
+      --tail <N>
+          Number of tail events to include (bundle only)
+
+      --home <DIR>
+          Node home (default `$VOWP_HOME`, else `~/.vowp`)
+
+      --redact <LITERAL>
+          Replace this exact literal with `<redacted>` (ASIF only, repeatable)
+
+      --no-color
+          Disable colour even when stdout is a terminal
+
+      --redact-file <FILE>
+          Read exact redaction literals from a local file, one per line (ASIF only)
+
+      --keep-host-paths
+          Keep host-path-looking strings in a trusted local export (ASIF only)
+
+  -q, --quiet
+          Suppress non-essential human output
+
+      --report <FILE>
+          Keep the full `vowp-asif-report-v1` document at this file (ASIF only)
+
+  -v, --verbose...
+          Increase log verbosity (`-v`, `-vv`)
+
+      --strict
+          Refuse `Blocking` and `Integrity` ASIF losses (ASIF only)
+
+      --allow-loss
+          Let recoverable ASIF integrity/ambiguity problems become declared losses (ASIF only)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 #### `vowp session import`
 
 ```text
-Import a session bundle
+Import a session bundle or ASIF package
 
 Usage: vowp session import [OPTIONS] <FILE>
 
 Arguments:
-  <FILE>  Bundle file, or `-` for stdin
+  <FILE>
+          Bundle/package file, document, directory, or `-` for stdin
 
 Options:
-      --json                 Print one machine-readable JSON document on stdout
-      --node <NAME>          Node to import on
-      --executor <EXECUTOR>  Executor for the child session
-      --cwd <DIR>            Working directory
-      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
-      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
-      --same-id              Keep the bundle's session id; refuse when it already exists locally
-      --no-color             Disable colour even when stdout is a terminal
-  -q, --quiet                Suppress non-essential human output
-  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
-  -h, --help                 Print help
+      --format <FORMAT>
+          Interchange format
+
+          Possible values:
+          - bundle: Native `vowp-bundle-v1` JSON. The default for both commands
+          - asif:   ASIF 0.4 (review draft) package. Semantic interchange with declared losses
+          
+          [default: bundle]
+
+      --json
+          Print one machine-readable JSON document on stdout
+
+      --node <NAME>
+          Node to import on
+
+      --executor <EXECUTOR>
+          Executor for the child session (bundle only)
+
+      --project <NAME|PATH>
+          Project name or path; defaults to the nearest ancestor with `vowp.toml`
+
+      --cwd <DIR>
+          Working directory
+
+      --home <DIR>
+          Node home (default `$VOWP_HOME`, else `~/.vowp`)
+
+      --no-color
+          Disable colour even when stdout is a terminal
+
+      --same-id
+          Keep the bundle's session id; refuse when it already exists locally (bundle only)
+
+      --branch <ID>
+          Select one ASIF branch when the document has more than one (ASIF only)
+
+  -q, --quiet
+          Suppress non-essential human output
+
+      --report <FILE>
+          Keep the full `vowp-asif-report-v1` document at this file (ASIF only)
+
+  -v, --verbose...
+          Increase log verbosity (`-v`, `-vv`)
+
+      --strict
+          Refuse `Blocking` and `Integrity` ASIF losses (ASIF only)
+
+      --allow-loss
+          Let recoverable ASIF integrity/ambiguity problems become declared losses (ASIF only)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 #### `vowp session pull`
@@ -904,6 +1032,28 @@ Options:
       --json                 Print one machine-readable JSON document on stdout
       --same-id              Keep the source session id; refuse when it already exists locally
       --full                 Copy the full session directory (log, blobs, capsules, adapters.json)
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp session push`
+
+```text
+Push a session to another node
+
+Usage: vowp session push [OPTIONS] <NODE> <SESSION>
+
+Arguments:
+  <NODE>     Node that receives the session
+  <SESSION>  Local session id or unique prefix
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --same-id              Keep the source session id; refuse when it already exists on the node
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
@@ -1068,8 +1218,10 @@ Options:
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --takeover             Take the lease from a live surface before the first turn
+      --agent                Run the local agent chat bridge instead of the home surface
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
+      --session <ID>         Session id for `--agent`; equivalent to the positional id
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
 ```
@@ -1239,9 +1391,12 @@ Add, list or remove nodes
 Usage: vowp node [OPTIONS] <COMMAND>
 
 Commands:
-  add  Add a node and probe it
-  ls   List nodes
-  rm   Remove a node
+  add     Add a node and probe it
+  ls      List nodes
+  rm      Remove a node
+  enroll  Create a pending local-agent node and a one-time enrollment code
+  revoke  Revoke a node's credentials
+  show    Show the redacted node card
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -1301,6 +1456,73 @@ Options:
 Remove a node
 
 Usage: vowp node rm [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Node name
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --yes                  Remove without asking for confirmation
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp node enroll`
+
+```text
+Create a pending local-agent node and a one-time enrollment code
+
+Usage: vowp node enroll [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Node name slug
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --label <LABEL>        Owner-assigned label; repeat for several labels
+      --node <NAME>          Run the command on that node over ssh
+      --replace              Rotate a pending node's one-time code in one transaction
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp node revoke`
+
+```text
+Revoke a node's credentials
+
+Usage: vowp node revoke [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Node name
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --yes                  Revoke without asking for confirmation
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp node show`
+
+```text
+Show the redacted node card
+
+Usage: vowp node show [OPTIONS] <NAME>
 
 Arguments:
   <NAME>  Node name
@@ -2033,14 +2255,16 @@ Options:
 ### `vowp capacity`
 
 ```text
-Show or change measured capacity
+Show, change or reload measured capacity
 
 Usage: vowp capacity [OPTIONS] <COMMAND>
 
 Commands:
-  show    Show the current capacity report
-  report  Show the report used by the advisor
-  set     Write one capacity target row
+  show     Show the current capacity report
+  report   Show the report used by the advisor
+  set      Write one capacity target row
+  reload   Validate or apply the on-disk provider caps and target without a restart
+  history  Read the bounded capacity rollup history
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -2108,6 +2332,45 @@ Options:
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --reason <TEXT>        Why the target changed
       --by <ACTOR>           Who set the target
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp capacity reload`
+
+```text
+Validate or apply the on-disk provider caps and target without a restart
+
+Usage: vowp capacity reload [OPTIONS]
+
+Options:
+      --check                Validate and print the on-disk values without writing or asking the supervisor
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp capacity history`
+
+```text
+Read the bounded capacity rollup history
+
+Usage: vowp capacity history [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --since <DUR|DATE>     Start of the window (duration or date); defaults to 24h
+      --bucket <5m|1h|1d>    Bucket width: `5m` (stored), `1h` or `1d` (read-time); defaults to 5m
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
@@ -2595,6 +2858,8 @@ Options:
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
+
+For `orchestrator new`, --node <name> names the node that runs the app, not an SSH redirect.
 ```
 
 #### `vowp orchestrator ls`
@@ -2702,17 +2967,506 @@ Options:
 ### `vowp mcp`
 
 ```text
-Run the stdio MCP server
+Run the stdio MCP server or the Mac-side proxy
 
-Usage: vowp mcp [OPTIONS] --session <ID> --surface <ID> --token-file <FILE>
+Usage: vowp mcp [OPTIONS] --surface <ID>
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
-      --session <ID>         Session the server writes to
+      --session <ID>         Session the server writes to (home mode; not with --agent-socket)
       --node <NAME>          Run the command on that node over ssh
       --surface <ID>         Surface id this server represents
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
-      --token-file <FILE>    File that holds the lease token (read on every write)
+      --token-file <FILE>    File that holds the lease token (home mode; not with --agent-socket)
+      --agent-socket <PATH>  Unix socket served by `vowp agent run`; selects the local MCP proxy
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+### `vowp agent`
+
+```text
+Enroll, run or inspect the Mac-side agent
+
+Usage: vowp agent [OPTIONS] <COMMAND>
+
+Commands:
+  enroll   Enroll this Mac with a one-time code
+  paths    Add, remove or list the local project path map
+  pair     Redeem a home surface pairing code and store the token
+  run      Run the agent client until revoked or superseded
+  status   Show the last local agent status
+  service  Install, remove or inspect the launchd or systemd-user service
+  doctor   Report local agent warnings without failing on them
+  trust    Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent enroll`
+
+```text
+Enroll this Mac with a one-time code
+
+Usage: vowp agent enroll [OPTIONS] --code-file <PATH|->
+
+Options:
+      --json                          Print one machine-readable JSON document on stdout
+      --target <SSH-TARGET>           ssh destination of the home
+      --code-file <PATH|->            File holding the one-time code, or `-` for stdin
+      --node <NAME>                   Run the command on that node over ssh
+      --project <PATH>                Map a local project checkout; repeat for more projects
+      --home <DIR>                    Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --worktree-root <PATH>          Worktree root for every --project; defaults to `<checkout>/.vowp/worktrees`
+      --no-color                      Disable colour even when stdout is a terminal
+      --wss <URL>                     Reach the home through a WSS proxy URL instead of SSH
+  -q, --quiet                         Suppress non-essential human output
+      --tls-fingerprint <SHA256:HEX>  Hard-pin the proxy certificate (`sha256:<hex>`); only with --wss
+  -v, --verbose...                    Increase log verbosity (`-v`, `-vv`)
+  -h, --help                          Print help
+```
+
+#### `vowp agent paths`
+
+```text
+Add, remove or list the local project path map
+
+Usage: vowp agent paths [OPTIONS] <COMMAND>
+
+Commands:
+  add  Add or update one project checkout
+  rm   Remove one project from the map
+  ls   List the local project path map
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent paths add`
+
+```text
+Add or update one project checkout
+
+Usage: vowp agent paths add [OPTIONS] --project <PATH>
+
+Options:
+      --json                  Print one machine-readable JSON document on stdout
+      --project <PATH>        Local project checkout to map
+      --name <NAME>           Project name override; defaults to `[project].name` in its `vowp.toml`
+      --node <NAME>           Run the command on that node over ssh
+      --worktree-root <PATH>  Worktree root; defaults to `<checkout>/.vowp/worktrees`
+      --allow <REL>           Allowed relative path below the checkout; repeat for more
+      --home <DIR>            Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color              Disable colour even when stdout is a terminal
+  -q, --quiet                 Suppress non-essential human output
+  -v, --verbose...            Increase log verbosity (`-v`, `-vv`)
+  -h, --help                  Print help
+```
+
+##### `vowp agent paths rm`
+
+```text
+Remove one project from the map
+
+Usage: vowp agent paths rm [OPTIONS] <PROJECT>
+
+Arguments:
+  <PROJECT>  Project name slug to remove
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent paths ls`
+
+```text
+List the local project path map
+
+Usage: vowp agent paths ls [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent pair`
+
+```text
+Redeem a home surface pairing code and store the token
+
+Usage: vowp agent pair [OPTIONS] --code-file <PATH|-> --surface <ID> --session <ID>
+
+Options:
+      --code-file <PATH|->   File holding the one-time pairing code, or `-` for stdin
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --surface <ID>         Surface id printed by `vowp surface pair`
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --session <ID>         Session id printed by `vowp surface pair`
+      --app <APP>            Application name; defaults to `agent` when the home did not bind one
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent run`
+
+```text
+Run the agent client until revoked or superseded
+
+Usage: vowp agent run [OPTIONS]
+
+Options:
+      --foreground           Keep the process in the terminal (the Phase 0 default)
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --role <ROLE>          Agent role: `surface`, `executor` or `both`
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --service              Run under the service manager: write the `run` marker and drain on SIGTERM
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent status`
+
+```text
+Show the last local agent status
+
+Usage: vowp agent status [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent service`
+
+```text
+Install, remove or inspect the launchd or systemd-user service
+
+Usage: vowp agent service [OPTIONS] <COMMAND>
+
+Commands:
+  install    Write exactly one launchd plist or systemd user unit
+  uninstall  Stop the unit and remove only a VOWP-generated file
+  status     Show the unit path and the manager's reported state
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent service install`
+
+```text
+Write exactly one launchd plist or systemd user unit
+
+Usage: vowp agent service install [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --print                Print the unit text and commands without writing or invoking the manager
+      --force                Replace a file at the unit path that VOWP did not generate
+      --node <NAME>          Run the command on that node over ssh
+      --now                  Run the current-user manager commands after writing the unit
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent service uninstall`
+
+```text
+Stop the unit and remove only a VOWP-generated file
+
+Usage: vowp agent service uninstall [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --yes                  Remove the unit without asking for confirmation
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent service status`
+
+```text
+Show the unit path and the manager's reported state
+
+Usage: vowp agent service status [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent doctor`
+
+```text
+Report local agent warnings without failing on them
+
+Usage: vowp agent doctor [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp agent trust`
+
+```text
+Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band
+
+Usage: vowp agent trust [OPTIONS] --fingerprint <SHA256:HEX>
+
+Options:
+      --fingerprint <SHA256:HEX>  New leaf fingerprint (`sha256:<64 lowercase hex>`), verified through a trusted channel
+      --json                      Print one machine-readable JSON document on stdout
+      --node <NAME>               Run the command on that node over ssh
+      --project <NAME|PATH>       Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>                Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color                  Disable colour even when stdout is a terminal
+  -q, --quiet                     Suppress non-essential human output
+  -v, --verbose...                Increase log verbosity (`-v`, `-vv`)
+  -h, --help                      Print help
+```
+
+### `vowp surface`
+
+```text
+Create, list or revoke a paired local surface; `--node` names the surface's node
+
+Usage: vowp surface [OPTIONS] <COMMAND>
+
+Commands:
+  pair    Create a pending surface and print its one-time pairing code
+  ls      List surfaces, their scopes and token expiry
+  revoke  Revoke a surface and every token it holds
+  rotate  Rotate a surface token, keeping the old token for a ten-minute overlap
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+For `surface`, --node <name> names the node the surface runs on, not an SSH redirect.
+```
+
+#### `vowp surface pair`
+
+```text
+Create a pending surface and print its one-time pairing code
+
+Usage: vowp surface pair [OPTIONS] --session <ID> --kind <KIND>
+
+Options:
+      --json                  Print one machine-readable JSON document on stdout
+      --session <ID>          Session the surface will mirror
+      --kind <KIND>           Surface kind: `opencode` or `chat`
+      --node <NAME>           Run the command on that node over ssh
+      --app <APP>             Application name carried into the token scopes
+      --project <NAME|PATH>   Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>            Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --replace <SURFACE-ID>  Revoke this surface and create the replacement pending surface in one transaction
+      --no-color              Disable colour even when stdout is a terminal
+  -q, --quiet                 Suppress non-essential human output
+  -v, --verbose...            Increase log verbosity (`-v`, `-vv`)
+  -h, --help                  Print help
+
+For this command --node <name> names the node the surface runs on, not an SSH redirect.
+```
+
+#### `vowp surface ls`
+
+```text
+List surfaces, their scopes and token expiry
+
+Usage: vowp surface ls [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+For this command --node <name> filters by the surface's node, not an SSH redirect.
+```
+
+#### `vowp surface revoke`
+
+```text
+Revoke a surface and every token it holds
+
+Usage: vowp surface revoke [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Surface id
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --yes                  Revoke without asking for confirmation
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp surface rotate`
+
+```text
+Rotate a surface token, keeping the old token for a ten-minute overlap
+
+Usage: vowp surface rotate [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Surface id printed by `vowp surface pair`
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --wait <DURATION>      Poll the outbox for this long and exit 7 with `rotation_pending` if still queued
+      --grace <DURATION>     Shorten the old tokens to `now + grace` instead of the ten-minute default (max 24 h)
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+For this command --node <name> names the node the surface runs on, not an SSH redirect.
+```
+
+### `vowp offload`
+
+```text
+Show the effective offload policy or the offload read model
+
+Usage: vowp offload [OPTIONS] <COMMAND>
+
+Commands:
+  policy  Show the effective offload policy
+  status  Show nodes, live assignments and waiting jobs
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp offload policy`
+
+```text
+Show the effective offload policy
+
+Usage: vowp offload policy [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp offload status`
+
+```text
+Show nodes, live assignments and waiting jobs
+
+Usage: vowp offload status [OPTIONS]
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output

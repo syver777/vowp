@@ -1175,7 +1175,7 @@ fn open_tee(path: Option<&Path>) -> Option<File> {
 /// Only the variables listed in the spec that exist in this process are copied; `TERM` is
 /// always `dumb`. `extra` is appended verbatim and therefore wins on duplicates.
 pub fn child_env(extra: &[(String, String)]) -> Vec<(String, String)> {
-    const BASE: [&str; 11] = [
+    const BASE: [&str; 12] = [
         "PATH",
         "HOME",
         "USER",
@@ -1187,6 +1187,7 @@ pub fn child_env(extra: &[(String, String)]) -> Vec<(String, String)> {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
     ];
 
     let mut env = Vec::new();

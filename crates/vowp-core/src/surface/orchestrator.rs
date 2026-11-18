@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use vowp_adapters::proc::{Signal, signal_group};
 use vowp_protocol::{
-    ExecutorRef, JoinInstructions, Lease, Level, NewSession, OrchestratorApp, OrchestratorCard, Project, ProjectName,
-    SessionId, SessionRole, Surface, SurfaceId, SurfaceKind, Timestamp,
+    AgentFrame, ExecutorRef, JoinInstructions, Lease, Level, NewSession, NodeName, NodePresence, NodeStatus,
+    OrchestratorApp, OrchestratorCard, OrchestratorCommand, OrchestratorError, OrchestratorNodeState,
+    OrchestratorResult, Project, ProjectName, SessionId, SessionRole, Surface, SurfaceId, SurfaceKind, Timestamp,
 };
-use vowp_store::{Store, StoreError};
+use vowp_store::{Store, StoreError, hash_lease_token};
 
 use super::claude_remote::ClaudeRemoteHost;
 use super::lease::{AcquireLease, LeaseGuard};
@@ -77,8 +78,10 @@ desktop app, a Claude app, or `vowp chat`). This file is your standing instructi
   Use the commands and tools.
 - Never read, print, log or commit a secret value, token, key or `.env` file. Refer to secrets by
   name only; use `vowp secret request` for a value the owner must enter.
-- Never push, publish, deploy or change repository visibility. The supervisor merges; the owner
-  publishes.
+- Push, publish, deploy or change repository visibility only after explicit owner confirmation in
+  the current turn. State the repository/remote, branch/tag, files and expected effect, then wait
+  for a clear yes. Do not rely on standing or previous approval. Report the result after acting.
+  The supervisor still merges worker branches; workers do not push directly.
 - A write tool that refuses because the session moved is final. Do not retry it with another token
   or another surface; tell the owner and continue read-only here.
 - Never claim a tool, app join, tunnel or job is working without checking it.
@@ -123,6 +126,248 @@ pub const KEEPER_PID_FILE: &str = "keeper.pid";
 /// How long the keeper waits between checks of its pid file and lease.
 const KEEPER_TICK: Duration = Duration::from_secs(1);
 
+/// Home directory holding one command frame per node and request.
+const OUTBOX_DIR: &str = "agent-commands";
+
+/// Home directory holding one result frame per node and request.
+const INBOX_DIR: &str = "agent-results";
+
+/// Poll interval while a command waits for its result file.
+const COMMAND_POLL: Duration = Duration::from_millis(20);
+
+/// Default time a home command waits for the live agent's result before treating the
+/// command as durably queued.
+pub const COMMAND_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How the home delivers orchestrator commands to a node's live agent connection.
+///
+/// The production [`CommandSpool`] writes the `AgentFrame` a live connection would carry
+/// and waits briefly for the correlated result. Tests inject a fake stream that records
+/// the frames and answers without a network, tmux or app.
+pub trait OrchestratorTransport: Send + Sync {
+    /// Delivers one command to `node`.
+    ///
+    /// `Ok(Some(result))` is the correlated agent result. `Ok(None)` means the command is
+    /// durably queued for the node's next live connection; the caller records `starting`
+    /// and applies the result later with [`Orchestrator::apply_result`].
+    fn send(&self, node: &NodeName, command: &OrchestratorCommand) -> Result<Option<OrchestratorResult>, CoreError>;
+}
+
+/// The home's per-node command outbox and result inbox.
+///
+/// Layout below the home root:
+///
+/// ```text
+/// agent-commands/<node>/<request_id>.json   one AgentFrame::OrchestratorCommand
+/// agent-results/<node>/<request_id>.json    one AgentFrame::OrchestratorResult
+/// ```
+///
+/// A live gateway connection drains the outbox, sends the frame to the agent and writes the
+/// correlated result back. The files carry the same frame the connection carries: no port,
+/// password, pairing link, absolute path or secret value. They are 0600 in a 0700 directory.
+#[derive(Debug, Clone)]
+pub struct CommandSpool {
+    root: PathBuf,
+    timeout: Duration,
+}
+
+impl CommandSpool {
+    /// Builds a spool below `root` with the default result timeout.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            timeout: COMMAND_RESULT_TIMEOUT,
+        }
+    }
+
+    /// Builds a spool with an explicit result timeout.
+    pub fn with_timeout(root: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self {
+            root: root.into(),
+            timeout,
+        }
+    }
+
+    /// Returns the per-node outbox directory.
+    fn outbox(&self, node: &NodeName) -> PathBuf {
+        self.root.join(OUTBOX_DIR).join(node.as_str())
+    }
+
+    /// Returns the per-node result inbox directory.
+    fn inbox(&self, node: &NodeName) -> PathBuf {
+        self.root.join(INBOX_DIR).join(node.as_str())
+    }
+
+    /// Returns the commands waiting for a live connection, oldest request id first.
+    ///
+    /// A command whose result already exists is skipped: the waiting home command or an
+    /// earlier delivery already completed it. A missing outbox is an empty queue.
+    pub fn pending(&self, node: &NodeName) -> Result<Vec<OrchestratorCommand>, CoreError> {
+        let outbox = self.outbox(node);
+        let entries = match fs::read_dir(&outbox) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: outbox.display().to_string(),
+                    source,
+                });
+            }
+        };
+        let inbox = self.inbox(node);
+        let mut commands = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| CoreError::Io {
+                path: outbox.display().to_string(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|source| CoreError::Io {
+                path: path.display().to_string(),
+                source,
+            })?;
+            let frame: AgentFrame = serde_json::from_slice(&bytes)
+                .map_err(|error| CoreError::Invalid(format!("{}: {error}", path.display())))?;
+            let AgentFrame::OrchestratorCommand(command) = frame else {
+                return Err(CoreError::Invalid(format!(
+                    "{} does not contain an orchestrator command",
+                    path.display()
+                )));
+            };
+            if inbox.join(format!("{}.json", command.request_id())).exists() {
+                continue;
+            }
+            commands.push(command);
+        }
+        commands.sort_by(|left, right| left.request_id().cmp(right.request_id()));
+        Ok(commands)
+    }
+
+    /// Retires one queued command without publishing an unsolicited result.
+    ///
+    /// A result that no record names as its latest command is stale: the owner already
+    /// moved on to a newer request id. Removing the outbox file keeps the next connection
+    /// from re-sending a superseded command. A missing file is already retired.
+    pub fn retire(&self, node: &NodeName, request_id: &str) -> Result<(), CoreError> {
+        if !safe_request_id(request_id) {
+            return Err(CoreError::Invalid(format!(
+                "invalid orchestrator request id {request_id:?}"
+            )));
+        }
+        let path = self.outbox(node).join(format!("{request_id}.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(CoreError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// Publishes one agent result and retires its command.
+    ///
+    /// The result file is written before the command is removed, so an interrupted write
+    /// leaves the command queued for the next connection instead of losing it.
+    pub fn complete(&self, node: &NodeName, result: &OrchestratorResult) -> Result<(), CoreError> {
+        if !safe_request_id(&result.request_id) {
+            return Err(CoreError::Invalid(format!(
+                "invalid orchestrator request id {:?}",
+                result.request_id
+            )));
+        }
+        let inbox = self.inbox(node);
+        create_private_dir(&inbox)?;
+        let result_path = inbox.join(format!("{}.json", result.request_id));
+        write_spool_frame(&result_path, &AgentFrame::OrchestratorResult(result.clone()))?;
+        let _ = fs::remove_file(self.outbox(node).join(format!("{}.json", result.request_id)));
+        Ok(())
+    }
+}
+
+/// Returns whether a request id is a plain file name component.
+fn safe_request_id(request_id: &str) -> bool {
+    !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+impl OrchestratorTransport for CommandSpool {
+    fn send(&self, node: &NodeName, command: &OrchestratorCommand) -> Result<Option<OrchestratorResult>, CoreError> {
+        let outbox = self.outbox(node);
+        let inbox = self.inbox(node);
+        create_private_dir(&outbox)?;
+        create_private_dir(&inbox)?;
+        let request_id = command.request_id();
+        if !safe_request_id(request_id) {
+            return Err(CoreError::Invalid(format!(
+                "invalid orchestrator request id {request_id:?}"
+            )));
+        }
+        let command_path = outbox.join(format!("{request_id}.json"));
+        let result_path = inbox.join(format!("{request_id}.json"));
+        write_spool_frame(&command_path, &AgentFrame::OrchestratorCommand(command.clone()))?;
+
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            match fs::read(&result_path) {
+                Ok(bytes) => {
+                    let frame: AgentFrame = serde_json::from_slice(&bytes)
+                        .map_err(|error| CoreError::Invalid(format!("{}: {error}", result_path.display())))?;
+                    let _ = fs::remove_file(&result_path);
+                    let _ = fs::remove_file(&command_path);
+                    return match frame {
+                        AgentFrame::OrchestratorResult(result) => {
+                            if result.request_id == request_id {
+                                Ok(Some(sanitize_result(result)))
+                            } else {
+                                Err(CoreError::Invalid(format!(
+                                    "orchestrator result {} does not match request {request_id}",
+                                    result.request_id
+                                )))
+                            }
+                        }
+                        AgentFrame::Error { message, retryable, .. } => Ok(Some(OrchestratorResult::failed(
+                            request_id,
+                            OrchestratorNodeState::Failed,
+                            OrchestratorError::new("agent_error", redact_text(&message), retryable),
+                        ))),
+                        other => Err(CoreError::Invalid(format!(
+                            "unexpected agent frame for orchestrator result: {other:?}"
+                        ))),
+                    };
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CoreError::Io {
+                        path: result_path.display().to_string(),
+                        source,
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(COMMAND_POLL);
+        }
+    }
+}
+
+/// Writes one spool frame through a private temporary file and a rename.
+fn write_spool_frame(path: &Path, frame: &AgentFrame) -> Result<(), CoreError> {
+    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
+    write_private_json(&temp, frame)?;
+    fs::rename(&temp, path).map_err(|source| CoreError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
 /// A request to create an orchestrator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewOrchestrator {
@@ -149,34 +394,80 @@ pub struct OrchestratorInfo {
     pub session: SessionId,
     /// Running host, when any.
     pub host: Option<AppHandle>,
+    /// Last redacted node detail, when any.
+    pub detail: Option<String>,
+}
+
+/// What one command send did to the caller's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandDelivery {
+    /// The transport returned a correlated result, which was applied to the state.
+    Applied,
+    /// The command is durably queued for a live gateway; the state is still `starting`.
+    Queued,
 }
 
 /// The orchestrator manager.
 pub struct Orchestrator {
     deps: Deps,
     hosts: Vec<Arc<dyn AppHost>>,
+    transport: Arc<dyn OrchestratorTransport>,
 }
 
 impl Orchestrator {
     /// Creates a manager over `deps` with the real opencode and Claude Code hosts.
     pub fn new(deps: Deps) -> Self {
-        Self::with_hosts(
+        let transport = Arc::new(CommandSpool::new(deps.paths.root()));
+        Self::with_transport(
             deps,
             vec![Arc::new(OpencodeHost::default()), Arc::new(ClaudeRemoteHost::default())],
+            transport,
         )
     }
 
-    /// Creates a manager over `deps` with explicit app hosts.
+    /// Creates a manager that only queues commands for a live gateway to drain.
+    ///
+    /// The gateway uses this for `node_reconnected`: it must not block the connection for
+    /// the full [`COMMAND_RESULT_TIMEOUT`] while the agent runs the command. The result is
+    /// applied later by [`Orchestrator::apply_result`].
+    pub fn new_queued(deps: Deps) -> Self {
+        let transport = Arc::new(CommandSpool::with_timeout(deps.paths.root(), Duration::ZERO));
+        Self::with_transport(
+            deps,
+            vec![Arc::new(OpencodeHost::default()), Arc::new(ClaudeRemoteHost::default())],
+            transport,
+        )
+    }
+
+    /// Creates a manager over `deps` with explicit app hosts and the default spool.
     ///
     /// Tests pass fakes here; production uses [`Orchestrator::new`]. A missing host for
     /// an app that needs one is refused by [`Orchestrator::create`] and
     /// [`Orchestrator::resume`].
     pub fn with_hosts(deps: Deps, hosts: Vec<Arc<dyn AppHost>>) -> Self {
-        Self { deps, hosts }
+        let transport = Arc::new(CommandSpool::new(deps.paths.root()));
+        Self::with_transport(deps, hosts, transport)
     }
 
-    /// Creates and starts an orchestrator.
+    /// Creates a manager with explicit app hosts and an injected command transport.
+    ///
+    /// Hermetic tests use this to feed the home a fake agent frame stream.
+    pub fn with_transport(deps: Deps, hosts: Vec<Arc<dyn AppHost>>, transport: Arc<dyn OrchestratorTransport>) -> Self {
+        Self { deps, hosts, transport }
+    }
+
+    /// Creates and starts an orchestrator on the home.
     pub fn create(&self, req: &NewOrchestrator) -> Result<OrchestratorInfo, CoreError> {
+        self.create_on_node(req, None)
+    }
+
+    /// Creates an orchestrator whose app may run on `node`.
+    ///
+    /// An unknown or revoked node is refused before any directory or session exists. An
+    /// active node that is offline gets the home record in `node_offline` and is never
+    /// started on the home. An online node receives a typed start command; the card and
+    /// the persisted state carry the node, the request id and the resulting state.
+    pub fn create_on_node(&self, req: &NewOrchestrator, node: Option<NodeName>) -> Result<OrchestratorInfo, CoreError> {
         validate_name(&req.name)?;
         let dir = self.dir(&req.name);
         if dir.exists() {
@@ -189,22 +480,48 @@ impl Orchestrator {
             }
             self.remove_existing(&req.name)?;
         }
+
+        // Validate the node before creating a directory or a session: an unknown,
+        // pending or revoked node leaves no half-made record behind.
+        let remote_card = match node.as_ref() {
+            Some(node) if !self.is_home_node(node)? => Some(self.require_active_node(node)?),
+            _ => None,
+        };
+        let card_node = node.clone();
+
         let global = Store::open_global(&self.deps.paths)?;
         self.prepare_project(&global, req.project.as_ref())?;
         drop(global);
 
         create_private_dir(&dir)?;
-        let scoped = self.scoped_deps(req.project.as_ref())?;
+        let mut scoped = self.scoped_deps(req.project.as_ref())?;
+        // A remote-node orchestrator session lives on the home but records the node whose
+        // app will run it, so a later pairing on that node is authorized.
+        if let Some(card) = remote_card.as_ref() {
+            scoped.node = card.name.clone();
+        }
         let service = SessionService::new(scoped.clone());
+        let cwd = if remote_card.is_some() {
+            // The node resolves its own local root. The home never stores or shows the
+            // absolute path in a card, frame, error or log.
+            PathBuf::from(".")
+        } else {
+            dir.clone()
+        };
         let session = service.create_session(NewSession {
             project: req.project.clone(),
             job_id: None,
             role: SessionRole::Orchestrator,
             title: format!("orchestrator {}", req.name),
-            cwd: dir.clone(),
+            cwd,
             parent: None,
             executor: req.executor.as_ref().map(|executor| executor.executor.clone()),
         })?;
+
+        if let Some(card) = remote_card {
+            return self.create_on_remote_node(req, card, session, dir);
+        }
+
         let surface = self.surface(&req.name, req.app, &dir);
         let surface_id = surface.id.clone();
         let token_path = dir.join(LEASE_FILE);
@@ -257,10 +574,14 @@ impl Orchestrator {
                         session_id: session.clone(),
                         project: req.project.clone(),
                         executor: req.executor.clone(),
-                        state: "degraded".to_owned(),
+                        state: OrchestratorNodeState::Degraded,
                         created_at: self.deps.clock.now(),
                         join: Some(join),
                         surface_id: Some(surface_id.clone()),
+                        node: card_node,
+                        last_request_id: None,
+                        detail: Some(redact_text(&error.to_string())),
+                        last_error: None,
                     };
                     let _ = write_state(&dir, &state);
                     return Err(error);
@@ -281,16 +602,86 @@ impl Orchestrator {
             session_id: session.clone(),
             project: req.project.clone(),
             executor: req.executor.clone(),
-            state: "running".to_owned(),
+            state: OrchestratorNodeState::Running,
             created_at: self.deps.clock.now(),
             join: Some(join),
             surface_id: Some(surface_id),
+            node: card_node,
+            last_request_id: None,
+            detail: None,
+            last_error: None,
         };
         write_state(&dir, &state)?;
         if let (Some(host), Some(handle)) = (host.as_ref(), handle.as_ref()) {
             self.mirror(&dir, &state, host.as_ref(), handle);
         }
         Ok(info_from_state(state, dir, handle))
+    }
+
+    /// Creates the home record for an orchestrator whose app runs on `card`.
+    fn create_on_remote_node(
+        &self,
+        req: &NewOrchestrator,
+        card: vowp_protocol::NodeCard,
+        session: SessionId,
+        dir: PathBuf,
+    ) -> Result<OrchestratorInfo, CoreError> {
+        let request_id = new_request_id();
+        let online = card.presence == NodePresence::Online;
+        let mut state = StateFile {
+            name: req.name.clone(),
+            app: req.app,
+            session_id: session.clone(),
+            project: req.project.clone(),
+            executor: req.executor.clone(),
+            state: if online {
+                OrchestratorNodeState::Starting
+            } else {
+                OrchestratorNodeState::NodeOffline
+            },
+            created_at: self.deps.clock.now(),
+            join: Some(node_join(req.app, &card.name, &session)),
+            surface_id: None,
+            node: Some(card.name.clone()),
+            last_request_id: Some(request_id.clone()),
+            detail: if online {
+                None
+            } else {
+                Some(format!("node {} is {}", card.name, presence_name(card.presence)))
+            },
+            last_error: None,
+        };
+        write_state(&dir, &state)?;
+        if !online {
+            return Ok(info_from_state(state, dir, None));
+        }
+        let command = OrchestratorCommand::Start {
+            request_id,
+            name: req.name.clone(),
+            app: req.app,
+            project: req.project.clone(),
+        };
+        let result = self.send_command(&card.name, &command, &mut state);
+        // A queued command already persisted `starting` and its request id before the
+        // send. Writing this in-memory copy again could overwrite a `degraded` mark that
+        // the gateway wrote when the connection dropped during the wait.
+        if !matches!(&result, Ok(CommandDelivery::Queued)) {
+            write_state(&dir, &state)?;
+        }
+        match result {
+            Ok(CommandDelivery::Applied) if state.state == OrchestratorNodeState::Failed => {
+                Err(refused_by_node(&card.name, "start", &state))
+            }
+            Ok(_) => Ok(info_from_state(state, dir, None)),
+            Err(error) => {
+                self.deps.log.log(
+                    Level::Warn,
+                    "orchestrator",
+                    &format!("cannot deliver start for {} to node {}: {error}", state.name, card.name),
+                );
+                Ok(info_from_state(state, dir, None))
+            }
+        }
     }
 
     /// Lists every orchestrator.
@@ -333,11 +724,43 @@ impl Orchestrator {
     }
 
     /// Stops one orchestrator's host and releases its lease. The session stays.
+    ///
+    /// A local-node orchestrator receives a `stop` command (the agent maps it to
+    /// `SurfaceDetach`), never a home host stop and never a stop of the whole agent.
     pub fn stop(&self, name: &str) -> Result<(), CoreError> {
         validate_name(name)?;
         let dir = self.dir(name);
         let mut state = read_state(&dir)?.ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
         self.stop_keeper(&dir);
+        if self.state_is_remote(&state)? {
+            let node = state
+                .node
+                .clone()
+                .ok_or_else(|| CoreError::Invalid("remote state has no node".to_owned()))?;
+            let request_id = new_request_id();
+            state.last_request_id = Some(request_id.clone());
+            let command = OrchestratorCommand::Stop {
+                request_id,
+                name: state.name.clone(),
+            };
+            // The owner's stop is final even when the node cannot be reached now: the
+            // record is stopped and a later reconnect must not resume it.
+            if self.send_command(&node, &command, &mut state).is_err() {
+                self.deps.log.log(
+                    Level::Warn,
+                    "orchestrator",
+                    &format!(
+                        "{} could not deliver stop to node {}; recorded stopped",
+                        state.name, node
+                    ),
+                );
+            }
+            self.release_lease(&dir, &state.name, &state.session_id)?;
+            let _ = fs::remove_file(dir.join(LEASE_FILE));
+            state.state = OrchestratorNodeState::Stopped;
+            state.detail = None;
+            return write_state(&dir, &state);
+        }
         if let Some(handle) = host_handle(&dir, state.app) {
             if let Ok(host) = self.host_for(state.app)
                 && let Some(host) = host.as_ref()
@@ -347,19 +770,24 @@ impl Orchestrator {
         }
         self.release_lease(&dir, &state.name, &state.session_id)?;
         let _ = fs::remove_file(dir.join(LEASE_FILE));
-        state.state = "stopped".to_owned();
+        state.state = OrchestratorNodeState::Stopped;
+        state.detail = None;
         write_state(&dir, &state)
     }
 
     /// Starts one orchestrator's host again.
+    ///
+    /// A local-node orchestrator receives a typed `resume` command. When its node is
+    /// offline the call fails with `node_offline` and the record is marked
+    /// `node_offline`; it is never started on the home.
     pub fn resume(&self, name: &str) -> Result<OrchestratorInfo, CoreError> {
         validate_name(name)?;
         let dir = self.dir(name);
         let mut state = read_state(&dir)?.ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
-        // A resume replaces the lease token; the old keeper must stop before the new
-        // token is written, or it would keep heartbeating a dead token and exit after
-        // the CLI's `ensure_keeper` has already seen it alive.
         self.stop_keeper(&dir);
+        if self.state_is_remote(&state)? {
+            return self.resume_on_remote_node(&dir, state);
+        }
         let host = self.host_for(state.app)?;
         let config = self.config_path(&dir, state.app);
         let mut token = None;
@@ -399,7 +827,8 @@ impl Orchestrator {
             current
         } else {
             let Some(host) = host.as_ref() else {
-                state.state = "running".to_owned();
+                state.state = OrchestratorNodeState::Running;
+                state.detail = None;
                 write_state(&dir, &state)?;
                 return Ok(info_from_state(state, dir, None));
             };
@@ -416,7 +845,8 @@ impl Orchestrator {
                         self.release_lease_with(&state.session_id, token)?;
                         let _ = fs::remove_file(dir.join(LEASE_FILE));
                     }
-                    state.state = "degraded".to_owned();
+                    state.state = OrchestratorNodeState::Degraded;
+                    state.detail = Some(redact_text(&error.to_string()));
                     let _ = write_state(&dir, &state);
                     return Err(error);
                 }
@@ -428,7 +858,8 @@ impl Orchestrator {
                 .unwrap_or_else(|_| fallback_join(state.app, &state.session_id)),
             None => fallback_join(state.app, &state.session_id),
         };
-        state.state = "running".to_owned();
+        state.state = OrchestratorNodeState::Running;
+        state.detail = None;
         state.join = Some(join);
         write_state(&dir, &state)?;
         if let Some(host) = host.as_ref() {
@@ -437,17 +868,33 @@ impl Orchestrator {
         Ok(info_from_state(state, dir, Some(handle)))
     }
 
-    /// Resumes every orchestrator whose persisted state is `running`.
+    /// Resumes every orchestrator that was live before the home restarted.
     ///
-    /// Called by the node supervisor at startup. A host that cannot start is marked
+    /// A local-node orchestrator is never started on the home. If its node is offline at
+    /// startup the record is marked `degraded` and the home resumes it on reconnect; a
+    /// `stopped` or `failed` record stays as it is. A host that cannot start is marked
     /// `degraded` and does not fail the remaining orchestrators.
     pub fn resume_all(&self) -> Result<Vec<OrchestratorInfo>, CoreError> {
         let mut resumed = Vec::new();
-        for state in self.states()? {
-            if state.state != "running" {
+        for mut state in self.states()? {
+            let dir = self.dir(&state.name);
+            if self.state_is_remote(&state)? {
+                match self.resume_remote_after_restart(&dir, &mut state) {
+                    Ok(Some(info)) => resumed.push(info),
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.deps.log.log(
+                            Level::Warn,
+                            "orchestrator",
+                            &format!("cannot resume {}: {error}", state.name),
+                        );
+                    }
+                }
                 continue;
             }
-            let dir = self.dir(&state.name);
+            if state.state != OrchestratorNodeState::Running {
+                continue;
+            }
             // A live host is already running. Reuse it only while it still owns its
             // lease: a supervisor restart must not invalidate every app config, and it
             // must not steal a session another surface took over.
@@ -465,6 +912,7 @@ impl Orchestrator {
                 }
                 if let Ok(Some(host)) = self.host_for(state.app) {
                     self.mirror(&dir, &state, host.as_ref(), &handle);
+                    state.detail = None;
                     resumed.push(info_from_state(state, dir, Some(handle)));
                     continue;
                 }
@@ -481,6 +929,312 @@ impl Orchestrator {
             }
         }
         Ok(resumed)
+    }
+
+    /// Resumes one local-node orchestrator at home startup, or marks it degraded.
+    fn resume_remote_after_restart(
+        &self,
+        dir: &Path,
+        state: &mut StateFile,
+    ) -> Result<Option<OrchestratorInfo>, CoreError> {
+        let Some(node) = state.node.clone() else {
+            return Ok(None);
+        };
+        match state.state {
+            OrchestratorNodeState::Stopped | OrchestratorNodeState::Failed => return Ok(None),
+            OrchestratorNodeState::Running
+            | OrchestratorNodeState::Starting
+            | OrchestratorNodeState::Degraded
+            | OrchestratorNodeState::NodeOffline => {}
+        }
+        let online = self.node_is_active_online(&node)?;
+        if !online {
+            if state.state != OrchestratorNodeState::NodeOffline {
+                state.state = OrchestratorNodeState::Degraded;
+                state.detail = Some(format!("node {node} is offline at home startup"));
+                write_state(dir, state)?;
+            }
+            return Ok(None);
+        }
+        // A `starting` record may have been queued but never applied before the home
+        // restarted, so re-send `Start`; a live or degraded record gets `Resume`.
+        let start = matches!(
+            state.state,
+            OrchestratorNodeState::NodeOffline | OrchestratorNodeState::Starting
+        );
+        let request_id = new_request_id();
+        state.last_request_id = Some(request_id.clone());
+        state.state = OrchestratorNodeState::Starting;
+        state.detail = None;
+        write_state(dir, state)?;
+        let command = if start {
+            OrchestratorCommand::Start {
+                request_id,
+                name: state.name.clone(),
+                app: state.app,
+                project: state.project.clone(),
+            }
+        } else {
+            OrchestratorCommand::Resume {
+                request_id,
+                name: state.name.clone(),
+            }
+        };
+        let result = self.send_command(&node, &command, state);
+        if !matches!(&result, Ok(CommandDelivery::Queued)) {
+            write_state(dir, state)?;
+        }
+        match result {
+            Ok(_) => Ok(Some(info_from_state(state.clone(), dir.to_path_buf(), None))),
+            Err(error) => {
+                self.deps.log.log(
+                    Level::Warn,
+                    "orchestrator",
+                    &format!("cannot resume {} on node {node}: {error}", state.name),
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Marks every live orchestrator on `node` degraded after a connection drop.
+    ///
+    /// The gateway calls this when an authenticated agent connection closes. It changes
+    /// only `starting`, `running` and `degraded` records; `stopped`, `failed` and
+    /// `node_offline` keep their owner-visible meaning.
+    pub fn mark_node_disconnected(&self, node: &NodeName) -> Result<usize, CoreError> {
+        let mut changed = 0;
+        for mut state in self.states()? {
+            if state.node.as_ref() != Some(node) {
+                continue;
+            }
+            if !matches!(
+                state.state,
+                OrchestratorNodeState::Starting | OrchestratorNodeState::Running | OrchestratorNodeState::Degraded
+            ) {
+                continue;
+            }
+            state.state = OrchestratorNodeState::Degraded;
+            state.detail = Some(format!("node {node} connection dropped"));
+            write_state(&self.dir(&state.name), &state)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Resumes every degraded or offline orchestrator when `node` reconnects.
+    ///
+    /// The gateway calls this after a new authenticated connection is welcome. A
+    /// `stopped` or `failed` record is never resumed automatically.
+    pub fn node_reconnected(&self, node: &NodeName) -> Result<Vec<OrchestratorInfo>, CoreError> {
+        if !self.node_is_active_online(node)? {
+            return Ok(Vec::new());
+        }
+        let mut resumed = Vec::new();
+        for mut state in self.states()? {
+            if state.node.as_ref() != Some(node) {
+                continue;
+            }
+            let start = match state.state {
+                OrchestratorNodeState::Degraded => false,
+                OrchestratorNodeState::NodeOffline => true,
+                _ => continue,
+            };
+            let dir = self.dir(&state.name);
+            let request_id = new_request_id();
+            state.last_request_id = Some(request_id.clone());
+            state.state = OrchestratorNodeState::Starting;
+            state.detail = None;
+            write_state(&dir, &state)?;
+            let command = if start {
+                OrchestratorCommand::Start {
+                    request_id,
+                    name: state.name.clone(),
+                    app: state.app,
+                    project: state.project.clone(),
+                }
+            } else {
+                OrchestratorCommand::Resume {
+                    request_id,
+                    name: state.name.clone(),
+                }
+            };
+            match self.send_command(node, &command, &mut state) {
+                Ok(CommandDelivery::Queued) => {
+                    // `starting` and the request id are already persisted.
+                    resumed.push(info_from_state(state, dir, None));
+                }
+                Ok(CommandDelivery::Applied) => {
+                    write_state(&dir, &state)?;
+                    resumed.push(info_from_state(state, dir, None));
+                }
+                Err(error) => {
+                    write_state(&dir, &state)?;
+                    self.deps.log.log(
+                        Level::Warn,
+                        "orchestrator",
+                        &format!("cannot resume {} on reconnect: {error}", state.name),
+                    );
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Returns whether `command` is still the latest command for its record on `node`.
+    ///
+    /// A `stop` is always current: the owner's stop is final even when a newer start or
+    /// resume was queued behind it. Any other command whose request id is no longer the
+    /// record's latest one has been superseded and must be retired rather than sent.
+    pub fn is_command_current(&self, node: &NodeName, command: &OrchestratorCommand) -> Result<bool, CoreError> {
+        if matches!(command, OrchestratorCommand::Stop { .. }) {
+            return Ok(true);
+        }
+        let state = match read_state(&self.dir(command.name())) {
+            Ok(Some(state)) => state,
+            // A record that is absent has no command waiting for it. A momentarily
+            // unreadable record is not proof of supersession; sending is safe because the
+            // correlated result decides.
+            Ok(None) => return Ok(false),
+            Err(_) => return Ok(true),
+        };
+        Ok(state.node.as_ref() == Some(node) && state.last_request_id.as_deref() == Some(command.request_id()))
+    }
+
+    /// Applies one agent result to the record with the matching node and request id.
+    ///
+    /// The gateway calls this when a live connection delivers an
+    /// `AgentFrame::OrchestratorResult` after the command was queued; the home never
+    /// applies a result with another request id.
+    pub fn apply_result(
+        &self,
+        node: &NodeName,
+        result: &OrchestratorResult,
+    ) -> Result<Option<OrchestratorInfo>, CoreError> {
+        let result = sanitize_result(result.clone());
+        for mut state in self.states()? {
+            if state.node.as_ref() != Some(node) || state.last_request_id.as_deref() != Some(result.request_id.as_str())
+            {
+                continue;
+            }
+            apply_result_to_state(&mut state, &result);
+            let dir = self.dir(&state.name);
+            write_state(&dir, &state)?;
+            return Ok(Some(info_from_state(state, dir, None)));
+        }
+        Ok(None)
+    }
+
+    /// Sends a resume command to a local-node orchestrator and updates the record.
+    fn resume_on_remote_node(&self, dir: &Path, mut state: StateFile) -> Result<OrchestratorInfo, CoreError> {
+        let node = state
+            .node
+            .clone()
+            .ok_or_else(|| CoreError::Invalid("local-node orchestrator has no node".to_owned()))?;
+        let card = self.require_active_node(&node)?;
+        if card.presence != NodePresence::Online {
+            state.state = OrchestratorNodeState::NodeOffline;
+            state.detail = Some(format!("node {node} is {}", presence_name(card.presence)));
+            write_state(dir, &state)?;
+            return Err(CoreError::Refused(format!(
+                "node_offline: node {node} is {}; `vowp orchestrator resume` waits for the node to reconnect",
+                presence_name(card.presence)
+            )));
+        }
+        let request_id = new_request_id();
+        state.last_request_id = Some(request_id.clone());
+        state.state = OrchestratorNodeState::Starting;
+        state.detail = None;
+        write_state(dir, &state)?;
+        let command = OrchestratorCommand::Resume {
+            request_id,
+            name: state.name.clone(),
+        };
+        let result = self.send_command(&node, &command, &mut state);
+        if !matches!(&result, Ok(CommandDelivery::Queued)) {
+            write_state(dir, &state)?;
+        }
+        result?;
+        if state.state == OrchestratorNodeState::Failed {
+            return Err(refused_by_node(&node, "resume", &state));
+        }
+        Ok(info_from_state(state, dir.to_path_buf(), None))
+    }
+
+    /// Sends one command and folds a synchronous result into `state`.
+    fn send_command(
+        &self,
+        node: &NodeName,
+        command: &OrchestratorCommand,
+        state: &mut StateFile,
+    ) -> Result<CommandDelivery, CoreError> {
+        match self.transport.send(node, command) {
+            Ok(Some(result)) => {
+                apply_result_to_state(state, &sanitize_result(result));
+                Ok(CommandDelivery::Applied)
+            }
+            Ok(None) => {
+                // The caller already wrote `starting` before sending. Leave the field as
+                // it is: the gateway may have marked the record `degraded` on a disconnect
+                // while this command waited, and this process must not overwrite that.
+                Ok(CommandDelivery::Queued)
+            }
+            Err(error) => {
+                state.state = if is_node_offline_error(&error) {
+                    OrchestratorNodeState::NodeOffline
+                } else {
+                    OrchestratorNodeState::Failed
+                };
+                state.detail = Some(redact_text(&error.to_string()));
+                Err(error)
+            }
+        }
+    }
+
+    /// Returns whether `state` is bound to a node other than the home.
+    fn state_is_remote(&self, state: &StateFile) -> Result<bool, CoreError> {
+        match state.node.as_ref() {
+            Some(node) => Ok(!self.is_home_node(node)?),
+            None => Ok(false),
+        }
+    }
+
+    /// Returns whether `node` is this home.
+    ///
+    /// The home is the local identity in `deps`, or a registry row marked `is_local` (for
+    /// example the `local` row a fresh home creates). A node orchestrator bound to the home
+    /// keeps the home host, lease and keeper path.
+    pub fn is_home_node(&self, node: &NodeName) -> Result<bool, CoreError> {
+        if *node == self.deps.node {
+            return Ok(true);
+        }
+        let store = Store::open_global(&self.deps.paths)?;
+        Ok(store.node(node)?.is_some_and(|row| row.is_local))
+    }
+
+    /// Returns an active node card, refusing unknown, pending and revoked nodes.
+    fn require_active_node(&self, node: &NodeName) -> Result<vowp_protocol::NodeCard, CoreError> {
+        let store = Store::open_global(&self.deps.paths)?;
+        let Some(card) = store.node_card(node, self.deps.clock.now())? else {
+            return Err(CoreError::NotFound(format!("node {node}")));
+        };
+        match card.status {
+            NodeStatus::Active => Ok(card),
+            NodeStatus::Pending => Err(CoreError::Refused(format!(
+                "node {node} is pending; approve the enrollment first"
+            ))),
+            NodeStatus::Revoked => Err(CoreError::Refused(format!(
+                "node {node} is revoked; enroll it again before creating an orchestrator"
+            ))),
+        }
+    }
+
+    /// Returns whether `node` is active and online at the current clock.
+    fn node_is_active_online(&self, node: &NodeName) -> Result<bool, CoreError> {
+        let store = Store::open_global(&self.deps.paths)?;
+        Ok(store
+            .node_card(node, self.deps.clock.now())?
+            .is_some_and(|card| card.status == NodeStatus::Active && card.presence == NodePresence::Online))
     }
 
     /// Returns whether a live host still owns the lease named by its token file.
@@ -500,9 +1254,10 @@ impl Orchestrator {
         }
         let scoped = self.scoped_deps(state.project.as_ref())?;
         let store = scoped.open_store()?;
+        let token_hash = hash_lease_token(&token);
         Ok(store
             .lease(&state.session_id)?
-            .is_some_and(|lease| lease.token == token))
+            .is_some_and(|lease| lease.token == token_hash))
     }
 
     /// Keeps one orchestrator's lease alive until its pid file changes or it is revoked.
@@ -519,6 +1274,11 @@ impl Orchestrator {
         if state.app == OrchestratorApp::Chat {
             return Err(CoreError::Invalid("the chat app has no host to keep alive".to_owned()));
         }
+        if self.state_is_remote(&state)? {
+            return Err(CoreError::Refused(format!(
+                "orchestrator {name} runs on a local node; the home keeps no lease for it"
+            )));
+        }
         let scoped = self.scoped_deps(state.project.as_ref())?;
         let store = scoped.open_store()?;
         let token_path = dir.join(LEASE_FILE);
@@ -530,7 +1290,7 @@ impl Orchestrator {
                 CoreError::Refused(format!("orchestrator {name} has no lease token file; the keeper stops"))
             })?;
         match store.lease(&state.session_id)? {
-            Some(lease) if lease.token != token => {
+            Some(lease) if lease.token != hash_lease_token(&token) => {
                 return Err(CoreError::Refused(format!(
                     "orchestrator {name} moved to another surface; the keeper stops"
                 )));
@@ -646,14 +1406,25 @@ impl Orchestrator {
     fn info_from_dir(&self, state: StateFile, dir: PathBuf) -> OrchestratorInfo {
         let host = host_handle(&dir, state.app);
         let mut card = state.card();
-        if card.state == "running" && state.app != OrchestratorApp::Chat && host.is_none() {
-            card.state = "degraded".to_owned();
+        if self.state_is_remote(&state).unwrap_or(false) {
+            if let Some(node) = card.node.as_ref()
+                && matches!(
+                    card.state,
+                    OrchestratorNodeState::Starting | OrchestratorNodeState::Running
+                )
+                && !self.node_is_active_online(node).unwrap_or(false)
+            {
+                card.state = OrchestratorNodeState::Degraded;
+            }
+        } else if card.state == OrchestratorNodeState::Running && state.app != OrchestratorApp::Chat && host.is_none() {
+            card.state = OrchestratorNodeState::Degraded;
         }
         OrchestratorInfo {
             card,
             dir,
             session: state.session_id,
             host,
+            detail: state.detail,
         }
     }
 
@@ -865,12 +1636,18 @@ impl Orchestrator {
             return Ok(());
         };
         let token = fs::read_to_string(dir.join(LEASE_FILE)).ok();
-        let owns_lease = match token.as_deref() {
-            Some(token) => token.trim() == lease.token,
-            None => lease.holder == holder,
-        };
-        if owns_lease {
-            store.release_lease(session, &lease.token)?;
+        match token.as_deref() {
+            Some(token) => {
+                let token = token.trim();
+                if hash_lease_token(token) == lease.token {
+                    store.release_lease(session, token)?;
+                }
+            }
+            None => {
+                if lease.holder == holder {
+                    store.release_lease_hash(session, &lease.token)?;
+                }
+            }
         }
         Ok(())
     }
@@ -885,8 +1662,18 @@ impl Orchestrator {
     /// Stops and removes an existing orchestrator directory (`--force`).
     fn remove_existing(&self, name: &str) -> Result<(), CoreError> {
         let dir = self.dir(name);
-        if let Some(state) = read_state(&dir)? {
+        if let Some(mut state) = read_state(&dir)? {
             self.stop_keeper(&dir);
+            if self.state_is_remote(&state)?
+                && let Some(node) = state.node.clone()
+            {
+                let request_id = new_request_id();
+                let command = OrchestratorCommand::Stop {
+                    request_id,
+                    name: state.name.clone(),
+                };
+                let _ = self.send_command(&node, &command, &mut state);
+            }
             if let Some(handle) = host_handle(&dir, state.app)
                 && let Ok(Some(host)) = self.host_for(state.app)
             {
@@ -894,14 +1681,186 @@ impl Orchestrator {
             }
             self.release_lease(&dir, &state.name, &state.session_id)?;
         }
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(CoreError::Io {
-                path: dir.display().to_string(),
-                source,
-            }),
+        remove_dir_all_bounded(&dir)
+    }
+}
+
+/// How many attempts a forced orchestrator-directory removal may make.
+const REMOVE_ATTEMPTS: u32 = 25;
+
+/// How long each failed removal waits before retrying.
+const REMOVE_RETRY: Duration = Duration::from_millis(40);
+
+/// Removes `dir`, retrying transient `--force` races while a dying app flushes its WAL.
+///
+/// A SQLite WAL checkpoint can keep recreating a file while `remove_dir_all` walks the
+/// tree, which surfaces as `DirectoryNotEmpty`/`ENOTEMPTY`, `AlreadyExists` or
+/// `PermissionDenied`. `NotFound` is already the desired state.
+fn remove_dir_all_bounded(dir: &Path) -> Result<(), CoreError> {
+    for attempt in 0..REMOVE_ATTEMPTS {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if attempt + 1 < REMOVE_ATTEMPTS && transient_remove_error(&error) => {
+                thread::sleep(REMOVE_RETRY);
+            }
+            Err(source) => {
+                return Err(CoreError::Io {
+                    path: dir.display().to_string(),
+                    source,
+                });
+            }
         }
+    }
+    Err(CoreError::Io {
+        path: dir.display().to_string(),
+        source: std::io::Error::other("the directory was still busy after the bounded retries"),
+    })
+}
+
+/// Returns whether a directory-removal error can clear up on its own.
+fn transient_remove_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::DirectoryNotEmpty
+            | std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::PermissionDenied
+    ) || matches!(error.raw_os_error(), Some(39) | Some(66))
+}
+
+/// Returns a fresh, opaque command correlation id.
+fn new_request_id() -> String {
+    ulid::Ulid::generate().to_string()
+}
+
+/// Returns the stable human name of a node presence.
+fn presence_name(presence: NodePresence) -> &'static str {
+    match presence {
+        NodePresence::Online => "online",
+        NodePresence::Degraded => "degraded",
+        NodePresence::Offline => "offline",
+        NodePresence::Revoked => "revoked",
+    }
+}
+
+/// Returns whether a transport failure means the node is not reachable now.
+fn is_node_offline_error(error: &CoreError) -> bool {
+    match error {
+        CoreError::Refused(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("node_offline") || message.contains("offline")
+        }
+        CoreError::NotFound(_) => true,
+        _ => false,
+    }
+}
+
+/// Builds the refusal a failed synchronous node result returns.
+///
+/// The detail is redacted again here as defence in depth: a caller may hold state from an
+/// older file, and a refusal is printed on the terminal and captured in scripts.
+fn refused_by_node(node: &NodeName, action: &str, state: &StateFile) -> CoreError {
+    let detail = state
+        .detail
+        .as_deref()
+        .map(redact_text)
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or_else(|| "the node returned no detail".to_owned());
+    CoreError::Refused(format!(
+        "node {node} refused to {action} orchestrator {}: {detail}",
+        state.name
+    ))
+}
+
+/// Applies one agent result to a persisted record.
+fn apply_result_to_state(state: &mut StateFile, result: &OrchestratorResult) {
+    state.state = result.state;
+    state.detail = result.detail.as_deref().map(redact_text).or_else(|| {
+        result
+            .error
+            .as_ref()
+            .map(|error| redact_text(&format!("{}: {}", error.code, error.message)))
+    });
+}
+
+/// Redacts a result's free text before the home stores or shows it.
+fn sanitize_result(mut result: OrchestratorResult) -> OrchestratorResult {
+    if let Some(error) = result.error.as_mut() {
+        error.message = redact_text(&error.message);
+    }
+    if let Some(detail) = result.detail.as_mut() {
+        *detail = redact_text(detail);
+    }
+    result
+}
+
+/// Redacts absolute paths, URLs with credentials or a loopback port, and secret values
+/// from free text.
+///
+/// The agent contract already forbids a path or a secret in a result; this is the home's
+/// defence in depth so a mistaken detail cannot enter `orchestrator.json`, a card, a CLI
+/// refusal or a log. A URL is replaced whole, so a userinfo password or a
+/// `http://127.0.0.1:<port>` link never survives even when the port is the only secret.
+pub fn redact_text(text: &str) -> String {
+    let secret_keys = ["token", "password", "secret", "apikey", "api_key", "code"];
+    let mut words = Vec::new();
+    let mut redact_next = false;
+    for word in text.split_whitespace() {
+        let bare = word.trim_start_matches(['(', '[', '{', '\'', '"']);
+        let lower = bare.to_ascii_lowercase();
+        let looks_like_secret = lower.contains('=') && secret_keys.iter().any(|key| lower.contains(key));
+        let has_userinfo = bare
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest.split('/').next().unwrap_or_default().contains('@'));
+        let loopback = lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("0.0.0.0");
+        let was_redacted = redact_next;
+        if was_redacted {
+            words.push("<redacted>".to_owned());
+            redact_next = false;
+        } else if has_userinfo || loopback {
+            words.push("<url>".to_owned());
+        } else if bare.starts_with('/') || bare.starts_with("~/") {
+            words.push("<path>".to_owned());
+        } else if looks_like_secret {
+            words.push("<redacted>".to_owned());
+        } else {
+            words.push(word.to_owned());
+        }
+        // `token: value`, `password = value` and `Bearer value` are all assignments whose
+        // value is a secret. `token=value` was already redacted as one word.
+        if !was_redacted {
+            let key = bare.trim_end_matches([':', '=']).to_ascii_lowercase();
+            let assignment = secret_keys.contains(&key.as_str()) || key == "bearer";
+            redact_next = assignment && !looks_like_secret;
+        }
+    }
+    words.join(" ").chars().take(512).collect()
+}
+
+/// Join instructions for an orchestrator whose app runs on a local node.
+///
+/// They carry only commands and the node name: no port, pairing link, absolute path or
+/// secret value.
+fn node_join(app: OrchestratorApp, node: &NodeName, session: &SessionId) -> JoinInstructions {
+    match app {
+        OrchestratorApp::Opencode => JoinInstructions {
+            desktop: format!(
+                "On the home run `vowp surface pair --session {session} --node {node} --kind opencode`; \
+                 then on {node} run `vowp agent pair --code-file -` and open the opencode app."
+            ),
+            phone: format!("Open the home app or run `vowp chat {session}`."),
+            chat: format!("vowp chat --agent --session {session}"),
+        },
+        OrchestratorApp::ClaudeCode => JoinInstructions {
+            desktop: format!("Open https://claude.ai/code and choose this Remote Control session; it runs on {node}."),
+            phone: format!("Open the home app or run `vowp chat {session}`."),
+            chat: format!("vowp chat --agent --session {session}"),
+        },
+        OrchestratorApp::Chat => JoinInstructions {
+            desktop: format!("vowp chat --agent --session {session}"),
+            phone: format!("vowp chat {session}"),
+            chat: format!("vowp chat --agent --session {session}"),
+        },
     }
 }
 
@@ -918,13 +1877,25 @@ struct StateFile {
     project: Option<ProjectName>,
     #[serde(default)]
     executor: Option<ExecutorRef>,
-    state: String,
+    state: OrchestratorNodeState,
     created_at: Timestamp,
     #[serde(default)]
     join: Option<JoinInstructions>,
     /// Surface id used by the app's MCP config; kept so resume can reuse it.
     #[serde(default)]
     surface_id: Option<SurfaceId>,
+    /// Node that runs the app; absent on a v0.2 home orchestrator.
+    #[serde(default)]
+    node: Option<NodeName>,
+    /// Request id of the most recent command sent to a local node.
+    #[serde(default)]
+    last_request_id: Option<String>,
+    /// Last redacted failure or state detail for the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    /// Derived card field, persisted so the fleet snapshot sees the same last error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 impl StateFile {
@@ -935,11 +1906,26 @@ impl StateFile {
             session_id: self.session_id.clone(),
             project: self.project.clone(),
             app: self.app,
-            state: self.state.clone(),
+            state: self.state,
+            node: self.node.clone(),
+            last_error: self.last_error(),
             join: self
                 .join
                 .clone()
                 .unwrap_or_else(|| fallback_join(self.app, &self.session_id)),
+        }
+    }
+
+    /// Returns the redacted failure detail only for a failed, degraded or offline record.
+    ///
+    /// A cleanly running or stopped record has no `last_error`, even when an old detail is
+    /// still on disk; [`Orchestrator::resume`] and [`Orchestrator::stop`] clear it as well.
+    fn last_error(&self) -> Option<String> {
+        match self.state {
+            OrchestratorNodeState::Failed | OrchestratorNodeState::Degraded | OrchestratorNodeState::NodeOffline => {
+                self.detail.as_deref().map(redact_text)
+            }
+            OrchestratorNodeState::Starting | OrchestratorNodeState::Running | OrchestratorNodeState::Stopped => None,
         }
     }
 }
@@ -964,6 +1950,7 @@ fn info_from_state(state: StateFile, dir: PathBuf, host: Option<AppHandle>) -> O
         dir,
         session: state.session_id,
         host,
+        detail: state.detail,
     }
 }
 
@@ -983,8 +1970,13 @@ fn read_state(dir: &Path) -> Result<Option<StateFile>, CoreError> {
 }
 
 /// Writes an orchestrator state file with mode 0600.
+///
+/// The persisted document also carries the derived [`OrchestratorCard::last_error`] so the
+/// fleet snapshot, which reads this same file, shows the same redacted failure detail.
 fn write_state(dir: &Path, state: &StateFile) -> Result<(), CoreError> {
-    write_private_json(&dir.join(STATE_FILE), state)
+    let mut stored = state.clone();
+    stored.last_error = state.last_error();
+    write_private_json(&dir.join(STATE_FILE), &stored)
 }
 
 /// Returns the live app handle recorded by a host, when its pid is still alive.
@@ -1102,7 +2094,7 @@ fn fallback_join(app: OrchestratorApp, session: &SessionId) -> JoinInstructions 
 
 #[cfg(test)]
 mod tests {
-    use super::validate_name;
+    use super::{redact_text, validate_name};
 
     #[test]
     fn names_cannot_escape_the_orchestrator_root() {
@@ -1112,5 +2104,17 @@ mod tests {
         for name in ["vowp", "release-2", "team_a", "a.b"] {
             assert!(validate_name(name).is_ok(), "{name:?} was refused");
         }
+    }
+
+    #[test]
+    fn redacts_paths_and_secret_assignments_from_node_text() {
+        let detail = "cannot start /srv/vowp/app token=FAKE-NOT-A-SECRET-0000";
+        let redacted = redact_text(detail);
+        assert!(!redacted.contains("/srv/"), "{redacted}");
+        assert!(!redacted.contains("FAKE-NOT-A-SECRET-0000"), "{redacted}");
+        assert!(redacted.contains("<path>"), "{redacted}");
+        assert!(redacted.contains("<redacted>"), "{redacted}");
+        assert_eq!(redact_text("the app did not start"), "the app did not start");
+        assert!(redact_text(&"x".repeat(2048)).chars().count() <= 512);
     }
 }

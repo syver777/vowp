@@ -46,6 +46,22 @@ pub enum StoreError {
     /// The database is still the v0.1 single-file schema and must be migrated.
     #[error("schema v0.1 database: run `vowp migrate` before opening it")]
     MigrationRequired,
+    /// A newer binary found an older split-home schema while another supervisor runs.
+    ///
+    /// Ordinary reads open the older schema without migrating it. An operation that needs
+    /// a table only the newer schema has reports this until `vowp up --replace` drains the
+    /// running supervisor and applies the upgrade.
+    #[error(
+        "schema migration deferred while supervisor pid {running_pid} runs (found version {found}, target {target}); `vowp up --replace` upgrades it once drained"
+    )]
+    MigrationDeferred {
+        /// Supervisor process holding `<home>/supervisor.lock`.
+        running_pid: u32,
+        /// Schema version found on disk.
+        found: i64,
+        /// Schema version this binary writes.
+        target: i64,
+    },
     /// Stored data or a file could not be parsed or failed an integrity check.
     #[error("corrupt data in {path:?} (line {line:?}): {reason}")]
     Corrupt {
@@ -120,6 +136,7 @@ impl StoreError {
             | Self::Poisoned => ErrorKind::Conflict,
             Self::InvalidInput(_) | Self::WrongProject { .. } | Self::NoProject => ErrorKind::InvalidInput,
             Self::MigrationRequired => ErrorKind::Conflict,
+            Self::MigrationDeferred { .. } => ErrorKind::Conflict,
             Self::SchemaTooNew { .. } | Self::Sqlite(_) | Self::Busy => ErrorKind::Db,
             Self::Corrupt { .. } | Self::Json(_) => ErrorKind::Parse,
             Self::Io { .. } => ErrorKind::Io,

@@ -36,7 +36,7 @@ pub enum MergeStep {
     },
     /// Another merge is already running.
     InProgress,
-    /// The main checkout was not clean; the job must be parked manually.
+    /// The queue refused to touch the checkout (dirty main or divergent bases); park the job manually.
     Manual {
         /// Job to park.
         job: JobId,
@@ -103,17 +103,41 @@ impl MergeQueue {
         loop {
             push_attempts = push_attempts.saturating_add(1);
             self.deps.git.fetch(&repo, &remote)?;
-            let main_before = self.deps.git.head_sha(&repo, &base_ref)?;
+            let local_base = self.deps.git.head_sha(&repo, &base)?;
+            let remote_base = self.deps.git.head_sha(&repo, &base_ref)?;
+            let local_only = self.deps.git.commits_between(&repo, &remote_base, &local_base)?;
+            let remote_only = self.deps.git.commits_between(&repo, &local_base, &remote_base)?;
+            if !local_only.is_empty() && !remote_only.is_empty() {
+                let detail =
+                    format!("local {base} ({local_base}) and {base_ref} ({remote_base}) diverged; refusing to merge");
+                return self.refuse_manual(
+                    store,
+                    job,
+                    &detail,
+                    "the local and remote default branches diverged; reconcile them and resolve the job manually.",
+                );
+            }
+            if local_only.is_empty()
+                && !remote_only.is_empty()
+                && self.deps.git.merge_ff_only(&repo, &base_ref).is_err()
+            {
+                let detail = format!("cannot fast-forward local {base} ({local_base}) to {base_ref} ({remote_base})");
+                return self.refuse_manual(
+                    store,
+                    job,
+                    &detail,
+                    "the local default branch could not be fast-forwarded; resolve the main checkout manually.",
+                );
+            }
+            let main_before = self.deps.git.head_sha(&repo, &base)?;
             let rebase_start = Instant::now();
             let mut lockfile_refreshed = false;
             if self.deps.config.merge.rebase {
-                match self.deps.git.rebase(&worktree, &base_ref)? {
+                match self.deps.git.rebase(&worktree, &base)? {
                     RebaseResult::Clean => {}
                     RebaseResult::Conflict { files } => {
                         if files.iter().all(|file| is_lockfile(&self.deps, file)) {
-                            if let Err(step) =
-                                self.continue_lockfile_rebase(&worktree, &base_ref, &files, job, &trailer)
-                            {
+                            if let Err(step) = self.continue_lockfile_rebase(&worktree, &base, &files, job, &trailer) {
                                 return Ok(step);
                             }
                             lockfile_refreshed = true;
@@ -150,25 +174,12 @@ impl MergeQueue {
 
             if !self.deps.git.status_clean(&repo)? {
                 let detail = format!("main checkout {} is not clean", repo.display());
-                self.record_merge_failure(store, job, &detail)?;
-                super::open_inbox(
+                return self.refuse_manual(
                     store,
-                    &self.deps,
-                    super::NewInbox {
-                        project: Some(job.project.clone()),
-                        job_id: Some(job.id.clone()),
-                        kind: InboxKind::Notice,
-                        title: format!("merge blocked: {}", job.id),
-                        body: format!(
-                            "the main checkout is not clean; clean it and resolve the job manually. {detail}"
-                        ),
-                        options: vec!["resolved".to_owned()],
-                    },
-                )?;
-                return Ok(MergeStep::Manual {
-                    job: job.id.clone(),
-                    detail,
-                });
+                    job,
+                    &detail,
+                    "the main checkout is not clean; clean it and resolve the job manually.",
+                );
             }
             if self.deps.git.merge_ff_only(&repo, &branch).is_err() {
                 return Ok(MergeStep::ChecksFailed { job: job.id.clone() });
@@ -226,11 +237,11 @@ impl MergeQueue {
         }
     }
 
-    /// Takes the main version of a lockfile-only conflict and continues the rebase.
+    /// Takes the local base version of a lockfile-only conflict and continues the rebase.
     fn continue_lockfile_rebase(
         &self,
         worktree: &Path,
-        base_ref: &str,
+        base: &str,
         files: &[String],
         job: &Job,
         trailer: &str,
@@ -238,7 +249,7 @@ impl MergeQueue {
         for file in files {
             self.deps
                 .git
-                .checkout_path(worktree, base_ref, file)
+                .checkout_path(worktree, base, file)
                 .map_err(|_| MergeStep::ChecksFailed { job: job.id.clone() })?;
         }
         self.deps
@@ -254,6 +265,27 @@ impl MergeQueue {
         }
         let _ = self.refresh_lockfile(worktree, trailer);
         Ok(())
+    }
+
+    /// Records a refused merge, notifies the owner and returns the manual step.
+    fn refuse_manual(&self, store: &Store, job: &Job, detail: &str, advice: &str) -> Result<MergeStep, CoreError> {
+        self.record_merge_failure(store, job, detail)?;
+        super::open_inbox(
+            store,
+            &self.deps,
+            super::NewInbox {
+                project: Some(job.project.clone()),
+                job_id: Some(job.id.clone()),
+                kind: InboxKind::Notice,
+                title: format!("merge blocked: {}", job.id),
+                body: format!("{advice} {detail}"),
+                options: vec!["resolved".to_owned()],
+            },
+        )?;
+        Ok(MergeStep::Manual {
+            job: job.id.clone(),
+            detail: detail.to_owned(),
+        })
     }
 
     /// Regenerates `Cargo.lock` with `cargo update -w` when the worktree has a manifest.

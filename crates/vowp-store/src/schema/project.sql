@@ -17,7 +17,7 @@ CREATE TABLE jobs (
   brief_path       TEXT NOT NULL,
   report_path      TEXT NOT NULL,
   gates_json       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(gates_json)),
-  loop_json        TEXT NOT NULL DEFAULT '{"until":"gates","max_attempts":3,"on_exhausted":"escalate"}'
+  loop_json        TEXT NOT NULL DEFAULT '{"until":"gates","max_attempts":2,"on_exhausted":"escalate"}'
                      CHECK (json_valid(loop_json)),
   branch           TEXT,
   worktree         TEXT,
@@ -34,6 +34,12 @@ CREATE TABLE jobs (
 ) STRICT;
 CREATE INDEX jobs_project_state ON jobs(project, state);
 CREATE INDEX jobs_dispatch      ON jobs(state, priority DESC, created_at);
+
+CREATE TABLE job_placement (            -- per-job offload placement; kept off the jobs row (§7.1)
+  job        TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+  placement  TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
 
 CREATE TABLE edges (
   src        TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -218,4 +224,4 @@ CREATE TABLE releases (
 ) STRICT;
 CREATE INDEX releases_project ON releases(project, env, created_at DESC);
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;

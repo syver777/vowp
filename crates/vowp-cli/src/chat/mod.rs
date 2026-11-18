@@ -32,6 +32,8 @@ use vowp_store::session_log::SessionLog;
 use crate::node_ctx::NodeRole;
 use crate::{CliError, Ctx, IoStreams};
 
+pub mod agent;
+
 /// Display width for wrapped assistant text and event summaries.
 pub const CHAT_WIDTH: usize = 80;
 
@@ -60,6 +62,11 @@ pub fn run(ctx: &mut Ctx, io: &mut dyn IoStreams, opts: &ChatOptions) -> Result<
 /// The command dispatcher only holds `&Ctx`; the chat handler itself needs no mutable
 /// context state. This entry point keeps [`run`]'s frozen signature for callers that do.
 pub fn run_shared(ctx: &Ctx, io: &mut dyn IoStreams, opts: &ChatOptions) -> Result<i32, CliError> {
+    // `chat --agent` is the Mac surface. The CLI dispatches it before this home path, and
+    // this fallback keeps a direct in-process caller on the same bridge.
+    if crate::cli::agent_chat_requested() {
+        return agent::run_shared(ctx, io, opts);
+    }
     if ctx.role() != NodeRole::Home {
         return Err(CliError::Guard(
             "vowp chat needs the home that owns the session".to_owned(),
@@ -801,5 +808,6 @@ fn surface_kind_name(kind: SurfaceKind) -> &'static str {
         SurfaceKind::Mcp => "mcp",
         SurfaceKind::Mirror => "mirror",
         SurfaceKind::Api => "api",
+        SurfaceKind::Agent => "agent",
     }
 }

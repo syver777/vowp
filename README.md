@@ -21,6 +21,7 @@ licensed.
 | **Systematic execution** | Jobs form a DAG; deterministic L1–L9 loops keep it moving; cron and interval schedules make the work orderly. |
 | **Harness and provider freedom** | Claude Code, opencode, Codex/generic CLI; profile ladders, provider limits and failover. Stock harnesses, no forks. |
 | **Any surface** | opencode desktop, Claude app, `vowp chat` or MCP; SSH tunnels and no public port. |
+| **Work where the files are** | An outbound Mac or Linux **agent node** can run a local chat or opencode surface and opt-in offloaded jobs; the VPS stays the only home. |
 | **Guarded delivery** | Evidence gates, an independent verifier, one merge queue and reversible Work → Production. |
 
 A laptop sleeps, changes networks and carries your local context. A VPS stays on, has one address and
@@ -30,17 +31,17 @@ control surface; it holds no truth.
 
 **Vocabulary:** a **machine** is a registered execution host — the VPS home, your Mac, a laptop. A
 **job** is one unit of work; when talking about the graph, it is a **job node**. A **slot** is a
-concurrency place, and a **window** is a tmux view. The CLI command `vowp node` still manages machines
-until the v0.4 rename.
+concurrency place, and a **window** is a tmux view. The CLI command `vowp node` manages SSH machines;
+`vowp agent` manages the local agent node.
 
-## Set up VOWP 0.3.0
+## Set up VOWP 0.4.0
 
 Paste this prompt into Claude Code, opencode or another harness on the computer you want to use as
 the control machine:
 
 ```text
-Set up VOWP 0.3.0 for me. Read
-https://raw.githubusercontent.com/syver777/vowp/v0.3.0/docs/setup/agent-setup.md
+Set up VOWP 0.4.0 for me. Read
+https://raw.githubusercontent.com/syver777/vowp/v0.4.0/docs/setup/agent-setup.md
 and follow it exactly. Ask me only what it tells you to ask, show me the full plan once,
 and run it after I approve. Never ask me to paste a secret into this chat.
 ```
@@ -65,9 +66,10 @@ What you need before you paste it:
 - **A repository, optionally:** an existing checkout on the home with a `vowp.toml`, or no project
   yet. Setup registers repositories; it does not clone or rewrite them.
 
-> **Status: current — VOWP 0.3.0.** The v0.3 command surface, including the setup commands and the
-> loopback window, is implemented. The release process owns the 0.3.0 tag and published binaries. The
-> [roadmap](docs/roadmap.md) lists what is deliberately deferred.
+> **Status: current — VOWP 0.4.0.** The v0.4 command surface, including the setup commands, the
+> loopback window, outbound agent nodes, local surfaces, opt-in offload and the hardening work, is
+> implemented. The ASIF interchange is a review draft (below). The release process owns the 0.4.0
+> tag and published binaries. The [roadmap](docs/roadmap.md) lists what is deliberately deferred.
 
 ## How it fits together
 
@@ -159,7 +161,7 @@ Every file VOWP creates has a class, and the class decides whether it may ever b
 | **Closed sessions** | `log.jsonl` and blobs after the session closes | Kept 30 days, then compacted to a capsule + summary. |
 | **Run output** | `runs/*.jsonl`, `*.stderr` | 14 days; compressed after 1 day. |
 | **Worktrees** | a merged job's worktree; a failed, cancelled or replanned job's worktree | Removed after merge; kept 7 days after a failed terminal state. |
-| **Samples** | host samples | 24 hours; no minute rollup in this build. |
+| **Samples** | host samples and 5-minute capacity rollups | Raw samples 48 hours; rollups 30 days. |
 | **Cache** | disposable `tmp/` files | 24 hours. |
 
 `gc` is a dry run that lists files by class; `gc --apply` removes only the expired
@@ -167,6 +169,22 @@ disposable classes after compacting closed sessions. It never removes production
 secrets, never the main checkout, and never deletes a session row. A nightly schedule runs
 `gc --apply`. Backups include the global database, every project database and the session content,
 never secrets. See [Data lifecycle](docs/concepts/data-lifecycle.md).
+
+## ASIF interchange (v0.4, review draft)
+
+The current tree adds a second session interchange format beside the native bundle:
+`vowp session export <id> --format asif` writes a deterministic `.asif.zip`, and
+`vowp session import <file> --format asif` creates a new idle session from that package, a
+standalone `session.json`, a directory or stdin. The daemon window links the same download, serves
+a loss preview and has an `/import` page whose upload is token-gated. `--format bundle` remains the
+default and is unchanged.
+
+ASIF 0.4 is a review draft. Every command reports its declared losses and the VOWP operations that
+are not captured; `--strict` refuses blocking or integrity losses, and `--allow-loss` accepts the
+recoverable ones as declared losses. The interchange does not claim ASIF conformance, an exact or
+lossless round trip, portable continuation or native-harness import. Jobs, gates, leases and
+project rows are not in the package. See the
+[ASIF integration design](docs/design/v0.4/asif-integration.md).
 
 ## Secrets, honestly
 
@@ -231,6 +249,7 @@ The [security model](docs/security.md) states the full coverage and the remainin
 | [Writing jobs](docs/guides/jobs.md) | Briefs, reports, gates, ownership and the verify/fix loop. |
 | [Operating a home](docs/guides/operating.md) | `up`/`down`, fleet views, capacity, logs, backup, `gc` and migration. |
 | [Sessions](docs/guides/sessions.md) | Chat, takeover, switch, capsule, export/import and `session watch`. |
+| [ASIF interchange (review draft)](docs/design/v0.4/asif-integration.md) | The `--format asif` CLI, declared losses, strict mode and the daemon download/import routes. |
 | [Running a home on a VPS](docs/guides/vps.md) | The server account, harnesses, systemd, SSH and firewalls. |
 | [Control machines and extra machines](docs/guides/multi-node.md) | Routing, snapshot cache, tunnels, executor machines and cross-machine sessions. |
 | [Schedules](docs/guides/schedules.md) | Cron and interval schedules, missed runs, pause and resume. |
@@ -239,22 +258,27 @@ Also: [security model](docs/security.md), [troubleshooting](docs/troubleshooting
 [contributing](CONTRIBUTING.md), the [v0.2 specification](docs/design/v0.2/home-and-surfaces.md),
 the [CLI reference](docs/reference/cli.md) and the [roadmap](docs/roadmap.md).
 
-## Limits of v0.3
+## Limits of v0.4
 
 - **One home.** There is no replication, leader election or multi-home scheduling.
-- **Local execution is remote.** A control machine is a surface, not the home. A registered executor
-  machine can run a turn where local files are needed, but the VPS remains the only writer. The
-  local-surface/local-machine design is 0.4 work.
+- **Local execution is opt-in.** A Mac or Linux machine can join as an outbound agent node and run a
+  local surface or an offloaded job, but the VPS remains the only home and the only writer. Offload
+  is off by default; a project must opt in.
 - **Loopback window, separate daemon.** The web window and HTTP/SSE API are served by `vowp-daemon`
   on `127.0.0.1` only. The archives and npm package install `vowp` only, so install the daemon
   separately for the window; without it the supervisor runs without a window.
-- **SSH is the transport.** A control machine needs key-based, batch-mode SSH to the home. A phone
-  needs an SSH app and the key.
+- **SSH is the default transport.** The agent dials the home over SSH stdio. The optional WSS path
+  needs an owner-operated TLS reverse proxy; there is no hosted relay. A control machine still needs
+  key-based, batch-mode SSH to the home.
+- **Offload returns committed work only.** A push or bundle result carries committed git objects;
+  uncommitted files stay on the node, and home-only secrets are never offloaded.
+- **ASIF is a review draft.** Session export/import reports declared losses and does not claim ASIF
+  conformance, a lossless round trip or native-harness import.
 - **Apps keep their own limits.** VOWP can configure and host an app; it cannot close another vendor's
   window or force an app build to expose MCP tools.
-- **One operator.** Multi-user accounts, quotas, roles and audit are not in v0.3.
-- **Linux home, Linux/macOS control.** Windows is not supported, and there is no native VOWP desktop
-  app; the apps are the surfaces.
+- **One operator.** Multi-user accounts, quotas, roles and audit are not in v0.4.
+- **Linux home, Linux/macOS control and agent nodes.** Windows is not supported, and there is no
+  native VOWP desktop app; the apps are the surfaces.
 
 ## Repository layout
 

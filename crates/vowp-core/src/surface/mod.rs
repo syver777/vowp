@@ -3,6 +3,7 @@
 pub mod claude_remote;
 pub mod follow;
 pub mod lease;
+pub mod mcp;
 pub mod mirror;
 pub mod native;
 pub mod opencode_host;

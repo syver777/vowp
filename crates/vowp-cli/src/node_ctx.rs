@@ -120,6 +120,11 @@ impl NodeCtx {
         })
     }
 
+    /// Returns the role discovered for this machine.
+    pub fn role(&self) -> NodeRole {
+        self.role
+    }
+
     /// Returns the node paths, requiring the home role.
     pub fn require_home(&self) -> Result<&NodePaths, CliError> {
         match self.role {

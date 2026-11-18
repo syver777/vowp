@@ -3,12 +3,15 @@
 //! Spec: `docs/design/v0.3/http-api.md`. The API serves the same `vowp-protocol`
 //! objects the CLI prints; these are only the transport documents layered on top.
 //!
-//! Reads are token-free. The two writes are `POST /api/v1/inbox/{id}/answer` and
-//! `POST /api/v1/sessions/{id}/switch`, both gated by the daemon's bearer token
-//! (`VOWP_API_TOKEN`). Their request bodies are [`InboxAnswerRequest`] and
-//! [`SessionSwitchRequest`]; the answer response reuses [`InboxItem`] and the switch
-//! response reuses [`Switch`]. The per-session and board SSE streams are transports in
-//! `vowp-daemon`, not document types here. The listener stays loopback-only.
+//! Reads are token-free. The writes are `POST /api/v1/inbox/{id}/answer`,
+//! `POST /api/v1/sessions/{id}/switch` and the seven job actions
+//! `POST /api/v1/jobs/{id}/retry|park|cancel|nudge|restart|replan|fail`, all gated by the
+//! daemon's bearer token (`VOWP_API_TOKEN`). Their request bodies are
+//! [`InboxAnswerRequest`] and [`SessionSwitchRequest`]; the answer response reuses
+//! [`InboxItem`], the switch response reuses [`Switch`] and a job action returns
+//! [`JobActionResponse`]. The per-session and
+//! board SSE streams are transports in `vowp-daemon`, not document types here. The listener
+//! stays loopback-only.
 
 use std::collections::BTreeMap;
 
@@ -19,10 +22,12 @@ use crate::capsule::Capsule;
 use crate::cost::Tokens;
 use crate::error::ErrorKind;
 use crate::event::{EventEnvelope, SwitchReason};
+use crate::gate::GateResult;
 use crate::ids::{JobId, NodeName, ProjectName, SessionId};
 use crate::inbox::InboxItem;
 use crate::job::Job;
 use crate::limit::LimitRowKind;
+use crate::run::Run;
 use crate::session::{Node, Session};
 use crate::time::Timestamp;
 
@@ -121,6 +126,62 @@ pub struct Page<T> {
 
 /// One page of [`Job`] objects.
 pub type JobPage = Page<Job>;
+
+/// One page of [`Run`] objects for `GET /api/v1/jobs/{id}/runs`.
+///
+/// The items are the job's stored runs in the store's order, oldest first: `started_at`
+/// then `id`. The list is unpaginated, so `next` is always `null` and `total` is the
+/// number of runs in this response.
+pub type RunPage = Page<Run>;
+
+/// One page of [`GateResult`] objects for `GET /api/v1/jobs/{id}/gates`.
+///
+/// The items are the stored results of the job's newest attempt, ordered by `gate_index`
+/// then row id. The list is unpaginated, so `next` is always `null` and `total` is the
+/// number of results in this response.
+pub type GateResultPage = Page<GateResult>;
+
+/// One job action the loopback API may queue for the supervisor.
+///
+/// `Retry`, `Park` and `Cancel` mirror `vowp job retry|park|cancel`; `Nudge`, `Restart`,
+/// `Replan` and `Fail` mirror `vowp job nudge|restart|replan|fail`. The daemon validates
+/// the current job state with `vowp_graph::transition` and queues the same
+/// `vowp_core::requests::Request` the CLI would queue. The handler only queues a request;
+/// it never changes the job row itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobAction {
+    /// Retry a failed or stalled job, or resolve a parked one.
+    Retry,
+    /// Park a non-terminal job until a human resolves it.
+    Park,
+    /// Cancel a non-terminal job.
+    Cancel,
+    /// Nudge a stalled job to continue without a restart; valid only in `stalled`.
+    Nudge,
+    /// Restart a stalled job with a fresh process; valid only in `stalled`.
+    Restart,
+    /// Have the planner replace a job; valid in `stalled`, `parked` and `failed`.
+    Replan,
+    /// Give up on a stalled job and mark it failed; valid only in `stalled`.
+    Fail,
+}
+
+/// The `POST /api/v1/jobs/{id}/retry|park|cancel|nudge|restart|replan|fail` document
+/// returned with `202 Accepted`.
+///
+/// `request` is the id of the queued request row (`req:<project>:<ULID>`); the supervisor
+/// applies it on its next tick. The response carries no home path, SQL text, token or
+/// secret.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct JobActionResponse {
+    /// Job the action was queued for.
+    pub job: JobId,
+    /// Action that was queued.
+    pub action: JobAction,
+    /// Id of the request row the supervisor will apply.
+    pub request: String,
+}
 
 /// One page of [`Session`] objects.
 pub type SessionPage = Page<Session>;

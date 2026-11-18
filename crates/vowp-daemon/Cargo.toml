@@ -29,11 +29,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 time = { version = "0.3.45", features = ["macros", "parsing"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros", "time"] }
-vowp-core = { version = "0.3.0", path = "../vowp-core" }
-vowp-protocol = { version = "0.3.0", path = "../vowp-protocol" }
-vowp-store = { version = "0.3.0", path = "../vowp-store" }
-vowp-tmux = { version = "0.3.0", path = "../vowp-tmux" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros", "time", "fs", "io-util"] }
+vowp-core = { version = "0.4.0", path = "../vowp-core" }
+vowp-graph = { version = "0.4.0", path = "../vowp-graph" }
+vowp-protocol = { version = "0.4.0", path = "../vowp-protocol" }
+vowp-store = { version = "0.4.0", path = "../vowp-store" }
+vowp-tmux = { version = "0.4.0", path = "../vowp-tmux" }
 
 [lints]
 workspace = true
@@ -41,3 +42,4 @@ workspace = true
 [dev-dependencies]
 jsonschema = { version = "0.61.1", default-features = false }
 tempfile = "3.27.0"
+vowp-asif = "=0.1.1"

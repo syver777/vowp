@@ -136,9 +136,21 @@ fn classify_credits_402_insufficient_balance() {
     assert_eq!(out.kind, LimitKind::Credits);
 
     // Credits beats both rate and quota when several classes match.
-    let both =
-        classify_text("claude", "402 rate limit quota exceeded", None, now(), 0).expect("multi-class text classifies");
+    let both = classify_text(
+        "claude",
+        "payment required 402 rate limit quota exceeded",
+        None,
+        now(),
+        0,
+    )
+    .expect("multi-class text classifies");
     assert_eq!(both.kind, LimitKind::Credits);
+}
+
+#[test]
+fn classify_bare_402_in_a_transport_error_is_not_credits() {
+    let text = "deepseek: Error: Background service failed to start at z (/$bunfs/root/chunk.js:3:3708) at service.ensure (definition) at cli.server-connect; input tokens: 402";
+    assert_eq!(classify_text("deepseek", text, None, now(), 0), None);
 }
 
 #[test]

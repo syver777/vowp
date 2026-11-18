@@ -1,0 +1,607 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP job</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0; font-size: 1rem; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .page-nav a { margin-right: .75rem; }
+  .back { margin: 0; font-weight: 600; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; min-width: 58rem; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+  td.state { font-weight: 700; }
+  .summary { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: .35rem 1rem; margin: 0; }
+  .summary dt { color: var(--muted); font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .summary dd { margin: 0; overflow-wrap: anywhere; }
+  .error, .not-found {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  .notice {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--accent);
+    border-radius: .5rem;
+    color: var(--accent);
+    background: var(--card);
+    font-weight: 600;
+  }
+  .unlock-form { display: flex; flex-wrap: wrap; gap: .35rem .5rem; align-items: center; }
+  .unlock-form label { color: var(--muted); font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .unlock-form input {
+    font: inherit;
+    flex: 1 1 12rem;
+    min-width: 0;
+    padding: .35rem .5rem;
+    border: 1px solid var(--line);
+    border-radius: .4rem;
+    background: var(--paper);
+    color: var(--ink);
+  }
+  .unlock-form button, .actions button {
+    font: inherit;
+    padding: .35rem .7rem;
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    background: var(--card);
+    color: var(--accent);
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .5rem; }
+  .actions button.danger { border-color: var(--warn); color: var(--warn); }
+  [hidden] { display: none !important; }
+  @media (max-width: 420px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    th, td { padding: .35rem .4rem; }
+    .summary { grid-template-columns: minmax(0, 1fr); gap: .1rem; }
+    .summary dd { margin-bottom: .35rem; }
+  }
+</style>
+</head>
+<body>
+<main id="job">
+  <header class="page-head">
+    <div>
+      <h1>VOWP job</h1>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">Board</a>
+        <a href="/jobs" aria-current="page">Jobs</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+      <p class="back"><a href="/jobs">Back to jobs</a></p>
+    </div>
+    <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+  <p id="notice" class="notice" role="status" hidden></p>
+  <p id="not-found" class="not-found" role="status" hidden>Job not found.</p>
+
+  <section id="summary-card" class="card" aria-labelledby="summary-heading" hidden>
+    <h2 id="summary-heading">Job</h2>
+    <dl class="summary">
+      <dt>ID</dt>
+      <dd id="job-id" class="mono"></dd>
+      <dt>State</dt>
+      <dd id="job-state" class="state"></dd>
+      <dt>Kind</dt>
+      <dd id="job-kind"></dd>
+      <dt>Role</dt>
+      <dd id="job-role"></dd>
+      <dt>Priority</dt>
+      <dd id="job-priority"></dd>
+      <dt>Attempts</dt>
+      <dd id="job-attempts"></dd>
+      <dt>Updated</dt>
+      <dd id="job-updated"></dd>
+      <dt>Needs</dt>
+      <dd id="job-needs"></dd>
+      <dt>Note</dt>
+      <dd id="job-note"></dd>
+    </dl>
+    <p class="muted"><a id="job-sessions" href="/sessions">Sessions for this job</a></p>
+  </section>
+
+  <section id="unlock" class="card" aria-labelledby="unlock-heading" hidden>
+    <h2 id="unlock-heading">Unlock keeper actions</h2>
+    <p class="muted">Paste the daemon write token. It stays in this tab's sessionStorage and is never put in the URL.</p>
+    <form id="unlock-form" class="unlock-form">
+      <label for="key">Token</label>
+      <input id="key" name="key" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit">Save token</button>
+    </form>
+  </section>
+
+  <section id="actions-card" class="card" aria-labelledby="actions-heading" hidden>
+    <h2 id="actions-heading">Keeper actions</h2>
+    <p class="muted">Nudge or restart a stalled job, replan a stalled, parked or failed job, or fail a stalled job with a reason. The supervisor applies a queued action on its next tick.</p>
+    <p id="actions-hint" class="muted">Unlock to use the keeper actions.</p>
+    <div id="actions" class="actions" hidden></div>
+  </section>
+
+  <section class="card" aria-labelledby="runs-heading">
+    <h2 id="runs-heading">Runs</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Role</th>
+            <th>Purpose</th>
+            <th>Executor</th>
+            <th>Provider</th>
+            <th>Node</th>
+            <th>Started</th>
+            <th>Ended</th>
+            <th>Exit</th>
+            <th>Outcome</th>
+            <th>Limit</th>
+          </tr>
+        </thead>
+        <tbody id="runs-body">
+          <tr><td colspan="11" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="gates-heading">
+    <h2 id="gates-heading">Gates</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Attempt</th>
+            <th>Gate index</th>
+            <th>Kind</th>
+            <th>Passed</th>
+            <th>Duration</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody id="gates-body">
+          <tr><td colspan="6" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<noscript>The job page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const match = document.location.pathname.match(/^\/jobs\/([^/]+)\/?$/);
+  const jobId = match ? decodeURIComponent(match[1]) : "";
+  const TOKEN_KEY = "vowp-api-token";
+  const AUTH_HEADER = "Authorization";
+  const QUEUED_MESSAGE = "Action queued; the supervisor applies it on the next tick.";
+  const DISABLED_MESSAGE = "Writes are disabled: the daemon was started without a write key.";
+  // These lists mirror the graph's transition table: nudge, restart and fail are valid
+  // only in `stalled`; replan is also valid in `parked` and `failed`. done, cancelled and
+  // replanned are terminal and offer no keeper action.
+  const NUDGE_STATES = ["stalled"];
+  const RESTART_STATES = ["stalled"];
+  const REPLAN_STATES = ["stalled", "parked", "failed"];
+  const FAIL_STATES = ["stalled"];
+  const ACTION_PATHS = { nudge: "/nudge", restart: "/restart", replan: "/replan", fail: "/fail" };
+  const updatedLine = document.getElementById("updated");
+  const errorLine = document.getElementById("error");
+  const noticeLine = document.getElementById("notice");
+  const notFoundLine = document.getElementById("not-found");
+  const summaryCard = document.getElementById("summary-card");
+  const unlockCard = document.getElementById("unlock");
+  const unlockForm = document.getElementById("unlock-form");
+  const keyInput = document.getElementById("key");
+  const actionsCard = document.getElementById("actions-card");
+  const actionsHint = document.getElementById("actions-hint");
+  const actionsBox = document.getElementById("actions");
+  const runsBody = document.getElementById("runs-body");
+  const gatesBody = document.getElementById("gates-body");
+  const sessionsLink = document.getElementById("job-sessions");
+  let lastJob = null;
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function hideError() {
+    errorLine.textContent = "";
+    errorLine.hidden = true;
+  }
+
+  function showNotice(message) {
+    noticeLine.textContent = message;
+    noticeLine.hidden = false;
+  }
+
+  function hideNotice() {
+    noticeLine.textContent = "";
+    noticeLine.hidden = true;
+  }
+
+  // The shared unlock panel: the daemon write token lives only in this tab's
+  // sessionStorage, is never put in the URL and is never printed or logged.
+  function readKey() {
+    try {
+      return globalThis.sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writeKey(value) {
+    try {
+      if (value) {
+        globalThis.sessionStorage.setItem(TOKEN_KEY, value);
+      } else {
+        globalThis.sessionStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {
+      // A browser with storage disabled cannot unlock; reads still work.
+    }
+    updateUnlock();
+  }
+
+  function updateUnlock() {
+    unlockCard.hidden = readKey() !== "";
+    renderActions(lastJob);
+  }
+
+  function showNotFound() {
+    notFoundLine.hidden = false;
+    summaryCard.hidden = true;
+    actionsCard.hidden = true;
+    unlockCard.hidden = true;
+    runsBody.replaceChildren();
+    gatesBody.replaceChildren();
+  }
+
+  function formatValue(value, fallback) {
+    if (value === null || value === undefined || value === "") return fallback;
+    return String(value);
+  }
+
+  function formatTime(value) {
+    if (value === null || value === undefined || value === "") return "unknown";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatNeeds(needs) {
+    if (!Array.isArray(needs) || needs.length === 0) return "none";
+    return needs.map(String).join(", ");
+  }
+
+  function formatDuration(milliseconds) {
+    const value = Number(milliseconds);
+    if (!Number.isFinite(value)) return "unknown";
+    return value + " ms";
+  }
+
+  function gateKind(gate) {
+    if (gate && typeof gate === "object") {
+      const names = Object.keys(gate);
+      if (names.length > 0) return names[0];
+    }
+    return "unknown";
+  }
+
+  function cell(value, className) {
+    const element = document.createElement("td");
+    element.textContent = value;
+    if (className) element.className = className;
+    return element;
+  }
+
+  function emptyRow(body, columns, message) {
+    const row = document.createElement("tr");
+    const empty = cell(message, "muted");
+    empty.colSpan = columns;
+    row.appendChild(empty);
+    body.appendChild(row);
+  }
+
+  function renderJob(job) {
+    document.title = "VOWP job " + formatValue(job.id, "");
+    document.getElementById("job-id").textContent = formatValue(job.id, "unknown");
+    document.getElementById("job-state").textContent = formatValue(job.state, "unknown");
+    document.getElementById("job-kind").textContent = formatValue(job.kind, "unknown");
+    document.getElementById("job-role").textContent = formatValue(job.role, "unknown");
+    document.getElementById("job-priority").textContent = formatValue(job.priority, "unknown");
+    document.getElementById("job-attempts").textContent = formatValue(job.attempts, "0");
+    document.getElementById("job-updated").textContent = formatTime(job.updated_at);
+    document.getElementById("job-needs").textContent = formatNeeds(job.needs);
+    document.getElementById("job-note").textContent = formatValue(job.note, "—");
+    sessionsLink.href = "/sessions?job=" + encodeURIComponent(job.id);
+    summaryCard.hidden = false;
+  }
+
+  function renderRuns(items) {
+    runsBody.replaceChildren();
+    if (!Array.isArray(items) || items.length === 0) {
+      emptyRow(runsBody, 11, "No runs.");
+      return;
+    }
+    for (const run of items) {
+      const row = document.createElement("tr");
+      row.append(
+        cell(formatValue(run.id, "unknown"), "mono"),
+        cell(formatValue(run.role, "unknown")),
+        cell(formatValue(run.purpose, "unknown")),
+        cell(formatValue(run.executor, "—"), "mono"),
+        cell(formatValue(run.provider, "—")),
+        cell(formatValue(run.node, "unknown")),
+        cell(formatTime(run.started_at)),
+        cell(formatValue(run.ended_at, "—")),
+        cell(formatValue(run.exit_code, "—")),
+        cell(formatValue(run.outcome, "—")),
+        cell(formatValue(run.limit_kind, "—"))
+      );
+      runsBody.appendChild(row);
+    }
+  }
+
+  function renderGates(items) {
+    gatesBody.replaceChildren();
+    if (!Array.isArray(items) || items.length === 0) {
+      emptyRow(gatesBody, 6, "No gate results.");
+      return;
+    }
+    for (const result of items) {
+      const row = document.createElement("tr");
+      row.append(
+        cell(formatValue(result.attempt, "unknown")),
+        cell(formatValue(result.gate_index, "unknown")),
+        cell(gateKind(result.gate)),
+        cell(result.passed ? "yes" : "no", "state"),
+        cell(formatDuration(result.duration_ms)),
+        cell(formatTime(result.ts))
+      );
+      gatesBody.appendChild(row);
+    }
+  }
+
+  function actionButton(action, label) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.textContent = label;
+    if (action === "fail") button.className = "danger";
+    button.addEventListener("click", () => runAction(action));
+    return button;
+  }
+
+  function renderActions(job) {
+    if (!job) {
+      actionsCard.hidden = true;
+      return;
+    }
+    actionsCard.hidden = false;
+    actionsBox.replaceChildren();
+    if (readKey() === "") {
+      actionsBox.hidden = true;
+      actionsHint.textContent = "Unlock to use the keeper actions.";
+      actionsHint.hidden = false;
+      return;
+    }
+    const candidates = [
+      ["nudge", "Nudge", NUDGE_STATES],
+      ["restart", "Restart", RESTART_STATES],
+      ["replan", "Replan", REPLAN_STATES],
+      ["fail", "Fail", FAIL_STATES]
+    ];
+    for (const [action, label, states] of candidates) {
+      if (states.includes(job.state)) actionsBox.appendChild(actionButton(action, label));
+    }
+    if (actionsBox.childElementCount === 0) {
+      actionsBox.hidden = true;
+      actionsHint.textContent = "No keeper actions in this state.";
+      actionsHint.hidden = false;
+    } else {
+      actionsBox.hidden = false;
+      actionsHint.hidden = true;
+    }
+  }
+
+  async function errorDetail(response) {
+    try {
+      const value = await response.json();
+      if (value && value.error && value.error.message) return value.error.message;
+    } catch {
+      // Fall back to the status when the body is not the API error document.
+    }
+    return "HTTP " + response.status;
+  }
+
+  function runAction(action) {
+    if (!lastJob) return;
+    if (action === "fail") {
+      const reason = prompt("Fail reason (required) for " + lastJob.id, "");
+      if (reason === null) return;
+      const trimmed = reason.trim();
+      if (!trimmed) {
+        showError("A fail reason is required.");
+        return;
+      }
+      submitAction(action, { reason: trimmed });
+      return;
+    }
+    submitAction(action, null);
+  }
+
+  async function submitAction(action, payload) {
+    if (!lastJob) return;
+    const key = readKey();
+    if (!key) {
+      updateUnlock();
+      showError("Unlock the keeper actions with the daemon write key first.");
+      return;
+    }
+    hideError();
+    hideNotice();
+    const options = {
+      method: "POST",
+      headers: { [AUTH_HEADER]: "Bearer " + key }
+    };
+    if (payload !== null) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(payload);
+    }
+    try {
+      const response = await fetch(
+        "/api/v1/jobs/" + encodeURIComponent(lastJob.id) + ACTION_PATHS[action],
+        options
+      );
+      if (response.status === 202) {
+        showNotice(QUEUED_MESSAGE);
+        await load();
+        return;
+      }
+      if (response.status === 401) {
+        writeKey("");
+        showError("The key was rejected. Unlock with the current daemon write key.");
+        return;
+      }
+      if (response.status === 503) {
+        showError(DISABLED_MESSAGE);
+        return;
+      }
+      showError("Could not " + action + " " + lastJob.id + " (" + (await errorDetail(response)) + ").");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showError("Could not " + action + " " + lastJob.id + " (" + detail + ").");
+    }
+  }
+
+  async function load() {
+    if (!jobId) {
+      showError("This page needs a job id in its path.");
+      return;
+    }
+    try {
+      const jobResponse = await fetch("/api/v1/jobs/" + encodeURIComponent(jobId));
+      if (jobResponse.status === 404) {
+        showNotFound();
+        updatedLine.textContent = "Last updated: job not found";
+        return;
+      }
+      if (!jobResponse.ok) throw new Error("HTTP " + jobResponse.status);
+      const job = await jobResponse.json();
+      const [runsResponse, gatesResponse] = await Promise.all([
+        fetch("/api/v1/jobs/" + encodeURIComponent(jobId) + "/runs"),
+        fetch("/api/v1/jobs/" + encodeURIComponent(jobId) + "/gates")
+      ]);
+      if (!runsResponse.ok) throw new Error("HTTP " + runsResponse.status + " for runs");
+      if (!gatesResponse.ok) throw new Error("HTTP " + gatesResponse.status + " for gates");
+      const runsPage = await runsResponse.json();
+      const gatesPage = await gatesResponse.json();
+      lastJob = job;
+      renderJob(job);
+      renderRuns(runsPage.items);
+      renderGates(gatesPage.items);
+      hideError();
+      updateUnlock();
+      updatedLine.textContent = "Last updated: " + new Date().toLocaleString();
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showError("Could not load the job (" + detail + ").");
+    }
+  }
+
+  unlockForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = keyInput.value.trim();
+    if (!value) {
+      showError("Enter the daemon write key.");
+      return;
+    }
+    writeKey(value);
+    keyInput.value = "";
+    hideError();
+    showNotice("Unlocked for this tab.");
+    updateUnlock();
+  });
+
+  updateUnlock();
+  load();
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

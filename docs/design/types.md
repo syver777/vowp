@@ -20,6 +20,9 @@ Module → file map:
 | `snapshot` | v0.2 `snapshot.json` and the project registry view (§16.3) |
 | `catalog` | v0.2 lifecycle classes, catalog rows, GC and backup reports (§16.4) |
 | `vault` | v0.2 secret names, metadata, modes and the one-time request (§16.5) |
+| `agent` | v0.4 local-node path refs, capabilities, capacity, frames, redacted cards and app-surface frames (§16.7, §16.12) |
+| `offload` | v0.4 placement, waiting reasons, assignment payload and resume records (§16.8) |
+| `asif` | v0.4 adapter-free ASIF report summaries and import response (§16.11) |
 | `config`, `adapter`, `services`, `schema` | `vowp.toml`, adapter trait, service traits, JSON Schema export |
 
 `lib.rs` re-exports everything at the crate root (`vowp_protocol::Job`), plus `vowp_protocol::prelude::*`.
@@ -531,7 +534,7 @@ pub enum LoopUntil { Gates }                                   // v0.1: only "un
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)] #[serde(rename_all = "snake_case")]
 pub enum OnExhausted { Escalate, Park, Fail }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct JobLoop { pub until: LoopUntil, pub max_attempts: u32 /* default 3 */, pub on_exhausted: OnExhausted /* default Escalate */ }
+pub struct JobLoop { pub until: LoopUntil, pub max_attempts: u32 /* default 2 */, pub on_exhausted: OnExhausted /* default Escalate */ }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Job {
@@ -593,7 +596,7 @@ JSON (`vowp job show graph-engine --json`):
  "needs":["protocol"],"owns":["crates/vowp-graph/**"],"reads":["docs/design/**"],
  "brief":".vowp/jobs/graph-engine/brief.md","report":".vowp/jobs/graph-engine/report.md",
  "gates":[{"report":{"fields":["status","branch","commits","tests"]}},{"cmd":{"run":"cargo test -p vowp-graph","expect_exit":0}},{"owns_respected":true},{"review":{"by":"verifier"}}],
- "loop":{"until":"gates","max_attempts":3,"on_exhausted":"escalate"},
+ "loop":{"until":"gates","max_attempts":2,"on_exhausted":"escalate"},
  "branch":"job/graph-engine","worktree":"/home/user/project","attempts":0,"continues":0,"hang_restarts":0,
  "parked_reason":null,"note":"","created_by":"planner","last_progress_at":"2026-11-08T20:10:00.000Z",
  "state_changed_at":"2026-11-08T20:01:00.000Z","created_at":"2026-11-08T19:50:00.000Z","updated_at":"2026-11-08T20:10:00.000Z"}
@@ -925,6 +928,7 @@ pub struct VowpConfig {
     #[serde(default)] pub schedules: Vec<ScheduleConfig>,                 // [[schedules]]
     #[serde(default)] pub capsule: CapsuleConfig,
     #[serde(default)] pub merge: MergeConfig,
+    #[serde(default)] pub offload: OffloadConfig,
 }
 impl VowpConfig {
     pub fn from_toml(s: &str) -> Result<Self, ProtocolError>;            // + validate()
@@ -960,11 +964,57 @@ pub struct CapsuleConfig { pub executor: Option<Executor> /* cheapest capable; d
                            pub min_interval_secs: u64 /* 120 */, pub max_input_chars: u64 /* 200000 */, pub tail_turns: u32 /* 2 */ }
 pub struct MergeConfig { pub rebase: bool /* true */, pub check_cmds: Vec<String> /* repo-wide; falls back to project.check_cmds */,
                          pub timeout_secs: u64 /* 2700 */, pub secret_scan: bool /* true */ }
+pub struct OffloadConfig {
+    #[serde(default)] pub enabled: bool /* false */,
+    #[serde(default)] pub default: Placement /* home; validation refuses node:<name> */,
+    #[serde(default = "two")] pub max_remote_runs: u32 /* 2 */,
+    #[serde(default = "600")] pub grace_secs: u64 /* 600 */,
+    #[serde(default)] pub result_transport: ResultTransport /* push */,
+    #[serde(default)] pub pause_on_home_brake: bool /* false */,
+    #[serde(default = "true")] pub require_clean_base: bool /* true */,
+    #[serde(default = "5 GiB")] pub min_disk_bytes: u64 /* 5368709120 */,
+    #[serde(default)] pub projects: BTreeMap<ProjectName, OffloadProjectConfig>,
+    #[serde(default)] pub nodes: BTreeMap<NodeName, OffloadNodeConfig>,
+}
+#[serde(rename_all = "snake_case")]
+pub enum ResultTransport { #[default] Push, Bundle }   // bundle is legal in Phase 4; push stays the default
+pub struct OffloadProjectConfig {
+    #[serde(default)] pub placement: Option<Placement> /* None -> offload.default */,
+    #[serde(default)] pub home_only: bool /* false */,
+    #[serde(default = "default_offload_allow_kinds")] pub allow_kinds: Vec<JobKind>
+        /* [build, test, docs, fix, verify] */,
+    #[serde(default = "default_offload_deny_kinds")] pub deny_kinds: Vec<JobKind>
+        /* [merge, promote, release] */,
+    #[serde(default)] pub allow_secrets: Vec<SecretName> /* [] */,
+}
+pub struct OffloadNodeConfig {
+    #[serde(default)] pub max_workers: Option<u32> /* None -> the node's max_slots */,
+    #[serde(default)] pub allow_battery: bool /* false */,
+    #[serde(default)] pub labels: Vec<String> /* [] */,
+}
+impl OffloadConfig {
+    pub fn project_policy(&self, project: &ProjectName) -> OffloadProjectConfig;   // map entry or Default
+    pub fn node_policy(&self, node: &NodeName) -> OffloadNodeConfig;               // map entry or Default
+}
 ```
 All structs except `LoopConfig` use `#[serde(deny_unknown_fields)]`. **Every field that is not marked `required` carries `#[serde(default)]` (or a named
 default fn) giving exactly the value in its comment**; `Default` impls match. Config enums (`OnCreditsExhausted`, `Approval`, `MissedPolicy`, `OnQuota`, `ActiveState`)
 use `#[serde(rename_all = "snake_case")]`. `JobLoop` (§7) likewise: `#[serde(default = "...")]` on `until` (`gates`), `max_attempts` (3), `on_exhausted` (`escalate`).
 The only required keys in the whole file are `[project] name`, each profile's `ladder`, each `[env.*] checkout`, and each `[[schedules]] name` + `action`.
+
+`[offload]` is the §7.4 policy file embedded in `vowp.toml`. Offload is disabled by default, so
+every job stays on the home until the owner enables it and a project opts in. Validation refuses:
+
+- `max_remote_runs = 0` and `min_disk_bytes = 0`;
+- an empty `default`, and a `default` of `node:<name>` (only `home` or `any` may be a fleet
+  default; a node is named by a per-job placement);
+- `result_transport = "bundle"` is legal in Phase 4; `push` is the default and an assignment's
+  value wins for the whole run, with no fallback in either direction;
+- a project with `home_only = true` and an offload placement (`any` or `node:<name>`).
+
+Unknown keys inside any `[offload]` table are rejected by the same TOML path as every other config
+table. `OffloadConfig::project_policy` and `node_policy` fill the documented defaults for a name
+that has no table, which is what `vowp offload policy` prints.
 
 ### Node-level file (`~/.vowp/config.toml`)
 
@@ -979,6 +1029,18 @@ pub struct NodeFile {
     #[serde(default)] pub providers: BTreeMap<String, ProviderConfig>,
     #[serde(default)] pub harnesses: BTreeMap<String, HarnessConfig>,
     #[serde(default)] pub capsule: CapsuleConfig,
+    #[serde(default)] pub ingress: IngressConfig,
+}
+#[serde(deny_unknown_fields)]
+pub struct IngressConfig { #[serde(default)] pub wss: WssIngressConfig }
+#[serde(deny_unknown_fields)]
+pub struct WssIngressConfig {
+    #[serde(default)] pub enabled: bool,                 // false
+    #[serde(default = "127.0.0.1:8743")] pub listen: String,
+    #[serde(default = "/agent/v1")] pub path: String,
+    #[serde(default = "64")] pub max_connections: u32,
+    #[serde(default = "1048576")] pub max_frame_bytes: u64,
+    #[serde(default = "10")] pub handshake_timeout_secs: u64,
 }
 impl NodeFile { pub fn from_toml(s: &str) -> Result<Self, ProtocolError>; }
 impl VowpConfig {
@@ -1105,7 +1167,8 @@ pub enum ServiceError { #[error("{0}")] Failed(String), #[error("not found: {0}"
 /// Capsule, CapsuleDraft, Job, NewJob, Gate, Evidence, ReportFrontMatter, BriefFrontMatter,
 /// VowpConfig, Schedule, Release, InboxItem, Run, Session, Limit, Cost, ...; plus the v0.2
 /// capacity, surface/lease, snapshot, catalog, vault, fleet, tunnel and migration types in
-/// §16).
+/// §16, the v0.4 local-node and offload types in §16.7–16.8, and the app-surface frames in
+/// §16.12).
 pub fn all_schemas() -> std::collections::BTreeMap<&'static str, serde_json::Value>;
 pub fn schema_for_name(name: &str) -> Option<serde_json::Value>;
 ```
@@ -1312,7 +1375,25 @@ pub struct CapacityReport {
     pub reserve_ram_bytes: u64, pub min_disk_bytes: u64,
     pub estimates: Vec<UsageEstimate>, pub waiting: Vec<WaitingJob>, pub limits: Vec<Limit>,
 }
+
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource { Proc, Fallback, Mixed }
+pub struct CapacityMemory { pub min: u64, pub avg: u64, pub max: u64 }
+pub struct CapacityPoint {
+    pub at: Timestamp, pub samples: u32, pub mem_available: CapacityMemory,
+    pub load1_avg: f64, pub disk_free_home_min: u64, pub source: HistorySource,
+}
+pub struct CapacityHistory {
+    pub generated_at: Timestamp, pub since: Timestamp, pub until: Timestamp,
+    pub bucket_secs: u64, pub retention_secs: u64, pub points: Vec<CapacityPoint>,
+}
 ```
+
+`CapacityHistory` is the `vowp capacity history --json` document and an exported JSON Schema. A
+point is one 5-minute stored rollup, or one read-time `1h`/`1d` aggregation weighted by `samples`;
+an empty range is an empty `points` array, never a fabricated zero. A `fallback` source means the
+memory and load values are not a measurement. Raw `host_samples` are kept 48 hours and the
+rollups 30 days.
 
 ### 16.2 Surfaces, leases, remote execution and orchestrators (`surface`)
 
@@ -1321,7 +1402,7 @@ pub struct CapacityReport {
 pub fn new_lease_token() -> String;                       // two ULIDs, 160 random bits
 
 #[serde(rename_all = "snake_case")]
-pub enum SurfaceKind { Chat, Opencode, ClaudeCode, Mcp, Mirror, Api }
+pub enum SurfaceKind { Chat, Opencode, ClaudeCode, Mcp, Mirror, Api, Agent }
 
 pub struct Surface {
     pub id: SurfaceId, pub kind: SurfaceKind, pub node: NodeName, pub holder: String,
@@ -1329,10 +1410,25 @@ pub struct Surface {
     pub created_at: Timestamp, pub last_seen_at: Timestamp,
 }
 
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceState { Pending, Attached, Revoked }
+
+#[serde(transparent)] pub struct SurfaceScope(pub String);
+// Wire strings: `session.read:<id>`, `session.write:<id>`, `project.read:<name>`,
+// `fleet.read`, `tool:<name>`; unknown scopes are preserved.
+
+pub struct SurfaceInfo {
+    pub id: SurfaceId, pub kind: SurfaceKind, pub node: NodeName, pub holder: String,
+    pub app: Option<String>, pub cwd: Option<String>, pub metadata: serde_json::Value,
+    pub state: SurfaceState, pub created_at: Timestamp, pub last_seen_at: Timestamp,
+    pub revoked_at: Option<Timestamp>,
+}
+
 pub struct Lease {
     pub session_id: SessionId, pub surface_id: Option<SurfaceId>,
     pub surface_kind: SurfaceKind, pub node: NodeName, pub holder: String,
-    pub token: String, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
+    pub token: String,  // lowercase hex SHA-256; the plaintext exists only in the grant
+    pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
 }
 pub struct SurfaceRef {
     pub surface_id: SurfaceId, pub kind: SurfaceKind, pub holder: String,
@@ -1383,9 +1479,30 @@ pub struct TurnGrant {
 #[serde(rename_all = "snake_case")]
 pub enum OrchestratorApp { Opencode, ClaudeCode, Chat }
 pub struct JoinInstructions { pub desktop: String, pub phone: String, pub chat: String }
+
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorNodeState { Starting, Running, Stopped, Degraded, NodeOffline, Failed }
+
 pub struct OrchestratorCard {
     pub name: String, pub session_id: SessionId, pub project: Option<ProjectName>,
-    pub app: OrchestratorApp, pub state: String, pub join: JoinInstructions,
+    pub app: OrchestratorApp, pub state: OrchestratorNodeState,
+    pub node: Option<NodeName>,  // absent on a v0.2 home orchestrator
+    pub join: JoinInstructions,
+}
+
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum OrchestratorCommand {
+    Start { request_id: String, name: String, app: OrchestratorApp,
+            project: Option<ProjectName> },
+    Stop { request_id: String, name: String },
+    Resume { request_id: String, name: String },
+}
+
+pub struct OrchestratorError { pub code: String, pub message: String, pub retryable: bool }
+
+pub struct OrchestratorResult {
+    pub request_id: String, pub accepted: bool, pub state: OrchestratorNodeState,
+    pub error: Option<OrchestratorError>, pub detail: Option<String>,
 }
 
 // Changed enums:
@@ -1521,3 +1638,478 @@ storage types: `FleetStatus {snapshot, source, fetched_at, stale}`, `FleetQueueR
 `vowp schema` and have pages under [`docs/reference/schema/`](../reference/schema/README.md).
 `ControlConfig` and the setup plan/report types are CLI-local `Serialize` shapes (not protocol
 storage types); their fields are described in `v0.2/home-and-surfaces.md` §8 and §11.
+
+### 16.7 v0.4 local-node agent protocol (`agent`)
+
+```rust
+pub const AGENT_PROTOCOL: &str = "vowp-agent/1";
+pub const MAX_PATH_REF_LEN: usize = 1024;
+
+#[serde(try_from = "String", into = "String")]
+pub enum PathRef {
+    Project { project: ProjectName },
+    Worktree { project: ProjectName, job: JobId },
+    Subdir { project: ProjectName, rel: String },
+}
+// Wire strings: `project:vowp`, `worktree:vowp/<job>`, `subdir:vowp/src`.
+// Parse rejects `..`, leading `/`, `\`, NUL, an empty project or subdirectory, and a
+// string over MAX_PATH_REF_LEN; repeated `/` and `.` components are normalised.
+
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole { Surface, Executor, Both }
+
+pub struct AgentCapabilities {
+    pub os: String, pub arch: String, pub agent_version: String,
+    pub harnesses: BTreeMap<String, String>, pub git_version: Option<String>,
+    pub labels: Vec<String>, pub secret_names: Vec<SecretName>,
+    pub projects: Vec<ProjectName>,
+}
+
+pub struct AgentCapacity {
+    pub cpu_cores: u32, pub load1: f64,
+    pub mem_total_bytes: u64, pub mem_free_bytes: u64, pub disk_free_bytes: u64,
+    pub busy_slots: u32, pub max_slots: u32,
+    pub on_battery: Option<bool>, pub thermal_state: Option<String>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum NodeKind { Home, Ssh, Agent }
+#[serde(rename_all = "snake_case")]
+pub enum NodeStatus { Pending, Active, Revoked }
+#[serde(rename_all = "snake_case")]
+pub enum NodePresence { Online, Degraded, Offline, Revoked }
+
+pub struct AgentPathMap {
+    pub project: ProjectName, pub local_root: String,
+    pub worktree_root: Option<String>, pub allow: Vec<String>,
+}
+
+pub struct NodeCard {
+    pub name: NodeName, pub kind: NodeKind, pub status: NodeStatus,
+    pub presence: NodePresence, pub labels: Vec<String>,
+    pub capacity: Option<AgentCapacity>, pub runs: u32,
+    pub mapped: Vec<ProjectName>, pub agent_version: Option<String>,
+    pub protocol: Option<String>, pub last_error: Option<String>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum LeaseMode { Acquire, Takeover }
+
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentFrame {
+    AgentHello { node: NodeName, key_id: String, agent_version: String,
+                 os: String, arch: String, labels: Vec<String>,
+                 capabilities: AgentCapabilities },
+    HomeChallenge { nonce: String, home_id: String, connection_id: String,
+                    server_time: Timestamp, heartbeat_secs: u64, max_frame_bytes: u64 },
+    AgentAuth { signature: String },
+    HomeWelcome { protocol: String, home_id: String, node: NodeName,
+                  connection_id: String },
+    Enroll { code: String, public_key: String, agent_version: String, os: String,
+             arch: String, labels: Vec<String>, capabilities: AgentCapabilities,
+             paths: Vec<AgentPathMap> },
+    Enrolled { home_id: String, node: NodeName, protocol: String,
+               server_time: Timestamp, heartbeat_secs: u64 },
+    Heartbeat { at: Timestamp, capacity: AgentCapacity, pending_spool_bytes: u64 },
+    SurfacePair { code: String, surface_id: SurfaceId, session: SessionId, app: String },
+    SurfaceIssued { surface_id: SurfaceId, token: String,
+                    scopes: Vec<SurfaceScope>, expires_at: Timestamp },
+    SurfaceRevoked { surface_id: SurfaceId, reason: String },
+    LeaseAcquire { surface: SurfaceId, session: SessionId,
+                   surface_token: String, mode: LeaseMode },
+    LeaseHeartbeat { surface: SurfaceId, session: SessionId, token: String },
+    LeaseRelease { surface: SurfaceId, session: SessionId, token: String },
+    LeaseGrant { lease_token: String, expires_at: Timestamp, tail_seq: u64 },
+    LeaseLost { reason: String },
+    LeaseRevoked { reason: String, holder: String },
+    TurnBegin { surface: SurfaceId, session: SessionId, lease_token: String,
+                prompt: String, executor: String, cwd_ref: PathRef,
+                job: Option<JobId>, purpose: RunPurpose },
+    TurnGrant { run_id: RunId, session: SessionId, lease_token: String,
+                expires_at: Timestamp, tail_seq: u64 },
+    RemoteLine { run_id: RunId, epoch: u64, line: RemoteLine },
+    IngestAck { run_id: RunId, event_id: Option<EventId>, seq: Option<u64>,
+                duplicate: bool, lease_revoked: Option<String>, error: Option<String> },
+    Credit { run_id: RunId, count: u64 },
+    TurnEnd { run_id: RunId, summary: TurnSummary },
+    RunLost { run_id: RunId, reason: String },
+    BundleStart { run_id: RunId, epoch: u64, base: String, head: String,
+                  branch: String, bytes: u64, sha256: String },
+    BundleAccept { run_id: RunId, epoch: u64, offset: u64 },
+    BundleChunk { run_id: RunId, epoch: u64, offset: u64, data: String /* lowercase hex */ },
+    BundleEnd { run_id: RunId, epoch: u64, bytes: u64, sha256: String },
+    BundleAbort { run_id: RunId, epoch: u64, reason: String },
+    AssignRun { assignment: AssignmentPayload, lease_token: String,
+                lease_expires_at: Timestamp },
+    RunAccepted { assignment_id: String, run_id: RunId, epoch: u64 },
+    RunRejected { assignment_id: String, run_id: RunId, epoch: u64,
+                  reason: RunRejectReason, detail: String },
+    RunState { run_id: RunId, epoch: u64, state: RemoteRunState,
+               spool_bytes: u64, head_commit: Option<String>, detail: String },
+    CancelRun { run_id: RunId, epoch: u64, reason: String },
+    Resume { runs: Vec<RunResume>, surfaces: Vec<SurfaceResume> },
+    ResumeOk { runs: Vec<RunResumeResult>, surfaces: Vec<SurfaceResumeResult> },
+    PathMapUpdate { map: AgentPathMap },
+    Cleanup { run_id: RunId, job: JobId, worktree: PathRef },
+    OrchestratorCommand(OrchestratorCommand),
+    OrchestratorResult(OrchestratorResult),
+    Ping,
+    Pong,
+    Revoked { reason: String },
+    Superseded { connection_id: String },
+    Error { kind: ErrorKind, message: String, retryable: bool },
+}
+
+pub struct TurnSummary {
+    pub exit_code: Option<i32>, pub outcome: RunOutcome,
+    pub native_session_id: Option<String>, pub cost: Cost,
+    pub limit: Option<LimitEvent>, pub result_text: Option<String>,
+    pub stop_reason: StopReason, pub usage: Option<RemoteUsage>,
+}
+```
+
+`NodeCard` is the redacted read model: it has no path-map field and no secret names. The
+owner-only `node_paths` row holds [`AgentPathMap`]; callers must never copy it into a card,
+snapshot or log. `AgentFrame` covers Phase 0, surface pairing, lease control, the Phase 1
+local-chat stream, the Phase 2 offload assignment/resume frames in §16.8, the Phase 3
+app-surface frames in §16.12, the orchestrator node commands in §16.13 and the Phase 4 bundle
+frames above. `BundleStart`/`BundleChunk`/`BundleEnd` are agent→home, `BundleAccept` is home→agent
+and `BundleAbort` may go either way; every one carries `run_id` and `epoch`, and
+`BundleChunk.data` is lowercase hex capped at 256 KiB raw bytes.
+`TurnBegin.cwd_ref` is a project-relative [`PathRef`]; the home never receives the Mac's
+absolute working directory. `RemoteLine` wraps the existing v0.2 event, heartbeat and summary
+line with a run id and epoch, and `IngestAck` carries the home-assigned sequence or a
+takeover/rejection notice. `TurnSummary` is the terminal summary. `SurfaceKind` includes the
+`agent` wire variant, and the v5 store schema accepts it. `SurfaceIssued.token` (like
+`SurfacePair.code`) and the lease token are secret frame values: they are written 0600 on the
+agent and never logged.
+The home stores only their SHA-256 hashes — a surface token in `surface_tokens.token_hash`, a
+lease token in `leases.token_hash`. `LeaseAcquire.surface_token` authenticates the acquire
+frame; `LeaseHeartbeat` and `LeaseRelease` carry only the lease token, and the home binds them
+to the surface row and the connection node.
+
+`AssignRun.lease_token` is likewise a frame-only secret. It is issued when the home sends the
+frame, never stored in [`AssignmentPayload`] (§16.8) and never written to the assignment row;
+the home stores only its hash in the lease row and issues a fresh token on resume.
+
+### 16.8 v0.4 offload wire format (`offload`)
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum NodeFallback { Home }
+
+#[serde(try_from = "String", into = "String")]
+pub enum Placement {
+    Home,
+    Any,
+    Node { node: NodeName, fallback: Option<NodeFallback> },
+}
+// Wire strings: `home`, `any`, `node:<name>`, `node:<name>+home`. `Default` is `Home`.
+// Parse rejects an unknown selector, an empty node, whitespace, `/` or `:` inside the
+// node part and an unknown fallback; the node is a NodeName slug.
+
+#[serde(rename_all = "snake_case")]
+pub enum WaitingReason {
+    NodeOffline, NodeRevoked, NodeBusy, NodeBattery, NodeDiskLow, NodeLimit,
+    PathUnmapped, PathMissing, MissingSecret, HomeOnlySecret, KindNotAllowed,
+    ProjectHomeOnly, RemoteMismatch, NoEligibleNode,
+}
+
+pub struct AssignmentPayload {
+    pub assignment_id: String, pub run_id: RunId, pub session_id: SessionId,
+    pub project: ProjectName, pub job: JobId, pub executor: Executor,
+    pub purpose: RunPurpose, pub prompt: String, pub cwd_ref: PathRef,
+    pub base_commit: String, pub remote: String, pub remote_url: String,
+    pub result_transport: ResultTransport, /* #[serde(default)] = push */
+    pub env_names: Vec<String>, pub secret_names: Vec<SecretName>, pub epoch: u64,
+    pub deadline: Option<Timestamp>, pub spool_cap_bytes: u64,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RunRejectReason {
+    NodeInactive, ProjectUnmapped, PathMissing, PathNotWritable,
+    CwdOutsideAllow, HarnessMissing, EnvMissing, DiskLow, WorktreeConflict,
+    OriginMismatch, Other,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RemoteRunState { Running, Disconnected, Finishing }
+
+pub struct RunResume { pub run_id: RunId, pub epoch: u64, pub last_acked: u64 }
+pub struct SurfaceResume { pub surface: SurfaceId, pub last_acked: u64 }
+pub struct RunResumeResult {
+    pub run_id: RunId, pub epoch: u64, pub accepted: bool,
+    pub reason: Option<String>, pub tail_seq: u64,
+}
+pub struct SurfaceResumeResult {
+    pub surface: SurfaceId, pub accepted: bool,
+    pub reason: Option<String>, pub tail_seq: u64,
+}
+```
+
+[`Placement`] is the job's placement value from §7.1: `home` is the default, `any` lets the
+dispatcher choose the home or any eligible node, and `node:<name>` pins one node. The
+`+home` suffix is the explicit, opt-in `fallback = "home"`; there is no silent fallback to the
+home when a pinned node is ineligible. The node part is a `NodeName` slug and carries no
+whitespace, `/`, `:` or `+`. `AssignmentPayload.result_transport` is `push` or `bundle`, defaults
+to `push` when absent, and wins for the whole run; a bundle assignment carries an empty
+`remote_url` because it needs no push access and no git credential.
+
+[`WaitingReason`] is the §7.5 vocabulary a ready job records instead of running, in the
+documented order. It is a first-class read-model value, not a log line.
+
+| Reason | Meaning |
+|---|---|
+| `node_offline` | the pinned or chosen node is not active, or its heartbeat is degraded/offline |
+| `node_revoked` | the node's credentials were revoked |
+| `node_busy` | the node or the fleet is at its worker/remote-run cap |
+| `node_battery` | the node is on battery or thermally limited and `allow_battery = false` |
+| `node_disk_low` | free space is below `offload.min_disk_bytes` |
+| `node_limit` | a provider limit blocks the run's executor on that node |
+| `path_unmapped` | the project has no path-map row on the node |
+| `path_missing` | a mapped local/worktree root is missing or not writable |
+| `missing_secret` | the node does not declare a required secret name |
+| `home_only_secret` | the job needs a secret the project does not allow a node to resolve |
+| `kind_not_allowed` | the project policy denies the job kind for offload |
+| `project_home_only` | the project is marked `home_only` |
+| `remote_mismatch` | the node's origin does not match, or is not known to match, the project remote |
+| `no_eligible_node` | no node satisfies the placement and eligibility checks |
+
+The evaluator applies the checks in §7.2 order: enabled/active/online, placement match, project
+opt-in and `home_only`, kind allow/deny, labels and harness capabilities, secrets, path map and
+disk, slots/battery/thermal, provider limit, `owns` conflict, then origin/base/cleanliness. The
+first failure is the reason. `project_home_only`, `kind_not_allowed` and `home_only_secret` are
+job-level refusals that a per-job placement cannot override; a transient node fact is only a
+waiting reason for a pinned node, because `any` still has the home.
+
+[`AssignmentPayload`] is the durable payload the home stores in its assignment row and sends
+inside [`crate::agent::AgentFrame::AssignRun`]. It carries environment and secret **names**
+only, a project-relative `PathRef`, the base commit, the remote name, the project's expected
+remote URL, the epoch, an optional deadline and the per-run spool cap. It never contains a
+lease token, a secret value or an absolute local path. The `AssignRun` frame adds `lease_token`
+and `lease_expires_at` next to the payload: the token is frame-only, written to the lease row
+only as a SHA-256 hash and re-issued on resume.
+
+`AssignmentPayload.remote` is the git remote *name*; `remote_url` is the home project's remote
+URL. The home strips URL userinfo before storing `remote_url`, so the durable row never holds a
+credential. The agent compares its push URL (not the fetch URL) with `remote_url`, with
+credentials stripped on both sides, and refuses a mismatch as `remote_mismatch`; it never logs
+the raw URL.
+
+[`RunRejectReason`] is the machine-readable class of a pre-start refusal; the matching
+`RunRejected.detail` carries the human-readable text and never a secret value.
+[`RemoteRunState`] is the state an agent reports in `RunState` while a run is active.
+
+`Resume` and `ResumeOk` reconcile runs and surfaces after a reconnect: the agent offers each
+run and surface with `last_acked`, and the home answers `accepted`, an optional `reason` and
+the `tail_seq` the holder may continue from. `PathMapUpdate` carries one owner-only
+[`AgentPathMap`] whose absolute roots never appear in a card, snapshot or log. `Cleanup` names
+the run, job and project-relative worktree to remove; the agent resolves the worktree locally.
+
+### 16.9 Offload store records (`vowp-store::repo_offload`)
+
+These records are store read models, not protocol wire types. They live in `vowp-store` because
+they describe rows; the protocol owns `Placement`, `AssignmentPayload`, `LimitKind` and the
+`PathRef`/`SecretName` values they contain.
+
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAssignmentState {
+    Queued, Sent, Accepted, Running, Disconnected, Finished, Lost, Cancelled, Rejected,
+}
+
+pub struct AgentAssignment {
+    pub id: String, pub run_id: RunId, pub session_id: SessionId, pub project: ProjectName,
+    pub node: NodeName, pub epoch: u64, pub state: AgentAssignmentState,
+    pub payload: AssignmentPayload, pub created_at: Timestamp,
+    pub claimed_at: Option<Timestamp>, pub expires_at: Option<Timestamp>, pub detail: String,
+}
+
+pub struct NodeLimit {
+    pub provider: String, pub node: NodeName, pub kind: LimitKind,
+    pub resets_at: Option<Timestamp>, pub detail: String,
+    pub since: Timestamp, pub updated_at: Timestamp,
+}
+
+pub struct JobPlacement { pub job: JobId, pub placement: Placement, pub updated_at: Timestamp }
+
+pub struct AssignmentFilter {
+    pub node: Option<NodeName>, pub run_id: Option<RunId>, pub project: Option<ProjectName>,
+    pub states: Vec<AgentAssignmentState>, pub limit: Option<u32>,
+}
+```
+
+`job_placement` is a **side table** (`job TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE
+CASCADE, placement TEXT NOT NULL, updated_at TEXT NOT NULL`), not a column on `jobs`. The store
+persists `placement.to_string()` and parses it back with `Placement::parse`; a job with no row
+uses the protocol default, `Placement::Home`. Keeping placement off the `jobs` row is what lets
+every existing v0.3 `Job`, `NewJob` and `JobPatch` struct literal, YAML/JSON job import and wire
+client stay source-compatible.
+
+`AgentAssignment.payload` is the parsed `AssignmentPayload` from
+`agent_assignments.payload_json`. The row and payload must agree on assignment, run, session,
+project and epoch. The payload carries secret **names** only and never a lease token, a secret
+value or an absolute local path; the home stores only the lease token's SHA-256 hash in the
+lease row and re-issues a token on resume.
+
+`NodeLimit` is keyed by `(provider, node)`. `NodeLimit.kind` is the protocol `LimitKind`
+(`quota`, `credits`, `rate`, `context`, `auth`); the schema additionally reserves
+`unavailable` for a future home-side writer, so no store method produces that value yet.
+
+### 16.10 Offload policy evaluation (`vowp-core::offload`)
+
+These are pure core values, not wire types. Callers build one `NodeFacts` per candidate and pass
+the home facts once; the evaluator never opens a store, reads a clock or touches the filesystem.
+
+```rust
+pub struct HomeFacts { pub brake_active: bool, pub active_remote_runs: u32 }
+
+pub struct NodeCapabilities {
+    pub harnesses: Vec<String>, pub secrets: Vec<SecretName>, pub projects: Vec<ProjectName>,
+}
+pub struct PathFacts {
+    pub map_present: bool, pub local_root_present: bool,
+    pub worktree_root_present: bool, pub writable: bool,
+}
+pub struct LimitFact { pub provider: String, pub kind: LimitKind, pub detail: String }
+pub enum ThermalState { Nominal, Fair, Serious, Critical }
+pub struct NodePower { pub on_battery: bool, pub thermal_state: ThermalState }
+pub struct NodeFacts {
+    pub name: NodeName, pub status: NodeStatus, pub presence: NodePresence,
+    pub labels: Vec<String>, pub capabilities: NodeCapabilities,
+    pub capacity: Option<AgentCapacity>, pub power: Option<NodePower>,
+    pub limits: Vec<LimitFact>, pub path: Option<PathFacts>,
+    pub origin_matches: Option<bool>, pub base_fetchable: Option<bool>,
+    pub clean_base: Option<bool>, pub owns_conflict: Option<bool>,
+}
+
+pub struct JobRequirements {
+    pub labels: Vec<String>, pub harnesses: Vec<String>,
+    pub secrets: Vec<SecretName>, pub provider: Option<String>,
+}
+pub struct JobRequest { pub kind: JobKind, pub placement: Option<Placement>, pub requires: JobRequirements }
+
+pub enum Target { Home, Node(NodeName) }
+pub enum Decision {
+    Eligible { targets: Vec<Target> },
+    Waiting { reason: WaitingReason, detail: String, node: Option<NodeName> },
+}
+
+pub fn evaluate(
+    fleet: &OffloadConfig, project: &ProjectName, project_policy: &OffloadProjectConfig,
+    job: &JobRequest, home: &HomeFacts, nodes: &[NodeFacts],
+) -> Decision;
+```
+
+`JobRequest.placement` is the `job_placement` side-table value; `None` falls back to the project
+default and then `offload.default`. `NodeFacts` optional fields are deliberate: `None` means the
+home does not know the fact and the evaluator refuses (`remote_mismatch`, `no_eligible_node`, or
+`node_disk_low` for an unreported disk) instead of assuming the best case. `Decision::Waiting`
+leaves the job `ready`; only the job-level `project_home_only`, `kind_not_allowed` and
+`home_only_secret` are absolute offload refusals.
+
+### 16.11 v0.4 ASIF report types (`asif`)
+
+ASIF 0.4 is a review draft. These types are VOWP's **adapter-free summary** of the
+`vowp-asif-report-v1` document; they never claim conformance, losslessness, exact request
+reconstruction or continuation. The full report (mapping, coverage, loss classes) stays in the
+adapter and is written only through `--report`.
+
+```rust
+pub struct AsifCounts { pub events_in: u64, pub events_out: u64,
+                        pub resources: u64, pub capsules: u64 }
+pub struct AsifLoss { pub kind: String, pub stage: String,
+                      pub scope: Option<String>, pub message: String }
+pub struct AsifReport {
+    pub adapter_version: String, pub asif_version: String, pub asif_pin: String,
+    pub source_session: Option<String>, pub target_session: Option<String>,
+    pub counts: AsifCounts, pub loss_count: u64, pub losses: Vec<AsifLoss>,
+    pub unsupported: Vec<String>,
+}
+pub struct AsifImportResponse { pub session: Session, pub report: AsifReport,
+                               pub warnings: Vec<String> }
+```
+
+`stage` is the adapter's lower-case loss stage (`capture`, `normalization`, `redaction`,
+`translation`); `scope` is the adapter's lower-case coverage domain when it names one.
+`loss_count` equals `losses.len()`. The loss **class** used by `--strict` (`Blocking` /
+`Integrity` versus `Normalization` / `Omission`) is not serialized and never appears in this
+summary. No field carries source text, a secret value, an absolute host path or a temporary
+path. `AsifImportResponse` is shared by `vowp session import --json` and the daemon's import
+route; `session` is the ordinary registered row and `warnings` are the expected post-rename
+`project ... left null` / `job ... left null` reindex warnings.
+
+The four types are exported by `vowp schema` (`AsifCounts`, `AsifLoss`, `AsifReport`,
+`AsifImportResponse`).
+
+### 16.12 v0.4 local app-surface frames (`agent::surface`)
+
+These are the Phase 3 frames an app on the Mac (opencode first) uses to attach to a session,
+mirror normalized events under native ids, mark turn boundaries and proxy MCP tool calls. The
+frames travel inside [`crate::agent::AgentFrame`]; the payload types live in the nested
+`agent::surface` module because [`crate::event`] already names the `tool.call` and `tool.result`
+payload structs `ToolCall` and `ToolResult`.
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceTurnState { Started, Ended }
+
+pub struct SurfaceAttach { pub surface: SurfaceId, pub session: SessionId }
+pub struct SurfaceDetach { pub surface: SurfaceId, pub session: SessionId }
+
+pub struct SurfaceEvent {
+    pub surface: SurfaceId, pub session: SessionId, pub native_id: String,
+    pub event: EventBody,
+}
+pub struct SurfaceTurn {
+    pub surface: SurfaceId, pub session: SessionId, pub native_id: String,
+    pub state: SurfaceTurnState, pub at: Timestamp,
+}
+
+pub struct ToolCall {
+    pub request_id: String, pub surface: SurfaceId, pub session: SessionId,
+    pub tool: String, pub arguments: serde_json::Value,
+}
+pub struct ToolResult {
+    pub request_id: String, pub result: Option<serde_json::Value>,
+    pub error: Option<ToolError>,
+}
+pub struct ToolError { pub code: String, pub message: String, pub retryable: bool }
+```
+
+`SurfaceAttach`, `SurfaceDetach`, `SurfaceEvent`, `SurfaceTurn` and `ToolCall` are
+agent → home frames; `ToolResult` is the home → agent reply. `SurfaceTurnState` is
+`started|ended`. `SurfaceEvent.event` serialises as the typed `EventBody`: a dotted `type`
+plus the payload fields, for example `{"type":"assistant.message","text":"…"}`, and decodes
+through `EventBody::from_parts`.
+
+The home owns ordering and identity: it assigns the canonical `seq`, writes the event index
+row and the `native_events` dedupe row in one transaction, and skips a duplicate native id.
+The agent never sends `seq`. A native id is stable across retries and backfill, so a replay
+after a disconnect never appends the same app event twice.
+
+`ToolCall.arguments` is the normal MCP JSON object. By contract it never carries a local path
+or a secret value. The home checks the call against the surface token scope and the live
+session lease before executing the same core path as its own MCP server. `ToolResult` carries
+either `result` or a typed `ToolError` (`code`, `message`, `retryable`), never a free-string
+error, a home secret value or an absolute local path.
+
+### 16.13 v0.4 orchestrator node commands (`surface`)
+
+These are the frames the home uses to create, stop and resume an orchestrator whose app host
+runs on a local node. The command is home → agent and the result is agent → home; both travel
+inside [`crate::agent::AgentFrame`]. The payload types and the card state live in
+`surface` beside [`OrchestratorCard`].
+
+`OrchestratorCommand` carries a home-assigned `request_id`; the agent echoes it in
+`OrchestratorResult` so the home can correlate the answer with the record even when the result
+arrives after the CLI exited. `Start` carries the app and optional project; `Stop` and
+`Resume` carry the orchestrator name. The wire frame adds the outer `type` tag, for example
+`{"type":"orchestrator_command","action":"start","request_id":"…","name":"mac","app":"opencode"}`.
+
+`OrchestratorResult` carries `accepted`, the resulting `OrchestratorNodeState` and either a
+typed `OrchestratorError` (`code`, `message`, `retryable`) or a redacted `detail`. The
+`OrchestratorNodeState` values are `starting|running|stopped|degraded|node_offline|failed`.
+Neither frame carries a port, password, pair link, absolute local path or secret value. The
+home runs the same redaction over a result before it writes `orchestrator.json`.

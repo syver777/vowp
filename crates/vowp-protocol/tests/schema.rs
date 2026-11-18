@@ -12,11 +12,13 @@ use pretty_assertions::assert_eq;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use vowp_protocol::api::{JobAction, JobActionResponse};
 use vowp_protocol::capsule::Capsule;
 use vowp_protocol::cost::Cost;
 use vowp_protocol::event::EventEnvelope;
 use vowp_protocol::executor::Profile;
 use vowp_protocol::gate::GateResult;
+use vowp_protocol::ids::JobId;
 use vowp_protocol::inbox::InboxItem;
 use vowp_protocol::job::{Edge, Job};
 use vowp_protocol::limit::Limit;
@@ -66,6 +68,7 @@ const LISTED_TYPES: &[&str] = &[
     "RunningCapacity",
     "WaitingJob",
     "CapacitySnapshot",
+    "CapacityHistory",
     "Surface",
     "Lease",
     "SurfaceRef",
@@ -76,6 +79,10 @@ const LISTED_TYPES: &[&str] = &[
     "IngestAck",
     "TurnGrant",
     "OrchestratorCard",
+    "OrchestratorNodeState",
+    "OrchestratorCommand",
+    "OrchestratorResult",
+    "OrchestratorError",
     "JoinInstructions",
     "Snapshot",
     "SupervisorSnapshot",
@@ -107,6 +114,10 @@ const LISTED_TYPES: &[&str] = &[
     "BoardLimit",
     "Page",
     "JobPage",
+    "RunPage",
+    "GateResultPage",
+    "JobAction",
+    "JobActionResponse",
     "SessionPage",
     "NodePage",
     "SessionDetail",
@@ -119,6 +130,47 @@ const LISTED_TYPES: &[&str] = &[
     "CostTotal",
     "ApiError",
     "ApiErrorBody",
+    // v0.4 local-node agent protocol documents.
+    "PathRef",
+    "AgentRole",
+    "AgentCapabilities",
+    "AgentCapacity",
+    "AgentPathMap",
+    "NodeCard",
+    "NodeKind",
+    "NodeStatus",
+    "NodePresence",
+    "SurfaceInfo",
+    "SurfaceScope",
+    "SurfaceState",
+    "LeaseMode",
+    "AgentFrame",
+    "TurnSummary",
+    // v0.4 local app-surface frames.
+    "SurfaceAttach",
+    "SurfaceDetach",
+    "SurfaceEvent",
+    "SurfaceTurn",
+    "SurfaceTurnState",
+    "ToolCall",
+    "ToolError",
+    "ToolResult",
+    // v0.4 offload wire documents.
+    "Placement",
+    "NodeFallback",
+    "WaitingReason",
+    "AssignmentPayload",
+    "RunRejectReason",
+    "RemoteRunState",
+    "RunResume",
+    "SurfaceResume",
+    "RunResumeResult",
+    "SurfaceResumeResult",
+    // v0.4 ASIF report documents.
+    "AsifCounts",
+    "AsifLoss",
+    "AsifReport",
+    "AsifImportResponse",
 ];
 
 /// Decodes one JSON value into a concrete type.
@@ -209,6 +261,90 @@ fn schema_export_covers_listed_types() {
     let cost = schema_for_name("Cost").expect("Cost is exported");
     assert_eq!(cost["title"], "Cost");
     assert!(schema_for_name("NotAType").is_none());
+}
+
+#[test]
+fn job_action_response_has_a_schema_and_stable_action_names() {
+    for (action, name) in [
+        (JobAction::Retry, "retry"),
+        (JobAction::Park, "park"),
+        (JobAction::Cancel, "cancel"),
+        (JobAction::Nudge, "nudge"),
+        (JobAction::Restart, "restart"),
+        (JobAction::Replan, "replan"),
+        (JobAction::Fail, "fail"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(action).expect("action JSON"),
+            Value::String(name.to_owned()),
+            "the wire name of {action:?}"
+        );
+    }
+
+    let schema = schema_for_name("JobActionResponse").expect("JobActionResponse is exported");
+    assert_eq!(schema["title"], "JobActionResponse");
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .expect("required is an array")
+        .iter()
+        .map(|name| name.as_str().expect("required names are strings"))
+        .collect();
+    for field in ["job", "action", "request"] {
+        assert!(required.contains(&field), "the schema must require {field}: {schema}");
+    }
+
+    let response = JobActionResponse {
+        job: JobId::parse("job-a").expect("job id"),
+        action: JobAction::Park,
+        request: "01J00000000000000000000000".to_owned(),
+    };
+    let value = serde_json::to_value(&response).expect("response JSON");
+    check_structure("JobActionResponse", &schema, &value);
+    let decoded: JobActionResponse = serde_json::from_value(value.clone()).expect("round-trip");
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn capacity_history_json_matches_the_exported_schema() {
+    use vowp_protocol::capacity::{CapacityHistory, CapacityMemory, CapacityPoint, HistorySource};
+    use vowp_protocol::time::Timestamp;
+
+    let history = CapacityHistory {
+        generated_at: Timestamp::parse("2026-11-10T12:10:00Z").expect("generated_at"),
+        since: Timestamp::parse("2026-11-10T12:00:00Z").expect("since"),
+        until: Timestamp::parse("2026-11-10T12:10:00Z").expect("until"),
+        bucket_secs: 300,
+        retention_secs: 30 * 24 * 60 * 60,
+        points: vec![CapacityPoint {
+            at: Timestamp::parse("2026-11-10T12:05:00Z").expect("bucket"),
+            samples: 5,
+            mem_available: CapacityMemory {
+                min: 1000,
+                avg: 2000,
+                max: 3000,
+            },
+            load1_avg: 0.5,
+            disk_free_home_min: 42_000_000_000,
+            source: HistorySource::Proc,
+        }],
+    };
+    let value = serde_json::to_value(&history).expect("history JSON");
+    let schema = schema_for_name("CapacityHistory").expect("CapacityHistory is exported");
+    check_structure("capacity_history.json", &schema, &value);
+
+    assert_eq!(value["bucket_secs"], 300);
+    assert_eq!(value["points"][0]["mem_available"]["avg"], 2000);
+    assert_eq!(value["points"][0]["source"], "proc");
+    let decoded: CapacityHistory = serde_json::from_value(value).expect("round-trip");
+    assert_eq!(decoded, history);
+
+    let empty = CapacityHistory {
+        points: Vec::new(),
+        ..history
+    };
+    let value = serde_json::to_value(&empty).expect("empty history JSON");
+    check_structure("capacity_history_empty.json", &schema, &value);
+    assert_eq!(value["points"], serde_json::json!([]));
 }
 
 #[test]

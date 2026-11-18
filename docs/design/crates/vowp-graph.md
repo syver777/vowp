@@ -251,7 +251,7 @@ jobs:
     owns: ["crates/vowp-graph/**"]
     reads: ["docs/design/**"]
     gates: [{report: {fields: [status, branch, commits, tests]}}, {cmd: {run: "cargo test -p vowp-graph", expect_exit: 0}}, {owns_respected: true}, {review: {by: verifier}}]
-    loop: {until: gates, max_attempts: 3, on_exhausted: escalate}
+    loop: {until: gates, max_attempts: 2, on_exhausted: escalate}
 edges:
   - {src: graph-engine-verify-0, dst: graph-engine, kind: verifies}
 ```

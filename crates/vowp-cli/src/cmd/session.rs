@@ -32,9 +32,9 @@ use vowp_store::session_log::{
 use vowp_store::{NodePaths, SessionFilter, Store};
 
 use crate::cli::{
-    ChatArgs, Global, SessionCapsuleArgs, SessionCommand, SessionDirExportArgs, SessionExportArgs, SessionImportArgs,
-    SessionLsArgs, SessionNewArgs, SessionPullArgs, SessionShowArgs, SessionSwitchArgs, SessionTailArgs,
-    SessionWatchArgs,
+    ChatArgs, Global, SessionCapsuleArgs, SessionCommand, SessionDirExportArgs, SessionExportArgs, SessionFormat,
+    SessionImportArgs, SessionLsArgs, SessionNewArgs, SessionPullArgs, SessionPushArgs, SessionShowArgs,
+    SessionSwitchArgs, SessionTailArgs, SessionWatchArgs,
 };
 use crate::node_ctx::NodeRole;
 use crate::output::{Table, local_time_at, print_json};
@@ -50,9 +50,16 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &SessionCommand) -> Resul
         SessionCommand::Chat(args) => chat(ctx, io, args),
         SessionCommand::Switch(args) => switch(ctx, io, args),
         SessionCommand::Capsule(args) => capsule(ctx, io, args),
-        SessionCommand::Export(args) => export(ctx, io, args),
-        SessionCommand::Import(args) => import(ctx, io, args),
+        SessionCommand::Export(args) => match args.format {
+            SessionFormat::Bundle => export(ctx, io, args),
+            SessionFormat::Asif => crate::cmd::session_asif::export(ctx, io, args),
+        },
+        SessionCommand::Import(args) => match args.format {
+            SessionFormat::Bundle => import(ctx, io, args),
+            SessionFormat::Asif => crate::cmd::session_asif::import(ctx, io, args),
+        },
         SessionCommand::Pull(args) => pull(ctx, io, args),
+        SessionCommand::Push(args) => push(ctx, io, args),
         SessionCommand::DirExport(args) => dir_export(ctx, io, args),
         SessionCommand::Watch(args) => watch(ctx, io, args),
         SessionCommand::Tail(args) => tail(ctx, io, args),
@@ -100,6 +107,13 @@ pub fn maybe_run_remote(
         let ctx = Ctx::build(global, io)?;
         return Ok(Some(pull(&ctx, io, args)?));
     }
+    // `session push` is the reverse: it exports one local bundle and streams it to the
+    // named node. Its first positional argument is the destination, so it must not reach
+    // the generic `--node` SSH redirect below either.
+    if let SessionCommand::Push(args) = command {
+        let ctx = Ctx::build(global, io)?;
+        return Ok(Some(push(&ctx, io, args)?));
+    }
     // The hidden session interfaces run on the home that owns the session. Their `--node`
     // names the executor or surface, not a redirect target, so they must not go through the
     // generic `--node` SSH redirect below.
@@ -138,8 +152,14 @@ pub fn maybe_run_remote(
     let code = match command {
         SessionCommand::New(args) => remote_new(&ctx, io, target, args)?,
         SessionCommand::Switch(args) => remote_switch(&ctx, io, target, &name, args)?,
-        SessionCommand::Export(args) => remote_export(&ctx, io, target, args)?,
-        SessionCommand::Import(args) => remote_import(&ctx, io, target, args)?,
+        SessionCommand::Export(args) => match args.format {
+            SessionFormat::Bundle => remote_export(&ctx, io, target, args)?,
+            SessionFormat::Asif => crate::cmd::session_asif::remote_export(&ctx, io, target, args)?,
+        },
+        SessionCommand::Import(args) => match args.format {
+            SessionFormat::Bundle => remote_import(&ctx, io, target, args)?,
+            SessionFormat::Asif => crate::cmd::session_asif::remote_import(&ctx, io, target, args)?,
+        },
         _ => return Ok(None),
     };
     Ok(Some(code))
@@ -152,8 +172,43 @@ struct RemoteRun {
     stderr: String,
 }
 
-/// Runs `ssh … vowp <args>` with optional stdin and captured output.
+/// One captured remote invocation whose stdout may be binary.
+pub(super) struct RemoteBytesRun {
+    /// Exit code returned by the remote command.
+    pub code: i32,
+    /// Exact remote stdout bytes.
+    pub stdout: Vec<u8>,
+    /// Remote stderr, decoded lossily as UTF-8.
+    pub stderr: String,
+}
+
+/// Runs `ssh … vowp <args>` with optional text stdin and captured output.
 fn run_remote_capture(target: &str, args: &[String], stdin: Option<&str>) -> Result<RemoteRun, CliError> {
+    let run = run_remote_capture_bytes(target, args, stdin.map(str::as_bytes))?;
+    Ok(RemoteRun {
+        code: run.code,
+        stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
+        stderr: run.stderr,
+    })
+}
+
+/// Runs `ssh … vowp <args>` with optional binary stdin and captured binary output.
+pub(super) fn run_remote_capture_bytes(
+    target: &str,
+    args: &[String],
+    stdin: Option<&[u8]>,
+) -> Result<RemoteBytesRun, CliError> {
+    let reader: Option<Box<dyn Read + Send + '_>> =
+        stdin.map(|bytes| Box::new(std::io::Cursor::new(bytes)) as Box<dyn Read + Send + '_>);
+    run_remote_capture_stream(target, args, reader)
+}
+
+/// Runs `ssh … vowp <args>`, streaming an optional reader into the remote stdin.
+pub(super) fn run_remote_capture_stream(
+    target: &str,
+    args: &[String],
+    stdin: Option<Box<dyn Read + Send + '_>>,
+) -> Result<RemoteBytesRun, CliError> {
     let argv = crate::remote::build_ssh_argv(target, args, false);
     let (program, rest) = argv
         .split_first()
@@ -167,10 +222,25 @@ fn run_remote_capture(target: &str, args: &[String], stdin: Option<&str>) -> Res
     let mut child = command
         .spawn()
         .map_err(|error| CliError::Remote(format!("ssh {target}: {error}")))?;
-    if let Some(text) = stdin
+    if let Some(mut reader) = stdin
         && let Some(mut pipe) = child.stdin.take()
     {
-        pipe.write_all(text.as_bytes())?;
+        // A remote command that rejects the document before reading all of it closes
+        // stdin early. Its exit code and stderr are the real result, so a broken pipe
+        // here must not mask them with a local I/O error.
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => return Err(error.into()),
+            };
+            match pipe.write_all(&buffer[..read]) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
     let output = child
         .wait_with_output()
@@ -182,15 +252,15 @@ fn run_remote_capture(target: &str, args: &[String], stdin: Option<&str>) -> Res
     if code == 255 {
         return Err(CliError::Remote(format!("ssh {target} failed with exit 255")));
     }
-    Ok(RemoteRun {
+    Ok(RemoteBytesRun {
         code,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stdout: output.stdout,
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
 
 /// Returns the global arguments a remote session command needs to select the project.
-fn remote_prefix(ctx: &Ctx) -> Vec<String> {
+pub(super) fn remote_prefix(ctx: &Ctx) -> Vec<String> {
     vec!["--project".to_owned(), ctx.project().to_string()]
 }
 
@@ -286,13 +356,19 @@ fn remote_export(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &Session
     Ok(0)
 }
 
-/// Imports a local bundle on a remote node, streaming it over ssh stdin.
-fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &SessionImportArgs) -> Result<i32, CliError> {
-    let text = if args.file == "-" {
-        crate::read_stdin(io)?
-    } else {
-        std::fs::read_to_string(&args.file)?
-    };
+/// Runs the remote importer with one bundle on stdin.
+///
+/// Both `session import --node` and `session push` send the same `vowp-bundle-v1`
+/// document to `vowp --project … --json session import -`; this helper owns that argv so
+/// the two commands cannot drift.
+fn run_remote_import(
+    ctx: &Ctx,
+    target: &str,
+    text: &str,
+    executor: Option<&str>,
+    cwd: Option<&Path>,
+    same_id: bool,
+) -> Result<RemoteRun, CliError> {
     let mut remote = remote_prefix(ctx);
     remote.extend([
         "--json".to_owned(),
@@ -300,16 +376,33 @@ fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &Session
         "import".to_owned(),
         "-".to_owned(),
     ]);
-    if let Some(executor) = &args.executor {
-        remote.extend(["--executor".to_owned(), executor.clone()]);
+    if let Some(executor) = executor {
+        remote.extend(["--executor".to_owned(), executor.to_owned()]);
     }
-    if let Some(cwd) = &args.cwd {
+    if let Some(cwd) = cwd {
         remote.extend(["--cwd".to_owned(), cwd.display().to_string()]);
     }
-    if args.same_id {
+    if same_id {
         remote.push("--same-id".to_owned());
     }
-    let run = run_remote_capture(target, &remote, Some(&text))?;
+    run_remote_capture(target, &remote, Some(text))
+}
+
+/// Imports a local bundle on a remote node, streaming it over ssh stdin.
+fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &SessionImportArgs) -> Result<i32, CliError> {
+    let text = if args.file == "-" {
+        crate::read_stdin(io)?
+    } else {
+        std::fs::read_to_string(&args.file)?
+    };
+    let run = run_remote_import(
+        ctx,
+        target,
+        &text,
+        args.executor.as_deref(),
+        args.cwd.as_deref(),
+        args.same_id,
+    )?;
     if run.code != 0 {
         return relay_failure(io, &run);
     }
@@ -322,12 +415,12 @@ fn remote_import(ctx: &Ctx, io: &mut dyn IoStreams, target: &str, args: &Session
     Ok(0)
 }
 
-/// JSON shape for a cross-node pull.
+/// JSON shape for a cross-node pull or push.
 ///
 /// The default child mode serialises `child_session`; `--same-id` serialises
 /// `same_id_session` instead, so existing consumers keep their exact document.
 #[derive(Debug, serde::Serialize)]
-struct PullOutput {
+struct TransferOutput {
     node: NodeName,
     source_session: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -345,7 +438,7 @@ struct PullOutput {
 /// the source; `--same-id` keeps the source id and refuses a duplicate instead of
 /// overwriting. `--full` instead copies the whole session directory; see [`pull_full`].
 fn pull(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPullArgs) -> Result<i32, CliError> {
-    let (node, target) = pull_target(ctx, &args.node)?;
+    let (node, target) = remote_target(ctx, &args.node)?;
     if args.full {
         return pull_full(ctx, io, &node, &target, args);
     }
@@ -371,7 +464,15 @@ fn pull(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPullArgs) -> Result<i32
     if args.same_id && local_session_present(ctx, &source)? {
         let local = local_head(ctx.deps(), &source)?;
         let remote = bundle::head(&bundle);
-        return report_divergence(ctx, io, &node, &source, &local, &remote);
+        return report_divergence(
+            ctx,
+            io,
+            &node,
+            &source,
+            &local,
+            &remote,
+            "delete or export one side, then pull again",
+        );
     }
     let mode = if args.same_id {
         ImportMode::SameId
@@ -381,14 +482,14 @@ fn pull(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPullArgs) -> Result<i32
     let imported = bundle::import_with_mode(ctx.deps(), &bundle, None, None, mode)?;
     if ctx.json() {
         let output = if args.same_id {
-            PullOutput {
+            TransferOutput {
                 node,
                 source_session: source.clone(),
                 child_session: None,
                 same_id_session: Some(imported.clone()),
             }
         } else {
-            PullOutput {
+            TransferOutput {
                 node,
                 source_session: source.clone(),
                 child_session: Some(imported.clone()),
@@ -404,8 +505,86 @@ fn pull(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPullArgs) -> Result<i32
     Ok(0)
 }
 
-/// Resolves the source node and refuses a local node before any remote work.
-fn pull_target(ctx: &Ctx, node: &str) -> Result<(NodeName, String), CliError> {
+/// Pushes one local session bundle to another node.
+///
+/// The bundle is exported and serialised in memory: no temporary bundle file is written
+/// into the project. The default streams it to the remote importer, which creates a child
+/// whose parent is the local session. `--same-id` first reads the remote head with a
+/// read-only `session show`; an absent id (remote exit 3) proceeds under the origin id, a
+/// present id is reported as a divergence and nothing is exported, imported or mutated on
+/// either side. Every other remote failure is relayed without importing.
+fn push(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionPushArgs) -> Result<i32, CliError> {
+    let (node, target) = remote_target(ctx, &args.node)?;
+    let store = ctx.store()?;
+    let session = resolve_session(&store, &args.session)?;
+    let source = session.id.clone();
+
+    if args.same_id {
+        let run = run_remote_show(ctx, &target, &source)?;
+        match run.code {
+            0 => {
+                let remote = parse_remote_head(&run, &source)?;
+                let local = local_head(ctx.deps(), &source)?;
+                return report_divergence(
+                    ctx,
+                    io,
+                    &node,
+                    &source,
+                    &local,
+                    &remote,
+                    "delete or export one side, then push again",
+                );
+            }
+            // The remote resolver's not-found code means the id is absent there, so the
+            // same-id import can claim it.
+            3 => {}
+            _ => return relay_failure(io, &run),
+        }
+    }
+
+    let bundle = bundle::export(ctx.deps(), &source, 0)?;
+    let text = bundle::to_json(&bundle)?;
+    let imported = run_remote_import(ctx, &target, &text, None, None, args.same_id)?;
+    if imported.code != 0 {
+        return relay_failure(io, &imported);
+    }
+    let remote_session = parse_remote_session(&imported)?;
+
+    if ctx.json() {
+        let output = if args.same_id {
+            TransferOutput {
+                node,
+                source_session: source.clone(),
+                child_session: None,
+                same_id_session: Some(remote_session.id.clone()),
+            }
+        } else {
+            TransferOutput {
+                node,
+                source_session: source.clone(),
+                child_session: Some(remote_session.id.clone()),
+                same_id_session: None,
+            }
+        };
+        print_json(io, &output)?;
+    } else if args.same_id {
+        writeln!(
+            io.out(),
+            "pushed session {source} to {node} with same id {}",
+            remote_session.id
+        )?;
+    } else {
+        writeln!(
+            io.out(),
+            "pushed session {source} to {node} as child {}",
+            remote_session.id
+        )?;
+    }
+    Ok(0)
+}
+
+/// Resolves a remote node for a pull or push and refuses a local node before any remote work.
+fn remote_target(ctx: &Ctx, node: &str) -> Result<(NodeName, String), CliError> {
     let node = NodeName::parse(node)?;
     let store = ctx.store()?;
     let row = store.require_node(&node)?;
@@ -495,7 +674,15 @@ fn pull_full(
         }
         let local = local_head(ctx.deps(), &origin)?;
         let remote = remote_full_head(ctx, target, &origin)?;
-        return report_divergence(ctx, io, node, &origin, &local, &remote);
+        return report_divergence(
+            ctx,
+            io,
+            node,
+            &origin,
+            &local,
+            &remote,
+            "delete or export one side, then pull again",
+        );
     }
     let bytes = manifest.total_bytes();
     if bytes > SESSION_DIR_MAX_BYTES {
@@ -606,12 +793,12 @@ fn full_exists(id: &SessionId) -> CliError {
     ))
 }
 
-/// Reads the source head for a full-pull divergence report.
+/// Runs the read-only remote `session show --json --events 1` for one exact id.
 ///
-/// The directory manifest names the origin but carries no log position, so the source's
-/// existing read-only `session show --json --events 1` supplies its last seq, event,
-/// state and executor. This does not copy the directory and changes nothing.
-fn remote_full_head(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<SessionHead, CliError> {
+/// The remote exit code is returned unchanged: a same-id push treats 3 as "absent" and
+/// every other non-zero code as a remote failure, while the full-pull report treats any
+/// non-zero code as a failure.
+fn run_remote_show(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<RemoteRun, CliError> {
     let mut remote = remote_prefix(ctx);
     remote.extend([
         "--json".to_owned(),
@@ -621,15 +808,11 @@ fn remote_full_head(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<Sessi
         "1".to_owned(),
         origin.to_string(),
     ]);
-    let run = run_remote_capture(target, &remote, None)?;
-    if run.code != 0 {
-        return Err(CliError::Remote(format!(
-            "remote session show for {origin} failed with exit {}: {}",
-            run.code,
-            run.stderr.trim()
-        )));
-    }
+    run_remote_capture(target, &remote, None)
+}
 
+/// Parses a remote `session show --json --events 1` document into a head.
+fn parse_remote_head(run: &RemoteRun, origin: &SessionId) -> Result<SessionHead, CliError> {
     #[derive(serde::Deserialize)]
     struct Show {
         #[serde(flatten)]
@@ -641,14 +824,31 @@ fn remote_full_head(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<Sessi
         .map_err(|error| CliError::Remote(format!("remote printed an invalid session document: {error}")))?;
     if show.session.id != *origin {
         return Err(CliError::Remote(format!(
-            "remote resolved session {} but the manifest named {origin}",
+            "remote resolved session {} but the command named {origin}",
             show.session.id
         )));
     }
     Ok(SessionHead::from_session(&show.session, show.events.last()))
 }
 
-/// The stable JSON code for a pull whose id exists on both sides.
+/// Reads the source head for a full-pull divergence report.
+///
+/// The directory manifest names the origin but carries no log position, so the source's
+/// existing read-only `session show --json --events 1` supplies its last seq, event,
+/// state and executor. This does not copy the directory and changes nothing.
+fn remote_full_head(ctx: &Ctx, target: &str, origin: &SessionId) -> Result<SessionHead, CliError> {
+    let run = run_remote_show(ctx, target, origin)?;
+    if run.code != 0 {
+        return Err(CliError::Remote(format!(
+            "remote session show for {origin} failed with exit {}: {}",
+            run.code,
+            run.stderr.trim()
+        )));
+    }
+    parse_remote_head(&run, origin)
+}
+
+/// The stable JSON code for a pull or push whose id exists on both sides.
 const DIVERGENCE_CODE: &str = "session_divergence";
 
 /// The manual-choice note printed with a divergence report.
@@ -657,13 +857,13 @@ const DIVERGENCE_NOTE: &str = "choose which side advances; no merge performed";
 /// The exit code for a divergence report: the conflict code from `cli.md` §1.1.
 const DIVERGENCE_EXIT: i32 = 4;
 
-/// JSON shape for a divergent pull.
+/// JSON shape for a divergent pull or push.
 #[derive(Debug, serde::Serialize)]
 struct DivergenceOutput {
     error: DivergenceError,
 }
 
-/// The `error` document a divergent pull prints under `--json`.
+/// The `error` document a divergent pull or push prints under `--json`.
 #[derive(Debug, serde::Serialize)]
 struct DivergenceError {
     kind: &'static str,
@@ -718,9 +918,9 @@ fn report_divergence(
     source: &SessionId,
     local: &SessionHead,
     remote: &SessionHead,
+    hint: &'static str,
 ) -> Result<i32, CliError> {
     let message = format!("session {source} exists locally and on {node}; refusing to overwrite or merge");
-    let hint = "delete or export one side, then pull again";
     // The source row names its own node; the operator knows it by the local registry name.
     let remote = SessionHead {
         node: node.clone(),
@@ -948,7 +1148,7 @@ fn private_temp_dir() -> Result<PathBuf, CliError> {
 }
 
 /// Creates a fresh 0700 directory named `<prefix>-<pid>-<millis>-<counter>` under `base`.
-fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, CliError> {
+pub(super) fn private_dir_in(base: &Path, prefix: &str) -> Result<PathBuf, CliError> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     for _ in 0..32 {
         let name = format!(
@@ -1709,8 +1909,34 @@ struct ExportOutput {
     events: usize,
 }
 
+/// Rejects ASIF-only flags on a bundle export.
+fn validate_bundle_export_flags(args: &SessionExportArgs) -> Result<(), CliError> {
+    let invalid = if !args.redact.is_empty() {
+        Some("--redact")
+    } else if !args.redact_file.is_empty() {
+        Some("--redact-file")
+    } else if args.keep_host_paths {
+        Some("--keep-host-paths")
+    } else if args.report.is_some() {
+        Some("--report")
+    } else if args.strict {
+        Some("--strict")
+    } else if args.allow_loss {
+        Some("--allow-loss")
+    } else if args.asif_stream {
+        Some("--asif-stream")
+    } else {
+        None
+    };
+    match invalid {
+        Some(flag) => Err(CliError::Invalid(format!("{flag} is only valid with --format asif"))),
+        None => Ok(()),
+    }
+}
+
 /// Exports a session bundle.
 fn export(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionExportArgs) -> Result<i32, CliError> {
+    validate_bundle_export_flags(args)?;
     let store = ctx.store()?;
     let session = resolve_session(&store, &args.id)?;
     let bundle = bundle::export(ctx.deps(), &session.id, args.tail.unwrap_or(0))?;
@@ -1743,8 +1969,28 @@ fn export(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionExportArgs) -> Result
     Ok(0)
 }
 
+/// Rejects ASIF-only flags on a bundle import.
+fn validate_bundle_import_flags(args: &SessionImportArgs) -> Result<(), CliError> {
+    let invalid = if args.branch.is_some() {
+        Some("--branch")
+    } else if args.report.is_some() {
+        Some("--report")
+    } else if args.strict {
+        Some("--strict")
+    } else if args.allow_loss {
+        Some("--allow-loss")
+    } else {
+        None
+    };
+    match invalid {
+        Some(flag) => Err(CliError::Invalid(format!("{flag} is only valid with --format asif"))),
+        None => Ok(()),
+    }
+}
+
 /// Imports a bundle as a child session.
 fn import(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionImportArgs) -> Result<i32, CliError> {
+    validate_bundle_import_flags(args)?;
     if let Some(node) = &args.node {
         let name = vowp_protocol::NodeName::parse(node)?;
         let store = ctx.store()?;
@@ -1961,19 +2207,22 @@ fn import_transcript(ctx: &Ctx, store: &Store, path: &Path) -> Result<usize, Cli
             let Some((body, actor)) = transcript_event(entry) else {
                 continue;
             };
+            let event = vowp_store::session_log::NewEvent {
+                actor,
+                source: EventSource {
+                    harness,
+                    model: Some(CLAUDE_MODEL.to_owned()),
+                    node: Some(ctx.config().node.name.clone()),
+                    native_session_id: Some(native.clone()),
+                },
+                body,
+                raw: Some(line.value.clone()),
+                ts: None,
+            };
+            // Redact exact values from the mapped body and the raw transcript line
+            // before the log line is written. A failure fails the import.
             let appended = log
-                .append(vowp_store::session_log::NewEvent {
-                    actor,
-                    source: EventSource {
-                        harness,
-                        model: Some(CLAUDE_MODEL.to_owned()),
-                        node: Some(ctx.config().node.name.clone()),
-                        native_session_id: Some(native.clone()),
-                    },
-                    body,
-                    raw: Some(line.value.clone()),
-                    ts: None,
-                })
+                .append(vowp_core::vault::redact_event(ctx.deps(), event)?)
                 .map_err(vowp_core::CoreError::from)?;
             store.index_event(&vowp_store::session_log::index_row(&appended))?;
             store.insert_native_event(
@@ -2257,8 +2506,8 @@ fn capsule_path(ctx: &Ctx, session: &SessionId, capsule_id: &vowp_protocol::Caps
     })
 }
 
-/// Resolves a session id or unique prefix.
-fn resolve_session(store: &Store, input: &str) -> Result<Session, CliError> {
+/// Resolves a session by exact id or unique prefix.
+pub(super) fn resolve_session(store: &Store, input: &str) -> Result<Session, CliError> {
     if let Ok(id) = SessionId::parse(input)
         && let Some(session) = store.session(&id)?
     {

@@ -37,6 +37,10 @@ struct StatusOutput {
 struct ProjectStatus {
     name: String,
     state: &'static str,
+    /// Jobs on the card that hold their lock.
+    ///
+    /// A lock-holding parent in `fixing` or a `stalled` row is included, so this can be
+    /// larger than [`Slots::busy`], which counts only runs with an executor.
     running: u32,
     ready: u32,
     blocked: u32,
@@ -174,10 +178,16 @@ fn fleet_jobs_by_state(snapshot: &Snapshot) -> BTreeMap<String, u32> {
     jobs
 }
 
-/// Counts running jobs across every project card.
+/// Counts running jobs with a live run across every project card.
+///
+/// A card lists every job that holds its lock (`running`, `stalled`, `gating`,
+/// `reviewing`, `fixing`, `merging`). A parent in `fixing`, or a `stalled` row, holds its
+/// paths and worktree without an open run, so its card reports no executor. Only a card
+/// built from an open run carries an executor, and only those runs occupy a slot.
 fn fleet_slots_busy(snapshot: &Snapshot) -> u32 {
     snapshot.projects.iter().fold(0_u32, |total, project| {
-        total.saturating_add(u32::try_from(project.running.len()).unwrap_or(u32::MAX))
+        let live = project.running.iter().filter(|run| run.executor.is_some()).count();
+        total.saturating_add(u32::try_from(live).unwrap_or(u32::MAX))
     })
 }
 
@@ -229,6 +239,8 @@ fn print_human(
     }
     writeln!(io.out(), "home: {}", fleet.home)?;
     writeln!(io.out(), "projects:")?;
+    // A card lists every lock holder, including a parent in `fixing` or a `stalled` row
+    // with no open run; the `slots:` line below counts only runs with an executor.
     for project in &fleet.projects {
         let ready = project.jobs_by_state.get("ready").copied().unwrap_or(0);
         writeln!(

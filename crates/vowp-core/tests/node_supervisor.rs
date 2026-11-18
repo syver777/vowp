@@ -12,9 +12,9 @@ use vowp_core::loops::NodeSupervisor;
 use vowp_core::requests::{Request, push};
 use vowp_core::{Deps, SystemGit};
 use vowp_protocol::{
-    ActiveState, Cost, FakeClock, InboxState, Job, JobId, JobKind, JobState, MemoryLog, NewJob, NodeName, Project,
-    ProjectName, ProjectState, Role, Run, RunId, RunPurpose, RunRole, Session, SessionRole, SessionState, Timestamp,
-    VowpConfig,
+    ActiveState, CancelToken, Cost, FakeClock, InboxState, Job, JobId, JobKind, JobState, MemoryLog, NewJob, NodeName,
+    Project, ProjectName, ProjectState, Role, Run, RunId, RunPurpose, RunRole, Session, SessionRole, SessionState,
+    Timestamp, VowpConfig,
 };
 use vowp_store::{MigrationReport, NodePaths, RunFinish, Store};
 use vowp_tmux::fake::FakeWindows;
@@ -832,6 +832,186 @@ fn startup_returns_the_migration_it_was_given() {
     node.record_migration(migration.clone());
     let report = node.startup().expect("startup");
     assert_eq!(report.migration, Some(migration));
+}
+
+#[test]
+fn drain_mode_finishes_in_flight_run_without_admitting_ready_jobs() {
+    let env = NodeEnv::new();
+    let alpha = env.add_project("alpha", |_| {});
+    let running = env.insert_job(&alpha, "finish-then-drain", JobState::Running);
+    let queued = env.insert_job(&alpha, "wait-for-the-next-supervisor", JobState::Ready);
+
+    // The run ended before the tick but the job is still `running`: drain maintenance must
+    // harvest it, and must not start the ready job in the same pass.
+    let worktree = env.tmp.path().join("drain-worktree");
+    let report_path = worktree.join(&running.report);
+    std::fs::create_dir_all(report_path.parent().expect("report parent")).expect("report dir");
+    std::fs::write(
+        &report_path,
+        format!(
+            "---\njob: {}\nstatus: done\nbranch: job/{}\ncommits: []\ntests: \"cargo test: pass\"\n\
+             files_changed: []\nopen_items: []\nquestions_for_owner: []\n---\n\nDone.\n",
+            running.id, running.id
+        ),
+    )
+    .expect("report");
+    Store::open_with_project(&env.paths, &alpha)
+        .expect("alpha store")
+        .set_job_workspace(
+            &running.id,
+            Some(&format!("job/{}", running.id)),
+            Some(&worktree.display().to_string()),
+        )
+        .expect("workspace");
+    let run = env.insert_run(
+        &alpha,
+        Some(&running.id),
+        None,
+        Timestamp::from_unix_secs(0),
+        Some(vowp_protocol::RunOutcome::Ok),
+    );
+
+    std::fs::write(env.paths.root().join("drain"), "test").expect("drain marker");
+    let mut node = NodeSupervisor::new(env.deps.clone()).expect("supervisor");
+    node.startup().expect("startup");
+    let report = node.tick().expect("maintenance tick");
+
+    let tick = report.projects.get(&alpha).expect("alpha ticked");
+    assert!(
+        !tick.steps.iter().any(|step| step.name == "dispatch"),
+        "a drain must not dispatch: {tick:?}"
+    );
+    assert!(
+        tick.steps.iter().any(|step| step.name == "harvest"),
+        "a drain keeps harvesting: {tick:?}"
+    );
+    assert!(
+        tick.transitions
+            .iter()
+            .any(|(id, from, to)| id == &running.id && *from == JobState::Running && *to == JobState::Gating),
+        "the in-flight run advanced: {:?}",
+        tick.transitions
+    );
+    let store = Store::open_with_project(&env.paths, &alpha).expect("alpha store");
+    assert_eq!(
+        store.require_job(&running.id).expect("running job").state,
+        JobState::Gating
+    );
+    assert_eq!(
+        store.require_job(&queued.id).expect("queued job").state,
+        JobState::Ready,
+        "the ready job was not admitted during the drain"
+    );
+    assert_eq!(
+        store.require_run(&run.id).expect("run").outcome,
+        Some(vowp_protocol::RunOutcome::Ok)
+    );
+    assert!(node.drain_requested());
+
+    // The foreground loop keeps ticking maintenance until any gate task spawned by the
+    // harvest has also completed, then exits on its own and removes the marker.
+    node.run(&CancelToken::default()).expect("run drains and exits");
+    assert!(node.drained());
+    assert_eq!(node.active_children(), 0, "the run, gates and harvest completed");
+    assert!(
+        !env.paths.root().join("drain").exists(),
+        "a completed drain removes the marker"
+    );
+    assert_eq!(
+        store.require_job(&queued.id).expect("queued job").state,
+        JobState::Ready,
+        "the ready job stays ready after the supervisor exits"
+    );
+}
+
+#[test]
+fn selective_project_reload_keeps_other_projects_running() {
+    let env = NodeEnv::new();
+    let alpha = env.add_project("alpha", |_| {});
+    let beta = env.add_project("beta", |_| {});
+    let alpha_job = env.insert_job(&alpha, "alpha-parked", JobState::Parked);
+    let beta_job = env.insert_job(&beta, "beta-parked", JobState::Parked);
+
+    let mut node = NodeSupervisor::new(env.deps.clone()).expect("supervisor");
+    node.startup().expect("startup");
+    // Keep the planner/keeper role turns out of this test: only project state matters.
+    for project in [&alpha, &beta] {
+        let store = Store::open_with_project(&env.paths, project).expect("project store");
+        store
+            .set_loop_state("l4-planner", ActiveState::Paused)
+            .expect("pause planner");
+        store
+            .set_loop_state("l5-keeper", ActiveState::Paused)
+            .expect("pause keeper");
+    }
+    assert_eq!(node.project(&alpha).expect("alpha").generation(), 0);
+    assert_eq!(node.project(&beta).expect("beta").generation(), 0);
+
+    // Crash residue that only a project startup repairs. It must be gone after the reload
+    // proves the project supervisor was actually re-opened.
+    let residue = env.insert_session(&alpha, SessionState::Running);
+
+    push(&env.global(), &Request::ReloadProject { project: alpha.clone() }).expect("reload request");
+    let report = node.tick().expect("tick");
+    let global_step = report
+        .steps
+        .iter()
+        .find(|step| step.name == "global")
+        .expect("global step");
+    assert!(
+        report.projects.contains_key(&beta),
+        "beta still ticked: {global_step:?} {:?}",
+        env.log.lines()
+    );
+    assert!(
+        global_step.detail.contains("1 node request(s) applied"),
+        "reload request applied: {global_step:?}"
+    );
+
+    assert_eq!(
+        node.project(&alpha).expect("alpha").generation(),
+        1,
+        "alpha's supervisor was re-opened; log: {:?}",
+        env.log.lines()
+    );
+    assert_eq!(
+        node.project(&beta).expect("beta").generation(),
+        0,
+        "beta's supervisor was untouched"
+    );
+    let alpha_store = Store::open_with_project(&env.paths, &alpha).expect("alpha store");
+    assert_eq!(
+        alpha_store.session(&residue).expect("session").expect("row").state,
+        SessionState::Idle,
+        "alpha's reload ran startup reconciliation"
+    );
+    let beta_store = Store::open_with_project(&env.paths, &beta).expect("beta store");
+    assert_eq!(
+        beta_store.require_job(&beta_job.id).expect("beta job").state,
+        JobState::Parked,
+        "beta's work was not disturbed"
+    );
+    assert!(
+        Store::open_with_project(&env.paths, &alpha)
+            .expect("alpha store")
+            .require_job(&alpha_job.id)
+            .is_ok()
+    );
+    assert!(
+        env.log.contains("project alpha reloaded"),
+        "the reload is recorded: {:?}",
+        env.log.lines()
+    );
+
+    // The web-window restart is a node request too; it never recreates a project.
+    push(&env.global(), &Request::RestartWebWindow).expect("restart request");
+    node.tick().expect("tick");
+    assert!(
+        node.take_web_window_restart(),
+        "the restart request reached the wrapper"
+    );
+    assert_eq!(node.project(&alpha).expect("alpha").generation(), 1);
+    assert_eq!(node.project(&beta).expect("beta").generation(), 0);
 }
 
 #[test]

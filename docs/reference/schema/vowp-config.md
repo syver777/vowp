@@ -456,7 +456,7 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
       "description": "A job's bounded fix loop.",
       "properties": {
         "max_attempts": {
-          "default": 3,
+          "default": 2,
           "description": "Maximum fix rounds before `on_exhausted` applies.",
           "format": "uint32",
           "minimum": 0,
@@ -798,6 +798,163 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
       "description": "Node name slug, for example `vps`.",
       "type": "string"
     },
+    "OffloadConfig": {
+      "additionalProperties": false,
+      "description": "Offload settings from `[offload]`.\n\nDefaults disabled: every job stays on the home until the owner enables offload and a\nproject opts in with a placement. Validation rejects a zero fleet or disk cap and a\n`node:<name>` fleet default. `result_transport` is `push` by default and `bundle` is the\nread-only-node alternative; the two are mutually exclusive per assignment.",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/Placement",
+          "default": "home",
+          "description": "Fleet default placement; `home` or `any`."
+        },
+        "enabled": {
+          "default": false,
+          "description": "Whether any job may leave the home.",
+          "type": "boolean"
+        },
+        "grace_secs": {
+          "default": 600,
+          "description": "Disconnect grace period in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_remote_runs": {
+          "default": 2,
+          "description": "Fleet-wide cap on simultaneous remote runs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_disk_bytes": {
+          "default": 5368709120,
+          "description": "Free-disk reserve a node must keep, in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "nodes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/OffloadNodeConfig"
+          },
+          "default": {},
+          "description": "Per-node policy overrides.",
+          "type": "object"
+        },
+        "pause_on_home_brake": {
+          "default": false,
+          "description": "Whether an active home brake also stops remote dispatch.",
+          "type": "boolean"
+        },
+        "projects": {
+          "additionalProperties": {
+            "$ref": "#/$defs/OffloadProjectConfig"
+          },
+          "default": {},
+          "description": "Per-project policy overrides.",
+          "type": "object"
+        },
+        "require_clean_base": {
+          "default": true,
+          "description": "Refuse a node whose base checkout is not clean.",
+          "type": "boolean"
+        },
+        "result_transport": {
+          "$ref": "#/$defs/ResultTransport",
+          "default": "push",
+          "description": "How a remote run returns its result."
+        }
+      },
+      "type": "object"
+    },
+    "OffloadNodeConfig": {
+      "additionalProperties": false,
+      "description": "Per-node offload overrides from `[offload.nodes.<name>]`.",
+      "properties": {
+        "allow_battery": {
+          "default": false,
+          "description": "Whether the node may receive new runs while on battery or thermally limited.",
+          "type": "boolean"
+        },
+        "labels": {
+          "default": [],
+          "description": "Labels the node must have enrolled.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_workers": {
+          "default": null,
+          "description": "Worker cap for this node; `None` uses the node's reported `max_slots`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OffloadProjectConfig": {
+      "additionalProperties": false,
+      "description": "Per-project offload policy from `[offload.projects.<name>]`.",
+      "properties": {
+        "allow_kinds": {
+          "default": [
+            "build",
+            "test",
+            "docs",
+            "fix",
+            "verify"
+          ],
+          "description": "Job kinds allowed to leave the home.",
+          "items": {
+            "$ref": "#/$defs/JobKind"
+          },
+          "type": "array"
+        },
+        "allow_secrets": {
+          "default": [],
+          "description": "Secret names the project allows a node to resolve locally.",
+          "items": {
+            "$ref": "#/$defs/SecretName"
+          },
+          "type": "array"
+        },
+        "deny_kinds": {
+          "default": [
+            "merge",
+            "promote",
+            "release"
+          ],
+          "description": "Job kinds refused for offload.",
+          "items": {
+            "$ref": "#/$defs/JobKind"
+          },
+          "type": "array"
+        },
+        "home_only": {
+          "default": false,
+          "description": "The project never leaves the home, even with a per-job placement.",
+          "type": "boolean"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Project placement default; `None` falls back to [`OffloadConfig::default`]."
+        }
+      },
+      "type": "object"
+    },
     "OnCreditsExhausted": {
       "description": "What to do when a provider reports exhausted credits.",
       "oneOf": [
@@ -847,6 +1004,10 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
           "type": "string"
         }
       ]
+    },
+    "Placement": {
+      "description": "Where a job may run.\n\nThe wire form is one short string: `home`, `any`, `node:<name>` or\n`node:<name>+home`. Parsing rejects an unknown selector, an empty node, whitespace,\n`/` or `:` inside the node part and an unknown fallback. The node is a\n[`NodeName`] slug. [`Placement::Home`] is the default and there is no silent\nfallback: `node:<name>+home` is an explicit opt-in.",
+      "type": "string"
     },
     "PriceEntry": {
       "additionalProperties": false,
@@ -1062,6 +1223,21 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
       },
       "type": "object"
     },
+    "ResultTransport": {
+      "description": "How a remote run returns its result.",
+      "oneOf": [
+        {
+          "const": "push",
+          "description": "Push the job branch from the node; the home fetches and verifies it.",
+          "type": "string"
+        },
+        {
+          "const": "bundle",
+          "description": "Return a `base..head` git bundle over the agent connection; the home verifies it\nand imports only the verified head.",
+          "type": "string"
+        }
+      ]
+    },
     "ReviewGate": {
       "description": "The `review` gate: a verifier role must review the work.",
       "properties": {
@@ -1229,6 +1405,10 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
         "action"
       ],
       "type": "object"
+    },
+    "SecretName": {
+      "description": "A validated secret name: `^[A-Z][A-Z0-9_]{0,63}$`.",
+      "type": "string"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1302,6 +1482,22 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
         "tz_offset_minutes": 0
       },
       "description": "Node-wide settings."
+    },
+    "offload": {
+      "$ref": "#/$defs/OffloadConfig",
+      "default": {
+        "default": "home",
+        "enabled": false,
+        "grace_secs": 600,
+        "max_remote_runs": 2,
+        "min_disk_bytes": 5368709120,
+        "nodes": {},
+        "pause_on_home_brake": false,
+        "projects": {},
+        "require_clean_base": true,
+        "result_transport": "push"
+      },
+      "description": "Offload policy."
     },
     "profiles": {
       "additionalProperties": {

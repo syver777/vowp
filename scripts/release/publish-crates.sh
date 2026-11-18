@@ -47,6 +47,7 @@ done
 # Publish order: dependencies first.
 CRATES=(
   vowp-protocol
+  vowp-agent
   vowp-store
   vowp-graph
   vowp-tmux

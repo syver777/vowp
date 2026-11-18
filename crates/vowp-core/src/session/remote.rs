@@ -15,9 +15,9 @@ use std::time::{Duration, Instant};
 
 use vowp_protocol::{
     Actor, AttachAction, BLOB_SPILL_BYTES, CostEvent, ErrorEvent, ErrorKind, EventBody, EventEnvelope, EventSource,
-    EventType, Executor, ExecutorRef, HarnessKind, Limit, LimitEvent, LimitRowKind, NodeName, RemoteEvent, RemoteLine,
-    RemoteUsage, Run, RunId, RunOutcome, RunPurpose, RunRole, RunUsage, Session, SessionExecutor, SessionId,
-    SessionRole, SessionState, StopReason, Timestamp, TurnEnded, TurnGrant, TurnStarted, UserMessage,
+    EventType, Executor, ExecutorRef, HarnessKind, Level, Limit, LimitEvent, LimitRowKind, NodeName, RemoteEvent,
+    RemoteLine, RemoteUsage, Run, RunId, RunOutcome, RunPurpose, RunRole, RunUsage, Session, SessionExecutor,
+    SessionId, SessionRole, SessionState, StopReason, Timestamp, TurnEnded, TurnGrant, TurnStarted, UserMessage,
 };
 use vowp_store::session_files::{AdapterMapping, add_adapter_mapping};
 use vowp_store::session_log::{AppendedEvent, NewEvent, SessionLog, index_row};
@@ -297,6 +297,8 @@ pub struct IngestSession<'a> {
     done: bool,
     events: u64,
     duplicates: u64,
+    /// Last head commit reported in a preceding `RunState` frame, when any.
+    reported_head: Option<String>,
 }
 
 impl<'a> IngestSession<'a> {
@@ -325,7 +327,17 @@ impl<'a> IngestSession<'a> {
             done: false,
             events: 0,
             duplicates: 0,
+            reported_head: None,
         })
+    }
+
+    /// Remembers the head commit a `RunState` frame reported for this run.
+    ///
+    /// The frame arrives before `TurnEnd` on the same connection. The value is only a
+    /// convenience hint: the dispatcher also records a durable copy with the assignment, so
+    /// a reconnect can verify the same head after an in-memory loss.
+    pub fn set_reported_head(&mut self, head: Option<&str>) {
+        self.reported_head = head.map(str::trim).filter(|head| !head.is_empty()).map(str::to_owned);
     }
 
     /// Processes one JSON line and writes its acknowledgement(s).
@@ -732,7 +744,7 @@ impl<'a> IngestSession<'a> {
         };
         self.store
             .set_session_state(&self.grant.session, state, executor.as_ref())?;
-        let finish = RunFinish {
+        let mut finish = RunFinish {
             outcome,
             exit_code,
             limit_kind: limit.as_ref().map(|limit| limit.kind),
@@ -748,7 +760,34 @@ impl<'a> IngestSession<'a> {
                 1500,
             ),
         };
+        // An offloaded run returns its work by pushing `job/<id>`. Verify and gate the
+        // fetched branch before the run row is closed; a rejection turns the summary into
+        // `git_push_failed`/`result_gate_failed` and keeps the job retryable.
+        let settled = match crate::agent::result::settle_terminal(
+            self.deps,
+            self.store,
+            &run,
+            self.reported_head.as_deref(),
+            finish.outcome,
+            finish.detail.clone(),
+        ) {
+            Ok(settled) => settled,
+            Err(error) => {
+                self.deps.log.log(
+                    Level::Warn,
+                    "result",
+                    &format!("result return for {} failed: {:?}", self.grant.run, error.kind()),
+                );
+                crate::agent::result::Settled {
+                    outcome: RunOutcome::Error,
+                    detail: format!("result_return_failed: {:?}", error.kind()),
+                }
+            }
+        };
+        finish.outcome = settled.outcome;
+        finish.detail = settled.detail;
         self.store.finish_run(&self.grant.run, &finish)?;
+        let outcome = finish.outcome;
 
         if let Some(limit) = &limit {
             record_limit(self.store, limit, harness)?;

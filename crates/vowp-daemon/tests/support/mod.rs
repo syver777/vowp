@@ -393,7 +393,24 @@ fn request(
         stream.write_all(body.as_bytes()).expect("write body");
     }
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).expect("read response");
+    let mut buffer = [0u8; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            // Retry an interrupted read, as `read_to_end` did.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            // macOS resets a connection when the server closes it while a rejected request
+            // body is still unread. The response bytes already received are complete.
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+            Err(error) => panic!("read response: {error:?}"),
+        }
+    }
+    assert!(
+        response.starts_with(b"HTTP/"),
+        "the server closed without writing an HTTP status line ({} bytes)",
+        response.len()
+    );
     let split = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

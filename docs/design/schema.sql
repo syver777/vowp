@@ -67,7 +67,7 @@ CREATE TABLE jobs (
   brief_path       TEXT NOT NULL,       -- relative to the project checkout: .vowp/jobs/<id>/brief.md
   report_path      TEXT NOT NULL,       -- .vowp/jobs/<id>/report.md
   gates_json       TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(gates_json)),   -- [Gate]
-  loop_json        TEXT NOT NULL DEFAULT '{"until":"gates","max_attempts":3,"on_exhausted":"escalate"}'
+  loop_json        TEXT NOT NULL DEFAULT '{"until":"gates","max_attempts":2,"on_exhausted":"escalate"}'
                      CHECK (json_valid(loop_json)),                              -- JobLoop
   branch           TEXT,                -- job/<id> once a worktree exists
   worktree         TEXT,                -- absolute path of the job worktree

@@ -289,13 +289,15 @@ re-run `vowp secret upgrade`. Without sudo, VOWP stays in basic mode; injection 
 work, but the runtime user owns the secret files.
 
 **A secret value appears in a log or report.** Rotate the secret and remove the value from the
-artifact. Redaction replaces injected exact values with `[REDACTED:<NAME>]` on the session-service and
-remote-ingest event paths, in the snapshot, in capsules, and in a finished report and run mirror. It
-is not applied to the supervisor log, gate command evidence, ledger rows, the `session switch` harness
-events or the `session watch` importer, so a value a command printed can remain in those files;
-restrict access to `~/.vowp`. The full list is in the [security model](security.md#redaction). If the
-value is in a path that should be redacted, stop and report the file and the secret **name** only. Do
-not paste the value into a public issue.
+artifact. Redaction replaces injected exact values with `[REDACTED:<NAME>]` on every session event
+path (the service, remote ingest, a switch turn and the `session watch` importer), in the snapshot, in
+capsules, in the supervisor log, in command-gate evidence and ledger rows, and in a finished report and
+run mirror. It matches only the exact stored value, so a transformed or encoded copy can remain;
+restrict access to `~/.vowp`. The supervisor loads the secret values at
+startup, so a secret added after it started is covered at the next supervisor restart. The full list
+is in the [security model](security.md#redaction). If the value is in a path that should be
+redacted, stop and report the file and the secret **name** only. Do not paste the value into a
+public issue.
 
 **A backup says `secrets/: never backed up`.** That is correct. Restore the home, then set each secret
 again with `vowp secret set NAME`. Never put a secret in a backup or an encrypted archive as a

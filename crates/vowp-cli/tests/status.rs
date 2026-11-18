@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use vowp_protocol::{
-    InboxId, InboxItem, InboxKind, InboxState, JobId, JobKind, JobState, NewJob, NodeName, Project, ProjectName, Role,
-    Session, SessionId, SessionRole, SessionState, Timestamp, VowpConfig,
+    Cost, Executor, InboxId, InboxItem, InboxKind, InboxState, JobId, JobKind, JobState, NewJob, NodeName, Project,
+    ProjectName, Role, Run, RunId, RunPurpose, RunRole, Session, SessionId, SessionRole, SessionState, Timestamp,
+    VowpConfig,
 };
 use vowp_store::{NodePaths, StateChange, Store};
 
@@ -341,20 +342,57 @@ fn insert_job(env: &common::TestEnv, project: &ProjectName, id: &str) {
         .expect("insert job");
 }
 
-/// Moves a job in a named project to `running`.
-fn set_running(env: &common::TestEnv, project: &ProjectName, id: &str) {
+/// Moves a job in a named project to `state`.
+fn set_state(env: &common::TestEnv, project: &ProjectName, id: &str, state: JobState) {
     let paths = NodePaths::new(env.home_path());
     let store = Store::open_with_project(&paths, project).expect("project store");
     store
         .set_job_state(
             &JobId::parse(id).expect("job id"),
-            JobState::Running,
+            state,
             &StateChange {
                 note: None,
                 parked_reason: None,
             },
         )
-        .expect("running job");
+        .expect("job state");
+}
+
+/// Moves a job in a named project to `running`.
+fn set_running(env: &common::TestEnv, project: &ProjectName, id: &str) {
+    set_state(env, project, id, JobState::Running);
+}
+
+/// Inserts one open run for a job, as the dispatcher would for a live worker.
+fn insert_open_run(env: &common::TestEnv, project: &ProjectName, id: &str, executor: &str) {
+    let paths = NodePaths::new(env.home_path());
+    let store = Store::open_with_project(&paths, project).expect("project store");
+    let now = store.clock().now();
+    store
+        .insert_run(&Run {
+            id: RunId::new(),
+            job_id: Some(JobId::parse(id).expect("job id")),
+            session_id: None,
+            role: RunRole::Worker,
+            purpose: RunPurpose::Start,
+            profile: None,
+            rung: 0,
+            executor: Some(Executor::parse(executor).expect("executor")),
+            provider: Some("deepseek".to_owned()),
+            node: NodeName::parse("local").expect("node"),
+            native_session_id: None,
+            pid: None,
+            window: None,
+            cwd: None,
+            started_at: now.minus(Duration::from_secs(30)),
+            ended_at: None,
+            exit_code: None,
+            outcome: None,
+            limit_kind: None,
+            cost: Cost::unknown(),
+            detail: String::new(),
+        })
+        .expect("open run");
 }
 
 /// Inserts one session row attributed to a named project.
@@ -498,6 +536,8 @@ fn two_project_home_routes_status_board_and_fleet() {
     insert_job(&env, &beta, "b02-beta-pending");
     set_running(&env, &alpha, "a01-alpha-run");
     set_running(&env, &beta, "b01-beta-run");
+    insert_open_run(&env, &alpha, "a01-alpha-run", "opencode:deepseek/deepseek-flash");
+    insert_open_run(&env, &beta, "b01-beta-run", "opencode:deepseek/deepseek-flash");
     insert_session(&env, &alpha, "alpha session");
     insert_session(&env, &beta, "beta session");
 
@@ -598,6 +638,56 @@ fn two_project_home_routes_status_board_and_fleet() {
         "beta's queued job leaked into alpha: {value}"
     );
     assert!(snapshot_path(&env).is_file(), "--refresh wrote the snapshot");
+    drop(beta_dir);
+}
+
+/// A parent in `fixing` and a `stalled` row hold locks without a run, so they must not take
+/// slots; only the live fix child does, and `slots` says 1/6 rather than 3/6.
+#[test]
+fn fleet_slots_busy_ignores_lock_holders_without_live_run() {
+    let env = common::TestEnv::new();
+    let outside = tempfile::tempdir().expect("outside dir");
+    let project = env.config.project.name.clone();
+    let parent = env.insert_job("n01-parent", "Parent", JobKind::Build, &[]);
+    let fix = env.insert_job("n02-fix", "Fix child", JobKind::Fix, &[]);
+    let stalled = env.insert_job("n03-stalled", "Stalled", JobKind::Build, &[]);
+    // A second project makes a bare `status` use the fleet context instead of selecting
+    // the only project.
+    let (beta_dir, _) = add_project(&env, "beta");
+    set_state(&env, &project, parent.id.as_str(), JobState::Fixing);
+    set_state(&env, &project, fix.id.as_str(), JobState::Running);
+    set_state(&env, &project, stalled.id.as_str(), JobState::Stalled);
+    insert_open_run(&env, &project, fix.id.as_str(), "opencode:deepseek/deepseek-flash");
+
+    let output = run_bare_in(&env, outside.path(), &["status"]);
+    assert!(
+        output.status.success(),
+        "vowp status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("slots: 1/6"),
+        "only the live run takes a slot:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("test/n03-stalled  -"),
+        "the stalled lock holder is still listed without an executor:\n{stdout}"
+    );
+
+    let value = output_json(&run_bare_in(&env, outside.path(), &["--json", "status"]));
+    assert_eq!(value["slots"]["busy"], 1, "one live run is one busy slot: {value}");
+    assert_eq!(value["slots"]["total"], 6, "{value}");
+    let projects = value["projects"].as_array().expect("projects");
+    assert_eq!(projects.len(), 2, "{value}");
+    let test = projects
+        .iter()
+        .find(|project| project["name"] == "test")
+        .unwrap_or_else(|| panic!("missing test project row: {value}"));
+    assert_eq!(
+        test["running"], 3,
+        "the project row still counts the lock holders it lists: {value}"
+    );
     drop(beta_dir);
 }
 

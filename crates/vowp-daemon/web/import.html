@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP import</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0 0 .6rem; font-size: 1rem; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .form { display: grid; gap: .55rem; max-width: 34rem; }
+  .form label { font-weight: 600; }
+  .form input[type="text"],
+  .form input[type="password"] {
+    width: 100%;
+    padding: .45rem .55rem;
+    border: 1px solid var(--line);
+    border-radius: .4rem;
+    background: var(--paper);
+    color: var(--ink);
+    font: inherit;
+  }
+  .form button {
+    justify-self: start;
+    padding: .45rem .9rem;
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    background: var(--accent);
+    color: var(--paper);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .form button:disabled { opacity: .6; cursor: progress; }
+  .status { margin: .2rem 0 0; font-weight: 600; }
+  .status[data-state="error"] { color: var(--warn); }
+  .status[data-state="done"] { color: var(--accent); }
+  .result { display: grid; gap: .35rem; }
+  .bullets { margin: 0; padding-left: 1.15rem; }
+  .bullets li { margin: .15rem 0; overflow-wrap: anywhere; }
+  [hidden] { display: none !important; }
+  @media (max-width: 360px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+  }
+</style>
+</head>
+<body>
+<main id="import">
+  <header class="page-head">
+    <div>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">← Board</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/import" aria-current="page">Import</a>
+      </nav>
+      <h1 id="heading">Import ASIF</h1>
+      <p class="muted">Upload one <span class="mono">.asif.zip</span> package as a new session. The import is token-gated and never starts a turn.</p>
+    </div>
+  </header>
+
+  <p id="error" class="status" role="alert" data-state="error" hidden></p>
+
+  <section class="card" id="unlock-panel" aria-labelledby="unlock-heading" hidden>
+    <h2 id="unlock-heading">Unlock import</h2>
+    <p class="muted">Paste the daemon write token. It stays in this tab's sessionStorage and is never put in the URL.</p>
+    <form id="unlock-form" class="form">
+      <label for="token">Token</label>
+      <input id="token" name="token" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit">Save token</button>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="upload-heading">
+    <h2 id="upload-heading">Package</h2>
+    <form id="upload-form" class="form">
+      <label for="file">ASIF package</label>
+      <input id="file" name="file" type="file" accept=".asif.zip,application/zip" required>
+      <p id="file-note" class="muted" aria-live="polite">No file selected.</p>
+      <label for="branch">Branch (optional)</label>
+      <input id="branch" name="branch" type="text" autocomplete="off" spellcheck="false"
+             placeholder="main">
+      <p class="muted">A package with more than one branch requires a branch name; the API error names the choice when it is missing.</p>
+      <p class="muted">The archive limit is 272 MiB. Host paths are scrubbed; exact secrets are not detected. The import is not continued automatically.</p>
+      <button id="upload-submit" type="submit">Import package</button>
+    </form>
+    <p id="status" class="status" role="status" aria-live="polite" hidden></p>
+  </section>
+
+  <section class="card" id="result-panel" aria-labelledby="result-heading" hidden>
+    <h2 id="result-heading">Imported session</h2>
+    <div class="result">
+      <p><a id="session-link" class="mono" href="/sessions">Open session</a></p>
+      <dl class="result" id="result-facts">
+        <div><dt class="muted">Events</dt><dd id="result-events">–</dd></div>
+        <div><dt class="muted">Losses</dt><dd id="result-losses">–</dd></div>
+      </dl>
+      <ul id="result-warnings" class="bullets"></ul>
+      <p class="muted">The imported session is idle. It is not continued automatically and no turn, capsule or job is started.</p>
+    </div>
+  </section>
+</main>
+
+<noscript>The import page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const TOKEN_KEY = "vowp-api-token";
+  const MAX_ARCHIVE_BYTES = 272 * 1024 * 1024;
+  const LIMIT_TEXT = "272 MiB";
+  const errorLine = document.getElementById("error");
+  const unlockPanel = document.getElementById("unlock-panel");
+  const unlockForm = document.getElementById("unlock-form");
+  const tokenInput = document.getElementById("token");
+  const uploadForm = document.getElementById("upload-form");
+  const fileInput = document.getElementById("file");
+  const fileNote = document.getElementById("file-note");
+  const branchInput = document.getElementById("branch");
+  const submit = document.getElementById("upload-submit");
+  const statusLine = document.getElementById("status");
+  const resultPanel = document.getElementById("result-panel");
+  const sessionLink = document.getElementById("session-link");
+  const resultEvents = document.getElementById("result-events");
+  const resultLosses = document.getElementById("result-losses");
+  const resultWarnings = document.getElementById("result-warnings");
+
+  function storedToken() {
+    try {
+      return window.sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function setStoredToken(value) {
+    try {
+      if (value) {
+        window.sessionStorage.setItem(TOKEN_KEY, value);
+      } else {
+        window.sessionStorage.removeItem(TOKEN_KEY);
+      }
+    } catch {
+      // A browser with storage disabled cannot unlock; the page still loads.
+    }
+    updateUnlock();
+  }
+
+  function updateUnlock() {
+    unlockPanel.hidden = storedToken() !== "";
+  }
+
+  function clearError() {
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+  }
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function showStatus(message, state) {
+    statusLine.textContent = message;
+    statusLine.dataset.state = state;
+    statusLine.hidden = false;
+  }
+
+  function hideStatus() {
+    statusLine.textContent = "";
+    statusLine.hidden = true;
+    delete statusLine.dataset.state;
+  }
+
+  async function errorDetail(response) {
+    try {
+      const body = await response.json();
+      if (body && body.error && body.error.message) return body.error.message;
+    } catch {
+      // Fall back to the HTTP status when the body is not the API error document.
+    }
+    return "HTTP " + response.status;
+  }
+
+  function describeResult(body) {
+    const report = body.report || {};
+    const counts = report.counts || {};
+    sessionLink.href = "/sessions/" + encodeURIComponent(body.session.id);
+    sessionLink.textContent = "Open session " + body.session.id;
+    resultEvents.textContent = String(counts.events_out ?? "unknown");
+    const losses = report.loss_count ?? 0;
+    resultLosses.textContent = String(losses);
+    resultWarnings.replaceChildren();
+    const warnings = Array.isArray(body.warnings) ? body.warnings : [];
+    for (const warning of warnings) {
+      const item = document.createElement("li");
+      item.textContent = String(warning);
+      resultWarnings.appendChild(item);
+    }
+    resultPanel.hidden = false;
+  }
+
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files && fileInput.files[0];
+    fileNote.textContent = file ? "Selected archive: " + file.size + " bytes." : "No file selected.";
+  });
+
+  unlockForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = tokenInput.value.trim();
+    if (!value) {
+      showError("Enter the daemon write token.");
+      return;
+    }
+    setStoredToken(value);
+    tokenInput.value = "";
+    clearError();
+    showStatus("Token saved for this tab.", "done");
+  });
+
+  uploadForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    clearError();
+    hideStatus();
+    const token = storedToken();
+    if (!token) {
+      updateUnlock();
+      showError("Unlock import with the daemon write token first.");
+      return;
+    }
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      showError("Choose an .asif.zip package first.");
+      return;
+    }
+    if (file.size > MAX_ARCHIVE_BYTES) {
+      showError("The package exceeds the " + LIMIT_TEXT + " archive limit and was not sent.");
+      return;
+    }
+    let url = "/api/v1/sessions/import/asif";
+    const branch = branchInput.value.trim();
+    if (branch) url += "?branch=" + encodeURIComponent(branch);
+    submit.disabled = true;
+    showStatus("Importing…", "working");
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + token,
+          "Content-Type": "application/zip",
+        },
+        body: file,
+      });
+      if (response.status === 201) {
+        describeResult(await response.json());
+        showStatus("Imported. The session is idle and is not continued automatically.", "done");
+        uploadForm.reset();
+        fileNote.textContent = "No file selected.";
+        return;
+      }
+      if (response.status === 401) {
+        setStoredToken("");
+        showStatus("The token was rejected. Unlock with the current daemon write token.", "error");
+        return;
+      }
+      if (response.status === 413) {
+        showStatus("The package exceeds the " + LIMIT_TEXT + " archive limit.", "error");
+        return;
+      }
+      if (response.status === 503) {
+        showStatus("Writes are disabled: the daemon was started without VOWP_API_TOKEN.", "error");
+        return;
+      }
+      showStatus("Could not import the package (" + (await errorDetail(response)) + ").", "error");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showStatus("Could not import the package (" + detail + ").", "error");
+    } finally {
+      submit.disabled = false;
+    }
+  });
+
+  updateUnlock();
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

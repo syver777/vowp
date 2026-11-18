@@ -41,18 +41,25 @@ pub fn current(store: &Store) -> Result<CapacityTarget, CoreError> {
     current_at(store, store.clock().now(), None)
 }
 
-/// Returns the current worker target, letting the caller supply the provider cap.
+/// Returns the current worker target reading the live config cell in `deps`.
 ///
 /// The `deps`-aware overload exists because the configured provider `max_concurrent` values
 /// are not stored in the database; the exported [`current`] keeps its original signature.
 pub fn current_for(deps: &Deps, store: &Store, now: Timestamp) -> Result<CapacityTarget, CoreError> {
-    let provider_cap = deps
-        .config
-        .providers
-        .values()
-        .map(|provider| provider.max_concurrent)
-        .min();
-    current_at_with(store, now, provider_cap, deps.config.node.max_workers.max(MIN_TARGET))
+    current_with_config(&super::reload::effective_config(deps), store, now)
+}
+
+/// Returns the current worker target for an explicit config document.
+///
+/// The reload checker uses this to preview the target the on-disk config would produce
+/// without swapping the live cell.
+pub fn current_with_config(
+    config: &vowp_protocol::VowpConfig,
+    store: &Store,
+    now: Timestamp,
+) -> Result<CapacityTarget, CoreError> {
+    let provider_cap = config.provider_caps().values().copied().min();
+    current_at_with(store, now, provider_cap, config.node.max_workers.max(MIN_TARGET))
 }
 
 /// Returns the current target with an explicit provider cap.

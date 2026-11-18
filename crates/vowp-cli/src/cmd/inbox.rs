@@ -180,9 +180,9 @@ fn answer(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxAnswerArgs) -> Result<i
         .or_else(|| std::env::var("USER").ok())
         .unwrap_or_else(|| "cli".to_owned());
     let answered = store.answer_inbox(&item.id, &answer_text, &by)?;
-    if answered.job_id.is_some() {
-        requests::push(&store, &Request::AnswerInbox { id: item.id.clone() })?;
-    }
+    // Provider-level questions have no job_id, but the supervisor still has to
+    // clear the provider limit and resolve every parked job for that provider.
+    requests::push(&store, &Request::AnswerInbox { id: item.id.clone() })?;
     if ctx.json() {
         print_json(io, &answered)?;
     } else {

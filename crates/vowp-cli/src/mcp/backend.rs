@@ -577,14 +577,14 @@ impl<'a> Backend<'a> {
             None => global,
         };
         let answered = store.answer_inbox(&item.id, answer, &self.actor())?;
-        if answered.job_id.is_some() {
-            requests::push(
-                &store,
-                &Request::AnswerInbox {
-                    id: answered.id.clone(),
-                },
-            )?;
-        }
+        // Provider-level questions have no job_id, but the supervisor still has
+        // to clear the limit and resolve every parked job for that provider.
+        requests::push(
+            &store,
+            &Request::AnswerInbox {
+                id: answered.id.clone(),
+            },
+        )?;
         self.record(
             &store,
             answered.project.clone(),

@@ -1,11 +1,12 @@
 # v0.3 — web / PWA window
 
 Status: moved from `docs/design/v0.2/` by the v0.2 spec; planned for v0.3, not v0.2. The static
-board, session, capsule, cost, inbox and nodes pages, the cost chart, the token-gated inbox answer
-and local session switch, and the PWA manifest/service-worker shell are implemented. `vowp up`
-starts the serving `vowp-daemon` as a separate child process, prints the window address and the
-actual-port `vowp tunnel open window` hint, and the rest of this note is design. v0.1 has no
-browser UI and no listening socket.
+board, session, capsule, cost, inbox, nodes, jobs and job-detail pages, the cost chart, the
+token-gated inbox answer, local session switch, job retry/park/cancel and the four keeper
+actions, and the PWA manifest/service-worker
+shell are implemented. `vowp up` starts the serving `vowp-daemon` as a separate child process,
+prints the window address and the actual-port `vowp tunnel open window` hint, and the rest of this
+note is design. v0.1 has no browser UI and no listening socket.
 
 ## Goal
 
@@ -19,13 +20,18 @@ tunnel. It should answer the questions an operator asks from a browser without o
 - **Capsule view** — the capsule's metadata and structured fields (`at_seq`, trigger, `from`
   executor, intent, constraints, decisions, state, files, gotchas and open questions).
 - **Board** — job counts, running jobs, slot occupancy, limits, today's cost and open inbox count.
+- **Jobs** — every job in the served project with its state and the fields an operator needs,
+  plus token-gated retry, park and cancel controls, and a detail view with the job's runs and
+  gate results and the token-gated keeper actions (nudge, restart, replan, fail).
 
 The board uses the same JSON shape as `vowp board --json`; the session list and event timeline use
-the API from [`http-api.md`](http-api.md). Reads are token-free. This slice has two browser
-writes: answering an inbox item uses the existing request queue behind the daemon bearer token,
-and the session detail page switches the local executor through the same `SessionService` switch
-as the CLI (the queue has no switch variant). The switch is local-node only, requires the token,
-and shows the drain and its blocked result.
+the API from [`http-api.md`](http-api.md). Reads are token-free. The browser writes are answering an
+inbox item through the existing request queue, switching the local executor on the session detail
+page through the same `SessionService` switch as the CLI (the queue has no switch variant),
+retrying, parking or cancelling a job from the jobs page through the queued job-action routes, and
+nudging, restarting, replanning or failing a job from the detail page through the queued keeper
+routes. They all sit behind the daemon bearer token. The switch is local-node only, requires the
+token, and shows the drain and its blocked result.
 
 ## Non-goals
 
@@ -49,14 +55,15 @@ and shows the drain and its blocked result.
   implemented slices deliberately skip the build step: every page is a hand-written HTML shell
   with inline CSS and vanilla JavaScript.
 - Routes: `/` (board; `/board` is its phone alias), `/sessions`, `/sessions/:id`,
-  `/sessions/:id/capsules/:capsuleId`, `/nodes`, `/cost`, `/inbox`. All are implemented, with
-  `/nodes` a read-only node list and no node mutation or SSH path.
+  `/sessions/:id/capsules/:capsuleId`, `/nodes`, `/cost`, `/inbox`, `/jobs` and `/jobs/:id`.
+  All are implemented, with `/nodes` a read-only node list and no node mutation or SSH path;
+  `/jobs/:id` is the job detail page with the four token-gated keeper controls.
 - PWA manifest and a small hand-written service worker; cache only the static shell, never cache
   event data as authoritative.
-- The write token is kept in `sessionStorage`, never in a URL. The inbox page and the session
-  switch form show a one-field unlock panel when no token is stored; a `401` clears it and shows
-  the panel again. Rotating the token means restarting the daemon with a new `VOWP_API_TOKEN`,
-  then unlocking again.
+- The write token is kept in `sessionStorage`, never in a URL. The inbox, session switch, jobs and
+  job detail pages show a one-field unlock panel when no token is stored; a `401` clears it and shows
+  the panel again. Rotating the token means restarting the daemon with a new `VOWP_API_TOKEN`, then
+  unlocking again.
 - SSE with `after_seq` resume and a visible "reconnecting" state; fall back to polling if SSE fails.
   The session timeline uses the per-session stream with `after_seq` resume. The board uses the
   snapshot `/api/v1/board/stream` with reconnect and polling fallback. The cost, inbox and nodes
@@ -89,7 +96,7 @@ or close the page shows a visible "Reconnecting..." state, retries with bounded 
 backoff and keeps the five-second polling fallback until a stream open succeeds. If
 `EventSource` is unavailable the page polls only. A failed fetch or stream keeps the last board
 and its timestamp visible. The page uses text labels as well as colour and carries a
-`<noscript>` message. It links to `/sessions`, `/cost` and `/inbox`.
+`<noscript>` message. It links to `/jobs`, `/sessions`, `/cost` and `/inbox`.
 
 `vowp up` starts this daemon for the window as a separate `vowp-daemon` child process, prints
 `web window: http://127.0.0.1:<port>/` together with the exact `vowp tunnel open window
@@ -129,9 +136,10 @@ The same page is the PWA at any width. On a phone, use `/board` for the narrow c
 same shell is also at `/`) and add the tunnel's local URL to the home screen. Reads need no
 token. `VOWP_API_TOKEN` is set in the environment that runs `vowp up` (for example the systemd
 unit), inherited by the daemon, and typed into a page's unlock panel; the page keeps it in
-`sessionStorage` and only the inbox answer and session switch writes use it. The value is never
-put in a URL, logged or returned by the API. Rotating the token means restarting the daemon with
-a new value and unlocking again.
+`sessionStorage` and only the inbox answer, session switch, ASIF import, jobs action and keeper
+action writes use it. The
+value is never put in a URL, logged or returned by the API. Rotating the token means restarting
+the daemon with a new value and unlocking again.
 
 The session pages are the same kind of embedded static shell,
 `crates/vowp-daemon/web/sessions.html`, served at `GET /sessions` and `GET /sessions/{id}`. The
@@ -165,9 +173,26 @@ result line. Submitting posts `{to, reason, force}` to
 the current turn may drain for up to five seconds. A `200` shows the returned `Switch` state
 and `error` and refreshes the session; a failed request shows the `ApiError` message and never
 claims the executor moved. The token stays in `sessionStorage`, a `401` clears it and a `503`
-shows the disabled line; it is never put in the URL. The page carries
+shows the disabled line; it is never put in the URL. The sessions nav also links the separate
+`/import` page. The detail page carries an "Export ASIF" card with a plain
+`<a download>` link to `/api/v1/sessions/{id}/export/asif` and a "Preview declared losses"
+button that fetches `?report=1` and shows either `N losses: kind, kind…` or
+"No declared losses.". The card says host paths are scrubbed but exact secrets are not
+detected, points to the CLI `vowp session export --format asif --redact-file <file>` for a
+specific redaction list, and says the export is semantic interchange with declared losses, not
+lossless. A failed preview leaves the download link usable. The page carries
 `<noscript>The session view requires JavaScript.</noscript>`, links back to the board and to
 cost and inbox, and never prints the token value, the home path or a provider secret.
+
+The ASIF import page is `crates/vowp-daemon/web/import.html`, served at `GET /import`. It uses
+the same token unlock and `sessionStorage` key as the session page, a file input accepting
+`.asif.zip,application/zip`, an optional branch text field and a submit button. The page
+checks the 272 MiB archive size in the browser, posts the raw file with an explicit
+`Content-Type: application/zip`, `Authorization: Bearer` and no multipart form or filename,
+and shows the new session link, the event and loss counts, the optional warnings and the
+"not continued automatically" note. A `401` clears the token, a `413` names the limit, a
+`400` shows the API hint and a `503` shows the writes-disabled line. It loads no external
+script, font or image, and it links back to the sessions page.
 
 The capsule page is `crates/vowp-daemon/web/capsule.html`, served at
 `GET /sessions/{id}/capsules/{capsule_id}`. The shell reads its own path and fetches
@@ -225,6 +250,47 @@ no add, remove or probe control and no SSH, exec or write path. It links to the 
 cost and inbox, carries `<noscript>The nodes page requires JavaScript.</noscript>`, and never
 prints a home path, token or provider secret.
 
+The jobs page is `crates/vowp-daemon/web/jobs.html`, served at `GET /jobs`. It fetches
+`GET /api/v1/jobs` on load and every five seconds, and after an action, and renders a table of job
+id, state, kind, role, priority, needs, attempts, updated time and note. Each job id links to
+the detail page at `/jobs/{id}`. A long list scrolls
+horizontally inside its own table wrapper, so the page stays usable on a narrow screen. Reads are
+token-free; a failed fetch shows an error line and keeps the last list and its "last updated" time
+visible, and an empty list shows "No jobs." The page carries the shared unlock panel: the
+`VOWP_API_TOKEN` value lives in `sessionStorage` (never the URL), a `401` clears it and shows the
+panel again, and a daemon started without a token shows the disabled `503` line. Actions appear
+only after unlock and only when the state allows them: retry for `failed`, `stalled` and `parked`;
+park and cancel for every non-terminal state; no actions for `done`, `cancelled` or `replanned`.
+Retry and cancel post to `/api/v1/jobs/{id}/retry` and `/api/v1/jobs/{id}/cancel`; park asks for an
+optional reason and posts `{"reason":"<text>"}` to `/api/v1/jobs/{id}/park`, and cancel asks for
+confirmation first. Every action sends `Authorization: Bearer`, shows the queued `202` outcome,
+refreshes the list and renders the API error message on `4xx`/`5xx`. The page is a consumer only:
+it never writes a job row and adds no API route. It links to the other pages, carries
+`<noscript>The jobs page requires JavaScript.</noscript>`, and never prints a home path, token
+value or provider secret. Job SSE for the list remains later work.
+
+The job-detail page is `crates/vowp-daemon/web/job.html`, served at `GET /jobs/{id}`. It
+reads the id from its own path and fetches `GET /api/v1/jobs/{id}`,
+`GET /api/v1/jobs/{id}/runs` and `GET /api/v1/jobs/{id}/gates` on load. It renders the job
+id, state, kind, role, priority, attempts, updated time, needs and note; a runs table with
+run id, role, purpose, executor, provider, node, started, ended, exit, outcome and limit; and
+a gates table with attempt, gate index, kind, passed, duration and timestamp. The job id
+links to its sessions at `/sessions?job=<id>`, and the page links back to `/jobs` and keeps
+the shared nav and a visible "last updated" line. A `404` for an unknown job shows "Job not
+found." while keeping the nav and the back link. The page carries the shared unlock panel:
+the `VOWP_API_TOKEN` value lives in `sessionStorage` (never the URL), a `401` clears it and
+shows the panel again, and a daemon started without a token shows the disabled `503` line.
+Keeper controls appear only after unlock and only when the graph's state table allows them:
+nudge and restart for `stalled`; replan for `stalled`, `parked` and `failed`; fail for
+`stalled` with a required reason prompt. There is no control for `done`, `cancelled` or
+`replanned`. Every control posts to `/api/v1/jobs/{id}/nudge`, `/restart`, `/replan` or
+`/fail` with `Authorization: Bearer`, shows the queued `202` outcome, refreshes the job and
+its runs and gates, and renders the API error message on `4xx`/`5xx`; fail posts
+`{"reason":"<text>"}`. The page never writes a job row itself. It never renders the stored
+`worktree`, `brief`, `owns`, `cwd` or `window` fields, a home path, a token value or a
+provider secret. It carries `<noscript>The job page requires JavaScript.</noscript>`.
+SSE for the jobs list and browser chat remain later work.
+
 ## PWA shell (implemented)
 
 `vowp-daemon` serves the installable shell assets, embedded with `include_str!` like the pages:
@@ -237,9 +303,10 @@ prints a home path, token or provider secret.
   `Service-Worker-Allowed: /`, so it can control the root scope and updates are revalidated.
 
 The service worker is hand-written with no build step. On install it opens cache
-`vowp-shell-v2` and caches a bounded `SHELL` list: `/`, `/board`, `/sessions`, `/cost`,
-`/inbox`, `/nodes`, `/manifest.webmanifest` and `/icon.svg`. The version was bumped from v1 when
-the cost page gained its chart, so existing clients replace the older shell; on activate the worker
+`vowp-shell-v4` and caches a bounded `SHELL` list: `/`, `/board`, `/jobs`, `/sessions`,
+`/import`, `/cost`, `/inbox`, `/nodes`, `/manifest.webmanifest` and `/icon.svg`. The version
+was bumped from v3 when the ASIF import page joined the shell, so existing clients replace
+the older shell; on activate the worker
 deletes every other cache version. The fetch handler bypasses `/api/` and any `/stream` URL (and
 any request whose `Accept` names `text/event-stream`) entirely: those requests go to the network
 only and are never cached. Navigations are network-first with a cached shell fallback, and other same-origin GET
@@ -255,10 +322,11 @@ Every page shell links `/manifest.webmanifest`, carries
 
 There is no Node or TypeScript build step and no browser test:
 `crates/vowp-daemon/tests/board_page.rs`, `session_page.rs`, `capsule_page.rs`,
-`cost_inbox_pages.rs`, `nodes_page.rs` and `pwa.rs` are HTTP-only tests over a temporary home and
-a real `127.0.0.1:0` listener, and `tests/sse.rs` reads real chunked stream bodies. The cost-page
-test pins the inline chart container and its accessible label, the selector and five-second
-refresh wiring, the unknown-row and empty-report paths, and the no-external-library rule, then
+`cost_inbox_pages.rs`, `nodes_page.rs`, `jobs_page.rs`, `job_detail.rs` and `pwa.rs` are HTTP-only tests over a
+temporary home and a real `127.0.0.1:0` listener, and `tests/sse.rs` reads real chunked stream
+bodies. The cost-page test pins the inline chart container and its accessible label, the selector
+and five-second refresh wiring, the unknown-row and empty-report paths, and the
+no-external-library rule, then
 reads `/api/v1/cost` in the same test to prove the chart's data source includes known rows and a
 null USD row. The board-page test pins the stream path, the `board` and `heartbeat` handlers, the
 "Reconnecting..." text and the polling fallback without running a browser. The session-page test pins the stream path, the `after_seq` resume, the
@@ -267,7 +335,14 @@ session-detail path, the capsule field labels, the lineage links, the "View caps
 no-capsule branch, and fetches `/api/v1/sessions/{id}` in the same test to prove the panel's data
 source. It also pins the switch route, the `Authorization: Bearer` header, the shared
 `vowp-api-token` storage key, the force warning and the visible state/error line, and proves the
-page and its API response never contain the token value or home path. The capsule-page test pins
+page and its API response never contain the token value or home path. The ASIF download test
+compares the streamed package with a direct core export, pins the attachment and loss headers,
+validates the report preview, allows a session outside the served project and pins the
+`404`/`409`/`413` paths with no leftover temp directory. The ASIF import test builds synthetic
+packages, pins the token-before-body checks, content types, the capped upload removal, the
+idle session and `Location`, branch selection, duplicate-id conflict and the absence of
+uploaded bytes, filenames or temp paths from every response; the import-page test pins the raw
+zip body, Bearer header, browser size check, `401` clearing and the no-filename rule. The capsule-page test pins
 the capsule API path, the metadata and section labels, the
 session back link, the `<noscript>` fallback and the absence of paths or secrets, fetches
 `/api/v1/sessions/{id}/capsules/{capsuleId}` in the same test to prove the page's data source, and
@@ -277,15 +352,31 @@ unlock, the queued message, the `401` and `503` lines, and the absence of a toke
 answer API test proves the write itself. The nodes-page test pins the `/api/v1/nodes` fetch, the
 node column labels, the empty and failed-fetch messages and the `<noscript>` fallback, and reads
 the same endpoint to prove the page's data source is a schema-valid `NodePage` of the stored
-local and remote nodes. The PWA test parses the manifest, pins the three asset content types and
-the service-worker headers, checks the bounded `SHELL` list and the API/SSE bypass, and asserts
-every page shell links and registers the service worker without printing a home path or token.
+local and remote nodes. The jobs-page test pins the `/api/v1/jobs` fetch, the job column labels,
+the five-second and after-action refresh, the state-to-action mapping (retry only for
+failed/stalled/parked, park and cancel for non-terminal states, none for terminal states), the
+cancel confirmation, the `Authorization: Bearer` write header, the shared `sessionStorage` unlock
+panel, the queued `202` and `401`/`503` paths and the `<noscript>` fallback; it also reads the same
+endpoint to prove the page's data source is a schema-valid `JobPage` and proves the existing retry,
+park and cancel routes still answer. The job-detail-page test pins the `/jobs/{id}` shell, the
+`/api/v1/jobs/{id}`, `/runs` and `/gates` fetches, the job and runs/gates column labels, the
+`/sessions?job=` and `/jobs` links, the not-found text, the four keeper controls, the shared
+unlock panel, the exact state lists (nudge/restart/fail only for `stalled`, replan also for
+`parked` and `failed`, none for terminal states), the `Authorization: Bearer` write, the
+queued `202` refresh, the `401` and `503` paths, and the absence of a home path, token value
+or the `worktree`, `brief`, `owns`, `cwd` and `window`
+fields; it reads the same three endpoints to prove the shell's data sources, and the job-detail
+API test pins the single `Job`, the `400` for an invalid id, the `404` for an unknown job, the
+run order (`started_at`, then `id`) and the newest-attempt gate order. The PWA test parses the manifest, pins the three asset content
+types and the service-worker headers, checks the bounded `SHELL` list and the API/SSE bypass, and
+asserts every page shell links and registers the service worker without printing a home path or
+token.
 The CLI `up` tests pin the printed window URL and the actual-port
 `vowp tunnel open window --remote-port <port>` hint, and prove a missing daemon warns without
 printing a hint.
 
-Still later: the reconnect UI on the pages that still poll, cross-node switching, dismiss and the
-other write actions, and a token rotation service.
+Still later: SSE for the jobs list, browser chat, the reconnect UI on the pages that still poll,
+cross-node switching, dismiss and the other write endpoints, and a token rotation service.
 Offline data entry, offline event data and push notifications remain out of scope. Markdown
 rendering, capsule editing and capsule writes remain out of scope. The API routes and their
 fallback are otherwise unchanged; unknown non-API paths still return the API's JSON 404.

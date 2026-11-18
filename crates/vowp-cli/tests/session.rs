@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -416,6 +417,59 @@ fn run_cli(env: &common::TestEnv, remote: &RemoteNode, args: &[&str]) -> std::pr
         .expect("run vowp")
 }
 
+/// Runs the real binary with the local home/project, a remote `VOWP_HOME` and a cwd.
+fn run_cli_in_dir(
+    env: &common::TestEnv,
+    remote: &RemoteNode,
+    args: &[&str],
+    cwd: &std::path::Path,
+) -> std::process::Output {
+    let tmp = env.home_path().join("tmp");
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let path = format!("{}:/usr/bin:/bin", remote.bin.path().display());
+    env.command(env!("CARGO_BIN_EXE_vowp"))
+        .env("PATH", path)
+        .env("VOWP_HOME", remote.home.path())
+        .env("TMPDIR", &tmp)
+        .current_dir(cwd)
+        .arg("--home")
+        .arg(env.home_path())
+        .arg("--project")
+        .arg(env.project_path())
+        .args(args)
+        .output()
+        .expect("run vowp")
+}
+
+/// Runs the real binary with the local home/project, a remote `VOWP_HOME` and stdin.
+fn run_cli_stdin(env: &common::TestEnv, remote: &RemoteNode, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    let tmp = env.home_path().join("tmp");
+    std::fs::create_dir_all(&tmp).expect("tmp dir");
+    let path = format!("{}:/usr/bin:/bin", remote.bin.path().display());
+    let mut child = env
+        .command(env!("CARGO_BIN_EXE_vowp"))
+        .env("PATH", path)
+        .env("VOWP_HOME", remote.home.path())
+        .env("TMPDIR", &tmp)
+        .arg("--home")
+        .arg(env.home_path())
+        .arg("--project")
+        .arg(env.project_path())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn vowp");
+    child
+        .stdin
+        .take()
+        .expect("stdin pipe")
+        .write_all(stdin)
+        .expect("write stdin");
+    child.wait_with_output().expect("run vowp")
+}
+
 /// Returns the text of one stream.
 fn output_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
@@ -601,6 +655,384 @@ fn session_cross_node_export_import_switch_via_fake_ssh() {
     );
 }
 
+#[test]
+fn session_export_asif_remote_stream_verifies_bytes_and_hash() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    let remote_id = new_session_in(&env, remote.home.path(), "remote asif stream");
+    let out = env.project_path().join("remote-stream.asif.zip");
+    let out_text = out.to_str().expect("path");
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session", "export", &remote_id, "--node", "vps", "--format", "asif", "--out", out_text,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "remote ASIF export failed: {}",
+        output_text(&output.stderr)
+    );
+    let direct = env.project_path().join("remote-direct.asif.zip");
+    let output = run_in_home(
+        &env,
+        remote.home.path(),
+        &[
+            "session",
+            "export",
+            &remote_id,
+            "--format",
+            "asif",
+            "--out",
+            direct.to_str().expect("path"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "direct ASIF export failed: {}",
+        output_text(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&out).expect("remote stream bytes"),
+        std::fs::read(&direct).expect("direct bytes"),
+        "the remote stream must carry the exact deterministic package"
+    );
+    vowp_asif::unpack(&out).expect("the received package unpacks");
+
+    let output = run_cli_in_dir(
+        &env,
+        &remote,
+        &["session", "export", &remote_id, "--node", "vps", "--format", "asif"],
+        env.project_path(),
+    );
+    assert!(
+        output.status.success(),
+        "remote default-name export failed: {}",
+        output_text(&output.stderr)
+    );
+    let default_name = format!("{remote_id}.asif.zip");
+    assert_eq!(output_text(&output.stdout).trim(), default_name);
+    assert!(env.project_path().join(&default_name).is_file());
+
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session", "export", &remote_id, "--node", "vps", "--format", "asif", "--out", "-",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "remote stdout export failed: {}",
+        output_text(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        std::fs::read(&direct).expect("direct bytes"),
+        "remote --out - must carry the exact package"
+    );
+    assert!(output_text(&output.stderr).contains("declared losses"));
+
+    let corrupt = env.project_path().join("remote-corrupt.asif.zip");
+    let envelope = serde_json::json!({
+        "format": "vowp-asif-export-stream-v1",
+        "session": remote_id,
+        "bytes": 3,
+        "sha256": "0".repeat(64),
+        "report": {
+            "adapter_version": "0.1.1",
+            "asif_version": "0.4",
+            "asif_pin": "652d9e23ddbe5656b9ceea311df7e09e93c1cd2f",
+            "source_session": remote_id,
+            "target_session": null,
+            "counts": {"events_in": 0, "events_out": 0, "resources": 0, "capsules": 0},
+            "loss_count": 0,
+            "losses": [],
+            "unsupported": []
+        }
+    });
+    let script = format!("#!/bin/sh\nprintf '%s\\n' '{}'\nprintf 'PK!'\n", envelope);
+    install_ssh(&remote, &script);
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "export",
+            &remote_id,
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+            "--out",
+            corrupt.to_str().expect("path"),
+        ],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "a digest mismatch must exit 7: {}",
+        output_text(&output.stderr)
+    );
+    assert!(!corrupt.exists(), "a failed verification must leave no package");
+}
+
+#[test]
+fn session_export_asif_remote_failure_writes_no_local_file() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    install_ssh(&remote, "#!/bin/sh\nprintf 'remote export refused\\n' >&2\nexit 9\n");
+    let out = env.project_path().join("remote-failure.asif.zip");
+    let id = vowp_protocol::SessionId::new().to_string();
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "export",
+            &id,
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+            "--out",
+            out.to_str().expect("path"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(9));
+    assert!(!out.exists(), "a failed remote export must write nothing locally");
+    assert!(output_text(&output.stderr).contains("remote export refused"));
+}
+
+#[test]
+fn session_export_asif_remote_report_is_refused_with_exit_two() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    install_ssh(&remote, "#!/bin/sh\nprintf 'ssh should not run\\n' >&2\nexit 9\n");
+    let id = vowp_protocol::SessionId::new().to_string();
+    let out = env.project_path().join("remote-report.asif.zip");
+    let report = env.project_path().join("remote-report.json");
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "export",
+            &id,
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+            "--out",
+            out.to_str().expect("path"),
+            "--report",
+            report.to_str().expect("path"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!output_text(&output.stderr).contains("ssh should not run"));
+    assert!(!out.exists());
+    assert!(!report.exists());
+}
+
+#[test]
+fn session_import_asif_remote_streams_and_relays_the_response() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    let local_id = create(&env);
+    let package = env.project_path().join("remote-import.asif.zip");
+    let (code, _, stderr) = env.run(&[
+        "session",
+        "export",
+        &local_id,
+        "--format",
+        "asif",
+        "--out",
+        package.to_str().expect("path"),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "import",
+            package.to_str().expect("path"),
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "remote ASIF import failed: {}",
+        output_text(&output.stderr)
+    );
+    let imported_id = output_text(&output.stdout).trim().to_owned();
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    remote_store
+        .require_session(&vowp_protocol::SessionId::parse(&imported_id).expect("id"))
+        .expect("remote session");
+    assert!(
+        env.store()
+            .session(&vowp_protocol::SessionId::parse(&imported_id).expect("id"))
+            .expect("local lookup")
+            .is_none(),
+        "a remote import must not create a local session"
+    );
+
+    let second = create(&env);
+    let second_package = env.project_path().join("remote-stdin.asif.zip");
+    let (code, _, stderr) = env.run(&[
+        "session",
+        "export",
+        &second,
+        "--format",
+        "asif",
+        "--out",
+        second_package.to_str().expect("path"),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let bytes = std::fs::read(&second_package).expect("package bytes");
+    let output = run_cli_stdin(
+        &env,
+        &remote,
+        &["session", "import", "-", "--node", "vps", "--format", "asif"],
+        &bytes,
+    );
+    assert!(
+        output.status.success(),
+        "remote stdin import failed: {}",
+        output_text(&output.stderr)
+    );
+    let stdin_id = output_text(&output.stdout).trim().to_owned();
+    remote_store
+        .require_session(&vowp_protocol::SessionId::parse(&stdin_id).expect("id"))
+        .expect("remote stdin session");
+}
+
+#[test]
+fn session_import_asif_remote_failure_creates_no_local_session() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    let local_id = create(&env);
+    let package = env.project_path().join("remote-import-failure.asif.zip");
+    let (code, _, stderr) = env.run(&[
+        "session",
+        "export",
+        &local_id,
+        "--format",
+        "asif",
+        "--out",
+        package.to_str().expect("path"),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let local_before = env
+        .store()
+        .list_sessions(&vowp_store::SessionFilter::default())
+        .expect("local sessions")
+        .len();
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let remote_before = remote_store
+        .list_sessions(&vowp_store::SessionFilter::default())
+        .expect("remote sessions")
+        .len();
+    install_ssh(&remote, "#!/bin/sh\nprintf 'remote import refused\\n' >&2\nexit 9\n");
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "import",
+            package.to_str().expect("path"),
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(9));
+    assert!(output_text(&output.stderr).contains("remote import refused"));
+    assert_eq!(
+        env.store()
+            .list_sessions(&vowp_store::SessionFilter::default())
+            .expect("local sessions")
+            .len(),
+        local_before
+    );
+    assert_eq!(
+        remote_store
+            .list_sessions(&vowp_store::SessionFilter::default())
+            .expect("remote sessions")
+            .len(),
+        remote_before
+    );
+}
+
+#[test]
+fn session_import_asif_remote_report_is_refused_with_exit_two() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    install_ssh(&remote, "#!/bin/sh\nprintf 'ssh should not run\\n' >&2\nexit 9\n");
+    let local_id = create(&env);
+    let package = env.project_path().join("remote-import-report.asif.zip");
+    let (code, _, stderr) = env.run(&[
+        "session",
+        "export",
+        &local_id,
+        "--format",
+        "asif",
+        "--out",
+        package.to_str().expect("path"),
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let report = env.project_path().join("remote-import-report.json");
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "import",
+            package.to_str().expect("path"),
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+            "--report",
+            report.to_str().expect("path"),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!output_text(&output.stderr).contains("ssh should not run"));
+    assert!(!report.exists());
+}
+
+#[test]
+fn session_import_asif_remote_directory_is_refused() {
+    let env = common::TestEnv::new();
+    let remote = remote_node(&env);
+    install_ssh(&remote, "#!/bin/sh\nprintf 'ssh should not run\\n' >&2\nexit 9\n");
+    let output = run_cli(
+        &env,
+        &remote,
+        &[
+            "session",
+            "import",
+            env.project_path().to_str().expect("path"),
+            "--node",
+            "vps",
+            "--format",
+            "asif",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output_text(&output.stderr).contains("directory"));
+    assert!(!output_text(&output.stderr).contains("ssh should not run"));
+}
+
 /// Runs one CLI command against an explicit home and the shared test project.
 fn run_in_home(env: &common::TestEnv, home: &Path, args: &[&str]) -> std::process::Output {
     env.command(env!("CARGO_BIN_EXE_vowp"))
@@ -740,10 +1172,25 @@ fn append_dangling_tool_result(home: &Path, id: &str, sha256: &str) {
 
 /// Returns how many sessions the local index holds.
 fn local_session_count(env: &common::TestEnv) -> usize {
-    env.store()
+    session_count_in(env.home_path())
+}
+
+/// Returns how many sessions one home's index holds.
+fn session_count_in(home: &Path) -> usize {
+    vowp_store::Store::open(&vowp_store::NodePaths::new(home))
+        .expect("store opens")
         .list_sessions(&vowp_store::SessionFilter::default())
-        .expect("local sessions")
+        .expect("sessions")
         .len()
+}
+
+/// Reads one session's log from a home without touching its index.
+fn events_in(home: &Path, id: &str) -> Vec<vowp_protocol::EventEnvelope> {
+    let id = vowp_protocol::SessionId::parse(id).expect("session id");
+    SessionLog::open_read(&vowp_store::NodePaths::new(home), &id)
+        .expect("session log")
+        .read_all()
+        .expect("session events")
 }
 
 /// Fails when the pull's temporary staging directory still holds anything.
@@ -1175,6 +1622,441 @@ fn session_pull_same_id_refuses_a_corrupt_bundle_before_importing() {
     assert!(
         !env.home_path().join("sessions").join(&source).exists(),
         "a corrupt same-id bundle wrote a session directory"
+    );
+    assert_temp_clean(&env);
+}
+
+#[test]
+fn session_push_imports_a_child_on_the_remote() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let remote = remote_node(&env);
+    let source = create(&env);
+    let source_id = vowp_protocol::SessionId::parse(&source).expect("source id");
+    let before_events = events_in(env.home_path(), &source);
+    assert_eq!(session_count_in(remote.home.path()), 0, "the remote must start empty");
+
+    let output = run_cli(&env, &remote, &["session", "push", "vps", &source]);
+    assert!(output.status.success(), "push failed: {}", output_text(&output.stderr));
+    let stdout = output_text(&output.stdout);
+    let prefix = format!("pushed session {source} to vps as child ");
+    assert!(
+        stdout.starts_with(&prefix),
+        "the push output does not name both ids: {stdout}"
+    );
+    let child = stdout.trim().rsplit_once(' ').expect("child id").1.to_owned();
+    let child_id = vowp_protocol::SessionId::parse(&child).expect("child id");
+    assert_ne!(child_id, source_id, "the default push must create a child id");
+
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let child_row = remote_store.require_session(&child_id).expect("remote child");
+    assert_eq!(
+        child_row.parent_session_id.as_ref(),
+        Some(&source_id),
+        "the remote child's parent_session_id must be the local session id"
+    );
+    assert_eq!(child_row.title, "session test (imported)");
+    assert!(
+        remote_store.session(&source_id).expect("source lookup").is_none(),
+        "the default push must not create a same-id session on the remote"
+    );
+    assert_eq!(
+        session_count_in(remote.home.path()),
+        1,
+        "the default push must create exactly one remote child"
+    );
+    drop(remote_store);
+
+    // The local source is not copied or rewritten: its original events are still a prefix.
+    let after_events = events_in(env.home_path(), &source);
+    assert!(
+        after_events.len() >= before_events.len(),
+        "the push truncated the local log"
+    );
+    assert_eq!(
+        &after_events[..before_events.len()],
+        &before_events[..],
+        "the push rewrote the local log"
+    );
+    let local_store = env.store();
+    assert!(
+        local_store.session(&source_id).expect("source lookup").is_some(),
+        "the push removed the local source session"
+    );
+    let imported_local = local_store
+        .list_sessions(&vowp_store::SessionFilter::default())
+        .expect("local sessions")
+        .into_iter()
+        .filter(|session| session.title.ends_with("(imported)"))
+        .count();
+    assert_eq!(imported_local, 0, "the push imported a session locally");
+    drop(local_store);
+    assert_temp_clean(&env);
+
+    // The JSON document names the source, the remote child and the node.
+    let output = run_cli(&env, &remote, &["--json", "session", "push", "vps", &source]);
+    assert!(
+        output.status.success(),
+        "json push failed: {}",
+        output_text(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_str(output_text(&output.stdout).trim()).expect("push JSON");
+    assert_eq!(value["node"], "vps");
+    assert_eq!(value["source_session"], source);
+    let json_child = value["child_session"].as_str().expect("child_session");
+    let json_child_id = vowp_protocol::SessionId::parse(json_child).expect("json child id");
+    assert_ne!(json_child_id, source_id);
+    assert!(
+        value.get("same_id_session").is_none(),
+        "the child push must not name a same-id session: {value}"
+    );
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let json_child_row = remote_store.require_session(&json_child_id).expect("remote json child");
+    assert_eq!(json_child_row.parent_session_id.as_ref(), Some(&source_id));
+    drop(remote_store);
+    assert_temp_clean(&env);
+}
+
+#[test]
+fn session_push_same_id_keeps_the_origin_id_on_the_remote() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let remote = remote_node(&env);
+    let source = create(&env);
+    append_user_message(env.home_path(), &source, "copy this event");
+    let source_id = vowp_protocol::SessionId::parse(&source).expect("source id");
+    let before_events = events_in(env.home_path(), &source);
+    assert_eq!(session_count_in(remote.home.path()), 0, "the remote must start empty");
+
+    let output = run_cli(&env, &remote, &["session", "push", "--same-id", "vps", &source]);
+    assert!(
+        output.status.success(),
+        "same-id push failed: {}",
+        output_text(&output.stderr)
+    );
+    let stdout = output_text(&output.stdout);
+    assert!(
+        stdout.contains(&format!("pushed session {source} to vps with same id {source}")),
+        "the same-id output does not name the source id: {stdout}"
+    );
+
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let row = remote_store
+        .require_session(&source_id)
+        .expect("remote same-id session");
+    assert_eq!(row.id, source_id, "the remote did not keep the origin id");
+    assert!(row.parent_session_id.is_none(), "a same-id push must not keep a parent");
+    assert_eq!(row.title, "session test", "the origin title is kept unchanged");
+    let remote_sessions = remote_store
+        .list_sessions(&vowp_store::SessionFilter::default())
+        .expect("remote sessions");
+    assert_eq!(
+        remote_sessions.len(),
+        1,
+        "the same-id push created a second remote session"
+    );
+    drop(remote_store);
+
+    let remote_events = events_in(remote.home.path(), &source);
+    assert!(matches!(
+        remote_events[0].body().expect("created body"),
+        EventBody::SessionCreated(payload) if payload.parent_session_id.is_none()
+    ));
+    assert!(
+        remote_events.iter().any(|event| matches!(
+            event.body(),
+            Ok(EventBody::UserMessage(payload)) if payload.text == "copy this event"
+        )),
+        "the bundle tail was not copied to the remote log: {remote_events:?}"
+    );
+
+    // The local copy keeps its id and history, with only the export capsule appended.
+    let after_events = events_in(env.home_path(), &source);
+    assert_eq!(
+        &after_events[..before_events.len()],
+        &before_events[..],
+        "the same-id push rewrote the local log"
+    );
+    let local_store = env.store();
+    let local_row = local_store.require_session(&source_id).expect("local source");
+    assert!(local_row.parent_session_id.is_none());
+    drop(local_store);
+    assert_temp_clean(&env);
+
+    // The same-id JSON document names the source and the same-id session, with no child field.
+    let second = create(&env);
+    append_user_message(env.home_path(), &second, "json same id");
+    let output = run_cli(
+        &env,
+        &remote,
+        &["--json", "session", "push", "--same-id", "vps", &second],
+    );
+    assert!(
+        output.status.success(),
+        "json same-id push failed: {}",
+        output_text(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_str(output_text(&output.stdout).trim()).expect("push JSON");
+    assert_eq!(value["node"], "vps");
+    assert_eq!(value["source_session"], second);
+    assert_eq!(value["same_id_session"], second);
+    assert!(
+        value.get("child_session").is_none(),
+        "same-id output must not name a child: {value}"
+    );
+    assert_temp_clean(&env);
+}
+
+#[test]
+fn session_push_same_id_reports_divergence_without_writing() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let remote = remote_node(&env);
+    let source = create(&env);
+    append_user_message(env.home_path(), &source, "shared event");
+    let source_id = vowp_protocol::SessionId::parse(&source).expect("source id");
+    let output = run_cli(&env, &remote, &["session", "push", "--same-id", "vps", &source]);
+    assert!(
+        output.status.success(),
+        "first same-id push failed: {}",
+        output_text(&output.stderr)
+    );
+    append_user_message(env.home_path(), &source, "local advanced");
+    append_user_message(remote.home.path(), &source, "remote advanced");
+
+    let local_paths = vowp_store::NodePaths::new(env.home_path());
+    let remote_paths = vowp_store::NodePaths::new(remote.home.path());
+    let local_events = events_in(env.home_path(), &source);
+    let remote_events = events_in(remote.home.path(), &source);
+    let local_log = local_paths.log_path(&source_id);
+    let remote_log = remote_paths.log_path(&source_id);
+    let before_local_log = std::fs::read(&local_log).expect("local log bytes");
+    let before_remote_log = std::fs::read(&remote_log).expect("remote log bytes");
+    let before_local_sessions = session_count_in(env.home_path());
+    let before_remote_sessions = session_count_in(remote.home.path());
+    let local_store = env.store();
+    let before_local_row = local_store.require_session(&source_id).expect("local row");
+    drop(local_store);
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let before_remote_row = remote_store.require_session(&source_id).expect("remote row");
+    drop(remote_store);
+
+    let output = run_cli(&env, &remote, &["session", "push", "--same-id", "vps", &source]);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a divergent same-id push must be a conflict: {}",
+        output_text(&output.stderr)
+    );
+    let stderr = output_text(&output.stderr);
+    assert!(
+        stderr.contains(&format!("session {source} exists locally and on vps")),
+        "the divergence was not named: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "local:  {source} on {}: seq {}, last user.message at ",
+            env.config.node.name,
+            local_events.len()
+        )),
+        "the local head is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "remote: {source} on vps: seq {}, last user.message at ",
+            remote_events.len()
+        )),
+        "the remote head is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("choose which side advances; no merge performed"),
+        "the manual-choice note is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("delete or export one side, then push again"),
+        "the push-specific hint is missing: {stderr}"
+    );
+    assert!(
+        !output_text(&output.stdout).contains("pushed session"),
+        "a divergent push printed a success line"
+    );
+    assert!(
+        !stderr.contains(&env.home_path().display().to_string()),
+        "the report leaked the local home path: {stderr}"
+    );
+    assert!(
+        !stderr.contains(&remote.home.path().display().to_string()),
+        "the report leaked the remote home path: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&local_log).expect("local log bytes"),
+        before_local_log,
+        "a divergent push rewrote the local log"
+    );
+    assert_eq!(
+        std::fs::read(&remote_log).expect("remote log bytes"),
+        before_remote_log,
+        "a divergent push rewrote the remote log"
+    );
+    assert_eq!(
+        session_count_in(env.home_path()),
+        before_local_sessions,
+        "a divergent push created a local session"
+    );
+    assert_eq!(
+        session_count_in(remote.home.path()),
+        before_remote_sessions,
+        "a divergent push created a remote session"
+    );
+    let local_store = env.store();
+    let local_row = local_store.require_session(&source_id).expect("local row");
+    assert_eq!(local_row.last_seq, before_local_row.last_seq);
+    assert_eq!(local_row.updated_at, before_local_row.updated_at);
+    drop(local_store);
+    let remote_store = vowp_store::Store::open(&vowp_store::NodePaths::new(remote.home.path())).expect("remote store");
+    let remote_row = remote_store.require_session(&source_id).expect("remote row");
+    assert_eq!(remote_row.last_seq, before_remote_row.last_seq);
+    assert_eq!(remote_row.updated_at, before_remote_row.updated_at);
+    assert!(
+        remote_store
+            .list_sessions(&vowp_store::SessionFilter::default())
+            .expect("remote sessions")
+            .iter()
+            .all(|session| session.parent_session_id.as_ref() != Some(&source_id)),
+        "a divergent push created a remote child"
+    );
+    drop(remote_store);
+    assert_temp_clean(&env);
+
+    // The JSON document is the same stable shape as a pull divergence.
+    let output = run_cli(
+        &env,
+        &remote,
+        &["--json", "session", "push", "--same-id", "vps", &source],
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "a JSON divergence must be a conflict: {}",
+        output_text(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_str(output_text(&output.stdout).trim()).expect("divergence JSON");
+    assert_eq!(value["error"]["kind"], "conflict");
+    assert_eq!(value["error"]["code"], "session_divergence");
+    assert_eq!(value["error"]["node"], "vps");
+    assert_eq!(value["error"]["source_session"], source);
+    assert_eq!(
+        value["error"]["local"]["last_seq"].as_u64(),
+        Some(local_events.len() as u64)
+    );
+    assert_eq!(value["error"]["local"]["last_event"], "user.message");
+    assert_eq!(
+        value["error"]["remote"]["last_seq"].as_u64(),
+        Some(remote_events.len() as u64)
+    );
+    assert_eq!(value["error"]["remote"]["last_event"], "user.message");
+    assert_eq!(value["error"]["remote"]["node"], "vps");
+    assert_eq!(value["error"]["note"], "choose which side advances; no merge performed");
+    assert!(
+        value["error"]["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("delete or export one side")),
+        "the manual hint is missing: {value}"
+    );
+    assert_eq!(
+        std::fs::read(&local_log).expect("local log bytes"),
+        before_local_log,
+        "a JSON divergence rewrote the local log"
+    );
+    assert_eq!(
+        std::fs::read(&remote_log).expect("remote log bytes"),
+        before_remote_log,
+        "a JSON divergence rewrote the remote log"
+    );
+    assert_temp_clean(&env);
+}
+
+#[test]
+fn session_push_refuses_a_local_node() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let source = create(&env);
+
+    let (code, stdout, stderr) = env.run(&["session", "push", "local", &source]);
+    assert_eq!(code, 2, "a local node must be invalid input: {stderr}");
+    assert!(
+        stderr.contains("node local is local"),
+        "the local-node refusal is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("vowp session export") && stderr.contains("vowp session import"),
+        "the export/import hint is missing: {stderr}"
+    );
+    assert!(stdout.trim().is_empty(), "the refusal printed a success line: {stdout}");
+}
+
+#[test]
+fn session_push_reports_a_missing_local_session_without_ssh() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let remote = remote_node(&env);
+    let runs = remote.bin.path().join("ssh-runs.txt");
+    std::fs::write(&runs, "sentinel\n").expect("ssh run log");
+    install_ssh(
+        &remote,
+        &format!("#!/bin/sh\nprintf 'run\\n' >> '{}'\nexit 0\n", runs.display()),
+    );
+    let missing = "missing-session";
+
+    let output = run_cli(&env, &remote, &["session", "push", "vps", missing]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "an unknown local session must be not-found: {}",
+        output_text(&output.stderr)
+    );
+    assert!(
+        output_text(&output.stderr).contains(&format!("session {missing}")),
+        "the local not-found was not reported: {}",
+        output_text(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&runs).expect("ssh run log"),
+        "sentinel\n",
+        "the push ran ssh before resolving the local session"
+    );
+    assert_eq!(local_session_count(&env), 0);
+    assert_temp_clean(&env);
+}
+
+#[test]
+fn session_push_relays_a_failed_remote_import() {
+    let env = common::TestEnv::new();
+    configure(&env);
+    let remote = remote_node(&env);
+    let source = create(&env);
+    install_ssh(&remote, "#!/bin/sh\nprintf 'remote import failed\\n' >&2\nexit 9\n");
+
+    let output = run_cli(&env, &remote, &["session", "push", "vps", &source]);
+    assert_eq!(
+        output.status.code(),
+        Some(9),
+        "the remote import exit code must be relayed: {}",
+        output_text(&output.stderr)
+    );
+    assert!(
+        output_text(&output.stderr).contains("remote import failed"),
+        "the remote error was not relayed: {}",
+        output_text(&output.stderr)
+    );
+    assert!(
+        !output_text(&output.stdout).contains("pushed session"),
+        "a failed remote import printed a success line: {}",
+        output_text(&output.stdout)
+    );
+    assert!(
+        !env.project_path().join(format!("{source}.vowp-bundle.json")).exists(),
+        "the push wrote a bundle file into the project"
     );
     assert_temp_clean(&env);
 }
@@ -2865,6 +3747,95 @@ fn session_watch_once_appends_to_one_session_without_duplicates() {
         cursor["offset"].as_u64(),
         Some(std::fs::metadata(&path).expect("metadata").len()),
         "the cursor does not point at the end of the complete lines"
+    );
+}
+
+#[test]
+fn session_watch_redacts_secret_from_transcript_body_and_raw() {
+    let env = common::TestEnv::new();
+    let ctx = vowp_cli::Ctx::build(&env.global(false), &vowp_cli::BufferIo::new("")).expect("context");
+    let secret = "watch-transcript-value-9713";
+    let name = vowp_protocol::SecretName::parse("WATCH_KEY").expect("secret name");
+    vowp_core::vault::write_secret(ctx.deps(), &name, secret).expect("write secret");
+
+    let dir = claude_transcripts(&env);
+    let path = dir.join("mangled-cwd").join("claude-secret.jsonl");
+    append_claude_line(
+        &path,
+        &claude_line(
+            "user",
+            "u1",
+            "native-secret",
+            serde_json::json!(format!("question {secret}")),
+            "2026-11-12T12:00:00Z",
+        ),
+    );
+    append_claude_line(
+        &path,
+        &claude_line(
+            "assistant",
+            "a1",
+            "native-secret",
+            serde_json::json!([{"type": "text", "text": format!("answer {secret}")}]),
+            "2026-11-12T12:00:01Z",
+        ),
+    );
+    let transcript_before = std::fs::read(&path).expect("read transcript");
+
+    let (code, stdout, stderr) = watch_once(&env, &dir);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("2 events imported"), "{stdout}");
+
+    let sessions = project_sessions(&env);
+    assert_eq!(sessions.len(), 1);
+    let events = watched_events(&env, &sessions[0].id);
+    let marker = "[REDACTED:WATCH_KEY]";
+    let mut messages = Vec::new();
+    for event in &events {
+        match event.body() {
+            Ok(EventBody::UserMessage(payload)) => messages.push(("user", event, payload.text)),
+            Ok(EventBody::AssistantMessage(payload)) => messages.push(("assistant", event, payload.text)),
+            _ => {}
+        }
+    }
+    assert_eq!(messages.len(), 2, "both transcript messages were imported");
+    for (kind, event, text) in messages {
+        assert!(!text.contains(secret), "{kind} body holds the raw secret: {text}");
+        assert!(text.contains(marker), "{kind} body records the redaction: {text}");
+        let raw = event
+            .raw
+            .as_ref()
+            .expect("the imported event keeps its raw transcript line");
+        let raw_text = raw.to_string();
+        assert!(
+            !raw_text.contains(secret),
+            "{kind} raw holds the raw secret: {raw_text}"
+        );
+        assert!(
+            raw_text.contains(marker),
+            "{kind} raw records the redaction: {raw_text}"
+        );
+    }
+    for event in &events {
+        assert!(
+            !event.payload.to_string().contains(secret),
+            "event {} ({}) holds the raw secret",
+            event.seq,
+            event.event_type
+        );
+        if let Some(raw) = &event.raw {
+            assert!(
+                !raw.to_string().contains(secret),
+                "event {} ({}) raw holds the raw secret",
+                event.seq,
+                event.event_type
+            );
+        }
+    }
+    let transcript_after = std::fs::read(&path).expect("read transcript again");
+    assert_eq!(
+        transcript_after, transcript_before,
+        "the importer must not modify the source transcript"
     );
 }
 

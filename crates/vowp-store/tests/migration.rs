@@ -2,11 +2,15 @@
 //! Spec: `docs/design/v0.2/home-and-surfaces.md` §3.9 and §15.
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
-use vowp_protocol::{JobId, ProjectName, RunId, SessionId, Timestamp};
-use vowp_store::{NodePaths, Store, StoreError, migrate_rollback, migrate_v01, migrate_v01_dry_run, resume_migration};
+use vowp_protocol::{JobId, Project, ProjectName, RunId, SessionId, Timestamp};
+use vowp_store::{
+    GLOBAL_SCHEMA_VERSION, NodePaths, PROJECT_SCHEMA_VERSION, Store, StoreError, migrate_rollback, migrate_v01,
+    migrate_v01_dry_run, resume_migration,
+};
 
 const V01_SCHEMA: &str = include_str!("../../../docs/design/schema.sql");
 
@@ -183,7 +187,7 @@ fn v01_database_migrates_with_matching_row_counts() {
     assert_eq!(report.tables["global:node_ledger"].after, 1);
 
     let global = Store::open_global(&paths).expect("global");
-    assert_eq!(global.global_schema_version().expect("version"), 2);
+    assert_eq!(global.global_schema_version().expect("version"), 7);
     assert_eq!(
         global.list_projects().expect("projects").len(),
         3,
@@ -192,7 +196,7 @@ fn v01_database_migrates_with_matching_row_counts() {
     drop(global);
 
     let alpha = Store::open_with_project(&paths, &project("alpha")).expect("alpha");
-    assert_eq!(alpha.project_schema_version().expect("version"), 1);
+    assert_eq!(alpha.project_schema_version().expect("version"), 2);
     assert!(alpha.require_job(&JobId::parse("alpha-a").expect("job")).is_ok());
     assert!(alpha.require_run(&alpha_run).is_ok());
     assert!(alpha.require_session(&alpha_session).is_ok());
@@ -396,7 +400,7 @@ fn migration_resume_finishes_a_swap() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 7);
     assert!(paths.project_db_path(&project("alpha")).is_file());
     assert!(paths.project_db_path(&project("_node")).is_file());
 }
@@ -501,4 +505,123 @@ fn v01_database_refuses_to_open_without_migration() {
         Timestamp::parse(T0).expect("time").as_rfc3339(),
         "2026-01-01T00:00:00.000Z"
     );
+}
+
+/// Builds a current split home, then rewinds it to a v5 global and a v1 project file.
+fn older_split_home() -> (TempDir, NodePaths, ProjectName) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = NodePaths::new(tmp.path());
+    let project = project("alpha");
+    {
+        let store = Store::open(&paths).expect("create home");
+        store
+            .upsert_project(&Project {
+                name: project.clone(),
+                path: tmp.path().join("alpha").display().to_string(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::json!({}),
+                created_at: Timestamp::parse(T0).expect("time"),
+                updated_at: Timestamp::parse(T0).expect("time"),
+            })
+            .expect("project row");
+    }
+    Store::create_project_db(&paths, &project).expect("project database");
+
+    // v6 adds only `agent_assignments` and `node_limits` over v5.
+    let global = Connection::open(paths.db_path()).expect("global database");
+    global
+        .execute_batch(
+            "DROP TABLE agent_assignments; DROP TABLE node_limits; DROP TABLE capacity_rollups;
+             PRAGMA user_version = 5;",
+        )
+        .expect("rewind global schema");
+    drop(global);
+    // v2 adds only `job_placement` over the project v1 schema.
+    let project_db = Connection::open(paths.project_db_path(&project)).expect("project database");
+    project_db
+        .execute_batch("DROP TABLE job_placement; PRAGMA user_version = 1;")
+        .expect("rewind project schema");
+    drop(project_db);
+    (tmp, paths, project)
+}
+
+#[test]
+fn cli_opens_older_schema_while_live_supervisor_holds_lock() {
+    let (_tmp, paths, project) = older_split_home();
+
+    // A live process that is not this one plays the older supervisor. `sleep` is used
+    // because the test needs a real pid, not a fabricated value.
+    let mut supervisor = Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn live supervisor stand-in");
+    std::fs::write(paths.supervisor_lock_path(), format!("{}\n{}\n", supervisor.id(), T0)).expect("supervisor lock");
+
+    // `Store::open` is the CLI's convenience constructor; opening it must not call the
+    // migration that `refuse_live_supervisor` would reject.
+    let store = Store::open(&paths).expect("open older split home while supervisor runs");
+    assert_eq!(store.global_schema_version().expect("global version"), 5);
+    assert_eq!(store.project_schema_version().expect("project version"), 1);
+    assert_eq!(store.list_projects().expect("projects").len(), 1, "alpha");
+    drop(store);
+
+    let global = Store::open_global(&paths).expect("open older global");
+    assert_eq!(global.global_schema_version().expect("global version"), 5);
+    drop(global);
+    let bound = Store::open_with_project(&paths, &project).expect("open older project");
+    assert_eq!(bound.project_schema_version().expect("project version"), 1);
+    assert_eq!(bound.list_jobs(&Default::default()).expect("jobs").len(), 0);
+    drop(bound);
+
+    // The on-disk schema is untouched while the other supervisor runs.
+    let global = Connection::open(paths.db_path()).expect("global database");
+    let version: i64 = global
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 5);
+    let v6_table: i64 = global
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'agent_assignments'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("v6 table");
+    assert_eq!(v6_table, 0, "the deferred open must not create v6 tables");
+    drop(global);
+    let project_db = Connection::open(paths.project_db_path(&project)).expect("project database");
+    let project_version: i64 = project_db
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("project version");
+    assert_eq!(project_version, 1);
+    let placement: i64 = project_db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'job_placement'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("placement table");
+    assert_eq!(placement, 0, "the deferred open must not create job_placement");
+    drop(project_db);
+
+    // Once the supervisor is gone, the same constructors apply the pending migration.
+    supervisor.kill().expect("stop the stand-in supervisor");
+    supervisor.wait().expect("reap the stand-in supervisor");
+    std::fs::remove_file(paths.supervisor_lock_path()).expect("release the lock");
+
+    let global = Store::open_global(&paths).expect("migrate after release");
+    assert_eq!(
+        global.global_schema_version().expect("global version"),
+        GLOBAL_SCHEMA_VERSION
+    );
+    drop(global);
+    let bound = Store::open_with_project(&paths, &project).expect("migrate project after release");
+    assert_eq!(
+        bound.project_schema_version().expect("project version"),
+        PROJECT_SCHEMA_VERSION
+    );
+    assert!(bound.list_job_placements().expect("placement table").is_empty());
 }

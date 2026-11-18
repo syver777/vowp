@@ -191,8 +191,9 @@ fn parse_kind(value: &str) -> Result<SurfaceKind, CliError> {
         "mcp" => Ok(SurfaceKind::Mcp),
         "mirror" => Ok(SurfaceKind::Mirror),
         "api" => Ok(SurfaceKind::Api),
+        "agent" => Ok(SurfaceKind::Agent),
         other => Err(CliError::Invalid(format!(
-            "unknown surface kind {other:?}; use chat, opencode, claude-code, mcp, mirror or api"
+            "unknown surface kind {other:?}; use chat, opencode, claude-code, mcp, mirror, api or agent"
         ))),
     }
 }
@@ -206,6 +207,7 @@ fn kind_name(kind: SurfaceKind) -> &'static str {
         SurfaceKind::Mcp => "mcp",
         SurfaceKind::Mirror => "mirror",
         SurfaceKind::Api => "api",
+        SurfaceKind::Agent => "agent",
     }
 }
 

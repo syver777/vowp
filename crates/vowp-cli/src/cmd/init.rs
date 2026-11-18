@@ -8,8 +8,8 @@ use std::path::Path;
 
 use serde::Serialize;
 use vowp_protocol::{
-    CapsuleConfig, Executor, Loop, LoopBounds, LoopKind, MergeConfig, Node, NodeConfig, OnQuota, Profile, Project,
-    ProjectConfig, ProjectName, VowpConfig,
+    CapsuleConfig, Executor, Loop, LoopBounds, LoopKind, MergeConfig, Node, NodeConfig, OffloadConfig, OnQuota,
+    Profile, Project, ProjectConfig, ProjectName, VowpConfig,
 };
 use vowp_store::Store;
 
@@ -231,6 +231,7 @@ fn default_config(name: ProjectName, tz_offset_minutes: i32) -> Result<VowpConfi
         schedules: Vec::new(),
         capsule: CapsuleConfig::default(),
         merge: MergeConfig::default(),
+        offload: OffloadConfig::default(),
     })
 }
 

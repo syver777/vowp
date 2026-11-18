@@ -7,14 +7,16 @@ loopback address as `web window: http://127.0.0.1:<port>/`, inherits `VOWP_API_T
 stops it on `vowp down` or SIGINT/SIGTERM. Running the binary directly remains supported.
 
 `vowp-daemon [--home <dir>] [--project <name>] [--port <n>]` opens an existing VOWP home
-read-only for its GET endpoints (and writable-but-non-creating for the two writes),
+read-only for its GET endpoints (and writable-but-non-creating for the writes),
 serves the static board page at `GET /` and its phone alias `GET /board`, the
 static session list at `GET /sessions`, session detail at `GET /sessions/{id}`, the
 individual capsule page at `GET /sessions/{id}/capsules/{capsule_id}`, the read-only nodes
-page at `GET /nodes`, and the API endpoints `GET /api/v1/health`, `/api/v1/board`,
+page at `GET /nodes`, the ASIF import page at `GET /import`, and the API endpoints
+`GET /api/v1/health`, `/api/v1/board`,
 `/api/v1/board/stream`, `/api/v1/jobs`, `/api/v1/sessions`,
 `/api/v1/sessions/{id}`, `/api/v1/sessions/{id}/capsules/{capsuleId}`,
 `/api/v1/sessions/{id}/events`, `/api/v1/sessions/{id}/events/stream`,
+`GET /api/v1/sessions/{id}/export/asif`, `POST /api/v1/sessions/import/asif`,
 `POST /api/v1/sessions/{id}/switch`, `/api/v1/inbox`,
 `/api/v1/nodes`, `POST /api/v1/inbox/{id}/answer` and `/api/v1/cost`, and binds
 `127.0.0.1` only. The default
@@ -66,6 +68,24 @@ the session. The server applies the CLI guards: an unknown session is `404`, a r
 without `force`, a switching or closed session, and a limited target provider are `409`, and an
 invalid body or executor is `400`. A failed switch never claims the executor moved.
 
+The session detail page also carries the ASIF export card: a plain download link to
+`/api/v1/sessions/{id}/export/asif` and a "Preview declared losses" button that fetches the
+same route with `?report=1` and shows the loss kinds or "No declared losses.". The download is
+token-free and streams a deterministic `.asif.zip` from a private temporary file; the headers
+include the attachment filename, the loss and unsupported counts and `nosniff`, and the temp
+directory is removed when the response ends. The page says host paths are scrubbed but exact
+secrets are not detected and points to the CLI `--redact-file` for a redaction list.
+
+The separate `/import` page keeps the same write token in `sessionStorage`, checks the 272 MiB
+archive size in the browser, and posts one raw `.asif.zip` with `Content-Type: application/zip`
+and a Bearer header to `POST /api/v1/sessions/import/asif?branch=`. The server streams the body
+to a private `0600` upload file with the adapter's hard cap and a five-minute timeout, runs the
+same core import as `vowp session import --format asif`, and answers `201 Created` with
+`Location`, `X-Vowp-Asif-Losses` and `AsifImportResponse`. The new session is idle in the served
+project's registered directory; nothing is auto-run, overwritten or merged. `401` clears the
+token, `413` names the limit, `415` refuses another content type and `409` keeps the existing
+session on a duplicate or conflicting import.
+
 The cost page renders grouped ledger rows and totals with a `by` selector. The inbox page
 renders open, answered and dismissed items with a state selector. Its open items carry the
 other browser write: a select of the item's options plus a free-text input (or only a text input
@@ -74,15 +94,18 @@ when there are no options) and an Answer button. A token unlock panel on both pa
 writes-disabled message and `202` shows "Answer queued; the supervisor applies it on the next
 tick" and refreshes the list. Reads work without a token.
 
-Reads are token-free. `POST /api/v1/inbox/{id}/answer` and
-`POST /api/v1/sessions/{id}/switch` require `Authorization: Bearer <VOWP_API_TOKEN>`. The binary
+Reads are token-free. `POST /api/v1/inbox/{id}/answer`,
+`POST /api/v1/sessions/{id}/switch` and `POST /api/v1/sessions/import/asif` require
+`Authorization: Bearer <VOWP_API_TOKEN>`. The binary
 reads the variable at startup; missing or empty disables writes with `503` and leaves reads
 available. The token is compared in constant time and never logged, echoed or put in a URL;
-rotate it by restarting the daemon. Both handlers open the existing home with
+rotate it by restarting the daemon. The handlers open the existing home with
 `Store::open_writable` (never `Store::open`): the answer writes the same item update and
 `answer_inbox` request row as `vowp inbox answer` and leaves job state to the supervisor; the
 switch runs the same `SessionService` switch as `vowp session switch` and never creates or
-migrates a home. The listener is loopback-only; this is not TLS or a multi-user login.
+migrates a home. The ASIF import hands its private upload file to the core import and never
+creates a home or writes outside the served project's sessions directory. The listener is
+loopback-only; this is not TLS or a multi-user login.
 
 The API serves the same `vowp-protocol` objects the CLI prints. Spec:
 [`docs/design/v0.3/http-api.md`](../../docs/design/v0.3/http-api.md).

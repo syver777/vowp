@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod blobs;
 mod convert;
 pub mod db;
@@ -26,6 +27,7 @@ pub mod repo_ledger;
 pub mod repo_loops;
 pub mod repo_misc;
 pub mod repo_nodes;
+pub mod repo_offload;
 pub mod repo_projects;
 pub mod repo_runs;
 pub mod repo_secrets;
@@ -34,16 +36,19 @@ pub mod repo_surfaces;
 pub mod session_files;
 pub mod session_log;
 
+pub use agent::{EnrollmentCode, EnrollmentKind, NodeCredential, NodePath};
 pub use db::{
     CostGroup, CostQuery, CostRow, GLOBAL_SCHEMA_VERSION, JobFilter, LedgerFilter, PROJECT_SCHEMA_VERSION, Request,
     RequestId, RunFinish, SCHEMA_VERSION, SessionFilter, StateChange, Store,
 };
 pub use error::StoreError;
 pub use migrate::{
-    MigrationCount, MigrationReport, migrate_rollback, migrate_v01, migrate_v01_dry_run, resume_migration,
+    MigrationCount, MigrationReport, migrate_rollback, migrate_v01, migrate_v01_dry_run, migrate_v02, migrate_v03,
+    migrate_v04, migrate_v05, resume_migration,
 };
 pub use paths::NodePaths;
 pub use reconcile::{CrossDbReconcile, ReconcileCounts};
+pub use repo_surfaces::{SurfaceToken, hash_lease_token};
 
 /// The reserved project that owns project-less session runs and node-wide history.
 pub const RESERVED_NODE_PROJECT: &str = "_node";

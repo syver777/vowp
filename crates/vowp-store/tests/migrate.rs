@@ -38,6 +38,17 @@ fn schema_table_names(schema: &str) -> Vec<String> {
     names
 }
 
+/// Returns whether `table` exists in the connection's main schema.
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("table lookup")
+        > 0
+}
+
 #[test]
 fn schema_file_is_identical_to_design() {
     assert_eq!(
@@ -48,10 +59,10 @@ fn schema_file_is_identical_to_design() {
 }
 
 #[test]
-fn open_creates_schema_version_1() {
+fn open_creates_current_schema_versions() {
     let (_tmp, paths, store) = file_store();
     assert_eq!(store.schema_version().expect("compat version"), 1);
-    assert_eq!(store.global_schema_version().expect("global version"), 2);
+    assert_eq!(store.global_schema_version().expect("global version"), 7);
     assert!(store.bound_project().is_none(), "a fresh home binds no project");
     assert!(matches!(store.project_schema_version(), Err(StoreError::NoProject)));
 
@@ -68,7 +79,7 @@ fn open_creates_schema_version_1() {
         assert_eq!(found, 1, "missing global table {table}");
     }
     let project_tables = schema_table_names(PROJECT_SCHEMA);
-    assert_eq!(project_tables.len(), 10, "the project schema declares ten tables");
+    assert_eq!(project_tables.len(), 11, "the project schema declares eleven tables");
 
     let project = ProjectName::parse("proj").expect("project");
     store
@@ -83,12 +94,12 @@ fn open_creates_schema_version_1() {
         })
         .expect("create project");
     assert_eq!(store.bound_project(), Some(&project));
-    assert_eq!(store.project_schema_version().expect("project version"), 1);
+    assert_eq!(store.project_schema_version().expect("project version"), 2);
     let project_conn = Connection::open(paths.project_db_path(&project)).expect("project db");
     let version: i64 = project_conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("project user_version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let mode: String = connection
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -120,7 +131,7 @@ fn open_refuses_newer_schema() {
     match error {
         StoreError::SchemaTooNew { found, supported } => {
             assert_eq!(found, 99);
-            assert_eq!(supported, 2);
+            assert_eq!(supported, 7);
         }
         other => panic!("expected SchemaTooNew, got {other:?}"),
     }
@@ -383,4 +394,152 @@ fn sample_run(job: JobId) -> Run {
         cost: Cost::unknown(),
         detail: String::new(),
     }
+}
+
+#[test]
+fn capacity_rollups_migrates_v6_to_v7_with_a_backup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = NodePaths::new(tmp.path());
+    {
+        let store = Store::open(&paths).expect("create home");
+        store.kv_set("kept", "yes").expect("kv row");
+    }
+    {
+        let conn = Connection::open(paths.db_path()).expect("global db");
+        conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             DROP TABLE capacity_rollups;
+             PRAGMA user_version = 6;",
+        )
+        .expect("rewind to v6");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 6);
+        assert!(!table_exists(&conn, "capacity_rollups"));
+    }
+
+    let report = vowp_store::migrate::migrate_v06(&paths).expect("migrate v6 to v7");
+    assert_eq!(report.from_version, 6);
+    assert_eq!(report.to_version, 7);
+    assert!(report.verified);
+    assert!(!report.dry_run);
+    assert!(Path::new(&report.backup).is_file(), "backup exists");
+
+    // The backup was taken before the change: it is a readable, untouched v6 file.
+    let backup = Connection::open(&report.backup).expect("backup db");
+    let backup_version: i64 = backup
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("backup version");
+    assert_eq!(backup_version, 6, "the backup is the untouched v6 file");
+    assert!(!table_exists(&backup, "capacity_rollups"));
+    let kept: String = backup
+        .query_row("SELECT value FROM kv WHERE key = 'kept'", [], |row| row.get(0))
+        .expect("backup kv row");
+    assert_eq!(kept, "yes");
+    drop(backup);
+
+    let live = Connection::open(paths.db_path()).expect("migrated db");
+    let version: i64 = live
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 7);
+    assert!(table_exists(&live, "capacity_rollups"));
+    let index: i64 = live
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'capacity_rollups_bucket'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index");
+    assert_eq!(index, 1);
+    let kept: String = live
+        .query_row("SELECT value FROM kv WHERE key = 'kept'", [], |row| row.get(0))
+        .expect("live kv row");
+    assert_eq!(kept, "yes", "the migration kept every existing row");
+    drop(live);
+
+    // A repeated call is a no-op: no second backup, no schema change.
+    let again = vowp_store::migrate::migrate_v06(&paths).expect("migrate again");
+    assert_eq!(again.from_version, 7);
+    assert_eq!(again.to_version, 7);
+    assert!(again.backup.is_empty());
+    let backups = std::fs::read_dir(paths.backups_dir())
+        .expect("backups dir")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("pre-0.7-"))
+        .count();
+    assert_eq!(backups, 1, "the idempotent call wrote no second backup");
+
+    // The shared open path, not only the direct call, migrates a v6 home.
+    {
+        let conn = Connection::open(paths.db_path()).expect("global db");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); DROP TABLE capacity_rollups; PRAGMA user_version = 6;")
+            .expect("rewind to v6 again");
+    }
+    let opened = Store::open(&paths).expect("open migrates a v6 home");
+    assert_eq!(opened.global_schema_version().expect("version"), 7);
+    let conn = Connection::open(paths.db_path()).expect("migrated db");
+    assert!(table_exists(&conn, "capacity_rollups"));
+
+    // An empty home opens directly at v7 with the rollup table.
+    let empty = tempfile::tempdir().expect("empty tempdir");
+    let empty_paths = NodePaths::new(empty.path());
+    let fresh = Store::open(&empty_paths).expect("open empty home");
+    assert_eq!(fresh.global_schema_version().expect("version"), 7);
+    let conn = Connection::open(empty_paths.db_path()).expect("fresh db");
+    assert!(table_exists(&conn, "capacity_rollups"));
+}
+
+#[test]
+fn capacity_rollups_migration_failure_leaves_the_v6_file_readable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = NodePaths::new(tmp.path());
+    {
+        let store = Store::open(&paths).expect("create home");
+        store.kv_set("kept", "yes").expect("kv row");
+    }
+    {
+        // A conflicting index makes the second DDL statement fail after the table was
+        // created inside the transaction. The rollback must remove the table and keep v6.
+        let conn = Connection::open(paths.db_path()).expect("global db");
+        conn.execute_batch(
+            "PRAGMA wal_checkpoint(TRUNCATE);
+             DROP TABLE capacity_rollups;
+             PRAGMA user_version = 6;
+             CREATE TABLE blocker (marker TEXT NOT NULL) STRICT;
+             CREATE INDEX capacity_rollups_bucket ON blocker(marker);",
+        )
+        .expect("v6 file with a conflicting index");
+    }
+
+    let error = vowp_store::migrate::migrate_v06(&paths).expect_err("the conflicting index fails the migration");
+    assert!(matches!(error, StoreError::Sqlite(_)), "got {error:?}");
+    let conn = Connection::open(paths.db_path()).expect("v6 db after failure");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 6, "the failed migration did not bump the version");
+    assert!(
+        !table_exists(&conn, "capacity_rollups"),
+        "the failed transaction left no partial table"
+    );
+    let kept: String = conn
+        .query_row("SELECT value FROM kv WHERE key = 'kept'", [], |row| row.get(0))
+        .expect("kept row");
+    assert_eq!(kept, "yes", "the v6 file is still readable");
+    conn.execute_batch("DROP INDEX capacity_rollups_bucket; DROP TABLE blocker;")
+        .expect("clear the blocker");
+    drop(conn);
+
+    let report = vowp_store::migrate::migrate_v06(&paths).expect("migrate after the failure is cleared");
+    assert_eq!(report.from_version, 6);
+    assert_eq!(report.to_version, 7);
+    let conn = Connection::open(paths.db_path()).expect("v7 db");
+    assert_eq!(
+        conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .expect("version"),
+        7
+    );
+    assert!(table_exists(&conn, "capacity_rollups"));
 }

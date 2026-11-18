@@ -1,26 +1,32 @@
 # Roadmap
 
-Status: current for the v0.3 feature set; a planning note for contributors.
+Status: current for the 0.4.0 release; a planning note for contributors.
 
-This page records what the current tree ships, what is deliberately **not** in v0.3, and the design
-order for v0.3 and later. It promises no dates. The authoritative proof for every claim is the
-linked document or the code itself.
+This page records what the current tree ships, the v0.4 local-orchestrator work and the open
+candidates. It promises no dates. The authoritative proof for every claim is the linked document,
+file or test, or the code itself.
 
-The v0.1 public release is **v0.1.0** and v0.2 is **v0.2.0**. The v0.3 feature set is merged on
-`main`; this tree identifies itself as `0.3.0`, and the release job owns the tag, published artifacts
-and release notes. This page
-does not duplicate those instructions.
+The v0.1 public release is **v0.1.0**, v0.2 is **v0.2.0**, v0.3 is **v0.3.0** and v0.4 is
+**v0.4.0**, shipped on 2026-11-18. The v0.4 local-orchestrator design is accepted and Phases 0–4
+shipped in 0.4.0. The security review checklist, the owner live Mac smoke test and the rollback
+drill are recorded in [`docs/releases/v0.4-hardening.md`](releases/v0.4-hardening.md); the owner
+smoke test passed on 2026-11-18. The shipped inventory is in [`CHANGELOG.md`](../CHANGELOG.md) and
+the [`0.4.0` release notes](release/0.4.0.md). The slices that merged after the 0.3.0 tag are
+included in 0.4.0 and recorded separately below.
 
 The product rationale is [`docs/design/plan.md`](design/plan.md); the v0.1 implementation spec is
 [`docs/design/README.md`](design/README.md); the normative v0.2 specification is
 [`docs/design/v0.2/home-and-surfaces.md`](design/v0.2/home-and-surfaces.md); the current behaviour is
 the code under `crates/`.
 
-## v0.2.0 — one home, many surfaces
+## v0.2.0 — one home, many surfaces (shipped)
 
-| Capability | What ships in one line | Proof |
+The v0.2 feature set shipped in **v0.2.0**. This section is the historical record; later releases add
+to it.
+
+| Capability | What shipped in one line | Proof |
 |---|---|---|
-| One home | A global DB plus one DB per project, one supervisor for every active project, project registry, migration from v0.1 with row-count checks and rollback. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md), [`docs/design/v0.2/home-and-surfaces.md`](design/v0.2/home-and-surfaces.md) |
+| One home | A global DB plus one DB per project, one node supervisor for every active project, project registry, migration from v0.1 with row-count checks and rollback. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md), [`docs/design/v0.2/home-and-surfaces.md`](design/v0.2/home-and-surfaces.md) |
 | Fleet read model | `snapshot.json` every tick, `vowp fleet status\|queue\|inbox\|capacity`, `vowp schema snapshot`, a board that shows every project. | [`docs/concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md#the-read-model) |
 | Measured capacity | Host sampler, per-run measurement, p50/p90 estimates, admission with waiting reasons, brakes that never kill, owner targets and override, AI advice through the inbox. | [`docs/concepts/capacity.md`](concepts/capacity.md) |
 | Sessions on surfaces | One append-only log on the home; leases with heartbeat and takeover; read-only follow mode; `vowp chat`. | [`docs/concepts/sessions-and-switching.md`](concepts/sessions-and-switching.md), [`docs/design/sessions.md`](design/sessions.md) |
@@ -35,18 +41,22 @@ the code under `crates/`.
 | Reference | Regenerated CLI and JSON Schema pages for the v0.1 and v0.2 command surface. | [`docs/reference/cli.md`](reference/cli.md), [`docs/reference/schema/README.md`](reference/schema/README.md) |
 | Verification | The Cargo test suite and the documentation link and command checks. | [`CHANGELOG.md`](../CHANGELOG.md), [`docs/tests/README.md`](tests/README.md) |
 
-The home is the only writer. A control machine, app or MCP server sends commands or streams events;
-it never opens a database over the network. The only listeners are loopback-only: the opencode app
-server joined through an SSH tunnel and the one-time secret paste page.
+The v0.2 home is the only writer. A control machine, app or MCP server sends commands or streams
+events; it never opens a database over the network. The only listeners are loopback-only: the
+opencode app server joined through an SSH tunnel and the one-time secret paste page.
 
-## What is deliberately not in v0.3
+## What was deliberately not in v0.2
+
+These were the v0.2 limits at that release. Later releases address some of them; each item says where.
 
 - **One home.** There is no replication, leader election or multi-home scheduler. A second home is a
   separate installation.
-- **No public HTTP or SSE API.** The v0.3 daemon API binds loopback and is reached through SSH; there
-  is no public listener.
-- **No cost dashboard.** The ACP adapter ships in v0.3; the cost dashboard remains deferred.
-- **No cross-machine live sync.** v0.3 adds explicit session pull; there is no automatic directory sync.
+- **No public HTTP or SSE API in v0.2.** The daemon API, web window and phone browser board shipped in
+  0.3.0; see below.
+- **No ACP adapter or cost dashboard in v0.2.** The first ACP adapter slice and the `/cost` page
+  shipped in 0.3.0; see below.
+- **No cross-node live sync.** v0.3.0 adds session-pull snapshots, and a bundle push merged after the
+  0.3.0 tag; neither is live sync. Export/import bundles remain the explicit way to copy a session.
 - **No multi-user accounts, quotas, roles or audit.** One operator per home is the supported shape.
 - **No VPS metrics history, parallel fan-out policies or hosted relay.** These need identity,
   policy or infrastructure that v0.2 does not provide.
@@ -57,196 +67,149 @@ server joined through an SSH tunnel and the one-time secret paste page.
   between those calls the app owns its transcript.
 - **No promise that every app exposes MCP tools.** opencode 2.0.28 can load the server and report it
   `connected` without exposing its tools to the model; `vowp chat` is the tool-free fallback.
-- **`session watch` starts a new VOWP session on each pass with new lines.** It does not reuse the
-  session already mapped to the Claude uuid (good first issue 4).
+- **`session watch` started a new VOWP session on each pass with new lines in v0.2.** 0.3.0 keeps a
+  byte cursor and reuses the canonical session for a Claude native uuid.
 
 The detailed list of known v0.2 limitations lives in the concepts pages where the behaviour is
-described. Follow-ups suitable for a first contribution are below.
+described. Open follow-ups are below.
 
-## v0.3 — the API, the window and the reach
+## v0.3.0 — the API, the window and the reach (shipped)
 
-These items were the v0.3 plan. The API, window, phone board, ACP adapter and explicit session pull
-ship in 0.3.0; the remaining rows are deferred.
+The v0.3 feature set shipped in **v0.3.0** on 2026-11-12. It adds the loopback daemon API, the
+web/PWA window and phone board, the first ACP adapter slice, the cost page and the session-pull path.
+The shipped inventory is in [`CHANGELOG.md`](../CHANGELOG.md) and the
+[`0.3.0` release notes](release/0.3.0.md); the design notes below remain the reference for each area.
 
-| Item | What it adds | Design note |
+| Item | What shipped in 0.3.0 | Design note |
 |---|---|---|
-| Daemon HTTP + SSE API | A loopback REST API and an event stream for jobs, sessions, events, board, inbox and cost. | [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
-| Web / PWA window | Machines, sessions, a session view with an executor switcher and capsule view, and the board. | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
-| Phone-friendly board | A mobile-first board page that installs as a PWA and shows the same snapshot as `vowp fleet status --json`. | [`design/v0.3/phone-board.md`](design/v0.3/phone-board.md) |
-| ACP adapter | One adapter for Agent Client Protocol servers, with richer events and a permission flow. | [`design/v0.2/acp-adapter.md`](design/v0.2/acp-adapter.md) |
-| Cost dashboard | Spend by day, job, role, provider and model; receipts, price-table estimates and unknown costs stay separate. | [`design/v0.2/cost-dashboard.md`](design/v0.2/cost-dashboard.md) |
-| Cross-machine session sync | Directory-level sync or same-id continuation beyond the v0.2 remote executor. | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
-| Multi-user and quotas | Accounts, per-user projects, role-based permissions, spend quotas and an audit trail. | — |
-| VPS metrics | CPU, memory, disk, load and process health per machine, with alerts and history. | — |
-| Parallel fan-out | Split one job into several candidates under a bounded budget, compare evidence and pick a winner. | — |
-| Hosted relay | Connect machines behind NAT without SSH, with authentication, end-to-end encryption and abuse/cost controls. | — |
+| Daemon HTTP + SSE API | A loopback read API for health, board, jobs, sessions, events, capsules, nodes, inbox and cost, with per-session and board SSE streams and the token-gated inbox-answer and local-session-switch writes. | [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
+| Web / PWA window | Embedded board, session list, session detail with a live timeline and capsule view, cost, inbox and nodes pages, plus the executor switcher and inbox answer form behind a token unlock panel. | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
+| Phone-friendly board | The same PWA shell at `/board` with a 360 px card layout, reached through the same loopback SSH tunnel. | [`design/v0.3/phone-board.md`](design/v0.3/phone-board.md) |
+| ACP adapter | The `acp` harness kind and `acp:<model>` executor, streamed tool/file/plan updates, one accumulated assistant message, token-only cost and a permission request that ends the turn. Streaming chunk events and a permission UI remain design. | [`design/v0.2/acp-adapter.md`](design/v0.2/acp-adapter.md) |
+| Cost dashboard | `GET /api/v1/cost` and the `/cost` page: grouping by job, day, role, provider and model, a known-USD chart and unknown rows kept separate. Budgets are not implemented. | [`design/v0.2/cost-dashboard.md`](design/v0.2/cost-dashboard.md) |
+| Cross-node session pull | Child and `--same-id` bundle pulls, `--full` directory copies with manifest and checksum checks, and a divergence report instead of a merge. Push and sync are not part of 0.3.0. | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
 
-The order above is the recommended dependency order, not a schedule. The API and its wire contract
-come first because the window, phone board and cost dashboard all consume it.
+### Merged after the 0.3.0 tag and shipped in 0.4.0
 
-## v0.4 — local surface and local machine
+These five slices are on `main` and in the 0.4.0 archives and release notes. They are not in the
+0.3.0 archives.
 
-This is a design direction, not a commitment. 0.3 keeps the VPS as the only home. The 0.4 work asks
-how the owner can run the orchestrator on their own machine with local context while the VPS stays
-the only writer:
+- **Session push.** `vowp session push <node> <session>` exports one `vowp-bundle-v1` in memory and
+  streams it to the remote importer. The default creates a child; `--same-id` keeps the origin id only
+  when it is absent remotely and reports the same `session_divergence` conflict as pull, writing
+  nothing on either side, when it is present. The remaining gap is a full-directory push (the `--full`
+  form of `session push`) and a bidirectional `session sync`; neither exists. See
+  [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md#fifth-v03-slice-implemented).
+- **Daemon job actions.** Token-gated `POST /api/v1/jobs/{id}/retry`, `/park` and `/cancel` validate
+  the current state with the graph transition rules and queue one existing request; the handler never
+  changes a job row. See [`design/v0.3/http-api.md`](design/v0.3/http-api.md).
+- **`/jobs` page and job detail.** The daemon serves `/jobs` with a job table and token-gated retry,
+  park and cancel controls, and a read-only `/jobs/{id}` detail page with the job's runs and gates.
+  SSE for the list and the keeper job actions remain later work. See
+  [`design/v0.3/web-window.md`](design/v0.3/web-window.md) and
+  [`design/v0.3/http-api.md`](design/v0.3/http-api.md).
+- **Supervisor-log redaction.** Every supervisor log message is redacted before the line is appended.
+  The redactor is loaded once at supervisor start; an unavailable redactor writes a fixed marker
+  instead of the message. See [`security.md`](security.md#redaction).
+- **Switch and watch redaction.** A switch turn and the `session watch` importer now redact every
+  appended payload and `raw` value. The remaining limits are in
+  [`security.md`](security.md#redaction): exact values only, the report and run mirror stay raw during
+  a turn, and a secret added after the supervisor started is picked up only at its next restart.
 
-- a **local surface** — the app runs locally, the session log and lease stay on the home;
-- a **local machine** — an outbound-only agent that executes offloaded jobs with per-machine path mapping.
+## v0.4 — local orchestrator
 
-The home remains the source of truth; the local machine is a surface and an executor, not a second
-home. The first deliverable is a design note, not code.
+Shipped in **0.4.0** on 2026-11-18. The v0.4 design is accepted:
+[`design/v0.4/local-orchestrator.md`](design/v0.4/local-orchestrator.md)
+records the decision. In one sentence: the Mac runs a local surface and an outbound-only local node,
+the home stays the only writer and the only home, the MVP transport is SSH stdio, results return by
+the node pushing `job/<id>` with its own git credentials, the local `vowp chat` path is proved first,
+and offload is opt-in with home-only secret values staying home.
 
-## Ideas / help wanted
+The accepted phases and their state in this tree:
 
-These are useful but unscoped. They are not commitments.
+| Phase | Scope | Status |
+|---|---|---|
+| 0 | Protocol frames, node identity, enrollment, SSH gateway and presence | shipped |
+| 1 | Local `vowp chat`: surface pairing, leases, turn ingest, spool replay and takeover | shipped |
+| 2 | Offload executor: placement policy, path map, isolated worktree, events, result push and home verification | shipped; offload is opt-in and off by default |
+| 3 | Local opencode surface: app frames, agent socket, opencode bridge, MCP proxy, orchestrator materialization and local cache | shipped |
+| 4 | Hardening: WSS ingress, launchd, token rotation UX, bundle result, separate user, metrics and docs | shipped in 0.4.0; security checklist, owner live Mac smoke test and rollback drill [recorded](releases/v0.4-hardening.md) |
 
-- Native adapters for more harnesses (the generic CLI mapping adapter already covers many).
-- Phone/push notifications through ntfy or a similar hook; v0.3 has no `[notify]` config key.
-- IANA time zones for schedules and limit reset parsing.
-- Shell completions for `vowp`.
-- Full-text search over session events and a sidecar tail index for very large logs.
-- A hash-chained or signed session log, and blob garbage collection beyond the lifecycle classes.
-- Replication or a shared database (libSQL/Postgres) for teams.
-- Windows support, or a documented WSL path.
-- More gates: lint, coverage, licence and dependency checks.
-- Better first-run docs for each supported harness.
+Phase 0 is proved by the wire types in
+[`crates/vowp-protocol/src/agent.rs`](../crates/vowp-protocol/src/agent.rs), the enrollment, key
+authentication and gateway in
+[`crates/vowp-core/src/agent/gateway.rs`](../crates/vowp-core/src/agent/gateway.rs), the node and
+enrollment records in [`crates/vowp-store/src/agent.rs`](../crates/vowp-store/src/agent.rs) and the
+gateway tests in [`crates/vowp-core/tests/agent.rs`](../crates/vowp-core/tests/agent.rs).
 
-## Good first issues
+Phase 1 is proved by the surface lease implementation in
+[`crates/vowp-core/src/surface/lease.rs`](../crates/vowp-core/src/surface/lease.rs), the local chat
+path in [`crates/vowp-cli/src/chat/mod.rs`](../crates/vowp-cli/src/chat/mod.rs), the pairing test
+[`crates/vowp-agent/tests/surface_pair.rs`](../crates/vowp-agent/tests/surface_pair.rs) and the lease
+tests in [`crates/vowp-core/tests/surface_lease.rs`](../crates/vowp-core/tests/surface_lease.rs).
 
-These are small, real tasks found by reading the current code. Each entry names the files to touch and
-the behaviour a reviewer can check.
+Phase 2 is proved by [`crates/vowp-core/src/offload/mod.rs`](../crates/vowp-core/src/offload/mod.rs)
+and [`crates/vowp-core/src/offload/policy.rs`](../crates/vowp-core/src/offload/policy.rs), the
+executor and worktree in [`crates/vowp-agent/src/executor.rs`](../crates/vowp-agent/src/executor.rs)
+and [`crates/vowp-agent/src/worktree.rs`](../crates/vowp-agent/src/worktree.rs), and the Phase 2 exit
+test [`crates/vowp-core/tests/offload_e2e.rs`](../crates/vowp-core/tests/offload_e2e.rs). Offload is
+off by default: the `[offload]` table in
+[`crates/vowp-protocol/src/config.rs`](../crates/vowp-protocol/src/config.rs) defaults `enabled` to
+false, every job stays on the home until the owner enables offload and a project opts in, and
+[`crates/vowp-protocol/tests/config.rs`](../crates/vowp-protocol/tests/config.rs) pins that default.
 
-### 1. Emit JSON from `vowp graph --json`
+Phase 3 is shipped. These slices are merged in this tree:
 
-**Files:** `crates/vowp-cli/src/cmd/graph.rs`, `crates/vowp-cli/tests/graph.rs`, `docs/design/cli.md`.
-**Problem:** `vowp graph` ignores the global `--json` flag and always prints ASCII or Mermaid, although
-the CLI contract says every command has machine-readable output.
-**Do:** print `{"jobs": [...], "edges": [...]}` for the normal read path, keeping `--export` and
-`--import` as they are. Add an integration test for the JSON document and update the design line.
-**Accept:** `vowp graph --json` is valid JSON, contains the same jobs as `vowp job ls --json`, and
-`vowp graph --mermaid` still prints only Mermaid.
+| Slice | What is in the tree | Proof |
+|---|---|---|
+| App frames | Attach/detach, native event, turn and MCP tool frames; the home assigns the sequence and deduplicates native ids. | [`crates/vowp-protocol/src/agent.rs`](../crates/vowp-protocol/src/agent.rs), [`crates/vowp-protocol/tests/surface.rs`](../crates/vowp-protocol/tests/surface.rs) |
+| Agent socket | A mode-0600 `agent.sock` forwards attach/detach and tool calls over the one outbound connection and correlates results by request id. | [`crates/vowp-agent/src/socket.rs`](../crates/vowp-agent/src/socket.rs), [`crates/vowp-agent/tests/socket.rs`](../crates/vowp-agent/tests/socket.rs) |
+| opencode bridge | Follows the local opencode event stream, maps completed events, backfills from a cursor, normalizes paths and redacts injected values before spooling. | [`crates/vowp-agent/src/bridge.rs`](../crates/vowp-agent/src/bridge.rs), [`crates/vowp-agent/tests/bridge.rs`](../crates/vowp-agent/tests/bridge.rs) |
+| MCP proxy | A local stdio MCP server answers initialize, list and ping locally and forwards tool calls through the agent socket; home-only tools are refused. | [`crates/vowp-cli/src/mcp/proxy.rs`](../crates/vowp-cli/src/mcp/proxy.rs), [`crates/vowp-cli/tests/mcp.rs`](../crates/vowp-cli/tests/mcp.rs) |
+| Home orchestrator record and command drain | The home records a node-bound orchestrator, queues typed start, resume and stop commands durably, and the live gateway drains them and applies correlated results; disconnect and reconnect update the record. | [`crates/vowp-core/src/surface/orchestrator.rs`](../crates/vowp-core/src/surface/orchestrator.rs), [`crates/vowp-core/src/agent/gateway.rs`](../crates/vowp-core/src/agent/gateway.rs), [`crates/vowp-cli/tests/orchestrator.rs`](../crates/vowp-cli/tests/orchestrator.rs) |
+| Agent-side orchestrator host | The agent materializes a private per-orchestrator config, starts the app in its own process group, attaches the paired surface, and keeps the host across a home disconnect; stop signals only that host group. | [`crates/vowp-agent/src/orchestrator.rs`](../crates/vowp-agent/src/orchestrator.rs), [`crates/vowp-agent/tests/orchestrator.rs`](../crates/vowp-agent/tests/orchestrator.rs) |
+| Offline read cache | A bounded private cache under `<state_dir>/cache` answers the six read-only MCP tools with an `as of` line when the home is offline or the reply times out; writes never use it and a revoked surface clears its entries. | [`crates/vowp-agent/src/cache.rs`](../crates/vowp-agent/src/cache.rs), [`crates/vowp-agent/tests/cache.rs`](../crates/vowp-agent/tests/cache.rs) |
+| Job detail page | The daemon serves a read-only job detail API with runs and gates, and the `/jobs/{id}` page renders them. | [`crates/vowp-daemon/src/app.rs`](../crates/vowp-daemon/src/app.rs), [`crates/vowp-daemon/tests/job_detail.rs`](../crates/vowp-daemon/tests/job_detail.rs) |
 
-### 2. Show configured gates before the first run
+Phase 3 is shipped in 0.4.0.
 
-**Files:** `crates/vowp-cli/src/cmd/job.rs`, `crates/vowp-cli/tests/job.rs`.
-**Problem:** `vowp job show --gates` prints only recorded results, so a job that has never run shows an
-empty section.
-**Do:** print every configured gate from `job.gates` with a `not run` marker, then replace each entry
-with its recorded result when one exists.
-**Accept:** a freshly added job lists `report`, `secret_scan` and any command gate as `not run`; after a
-run the same command shows the recorded pass/fail and evidence.
+Phase 4 shipped in 0.4.0. [`design/v0.4/hardening.md`](design/v0.4/hardening.md) turns the phase
+scope — optional WSS ingress behind a loopback listener, launchd/systemd-user service install,
+rotation UX, bundle result, separate user, bounded metrics history and the security-review, owner
+live Mac smoke test and rollback gates — into one contract per item, with the named hermetic tests
+and the ordered slice list. The WSS transport and listener, the agent service, the rotation
+`--wait`/`--grace` path, the bundle result, the separate-user checks and the capacity history are in
+the release, and [the agent-node guide](guides/agent-node.md) is the operator path. The security
+review checklist, the owner live Mac smoke test and the rollback drill on a restored copy are
+recorded in [`docs/releases/v0.4-hardening.md`](releases/v0.4-hardening.md); the smoke test passed on
+2026-11-18. The accepted [`design/v0.4/local-orchestrator.md`](design/v0.4/local-orchestrator.md)
+remains the binding design for the phases that shipped.
 
-### 3. Do not require API keys for harness-owned logins
+## Open follow-ups
 
-**Files:** `crates/vowp-cli/src/cmd/doctor.rs`, `crates/vowp-cli/tests/doctor.rs`.
-**Problem:** `check_providers` collects every provider in every profile and warns when
-`<PROVIDER>_API_KEY` is absent. A Claude Code login does not need `CLAUDE_API_KEY`, so a healthy setup
-gets a misleading warning.
-**Do:** classify a provider as harness-owned when every rung that uses it is `claude-code` (and, if
-appropriate, opencode's own login); report that as `ok` with a detail such as `claude-code uses its own
-login`. Still warn for a provider that a key-driven harness needs.
-**Accept:** a project whose only ladder is `claude-code:...` and whose environment has no
-`CLAUDE_API_KEY` gets an `ok` providers check; a project with an opencode rung still warns about the
-missing key.
+These follow-ups are drawn from the current code and the 0.3.0 known limitations. One has shipped;
+the rest are candidates or design work. They are not commitments, no release is promised, and a
+design note is linked only where one exists.
 
-### 4. Make `session watch` incremental by byte offset and add `--follow`
-
-**Files:** `crates/vowp-cli/src/cmd/session.rs`, `crates/vowp-cli/tests/session.rs`,
-`docs/design/sessions.md`.
-**Problem:** the importer stores a processed **line count**, re-reads the whole transcript every time,
-and `--follow` is rejected. A transcript that grows while VOWP watches is re-read from the start, and
-a line inserted anywhere throws the count off. Each pass with new lines also creates a new VOWP
-session for the same Claude uuid instead of reusing the existing one.
-**Do:** store the byte offset and the last complete line, read only the new suffix, poll every two
-seconds for `--follow` until interrupted, and find or create one canonical session by native uuid.
-Keep `--once` behaviour and never write to Claude's files.
-**Accept:** two `--once` runs append to one session and never create a duplicate session for the same
-uuid; `--follow` imports a growing fixture without duplicates and exits cleanly on Ctrl-C; a partial
-final line is not imported until it ends with a newline.
-
-### 5. Anchor interval schedules to their creation time
-
-**Files:** `crates/vowp-core/src/schedules/spec.rs`, `crates/vowp-core/src/schedules/engine.rs`,
-`crates/vowp-core/tests/schedules_spec.rs`, `crates/vowp-core/tests/schedules_engine.rs`.
-**Problem:** `ScheduleSpec::parse` has no anchor, so `every 30m` is aligned to the Unix epoch. The
-design says the anchor is the schedule's `created_at`.
-**Do:** carry an anchor into `next_after` and pass `schedule.created_at` from `sync_from_config`,
-`catch_up` and `tick`; keep cron behaviour unchanged.
-**Accept:** a schedule created at 10:07 with `every 30m` next runs at 10:37, and a restart before that
-time does not move it.
-
-### 6. Add state colours to `vowp graph --mermaid`
-
-**Files:** `crates/vowp-graph/src/render.rs`, `crates/vowp-graph/tests/render.rs`,
-`docs/design/crates/vowp-graph.md`.
-**Problem:** the Mermaid renderer emits plain nodes. State colours are marked v0.2 in the design and
-are a self-contained first step.
-**Do:** emit one `classDef` per state group (running, waiting, failed/parked, done) and assign each
-node a class. Keep the output deterministic and escape labels as today.
-**Accept:** the golden Mermaid output includes the class definitions and assignments in a stable order;
-no colours appear in the ASCII renderer.
-
-### 7. Add an `[env.<name>].build` command
-
-**Files:** `crates/vowp-protocol/src/config.rs`, `crates/vowp-core/src/promote/guards.rs`,
-`crates/vowp-protocol/tests/config.rs`, `crates/vowp-core/tests/promote_guards.rs`,
-`docs/design/architecture.md`.
-**Problem:** the promotion `build` guard falls back to `[merge].check_cmds` or
-`[project].check_cmds`; an environment cannot name its own build command, and `build = [...]` is
-rejected as an unknown key.
-**Do:** add an optional `build: Vec<String>` to `EnvConfig`; run it in the checkout when set, otherwise
-keep the current fallback. Document the precedence.
-**Accept:** a config with `[env.prod].build = ["make build"]` parses and the guard runs that command;
-without it the existing fallback and its recorded note are unchanged.
-
-### 8. Copy a job's brief into its worktree
-
-**Files:** `crates/vowp-core/src/loops/dispatch.rs`, `crates/vowp-core/tests/loops_supervisor.rs`.
-**Problem:** `write_brief` writes the generic fallback whenever the worktree copy is missing. A brief
-created by `vowp job add --brief-file` in the project checkout is not copied into the job worktree, so
-the worker reads the fallback.
-**Do:** when the worktree brief is absent, read the project-checkout copy at `<repo>/<job.brief>` and
-write that; use the generic fallback only when neither exists. Never overwrite an existing brief.
-**Accept:** a job added with a custom brief and then dispatched has that exact brief in its worktree;
-a job with no source brief still gets the generated fallback.
-
-### 9. Let `vowp schema` work without an initialised home
-
-**Files:** `crates/vowp-cli/src/lib.rs`, `crates/vowp-cli/src/cmd/maint.rs`,
-`crates/vowp-cli/tests/maint.rs`.
-**Problem:** `vowp schema` reads only static protocol types, but `Ctx::build` rejects a fresh
-`--home` before the command runs. A contributor cannot inspect the schemas until `vowp init`.
-**Do:** run `schema` before the context guard (like `doctor`) and pass it only the global `--json`
-flag; keep the existing output shape and exit codes.
-**Accept:** `vowp --home <fresh-temp-dir> schema` exits 0 and lists the type names; `vowp schema Job`
-prints the same document as before; commands that need a project still fail with the `vowp init` hint.
-
-### 10. Redact secrets from gate evidence and ledger details
-
-**Files:** `crates/vowp-core/src/gates/cmd.rs`, `crates/vowp-core/src/ledger/mod.rs`,
-`crates/vowp-core/tests/gates_cmd.rs`.
-**Problem:** v0.2 redacts exact injected values from events, capsules, report artifacts, raw run
-mirrors and the snapshot, but command-gate evidence and ledger details can still persist a value that
-a command printed.
-**Do:** run the same `vault::redact` pass over gate evidence and ledger detail before writing; keep the
-secret-scan gate as the separate backstop.
-**Accept:** a fake command that prints an injected value leaves only `[REDACTED:<NAME>]` in
-`gate_results` and `ledger`; an uninjected value is unchanged.
-
-### 11. Inject secrets into promotion/deploy commands by name — closed
-
-Closed because `[env.<name>].env_pass` now lists secret **names**. `Promoter::promote` and
-`Promoter::rollback` resolve the list through the vault once before anything is banked or deployed,
-pass the values only in the child environment of the serving-bank, deploy, probe and rollback
-commands, and fail with the variable's name when a configured secret is missing. Harness `env_pass`
-keeps its warn-and-skip behaviour.
-
-### 12. Setup verify fixture under load — closed
-
-Closed because the merged fixture uses a 300 s timeout and one test target.
+| Follow-up | Status | Design note or current limit |
+|---|---|---|
+| ACP streaming chunk events and a permission flow | design | [`design/v0.2/acp-adapter.md`](design/v0.2/acp-adapter.md), [`0.3.0` known limitations](release/0.3.0.md#acp-adapter) |
+| Live updates for the cost, inbox and nodes pages (they poll every five seconds) | candidate | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
+| Node add, remove and probe writes through the API (the nodes route is read-only) | candidate | [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
+| Job detail page (`/jobs/{id}`) and its runs and gates | shipped | [`design/v0.3/web-window.md`](design/v0.3/web-window.md), [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
+| SSE for the jobs list and the keeper job actions (nudge, restart, replan and fail) | design | [`design/v0.3/web-window.md`](design/v0.3/web-window.md), [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
+| A browser chat turn (needs a run queue and cancellation) | design | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
+| A full-directory push (the `--full` form of `session push`) and a bidirectional `session sync` | design | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
+| Multi-user accounts, quotas, roles and audit | open | — |
+| VPS metrics history and alerts | history shipped; alerts open | [`design/v0.4/hardening.md`](design/v0.4/hardening.md) §7 |
+| Parallel fan-out with a bounded budget | open | — |
+| A hosted relay without SSH | open | — |
+| Shell completions for `vowp` | candidate | — |
+| IANA time zones for schedules and limit resets | candidate | — |
 
 ## How to help
 
 Read [`CONTRIBUTING.md`](../CONTRIBUTING.md) first. Every command in the docs must run, tests must be
-hermetic, and a change should be one small commit. The v0.3 notes are the best place to start a design
-discussion before writing code.
+hermetic, and a change should be one small commit. Design discussion belongs in the design note for
+the area or in an issue that links this page; the v0.4 note and the open follow-ups above are the
+current starting points.

@@ -9,13 +9,22 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 
-use crate::api::{
-    ApiError, ApiErrorBody, Board, BoardLimit, BoardRun, CostReport, CostRow, CostTotal, EventPage, Health,
-    InboxAnswerRequest, InboxPage, JobPage, NodePage, Page, SessionDetail, SessionPage, SessionSwitchRequest,
+use crate::agent::surface::{
+    SurfaceAttach, SurfaceDetach, SurfaceEvent, SurfaceTurn, SurfaceTurnState, ToolCall, ToolError, ToolResult,
 };
+use crate::agent::{
+    AgentCapabilities, AgentCapacity, AgentFrame, AgentPathMap, AgentRole, LeaseMode, NodeCard, NodeKind, NodePresence,
+    NodeStatus, PathRef, SurfaceInfo, SurfaceScope, SurfaceState, TurnSummary,
+};
+use crate::api::{
+    ApiError, ApiErrorBody, Board, BoardLimit, BoardRun, CostReport, CostRow, CostTotal, EventPage, GateResultPage,
+    Health, InboxAnswerRequest, InboxPage, JobAction, JobActionResponse, JobPage, NodePage, Page, RunPage,
+    SessionDetail, SessionPage, SessionSwitchRequest,
+};
+use crate::asif::{AsifCounts, AsifImportResponse, AsifLoss, AsifReport};
 use crate::capacity::{
-    BrakeState, CapacityAdvice, CapacityReport, CapacitySnapshot, CapacityTarget, HostSample, RunUsage,
-    RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
+    BrakeState, CapacityAdvice, CapacityHistory, CapacityReport, CapacitySnapshot, CapacityTarget, HostSample,
+    RunUsage, RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
 };
 use crate::capsule::{Capsule, CapsuleDraft};
 use crate::catalog::{BackupFile, BackupReport, CatalogEntry, GcClassReport, GcReport};
@@ -28,6 +37,10 @@ use crate::inbox::InboxItem;
 use crate::job::{Edge, Job, JobPatch, NewJob};
 use crate::limit::Limit;
 use crate::loops::{Loop, Schedule};
+use crate::offload::{
+    AssignmentPayload, NodeFallback, Placement, RemoteRunState, RunRejectReason, RunResume, RunResumeResult,
+    SurfaceResume, SurfaceResumeResult, WaitingReason,
+};
 use crate::ops::{FleetQueueRow, FleetStatus, MigrationCount, MigrationReport, Tunnel};
 use crate::release::Release;
 use crate::report::{BriefFrontMatter, ReportFrontMatter};
@@ -38,8 +51,8 @@ use crate::snapshot::{
     RunningJobCard, SessionSurfaceCard, Snapshot, SupervisorSnapshot,
 };
 use crate::surface::{
-    IngestAck, JoinInstructions, Lease, LeaseStatus, OrchestratorCard, RemoteEvent, RemoteLine, Surface, SurfaceRef,
-    TakeoverReport, TurnGrant,
+    IngestAck, JoinInstructions, Lease, LeaseStatus, OrchestratorCard, OrchestratorCommand, OrchestratorError,
+    OrchestratorNodeState, OrchestratorResult, RemoteEvent, RemoteLine, Surface, SurfaceRef, TakeoverReport, TurnGrant,
 };
 use crate::vault::{SecretInfo, SecretRequest};
 
@@ -91,6 +104,7 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("RunningCapacity", schema_value::<RunningCapacity>());
     schemas.insert("WaitingJob", schema_value::<WaitingJob>());
     schemas.insert("CapacitySnapshot", schema_value::<CapacitySnapshot>());
+    schemas.insert("CapacityHistory", schema_value::<CapacityHistory>());
     schemas.insert("Surface", schema_value::<Surface>());
     schemas.insert("Lease", schema_value::<Lease>());
     schemas.insert("SurfaceRef", schema_value::<SurfaceRef>());
@@ -101,6 +115,10 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("IngestAck", schema_value::<IngestAck>());
     schemas.insert("TurnGrant", schema_value::<TurnGrant>());
     schemas.insert("OrchestratorCard", schema_value::<OrchestratorCard>());
+    schemas.insert("OrchestratorNodeState", schema_value::<OrchestratorNodeState>());
+    schemas.insert("OrchestratorCommand", schema_value::<OrchestratorCommand>());
+    schemas.insert("OrchestratorResult", schema_value::<OrchestratorResult>());
+    schemas.insert("OrchestratorError", schema_value::<OrchestratorError>());
     schemas.insert("JoinInstructions", schema_value::<JoinInstructions>());
     schemas.insert("Snapshot", schema_value::<Snapshot>());
     schemas.insert("SupervisorSnapshot", schema_value::<SupervisorSnapshot>());
@@ -132,6 +150,10 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("BoardLimit", schema_value::<BoardLimit>());
     schemas.insert("Page", schema_value::<Page<serde_json::Value>>());
     schemas.insert("JobPage", schema_value::<JobPage>());
+    schemas.insert("RunPage", schema_value::<RunPage>());
+    schemas.insert("GateResultPage", schema_value::<GateResultPage>());
+    schemas.insert("JobAction", schema_value::<JobAction>());
+    schemas.insert("JobActionResponse", schema_value::<JobActionResponse>());
     schemas.insert("SessionPage", schema_value::<SessionPage>());
     schemas.insert("NodePage", schema_value::<NodePage>());
     schemas.insert("SessionDetail", schema_value::<SessionDetail>());
@@ -144,6 +166,47 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("CostTotal", schema_value::<CostTotal>());
     schemas.insert("ApiError", schema_value::<ApiError>());
     schemas.insert("ApiErrorBody", schema_value::<ApiErrorBody>());
+    // v0.4 local-node agent protocol documents.
+    schemas.insert("PathRef", schema_value::<PathRef>());
+    schemas.insert("AgentRole", schema_value::<AgentRole>());
+    schemas.insert("AgentCapabilities", schema_value::<AgentCapabilities>());
+    schemas.insert("AgentCapacity", schema_value::<AgentCapacity>());
+    schemas.insert("AgentPathMap", schema_value::<AgentPathMap>());
+    schemas.insert("NodeCard", schema_value::<NodeCard>());
+    schemas.insert("NodeKind", schema_value::<NodeKind>());
+    schemas.insert("NodeStatus", schema_value::<NodeStatus>());
+    schemas.insert("NodePresence", schema_value::<NodePresence>());
+    schemas.insert("SurfaceInfo", schema_value::<SurfaceInfo>());
+    schemas.insert("SurfaceScope", schema_value::<SurfaceScope>());
+    schemas.insert("SurfaceState", schema_value::<SurfaceState>());
+    schemas.insert("LeaseMode", schema_value::<LeaseMode>());
+    schemas.insert("TurnSummary", schema_value::<TurnSummary>());
+    schemas.insert("AgentFrame", schema_value::<AgentFrame>());
+    // v0.4 local app-surface frames.
+    schemas.insert("SurfaceAttach", schema_value::<SurfaceAttach>());
+    schemas.insert("SurfaceDetach", schema_value::<SurfaceDetach>());
+    schemas.insert("SurfaceEvent", schema_value::<SurfaceEvent>());
+    schemas.insert("SurfaceTurn", schema_value::<SurfaceTurn>());
+    schemas.insert("SurfaceTurnState", schema_value::<SurfaceTurnState>());
+    schemas.insert("ToolCall", schema_value::<ToolCall>());
+    schemas.insert("ToolError", schema_value::<ToolError>());
+    schemas.insert("ToolResult", schema_value::<ToolResult>());
+    // v0.4 offload wire documents.
+    schemas.insert("Placement", schema_value::<Placement>());
+    schemas.insert("NodeFallback", schema_value::<NodeFallback>());
+    schemas.insert("WaitingReason", schema_value::<WaitingReason>());
+    schemas.insert("AssignmentPayload", schema_value::<AssignmentPayload>());
+    schemas.insert("RunRejectReason", schema_value::<RunRejectReason>());
+    schemas.insert("RemoteRunState", schema_value::<RemoteRunState>());
+    schemas.insert("RunResume", schema_value::<RunResume>());
+    schemas.insert("SurfaceResume", schema_value::<SurfaceResume>());
+    schemas.insert("RunResumeResult", schema_value::<RunResumeResult>());
+    schemas.insert("SurfaceResumeResult", schema_value::<SurfaceResumeResult>());
+    // v0.4 ASIF report documents (adapter-free summaries).
+    schemas.insert("AsifCounts", schema_value::<AsifCounts>());
+    schemas.insert("AsifLoss", schema_value::<AsifLoss>());
+    schemas.insert("AsifReport", schema_value::<AsifReport>());
+    schemas.insert("AsifImportResponse", schema_value::<AsifImportResponse>());
     schemas
 }
 

@@ -4,13 +4,14 @@
 //! fixed here; leases, remote ingest and app hosts build on them.
 
 use std::fmt;
+use std::str::FromStr;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::capacity::RemoteUsage;
 use crate::cost::Cost;
-use crate::error::ErrorKind;
+use crate::error::{ErrorKind, ProtocolError};
 use crate::event::{Actor, EventSource, EventType, LimitEvent, StopReason};
 use crate::ids::{CapsuleId, EventId, NodeName, ProjectName, RunId, SessionId};
 use crate::run::RunOutcome;
@@ -64,6 +65,8 @@ pub enum SurfaceKind {
     Mirror,
     /// A direct API client.
     Api,
+    /// A v0.4 local surface attached through a `vowp agent`.
+    Agent,
 }
 
 /// A registered surface.
@@ -326,6 +329,83 @@ pub struct JoinInstructions {
     pub chat: String,
 }
 
+/// Lifecycle state of an orchestrator.
+///
+/// The first three states are the v0.2 home states. The v0.4 local-node states add
+/// `node_offline` (the record exists but the node that runs the app is unreachable) and
+/// `failed` (the node refused or lost the app). `starting` covers the window between the
+/// home sending a start command and the node accepting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorNodeState {
+    /// The home sent a start command and is waiting for the node's result.
+    Starting,
+    /// The app host is running.
+    Running,
+    /// The app host was stopped by the owner.
+    Stopped,
+    /// The node is reachable but the app is not healthy.
+    Degraded,
+    /// The node that runs the app is offline, degraded or revoked.
+    NodeOffline,
+    /// The node refused the command or the app could not start.
+    Failed,
+}
+
+impl OrchestratorNodeState {
+    /// Every state, in the order shown by the design note.
+    pub const ALL: [Self; 6] = [
+        Self::Starting,
+        Self::Running,
+        Self::Stopped,
+        Self::Degraded,
+        Self::NodeOffline,
+        Self::Failed,
+    ];
+
+    /// Returns the stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+            Self::Degraded => "degraded",
+            Self::NodeOffline => "node_offline",
+            Self::Failed => "failed",
+        }
+    }
+
+    /// Returns whether the owner considers the orchestrator live.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Degraded)
+    }
+}
+
+impl fmt::Display for OrchestratorNodeState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OrchestratorNodeState {
+    type Err = ProtocolError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "starting" => Ok(Self::Starting),
+            "running" => Ok(Self::Running),
+            "stopped" => Ok(Self::Stopped),
+            "degraded" => Ok(Self::Degraded),
+            "node_offline" => Ok(Self::NodeOffline),
+            "failed" => Ok(Self::Failed),
+            other => Err(ProtocolError::InvalidId {
+                kind: "orchestrator_node_state",
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
+
 /// One orchestrator as shown by `vowp orchestrator ls` and the snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct OrchestratorCard {
@@ -337,8 +417,149 @@ pub struct OrchestratorCard {
     pub project: Option<ProjectName>,
     /// App the orchestrator runs in.
     pub app: OrchestratorApp,
-    /// `running`, `stopped` or `degraded`.
-    pub state: String,
+    /// Lifecycle state.
+    pub state: OrchestratorNodeState,
+    /// Node that runs the app; `None` for a v0.2 orchestrator hosted on the home.
+    #[serde(default)]
+    pub node: Option<NodeName>,
+    /// Last redacted failure or state detail, when the record is failed, degraded or
+    /// offline. `None` for a healthy or cleanly stopped orchestrator; never a path, port,
+    /// password, pairing link or secret value.
+    #[serde(default)]
+    pub last_error: Option<String>,
     /// How to join from the three surfaces.
     pub join: JoinInstructions,
+}
+
+/// One home -> agent orchestrator command.
+///
+/// The home correlates the agent's [`OrchestratorResult`] by `request_id`; the agent
+/// materializes the local copy and starts, stops or resumes the app. The payload never
+/// carries a port, a password, a pairing link, an absolute local path or a secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum OrchestratorCommand {
+    /// Create the local record and start the app host.
+    Start {
+        /// Home-assigned correlation id.
+        request_id: String,
+        /// Orchestrator name.
+        name: String,
+        /// App to run.
+        app: OrchestratorApp,
+        /// Project to bind, when any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<ProjectName>,
+    },
+    /// Stop the app host and release its surface.
+    Stop {
+        /// Home-assigned correlation id.
+        request_id: String,
+        /// Orchestrator name.
+        name: String,
+    },
+    /// Start the app host again for an existing record.
+    Resume {
+        /// Home-assigned correlation id.
+        request_id: String,
+        /// Orchestrator name.
+        name: String,
+    },
+}
+
+impl OrchestratorCommand {
+    /// Returns the correlation id.
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Start { request_id, .. } | Self::Stop { request_id, .. } | Self::Resume { request_id, .. } => {
+                request_id
+            }
+        }
+    }
+
+    /// Returns the orchestrator name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Start { name, .. } | Self::Stop { name, .. } | Self::Resume { name, .. } => name,
+        }
+    }
+
+    /// Returns the stable action string (`start`, `stop` or `resume`).
+    pub fn action(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::Stop { .. } => "stop",
+            Self::Resume { .. } => "resume",
+        }
+    }
+}
+
+/// A typed orchestrator failure.
+///
+/// `message` and `detail` are redacted by the sender: neither carries a local path, a port,
+/// a password, a pairing link or a secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestratorError {
+    /// Machine-readable code, for example `node_offline`, `refused` or `spawn_failed`.
+    pub code: String,
+    /// Human-readable message; never a secret value or an absolute local path.
+    pub message: String,
+    /// Whether retrying the same command may succeed.
+    pub retryable: bool,
+}
+
+impl OrchestratorError {
+    /// Builds one typed error.
+    pub fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }
+    }
+}
+
+/// One agent -> home orchestrator command result.
+///
+/// Exactly one of `error` and a successful `accepted` result describes the outcome; `state`
+/// is the node's resulting record state. The agent never sends a port, a password, an
+/// absolute local path or a secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestratorResult {
+    /// Request id from the matching [`OrchestratorCommand`].
+    pub request_id: String,
+    /// Whether the node accepted and applied the command.
+    pub accepted: bool,
+    /// Resulting lifecycle state of the orchestrator on the node.
+    pub state: OrchestratorNodeState,
+    /// Typed failure, when the command was refused or failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<OrchestratorError>,
+    /// Redacted explanation for the owner; never a path or a secret value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl OrchestratorResult {
+    /// Builds an accepted result.
+    pub fn accepted(request_id: impl Into<String>, state: OrchestratorNodeState) -> Self {
+        Self {
+            request_id: request_id.into(),
+            accepted: true,
+            state,
+            error: None,
+            detail: None,
+        }
+    }
+
+    /// Builds a failed result with a typed error.
+    pub fn failed(request_id: impl Into<String>, state: OrchestratorNodeState, error: OrchestratorError) -> Self {
+        Self {
+            request_id: request_id.into(),
+            accepted: false,
+            state,
+            error: Some(error),
+            detail: None,
+        }
+    }
 }

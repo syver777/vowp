@@ -4,12 +4,128 @@ All notable changes to VOWP are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project follows
 [Semantic Versioning](https://semver.org/).
 
-Release notes are in [`docs/release/0.3.0.md`](docs/release/0.3.0.md),
+Release notes are in [`docs/release/0.4.0.md`](docs/release/0.4.0.md),
+[`docs/release/0.3.0.md`](docs/release/0.3.0.md),
 [`docs/release/0.2.0.md`](docs/release/0.2.0.md) and
 [`docs/release/0.1.0.md`](docs/release/0.1.0.md). The product scope and the
-features deliberately left out of v0.3 are in [`docs/roadmap.md`](docs/roadmap.md).
+features deliberately left out of v0.4 are in [`docs/roadmap.md`](docs/roadmap.md).
 
 ## [Unreleased]
+
+## [0.4.0] - 2026-11-18
+
+The v0.4 feature set: outbound Mac and Linux agent nodes, paired local `vowp chat` and opencode
+orchestrator surfaces, opt-in run offload with push or verified git bundle return, and the phase-4
+hardening work — optional WSS ingress, launchd/systemd-user agent service, surface token rotation,
+separate-user checks, capacity history and live supervisor drain/upgrade. ASIF 0.4 session
+export/import is a review draft. The upgrade path and the known limits are in
+[`docs/release/0.4.0.md`](docs/release/0.4.0.md).
+
+### Added
+
+**ASIF 0.4 interchange (review draft)**
+
+- `vowp session export <id> --format asif` writes one deterministic `.asif.zip` through the
+  published `vowp-asif 0.1.1` adapter from crates.io. The default path is
+  `./<resolved-id>.asif.zip`; `--out -` writes the exact package bytes and is refused on a
+  terminal, and `--json` conflicts with it. Export is read-only: it writes no capsule, takes no
+  session lock and moves no lease.
+- Export redaction: repeatable `--redact` literals and `--redact-file` (read locally, one
+  literal per line). Host paths are scrubbed by default; `--keep-host-paths` is opt-in.
+- `vowp session import <file> --format asif` imports a `.asif.zip`, a standalone `session.json`,
+  a directory holding it or stdin as one new idle session with a fresh ULID. It never
+  overwrites, merges or keeps the source id; `--cwd` defaults to the project path and
+  `--branch` selects one branch of a multi-branch document.
+- Loss reporting and policy: human output prints the count and unique loss kinds to stderr,
+  `--json` carries the summary, and `--report` writes the full `vowp-asif-report-v1`.
+  `--strict` refuses `Blocking`/`Integrity` losses with exit 5 and writes nothing;
+  `--allow-loss` accepts recoverable integrity/ambiguity problems as declared losses. The two
+  flags conflict.
+- Remote export and import over the existing SSH transport. Export verifies the hidden stream's
+  byte count and SHA-256 before writing the local package; `--report` and directory input are
+  refused with `--node`.
+- `vowp_core::session::asif` exposes the adapter-free `AsifReport`/`AsifImportResponse` facade,
+  and `vowp-protocol` exports both documents with their JSON Schemas. The adapter is a runtime
+  dependency of `vowp-core` only; `vowp-cli` uses it as a dev-dependency for fixtures.
+- The daemon serves token-free `GET /api/v1/sessions/{id}/export/asif` (with `?report=1` for
+  the loss preview) and token-gated `POST /api/v1/sessions/import/asif?branch=<id>`. The session
+  detail page gains the download card, `/import` is the upload page, and the PWA shell includes
+  it.
+- The cross-cutting contract is in
+  [`docs/design/v0.4/asif-integration.md`](docs/design/v0.4/asif-integration.md); the session
+  narrative is `sessions.md` §6.8, and `cli.md` and `http-api.md` carry the command and route
+  detail.
+
+ASIF 0.4 is a review draft. The slice reports declared losses and does not claim ASIF
+conformance, an exact or lossless round trip, portable continuation or native-harness import.
+The adapter is the published `vowp-asif = "=0.1.1"` crate from crates.io, recorded in
+[`docs/design/v0.4/asif-integration.md`](docs/design/v0.4/asif-integration.md) §4.3; all nine
+workspace crates pass `scripts/release/check-packages.sh`.
+
+**v0.4 local orchestrator: agent nodes, local chat, offload and the local opencode surface**
+
+- Phase 0: outbound agent nodes with Ed25519 node identity and one-time enrollment, the
+  authenticated SSH-stdio gateway and presence reporting. The optional WSS transport is covered
+  in the Phase-4 entry below.
+- Phase 1: a local `vowp chat` surface that pairs over the agent connection, acquires and
+  heartbeats the same session lease as the home, ingests turns into the single session log and
+  replays its spool after a disconnect, with lease takeover and the read-only follow mode.
+- Phase 2: opt-in offload with a placement policy, a Mac path map, an isolated worktree per job,
+  ordered run events and home verification of the pushed `job/<id>` branch. Offload remains off
+  by default.
+- Phase 3: the local opencode surface — attach/detach, native-event, turn and MCP frames; the
+  mode-0600 agent socket; the opencode SSE bridge; the stdio MCP proxy with its bounded offline
+  read cache; and home materialization and lifecycle of a local orchestrator.
+- The acceptance repair: the home gateway handles all five local-surface frames and MCP tool
+  calls, `vowp agent pair` uses the live agent socket instead of superseding it, a local opencode
+  host auto-wires its bridge, and unsent bridge frames are included in the pending spool count.
+  The real-gateway multi-project E2E proof is
+  [`crates/vowp-cli/tests/agent.rs`](crates/vowp-cli/tests/agent.rs).
+
+The design is in [`docs/design/v0.4/local-orchestrator.md`](docs/design/v0.4/local-orchestrator.md);
+the Phase 3 proof table is in [`docs/roadmap.md`](docs/roadmap.md#v04-local-orchestrator). The owner
+live Mac smoke test passed on 2026-11-18; the record is in
+[`docs/releases/v0.4-hardening.md`](docs/releases/v0.4-hardening.md).
+
+**Phase-4 hardening: agent nodes, WSS, rotation, bundles and capacity history**
+
+- `vowp agent enroll --wss <url>` (with optional `--tls-fingerprint`) stores the optional WSS
+  transport. The home's `[ingress.wss]` table starts a loopback WebSocket listener behind the
+  owner's TLS reverse proxy; `vowp up` starts and stops the hidden `agent gateway --listen`
+  child. TLS, ACME and the public port stay outside VOWP.
+- `vowp agent trust --fingerprint <sha256:…>` confirms a changed system-mode WSS leaf
+  fingerprint after the owner verifies it through a trusted channel; it rewrites only the private
+  `agent.json` and never connects. A `tls = "pin"` transport stays a hard pin, so a changed pinned
+  certificate still requires re-enrollment with `--tls-fingerprint`.
+- `vowp agent service install|uninstall|status` writes or removes exactly one 0600 launchd
+  `LaunchAgent` or systemd user unit for the current user. `agent run --service` writes the
+  launchd restart marker and drains the spool and leases on SIGTERM. `agent doctor` reports
+  state-directory, service, surface and copied-login warnings by name only.
+- Surface rotation gains `--wait` and `--grace` (default ten minutes, capped at 24 hours), a
+  durable `queued_at`/`overlap_until` envelope, `PREFIX`/`OVERLAP` columns, a `surfaces` status
+  array and the `needs_pair` state. `surface pair --replace` revokes the old surface and creates
+  its replacement in one transaction. Rotation and revocation write one token-free ledger note.
+- `[offload] result_transport = "bundle"` is legal and returns a verified `base..head` git bundle
+  over the authenticated agent channel. The five bundle frames and
+  `AssignmentPayload.result_transport` are exported; the home verifies size/sha256,
+  `git bundle verify`, one job ref and base ancestry before the gates or any project ref. Push
+  stays the default and neither transport falls back.
+- Global schema v7 adds `capacity_rollups` with a v6-to-v7 migration and backup.
+  `vowp capacity history [--since] [--bucket 5m|1h|1d]` reads the bounded history read-only; raw
+  samples are kept 48 hours and rollups 30 days. Cost remains `vowp cost --by day`.
+- The separate-user shape, service limits, WSS trust boundary, rotation storage and bundle
+  verification are documented in [`docs/security.md`](docs/security.md), with the operator path
+  in [`docs/guides/agent-node.md`](docs/guides/agent-node.md) and the design/status pages updated.
+  The owner live Mac smoke test passed on 2026-11-18; the smoke-test record, the rollback drill and
+  the security-review sign-off are recorded phase-exit evidence in
+  [`docs/releases/v0.4-hardening.md`](docs/releases/v0.4-hardening.md).
+
+### Changed
+
+- The default fix loop is now two rounds (`max_attempts = 2`). The verifier's findings are
+  copied into each fix brief. A recovery retry that finds a terminal fix child allocates a fresh
+  child (`<id>-fix-<attempt>-rN`) instead of sending `NeedsSatisfied` to the finished job, which
+  closes the `NeedsSatisfied in state Done` wedge.
 
 ## [0.3.0] - 2026-11-12
 
@@ -348,7 +464,8 @@ generated CLI and JSON Schema reference (`docs/reference/`), the design spec
 (`docs/design/`), a docs command/link checker (`docs/tests/`) and the runnable
 `examples/hello-vowp` fake-adapter demo.
 
-[Unreleased]: https://github.com/syver777/vowp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/syver777/vowp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/syver777/vowp/releases/tag/v0.4.0
 [0.3.0]: https://github.com/syver777/vowp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/syver777/vowp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/syver777/vowp/releases/tag/v0.1.0

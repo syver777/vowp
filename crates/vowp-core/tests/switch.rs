@@ -598,6 +598,92 @@ fn switch_redacts_secret_from_written_capsule_file_and_row() {
 }
 
 #[test]
+fn switch_redacts_secret_from_target_turn_events() {
+    let tmp = tempdir().expect("tempdir");
+    let secret = "switch-target-value-8642";
+    let target = FakeAdapter::new(
+        HarnessKind::ClaudeCode,
+        vec![HarnessEvent {
+            ts: Some(ts()),
+            actor: Actor::Assistant,
+            body: EventBody::AssistantMessage(AssistantMessage {
+                text: format!("the target saw {secret}"),
+            }),
+            raw: Some(serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": format!("raw {secret}")}]},
+            })),
+        }],
+    );
+    let deps = deps(
+        &tmp,
+        AdapterRegistry::new()
+            .with("opencode", Arc::new(capsule_adapter("handoff")))
+            .with("claude-code", Arc::new(target)),
+    );
+    let name = SecretName::parse("TARGET_KEY").expect("secret name");
+    vowp_core::vault::write_secret(&deps, &name, secret).expect("write secret");
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, "target turn redaction");
+
+    let switch = run_switch_with_input(
+        &deps,
+        &request(&session, claude(), SwitchReason::Failover),
+        "continue",
+        &CancelToken::default(),
+    )
+    .expect("seeded switch");
+    assert_eq!(switch.state, SwitchState::Completed);
+
+    let marker = "[REDACTED:TARGET_KEY]";
+    let events = read_events(&deps, &session);
+    let assistant = events
+        .iter()
+        .find_map(|event| match event.body() {
+            Ok(EventBody::AssistantMessage(payload)) => Some((event, payload)),
+            _ => None,
+        })
+        .expect("the target turn appended its assistant message");
+    assert!(
+        assistant.1.text.contains(marker),
+        "the assistant body records the redaction: {:?}",
+        assistant.1.text
+    );
+    assert!(
+        !assistant.1.text.contains(secret),
+        "the assistant body does not hold the raw secret: {:?}",
+        assistant.1.text
+    );
+    let raw = assistant.0.raw.as_ref().expect("the harness raw value is kept");
+    let raw_text = raw.to_string();
+    assert!(
+        raw_text.contains(marker),
+        "the raw value records the redaction: {raw_text}"
+    );
+    assert!(
+        !raw_text.contains(secret),
+        "the raw value does not hold the raw secret: {raw_text}"
+    );
+    // No event written by the seeded switch may carry the exact value in its body or raw.
+    for event in &events {
+        assert!(
+            !event.payload.to_string().contains(secret),
+            "event {} ({}) holds the raw secret",
+            event.seq,
+            event.event_type
+        );
+        if let Some(raw) = &event.raw {
+            assert!(
+                !raw.to_string().contains(secret),
+                "event {} ({}) raw holds the raw secret",
+                event.seq,
+                event.event_type
+            );
+        }
+    }
+}
+
+#[test]
 fn session_ops_switch_uses_run_switch() {
     let tmp = tempdir().expect("tempdir");
     let deps = deps(

@@ -27,7 +27,7 @@ validated CLI commands, never by hand.
 | `brief` | Path to the job contract, normally `.vowp/jobs/<id>/brief.md`. |
 | `report` | Path to the result, normally `.vowp/jobs/<id>/report.md`. |
 | `gates` | Ordered gate list. Defaults depend on the kind; commands are added per job. |
-| `loop` | `until: gates`, `max_attempts` (default 3), `on_exhausted` (`escalate`, `park` or `fail`). |
+| `loop` | `until: gates`, `max_attempts` (default 2), `on_exhausted` (`escalate`, `park` or `fail`). |
 | `branch`, `worktree` | Created at dispatch; verify, fix and merge jobs reuse the original's. |
 | `attempts`, `continues`, `hang_restarts` | Bounded retry counters. |
 | `parked_reason`, `note`, `created_by` | Why it waits, a human note, and who created it. |
@@ -122,7 +122,7 @@ These commands are implemented today, including the supervisor commands (`vowp u
 |---|---|---|---|
 | **L1 Supervisor** | 60 s | Reconcile runs, harvest outcomes, detect stalls, run gates, schedule verifies and merges, dispatch, trigger planner/keeper, run schedules, write the board and heartbeat. | Never stops; the watchdog restarts it. |
 | **L2 Worker** | per job | Start the worker from its brief; if a run ends without a report, continue in the same session. | 2 continues per attempt, then the keeper. |
-| **L3 Verify** | after a report | A separate verifier reads the brief, diff and evidence, and returns pass or concrete findings. | 3 fix rounds, then escalate. |
+| **L3 Verify** | after a report | A separate verifier reads the brief, diff and evidence, and returns pass or concrete findings. | 2 fix rounds, then escalate. |
 | **L4 Planner** | events + 30 min heartbeat | Decompose, reprioritise, review reports, write checkpoints. | One planner turn at a time. |
 | **L5 Keeper** | stalls/failures + 20 min heartbeat | Diagnose, then nudge, restart, replan, park or fail. Covers planning when the planner's provider is limited. | One keeper turn at a time. |
 | **L6 Failover** | on limit events | Hand off to the next rung with a capsule, probe the limited provider after its reset. | Never moves work to an unlisted paid provider. |
@@ -200,7 +200,7 @@ repository-wide checks (`[project].check_cmds`) belong to the merge queue, not t
 | Hung before any output | 8 min |
 | Automatic continues per attempt | 2 |
 | Hang restarts before `stalled` | 3 |
-| Fix rounds (`max_attempts`) | 3 |
+| Fix rounds (`max_attempts`) | 2 |
 | Same action repeated without new evidence | 3 → stop and escalate |
 | Planner heartbeat / keeper heartbeat | 30 min / 20 min |
 | Minimum gap between planner/keeper turns | 5 min |

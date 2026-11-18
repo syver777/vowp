@@ -813,7 +813,7 @@ fn verify_no_verdict_twice_parks_original_with_question() {
 }
 
 #[test]
-fn verify_fail_creates_fix_job_same_branch_max_3_then_escalates() {
+fn verify_fail_creates_fix_job_same_branch_max_2_then_escalates() {
     let adapter = Arc::new(ScriptAdapter::new(
         vowp_protocol::HarnessKind::Opencode,
         report_script("verify-fail", Some("fail"), "done"),
@@ -826,14 +826,14 @@ fn verify_fail_creates_fix_job_same_branch_max_3_then_escalates() {
     });
     let store = node.store();
     let job = store.require_job(&original.id).expect("job");
-    assert_eq!(job.attempts, 3);
+    assert_eq!(job.attempts, 2);
     let fix_jobs = store
         .list_jobs(&JobFilter {
             kind: Some(JobKind::Fix),
             ..JobFilter::default()
         })
         .expect("fix jobs");
-    assert_eq!(fix_jobs.len(), 3);
+    assert_eq!(fix_jobs.len(), 2);
     for fix in &fix_jobs {
         assert_eq!(fix.branch, job.branch);
         assert_eq!(fix.worktree, job.worktree);
@@ -863,6 +863,40 @@ fn verify_fail_creates_fix_job_same_branch_max_3_then_escalates() {
     assert_eq!(decision.kind, JobKind::Decision);
     let inbox = store.list_inbox(None).expect("inbox");
     assert!(inbox.iter().any(|item| item.kind == vowp_protocol::InboxKind::Decision));
+}
+
+#[test]
+fn verify_fail_after_terminal_fix_gets_a_fresh_fix_child() {
+    let adapter = Arc::new(ScriptAdapter::new(
+        vowp_protocol::HarnessKind::Opencode,
+        report_script("verify-reuse", Some("fail"), "done"),
+    ));
+    let node = TestNode::with_adapter(true, adapter);
+    let original = reviewing_job(&node, "verify-reuse");
+    let stale = node.insert_job(
+        "verify-reuse-fix-1",
+        JobKind::Fix,
+        vowp_protocol::Role::Worker,
+        Some(vec![]),
+    );
+    node.force_state(&stale, JobState::Done);
+    let mut supervisor = node.supervisor();
+    node.tick_until(&mut supervisor, 60, |store| {
+        store
+            .require_job(&vowp_protocol::JobId::parse("verify-reuse-fix-1-r2").expect("id"))
+            .is_ok()
+    });
+    let store = node.store();
+    let fresh = store
+        .require_job(&vowp_protocol::JobId::parse("verify-reuse-fix-1-r2").expect("id"))
+        .expect("fresh fix child");
+    assert_eq!(fresh.kind, JobKind::Fix);
+    assert_ne!(fresh.state, JobState::Done);
+    assert_eq!(
+        store.require_job(&original.id).expect("original").state,
+        JobState::Fixing,
+        "the parent must wait on the new fix, not restart the terminal child"
+    );
 }
 
 #[test]

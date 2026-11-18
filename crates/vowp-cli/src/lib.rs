@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Cursor, IsTerminal, Write};
 
 use clap::Parser;
 
+pub mod agent_exec;
 pub mod chat;
 pub mod cli;
 pub mod cmd;
@@ -24,7 +25,7 @@ pub mod setup;
 pub mod signals;
 pub mod ssh_stream;
 
-pub use cli::{Cli, Command, Global};
+pub use cli::{Cli, Command, Global, SessionCommand};
 pub use ctx::Ctx;
 pub use errors::CliError;
 
@@ -192,6 +193,36 @@ fn execute(cli: Cli, original_args: &[String], io: &mut dyn IoStreams) -> Result
         if !paths.db_path().is_file() {
             vowp_store::Store::open(&paths)?;
         }
+    }
+    // The Mac agent has no store, project or `--node` meaning: it always runs locally against
+    // `~/.vowp-agent`. Handle it before the generic remote redirect.
+    if let Command::Agent { command } = &command {
+        return cmd::agent::run(&global, io, command);
+    }
+    // `chat --agent` is the Mac surface: it runs from `~/.vowp-agent` and the local
+    // checkout's `vowp.toml`, so it needs no local home database and must not be routed
+    // to the home from a control machine.
+    if let Command::Chat(args)
+    | Command::Session {
+        command: SessionCommand::Chat(args),
+    } = &command
+        && args.agent
+    {
+        return chat::agent::run_local(&global, io, args);
+    }
+    // `mcp --agent-socket` is the Mac proxy: it answers MCP locally and forwards tool calls
+    // over the agent socket. A Mac has no local home database, so it must run before the
+    // generic `--node` redirect and `Ctx::build`.
+    if let Command::Mcp(args) = &command
+        && args.agent_socket.is_some()
+    {
+        return cmd::mcp::run_proxy(io, args);
+    }
+    // `surface` is home-only and its `--node` flag names the node the surface runs on, not an
+    // SSH redirect. Handle it before the generic `--node` routing.
+    if let Command::Surface { command } = &command {
+        let ctx = Ctx::build(&global, io)?;
+        return cmd::surface::run(&ctx, io, command, global.node.as_deref());
     }
     // Refuse a command that still needs a v0.2 handler before the generic `--node` redirect,
     // which would otherwise silently run the v0.1 chat loop.

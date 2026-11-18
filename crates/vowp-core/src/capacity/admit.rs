@@ -56,7 +56,8 @@ pub fn request_for(deps: &Deps, store: &Store, job: &Job) -> Result<AdmitRequest
         .into_iter()
         .map(|limit| (limit.provider, limit.resets_at))
         .collect();
-    let profile = deps.config.profiles.get(&job.profile);
+    let config = super::reload::effective_config(deps);
+    let profile = config.profiles.get(&job.profile);
     let executor = profile
         .and_then(|profile| profile.pick(&limited, now))
         .map(|(_, executor)| executor.clone())
@@ -99,7 +100,7 @@ impl CapacityManager {
         self.handle_oom_kills(store, now)?;
         let target = targets::current_for(&self.deps, store, now)?;
         self.record_auto_target(store, &target, now)?;
-        if target.target_workers > self.deps.config.node.max_workers {
+        if target.target_workers > super::reload::effective_config(&self.deps).node.max_workers {
             self.ensure_worker_slots(store, target.target_workers)?;
         }
         Ok(sample)
@@ -274,7 +275,7 @@ impl CapacityManager {
 
         self.clear_wait(store, req)?;
         store.kv_set(LAST_PROJECT_KEY, req.project.as_str())?;
-        if target.target_workers > self.deps.config.node.max_workers {
+        if target.target_workers > super::reload::effective_config(&self.deps).node.max_workers {
             self.ensure_worker_slots(store, target.target_workers)?;
         }
         Ok(AdmitDecision::Admit)
@@ -351,7 +352,7 @@ impl CapacityManager {
         self.handle_oom_kills(store, now)?;
         let target = targets::current_for(&self.deps, store, now)?;
         self.record_auto_target(store, &target, now)?;
-        if target.target_workers > self.deps.config.node.max_workers {
+        if target.target_workers > super::reload::effective_config(&self.deps).node.max_workers {
             self.ensure_worker_slots(store, target.target_workers)?;
         }
         Ok(())
@@ -497,7 +498,7 @@ impl CapacityManager {
 
     /// Grows worker slots to the owner's target when it exceeds the config preference.
     fn ensure_worker_slots(&self, store: &Store, target: u32) -> Result<(), CoreError> {
-        let count = self.deps.config.node.max_workers.max(target);
+        let count = super::reload::effective_config(&self.deps).node.max_workers.max(target);
         if store.bound_project().is_some() {
             store.ensure_worker_slots(&self.deps.node, WorkerKind::Worker, count)?;
             return Ok(());

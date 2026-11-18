@@ -2,11 +2,14 @@
 
 VOWP 0.3 has one **home** on a Linux VPS that owns the truth. Every other machine is either a **control machine**
 that talks to it or an **executor machine** that runs work the home schedules. No control machine opens
-a database; no second machine is authoritative.
+a database; no second machine is authoritative. The v0.4 [agent node](agent-node.md) is the
+supported Mac or Linux executor: it dials the home, keeps its own node key and path map, and can
+run as a launchd or systemd-user service.
 
 > **Status: current.** `vowp control`, `vowp tunnel`, `vowp fleet`, `vowp node`, the `--node` redirect
 > and cross-machine session export/import/switch are implemented. Remote execution uses the home's
-> session service; the same session is never written by two machines.
+> session service; the same session is never written by two machines. The v0.4 agent node is in
+> [The agent node](agent-node.md).
 
 ## What each machine is
 
@@ -109,6 +112,23 @@ registered without a probe because the home will never dial it. `node rm` refuse
 On a control machine, `node add/ls/rm` edit the control machine's `nodes.json` mirror rather than a
 home database. Add the home once with `control init` or `setup control`; add other machines only when
 you need to address them from the laptop.
+
+## Run an agent node
+
+A Mac or Linux executor uses the v0.4 agent instead of the older `--node` executor. It enrolls
+with a one-time code, dials the home over SSH stdio or an owner-managed WSS proxy, and can be
+installed as a launchd or systemd-user service. The home keeps the database, the session log and
+the merge queue.
+
+```sh
+vowp node enroll mac-studio --label mac
+vowp node show mac-studio
+```
+
+Run the printed `vowp agent enroll` command on the node, then check it with `vowp agent status`.
+The full operator path — service install, separate user, surface rotation, WSS, bundle result and
+capacity history — is in [The agent node](agent-node.md). It is not a second home and does not
+change the rule that the home is the only writer.
 
 ## Use `--node` (machine selector)
 

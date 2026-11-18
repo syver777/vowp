@@ -3,10 +3,10 @@
 mod common;
 
 use clap::{CommandFactory, Parser};
-use vowp_cli::cli::{Cli, Command, JobCommand, ScheduleArgs, V0_1_COMMANDS, V0_2_COMMANDS};
+use vowp_cli::cli::{Cli, Command, JobCommand, ScheduleArgs, SurfaceCommand, V0_1_COMMANDS, V0_2_COMMANDS};
 use vowp_cli::output::kind_name;
 use vowp_cli::{BufferIo, CliError, Ctx, Global, IoStreams};
-use vowp_protocol::ErrorKind;
+use vowp_protocol::{ErrorKind, NodeName, NodeStatus};
 
 #[test]
 fn parse_global_flags_and_node() {
@@ -153,6 +153,63 @@ fn help_lists_every_v0_1_command() {
 }
 
 #[test]
+fn surface_commands_are_registered_and_node_is_a_filter() {
+    assert!(
+        V0_2_COMMANDS.contains(&"surface"),
+        "surface must be in the v0.2 command constant"
+    );
+    assert!(
+        Cli::command().render_help().to_string().contains("surface"),
+        "help must mention surface"
+    );
+
+    let cli = Cli::try_parse_from([
+        "vowp",
+        "surface",
+        "pair",
+        "--node",
+        "mac-studio",
+        "--session",
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "--kind",
+        "opencode",
+    ])
+    .expect("surface pair parses");
+    assert_eq!(cli.global.node.as_deref(), Some("mac-studio"));
+    match cli.command {
+        Command::Surface {
+            command: SurfaceCommand::Pair(args),
+        } => {
+            assert_eq!(args.session, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            assert_eq!(args.kind, "opencode");
+            assert!(args.app.is_none());
+        }
+        other => panic!("expected surface pair, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["vowp", "surface", "ls", "--node", "mac-studio"]).expect("surface ls parses");
+    assert_eq!(cli.global.node.as_deref(), Some("mac-studio"));
+    match cli.command {
+        Command::Surface {
+            command: SurfaceCommand::Ls(_),
+        } => {}
+        other => panic!("expected surface ls, got {other:?}"),
+    }
+
+    let cli = Cli::try_parse_from(["vowp", "surface", "revoke", "01ARZ3NDEKTSV4RRFFQ69G5FAW", "--yes"])
+        .expect("surface revoke parses");
+    match cli.command {
+        Command::Surface {
+            command: SurfaceCommand::Revoke(args),
+        } => {
+            assert_eq!(args.id, "01ARZ3NDEKTSV4RRFFQ69G5FAW");
+            assert!(args.yes);
+        }
+        other => panic!("expected surface revoke, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_schedule_add_examples_from_cli_md() {
     use vowp_cli::cli::{ScheduleActionArg, ScheduleCommand};
 
@@ -257,6 +314,74 @@ fn json_error_shape_not_found() {
         "{value}"
     );
     assert_eq!(value["error"]["hint"], "vowp job ls");
+}
+
+#[test]
+fn node_enroll_replace_rotates_a_pending_code_and_rm_yes_removes() {
+    let env = common::TestEnv::new();
+    let (code, first, stderr) = env.run_json(&["node", "enroll", "mac-studio", "--label", "old"]);
+    assert_eq!(code, 0, "{stderr}");
+    let first_code = first["code"].as_str().expect("first code").to_owned();
+
+    // Without --replace the existing pending node is a conflict.
+    let (code, _, stderr) = env.run(&["node", "enroll", "mac-studio"]);
+    assert_eq!(code, 4, "{stderr}");
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(stderr.contains("--replace"), "{stderr}");
+
+    let (code, second, stderr) = env.run_json(&["node", "enroll", "mac-studio", "--replace", "--label", "new"]);
+    assert_eq!(code, 0, "{stderr}");
+    let second_code = second["code"].as_str().expect("second code").to_owned();
+    assert_ne!(first_code, second_code, "the pending code rotates");
+
+    let store = env.store();
+    let now = store.clock().now();
+    let node = NodeName::parse("mac-studio").expect("node name");
+    assert!(
+        store
+            .consume_enrollment_code(&vowp_core::agent::hash_code(&first_code), now)
+            .expect("old code lookup")
+            .is_none(),
+        "the replaced code must not redeem"
+    );
+    assert!(
+        store
+            .consume_enrollment_code(&vowp_core::agent::hash_code(&second_code), now)
+            .expect("new code lookup")
+            .is_some(),
+        "the replacement code redeems"
+    );
+    let card = store.node_card(&node, now).expect("card").expect("present");
+    assert_eq!(card.labels, vec!["new".to_owned()], "labels are replaced when given");
+
+    // An active node is protected from a silent wipe.
+    store
+        .set_node_status(&node, NodeStatus::Active, "", now)
+        .expect("activate");
+    let (code, _, stderr) = env.run(&["node", "enroll", "mac-studio", "--replace"]);
+    assert_eq!(code, 4, "{stderr}");
+    assert!(stderr.contains("active"), "{stderr}");
+    assert!(stderr.contains("revoke"), "{stderr}");
+    assert!(stderr.contains("node rm"), "{stderr}");
+
+    // `node rm --yes` works non-interactively.
+    let (code, removed, stderr) = env.run_json(&["node", "rm", "mac-studio", "--yes"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(removed["name"], "mac-studio");
+    assert!(store.node_card(&node, now).expect("card").is_none());
+}
+
+#[test]
+fn node_rm_without_yes_keeps_its_previous_behavior() {
+    let env = common::TestEnv::new();
+    let (code, _, stderr) = env.run(&["node", "enroll", "old-mac"]);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, stdout, stderr) = env.run(&["node", "rm", "old-mac"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("removed node old-mac"), "{stdout}");
+    let node = NodeName::parse("old-mac").expect("node name");
+    let now = env.store().clock().now();
+    assert!(env.store().node_card(&node, now).expect("card").is_none());
 }
 
 #[test]

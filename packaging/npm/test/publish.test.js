@@ -13,6 +13,7 @@ const { startServer } = require("./helpers/server");
 
 const packageRoot = path.resolve(__dirname, "..");
 const { version } = require("../package.json");
+const versionPattern = version.replaceAll(".", "\\.");
 
 function makeFakeEnvironment() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "vowp-npm-publish-"));
@@ -72,7 +73,10 @@ test("publish.sh verifies the release and runs npm publish --dry-run by default"
   await withRelease(buildRelease({ version }), async (root, release) => {
     const result = await runPublish(root, release);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /verified vowp-0\.2\.0-x86_64-unknown-linux-gnu\.tar\.gz/);
+    assert.match(
+      result.stdout,
+      new RegExp(`verified vowp-${versionPattern}-x86_64-unknown-linux-gnu\\.tar\\.gz`),
+    );
     assert.match(result.stdout, /dry run only; nothing was published/);
     assert.equal(readLog(root), "publish --dry-run");
     assert.doesNotMatch(
@@ -98,7 +102,10 @@ test("publish.sh refuses when an archive does not match its checksum", async () 
     async (root, release) => {
       const result = await runPublish(root, release);
       assert.equal(result.status, 1);
-      assert.match(result.stderr, /SHA256 mismatch for vowp-0\.2\.0-aarch64-apple-darwin/);
+      assert.match(
+        result.stderr,
+        new RegExp(`SHA256 mismatch for vowp-${versionPattern}-aarch64-apple-darwin`),
+      );
       assert.equal(readLog(root), "");
     },
   );

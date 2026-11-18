@@ -195,7 +195,7 @@ refuse with exit 5 because the control machine has no local truth. A path accept
 | `[profiles.<name>]` | `ladder` | [executor string], **required** | — | ordered rungs `harness:model[@effort][#variant]` |
 | | `on_quota` | `next_then_probe_back`\|`next`\|`park` | `next_then_probe_back` | |
 | | `node` | string | project home | run this profile's sessions on that node |
-| `[providers.<p>]` | `max_concurrent` | int | 4 | concurrent runs for provider `p` (lowered after 429s) |
+| `[providers.<p>]` | `max_concurrent` | int | 4 | concurrent runs for provider `p`; reloaded live (a raise admits on the next tick, a lower only stops new admissions) and lowered after 429s |
 | | `on_credits_exhausted` | `"park"` | `park` | the only v0.1 option |
 | `[providers.<p>.prices."<model>"]` | `input_per_m`, `output_per_m`, `cache_read_per_m`, `cache_write_per_m` | float USD per 1M tokens | — | price table for `cost.source = "price-table"` |
 | `[harnesses.<name>]` | `binary`, `extra_args`, `env_pass`, `permission_mode`, `mapping` | | PATH lookup | per-harness overrides; `mapping` = generic cli adapter file |
@@ -205,6 +205,27 @@ refuse with exit 5 because the control machine has no local truth. A path accept
 | `[[schedules]]` | `name`, `cron` \| `every`, `tz`, `missed`, `action` | | | L9 (see `loops.md` §11) |
 | `[capsule]` | `executor`, `min_interval_secs`, `max_input_chars`, `tail_turns` | | cheapest capable = last rung of `keeper` | |
 | `[merge]` | `rebase`, `check_cmds`, `timeout_secs`, `secret_scan` | | true / project.check_cmds / 2700 / true | |
+
+#### Live reload of provider caps
+
+The supervisor keeps the effective `VowpConfig` in a `capacity::reload::ConfigCell`. Once per
+project tick it compares the project `vowp.toml` and the node `config.toml` with the fingerprint
+(mtime plus content hash) of the applied config. A changed valid file is parsed and validated into
+one complete `VowpConfig` and swapped into the cell atomically.
+
+- A raised `[providers.<name>].max_concurrent` frees provider slots on the next dispatch plan.
+- A lowered cap stops new admissions. It never kills, interrupts or pauses an active run; runs
+  that already started keep their slot and are counted against the new cap.
+- The capacity target is already a live database value and is re-read on every admission.
+- An invalid or unparseable file keeps the previous config. The supervisor logs the config path
+  and the error, opens one node-inbox notice, and applies no partial document.
+- Each applied reload writes one ledger `note` row with the old/new provider caps, old/new target
+  and the changed config keys. Logs and ledger rows never carry secret values.
+
+`vowp capacity reload [--check]` validates or asks the running supervisor to apply the same path;
+it never restarts the supervisor and never edits `vowp.toml` itself. With no running supervisor the
+command exits 5 and prints the start hint. `vowp capacity report` shows the effective provider caps
+and whether the on-disk file still differs from the applied config.
 
 ### 5.2 Annotated example
 

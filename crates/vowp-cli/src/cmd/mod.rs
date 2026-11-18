@@ -6,6 +6,7 @@
 use crate::cli::{Command, MaintCommand, PromoteCommand, SessionCommand, UpCommand};
 use crate::{CliError, Ctx, IoStreams};
 
+pub mod agent;
 pub mod attach;
 pub mod board;
 pub mod capacity;
@@ -25,6 +26,7 @@ pub mod maint;
 pub mod mcp;
 pub mod migrate;
 pub mod node;
+pub mod offload;
 pub mod orchestrator;
 pub mod plan;
 pub mod project;
@@ -33,8 +35,10 @@ pub mod schedule;
 pub mod schema;
 pub mod secret;
 pub mod session;
+pub mod session_asif;
 pub mod setup;
 pub mod status;
+pub mod surface;
 pub mod tunnel;
 pub mod up;
 pub mod window;
@@ -73,6 +77,7 @@ pub fn dispatch(ctx: &Ctx, io: &mut dyn IoStreams, command: Command) -> Result<i
         Command::Inbox { command } => inbox::run(ctx, io, &command),
         Command::Cost(args) => cost::run(ctx, io, &args),
         Command::Node { command } => node::run(ctx, io, &command),
+        Command::Offload(args) => offload::run(ctx, io, &args.command),
         Command::Loops(args) => loops::run(ctx, io, &args),
         Command::Schedule(args) => schedule::run(ctx, io, &args),
         Command::Promote(args) => promote::run(ctx, io, &PromoteCommand::Promote(args)),
@@ -92,6 +97,10 @@ pub fn dispatch(ctx: &Ctx, io: &mut dyn IoStreams, command: Command) -> Result<i
         Command::Orchestrator(args) => orchestrator::run(ctx, io, &args),
         Command::Migrate(args) => migrate::run(ctx, io, &args),
         Command::Mcp(args) => mcp::run(ctx, io, &args),
+        Command::Agent { .. } => Err(CliError::Invalid(
+            "agent commands run without a project context".to_owned(),
+        )),
+        Command::Surface { command } => surface::run(ctx, io, &command, None),
         Command::Version => maint::run(ctx, io, &MaintCommand::Version),
         Command::Window(args) => window::run(ctx, io, &args),
         Command::Exec(args) => exec::run(ctx, io, &args),

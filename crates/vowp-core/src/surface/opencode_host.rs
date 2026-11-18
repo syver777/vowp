@@ -52,6 +52,12 @@ const HTTP_ATTEMPTS: usize = 2;
 /// How long one `/api/event` read may take after the request is sent.
 const SSE_WINDOW: Duration = Duration::from_millis(750);
 
+/// How long `stop` waits for a stopped pid to exit after the signal.
+const STOP_EXIT_WAIT: Duration = Duration::from_secs(1);
+
+/// How often `stop` re-checks the stopped pid while it exits.
+const STOP_EXIT_POLL: Duration = Duration::from_millis(25);
+
 /// The opencode app host.
 ///
 /// Construct it with [`OpencodeHost::new`] in tests to point at a fake binary; the default
@@ -260,6 +266,7 @@ impl OpencodeHost {
             .env("XDG_DATA_HOME", &layout.data)
             .env("XDG_STATE_HOME", &layout.state)
             .env("XDG_CACHE_HOME", &layout.cache)
+            .env("OPENCODE_CONFIG_DIR", &layout.workdir)
             .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
             .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
             .stdin(Stdio::null())
@@ -356,8 +363,10 @@ impl AppHost for OpencodeHost {
         let state = read_host_state(&layout)?;
         if let Some(state) = &state {
             stop_pid(state.pid);
+            wait_for_exit(state.pid, STOP_EXIT_WAIT);
         } else if process_alive(handle.pid) {
             stop_pid(handle.pid);
+            wait_for_exit(handle.pid, STOP_EXIT_WAIT);
         }
         remove_private(&layout.host_json);
         remove_private(&layout.service_json);
@@ -941,6 +950,18 @@ fn read_to_end(stream: &mut TcpStream, timeout: Duration) -> Result<Vec<u8>, Cor
         }
     }
     Ok(bytes)
+}
+
+/// Waits briefly for a stopped pid to disappear.
+///
+/// `stop_pid` already sends SIGTERM and escalates to SIGKILL; this final bound gives the
+/// kernel time to reap the process before a caller removes its work directory, which is
+/// what makes `--force` reliable.
+fn wait_for_exit(pid: u32, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while process_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(STOP_EXIT_POLL);
+    }
 }
 
 /// Parses an HTTP/1.1 response into status and body.

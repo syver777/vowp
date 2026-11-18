@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOWP jobs</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#16855b">
+<style>
+  :root {
+    color-scheme: light dark;
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --ink: #1f2421;
+    --muted: #5c6660;
+    --line: #d8d5cc;
+    --accent: #16855b;
+    --warn: #a33a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #161a18;
+      --card: #1e2421;
+      --ink: #edf0ec;
+      --muted: #a2ada6;
+      --line: #343c37;
+      --accent: #55d39b;
+      --warn: #ff9b7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.45;
+    overflow-x: hidden;
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 3rem;
+    display: grid;
+    gap: 1rem;
+  }
+  main > * { min-width: 0; }
+  h1 { margin: 0; font-size: 1.65rem; }
+  h2 { margin: 0; font-size: 1rem; }
+  a { color: var(--accent); }
+  .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .page-nav { margin: .15rem 0 0; font-weight: 600; }
+  .page-nav a { margin-right: .75rem; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: .6rem;
+    padding: .9rem 1rem;
+    min-width: 0;
+  }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; min-width: 62rem; border-collapse: collapse; font-size: .9rem; }
+  th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-size: .75rem; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+  td.state { font-weight: 700; }
+  td.needs, td.note { max-width: 20rem; overflow-wrap: anywhere; }
+  .actions { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .actions-cell { min-width: 12rem; }
+  button {
+    background: var(--accent);
+    color: var(--card);
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    padding: .2rem .55rem;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  button.cancel { background: var(--card); color: var(--warn); border-color: var(--warn); }
+  .unlock-form { display: flex; flex-wrap: wrap; gap: .35rem .5rem; align-items: center; }
+  .unlock-form label { color: var(--muted); font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  input[type="password"] {
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: .4rem;
+    padding: .25rem .45rem;
+    font: inherit;
+  }
+  .error, .notice {
+    margin: 0;
+    padding: .65rem .9rem;
+    border: 1px solid var(--warn);
+    border-radius: .5rem;
+    color: var(--warn);
+    background: var(--card);
+    font-weight: 600;
+  }
+  .notice { border-color: var(--accent); color: var(--accent); }
+  [hidden] { display: none !important; }
+  @media (max-width: 420px) {
+    main { padding: .75rem .5rem 2rem; gap: .65rem; }
+    .card { padding: .7rem .75rem; border-radius: .5rem; }
+    h1 { font-size: 1.3rem; }
+    th, td { padding: .35rem .4rem; }
+  }
+</style>
+</head>
+<body>
+<main id="jobs">
+  <header class="page-head">
+    <div>
+      <h1>VOWP jobs</h1>
+      <nav class="page-nav" aria-label="Pages">
+        <a href="/">Board</a>
+        <a href="/jobs" aria-current="page">Jobs</a>
+        <a href="/sessions">Sessions</a>
+        <a href="/cost">Cost</a>
+        <a href="/inbox">Inbox</a>
+      </nav>
+      <p class="muted">Every job in the served project. Retry, park and cancel ask for the daemon write key.</p>
+    </div>
+    <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+  </header>
+
+  <p id="error" class="error" role="alert" hidden></p>
+  <p id="notice" class="notice" role="status" hidden></p>
+
+  <section id="unlock" class="card" aria-labelledby="unlock-heading" hidden>
+    <h2 id="unlock-heading">Unlock job actions</h2>
+    <p class="muted">Paste the daemon write token. It stays in this tab's sessionStorage and is never put in the URL.</p>
+    <form id="unlock-form" class="unlock-form">
+      <label for="key">Token</label>
+      <input id="key" name="key" type="password" autocomplete="off" spellcheck="false">
+      <button type="submit">Save token</button>
+    </form>
+    <script>
+      // The shared unlock panel: the daemon write token lives only in this tab's
+      // sessionStorage, is never put in the URL and is never printed or logged.
+      const TOKEN_KEY = "vowp-api-token";
+
+      function readKey() {
+        try {
+          return window.sessionStorage.getItem(TOKEN_KEY) || "";
+        } catch {
+          return "";
+        }
+      }
+
+      function writeKey(value) {
+        try {
+          if (value) {
+            window.sessionStorage.setItem(TOKEN_KEY, value);
+          } else {
+            window.sessionStorage.removeItem(TOKEN_KEY);
+          }
+        } catch {
+          // A browser with storage disabled cannot unlock; reads still work.
+        }
+        updateUnlock();
+      }
+
+      function updateUnlock() {
+        document.getElementById("unlock").hidden = readKey() !== "";
+      }
+    </script>
+  </section>
+
+  <section class="card" aria-labelledby="jobs-heading">
+    <h2 id="jobs-heading">Jobs</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>State</th>
+            <th>Kind</th>
+            <th>Role</th>
+            <th>Priority</th>
+            <th>Needs</th>
+            <th>Attempts</th>
+            <th>Updated</th>
+            <th>Note</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body">
+          <tr><td colspan="10" class="muted">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<noscript>The jobs page requires JavaScript.</noscript>
+
+<script>
+(() => {
+  "use strict";
+
+  const REFRESH_MS = 5000;
+  const AUTH_HEADER = "Authorization";
+  const QUEUED_MESSAGE = "Action queued; the supervisor applies it on the next tick.";
+  // Retry is allowed only for failed, stalled and parked jobs. Park and cancel apply to
+  // every non-terminal state; done, cancelled and replanned are terminal and offer no
+  // actions. Keep the two lists next to the renderer that uses them.
+  const RETRY_STATES = ["failed", "stalled", "parked"];
+  const TERMINAL_STATES = ["done", "cancelled", "replanned"];
+  const ACTION_PATHS = { retry: "/retry", park: "/park", cancel: "/cancel" };
+  const errorLine = document.getElementById("error");
+  const noticeLine = document.getElementById("notice");
+  const updatedLine = document.getElementById("updated");
+  const jobsBody = document.getElementById("jobs-body");
+  const unlockForm = document.getElementById("unlock-form");
+  const keyInput = document.getElementById("key");
+  let lastUpdated = null;
+  let lastItems = [];
+
+  function showError(message) {
+    errorLine.textContent = message;
+    errorLine.hidden = false;
+  }
+
+  function hideError() {
+    errorLine.textContent = "";
+    errorLine.hidden = true;
+  }
+
+  function showNotice(message) {
+    noticeLine.textContent = message;
+    noticeLine.hidden = false;
+  }
+
+  function hideNotice() {
+    noticeLine.textContent = "";
+    noticeLine.hidden = true;
+  }
+
+  function formatValue(value, fallback) {
+    if (value === null || value === undefined || value === "") return fallback;
+    return String(value);
+  }
+
+  function formatTime(value) {
+    if (value === null || value === undefined || value === "") return "unknown";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString();
+  }
+
+  function formatNeeds(needs) {
+    if (!Array.isArray(needs) || needs.length === 0) return "none";
+    return needs.map(String).join(", ");
+  }
+
+  function canRetry(state) {
+    return RETRY_STATES.includes(state);
+  }
+
+  function canParkOrCancel(state) {
+    return !TERMINAL_STATES.includes(state);
+  }
+
+  function cell(value, className) {
+    const element = document.createElement("td");
+    element.textContent = value;
+    if (className) element.className = className;
+    return element;
+  }
+
+  function jobIdCell(job) {
+    const element = document.createElement("td");
+    element.className = "mono";
+    const link = document.createElement("a");
+    link.href = "/jobs/" + encodeURIComponent(job.id);
+    link.textContent = formatValue(job.id, "unknown");
+    element.appendChild(link);
+    return element;
+  }
+
+  async function errorDetail(response) {
+    try {
+      const body = await response.json();
+      if (body && body.error && body.error.message) return body.error.message;
+    } catch {
+      // Fall back to the status when the body is not the API error document.
+    }
+    return "HTTP " + response.status;
+  }
+
+  function actionButton(job, action, label) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.textContent = label;
+    if (action === "cancel") button.className = "cancel";
+    button.addEventListener("click", () => runAction(job, action));
+    return button;
+  }
+
+  function runAction(job, action) {
+    if (action === "park") {
+      const reason = window.prompt("Park reason (optional) for " + job.id, "");
+      if (reason === null) return;
+      submitAction(job, action, { reason });
+      return;
+    }
+    if (action === "cancel" && !window.confirm("Cancel job " + job.id + "? The supervisor cancels it on the next tick.")) {
+      return;
+    }
+    submitAction(job, action, null);
+  }
+
+  async function submitAction(job, action, payload) {
+    const key = readKey();
+    if (!key) {
+      updateUnlock();
+      showError("Unlock the job actions with the daemon write key first.");
+      return;
+    }
+    hideNotice();
+    const options = {
+      method: "POST",
+      headers: { [AUTH_HEADER]: "Bearer " + key },
+    };
+    if (payload !== null) {
+      options.headers["Content-Type"] = "application/json";
+      options.body = JSON.stringify(payload);
+    }
+    try {
+      const response = await fetch(
+        "/api/v1/jobs/" + encodeURIComponent(job.id) + ACTION_PATHS[action],
+        options
+      );
+      if (response.status === 202) {
+        showNotice(QUEUED_MESSAGE);
+        await refresh();
+        return;
+      }
+      if (response.status === 401) {
+        writeKey("");
+        renderJobs(lastItems, false);
+        showError("The key was rejected. Unlock with the current daemon write key.");
+        return;
+      }
+      if (response.status === 503) {
+        showError("Writes are disabled: the daemon was started without a write key.");
+        return;
+      }
+      showError("Could not " + action + " " + job.id + " (" + (await errorDetail(response)) + ").");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      showError("Could not " + action + " " + job.id + " (" + detail + ").");
+    }
+  }
+
+  function actionCell(job, unlocked) {
+    const element = document.createElement("td");
+    element.className = "actions-cell";
+    if (!unlocked) {
+      element.className = "actions-cell muted";
+      element.textContent = "Unlock to act";
+      return element;
+    }
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    if (canRetry(job.state)) {
+      actions.appendChild(actionButton(job, "retry", "Retry"));
+    }
+    if (canParkOrCancel(job.state)) {
+      actions.appendChild(actionButton(job, "park", "Park"));
+      actions.appendChild(actionButton(job, "cancel", "Cancel"));
+    }
+    if (actions.childElementCount === 0) {
+      element.textContent = "—";
+    } else {
+      element.appendChild(actions);
+    }
+    return element;
+  }
+
+  function renderJobs(items, unlocked) {
+    jobsBody.replaceChildren();
+    if (items.length === 0) {
+      const row = document.createElement("tr");
+      const empty = cell("No jobs.", "muted");
+      empty.colSpan = 10;
+      row.appendChild(empty);
+      jobsBody.appendChild(row);
+      return;
+    }
+    for (const job of items) {
+      const row = document.createElement("tr");
+      row.append(
+        jobIdCell(job),
+        cell(formatValue(job.state, "unknown"), "state"),
+        cell(formatValue(job.kind, "unknown")),
+        cell(formatValue(job.role, "unknown")),
+        cell(formatValue(job.priority, "unknown")),
+        cell(formatNeeds(job.needs), "needs"),
+        cell(formatValue(job.attempts, "0")),
+        cell(formatTime(job.updated_at)),
+        cell(formatValue(job.note, "—"), "note"),
+        actionCell(job, unlocked)
+      );
+      jobsBody.appendChild(row);
+    }
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch("/api/v1/jobs");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const page = await response.json();
+      lastItems = Array.isArray(page.items) ? page.items : [];
+      renderJobs(lastItems, readKey() !== "");
+      lastUpdated = new Date();
+      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      hideError();
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      const when = lastUpdated ? " Showing data from " + lastUpdated.toLocaleString() + "." : "";
+      showError("Could not load the jobs (" + detail + ")." + when);
+    }
+  }
+
+  unlockForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = keyInput.value.trim();
+    if (!value) {
+      showError("Enter the daemon write key.");
+      return;
+    }
+    writeKey(value);
+    keyInput.value = "";
+    hideError();
+    showNotice("Unlocked for this tab.");
+    refresh();
+  });
+
+  updateUnlock();
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+})();
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+}
+</script>
+</body>
+</html>

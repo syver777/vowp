@@ -34,8 +34,10 @@ desktop app, a Claude app, or `vowp chat`). This file is your standing instructi
   Use the commands and tools.
 - Never read, print, log or commit a secret value, token, key or `.env` file. Refer to secrets by
   name only; use `vowp secret request` for a value the owner must enter.
-- Never push, publish, deploy or change repository visibility. The supervisor merges; the owner
-  publishes.
+- Push, publish, deploy or change repository visibility only after explicit owner confirmation in
+  the current turn. State the repository/remote, branch/tag, files and expected effect, then wait
+  for a clear yes. Do not rely on standing or previous approval. Report the result after acting.
+  The supervisor still merges worker branches; workers do not push directly.
 - A write tool that refuses because the session moved is final. Do not retry it with another token
   or another surface; tell the owner and continue read-only here.
 - Never claim a tool, app join, tunnel or job is working without checking it.

@@ -1,10 +1,11 @@
 # v0.3 — daemon HTTP + SSE API
 
-Status: the read API (including session detail, single-capsule reads and the node list), the
-per-session SSE stream, the board snapshot SSE stream and the two token-gated writes (inbox
-answer and local session switch) are implemented in `crates/vowp-daemon`, and `vowp up`
-starts the daemon as a separate child process; the rest of this note is design. The daemon
-is not part of v0.2. Nothing here is implemented in v0.1.
+Status: the read API (including job detail, session detail, single-capsule reads and the
+node list), the per-session SSE stream, the board snapshot SSE stream, the token-gated writes
+(inbox answer, local session switch, ASIF import and the seven job actions) and the ASIF
+download are implemented in
+`crates/vowp-daemon`, and `vowp up` starts the daemon as a separate child process; the rest of
+this note is design. The daemon is not part of v0.2. Nothing here is implemented in v0.1.
 
 ## First slice (implemented)
 
@@ -15,10 +16,9 @@ is not part of v0.2. Nothing here is implemented in v0.1.
 It resolves the home from `--home`, `VOWP_HOME`, then `$HOME/.vowp`; selects the only
 non-reserved registered project (or the one named by `--project`, with a clear error when
 zero or several are registered); reads the node name from that project's registered
-`vowp.toml` config; and opens the home with `Store::open_read_only`. The answer and switch
-handlers open the same existing home with `Store::open_writable`, which also never creates or
-migrates it. The listener binds `127.0.0.1` only, defaults to port `0` and prints the bound
-address.
+`vowp.toml` config; and opens the home with `Store::open_read_only`. The write handlers open
+the same existing home with `Store::open_writable`, which also never creates or migrates it.
+The listener binds `127.0.0.1` only, defaults to port `0` and prints the bound address.
 
 Served endpoints; every response is JSON except the two SSE streams and the static pages.
 
@@ -37,6 +37,18 @@ Served endpoints; every response is JSON except the two SSE streams and the stat
   waits for the next snapshot. A collect error ends the stream cleanly; the page reconnects
   and keeps its five-second polling fallback. The board still has no write or auth surface.
 - `/api/v1/jobs?state=&kind=&role=` — a `JobPage`; `state` may repeat or be comma-separated.
+- `/api/v1/jobs/{id}` — one exact stored `Job`. An invalid id is `400`, an unknown job is
+  `404`, and a store failure is a path-free `500`. The route is read-only and token-free; it
+  adds no job-row write.
+- `/api/v1/jobs/{id}/runs` — a `RunPage` of the job's exact stored `Run` objects in the
+  store's order, oldest first by `started_at` then `id`. `total` is the item count and `next`
+  is `null` because the list is unpaginated. An invalid id is `400`, an unknown job is `404`
+  before the run query, and a store failure is a path-free `500`.
+- `/api/v1/jobs/{id}/gates` — a `GateResultPage` of the job's exact stored `GateResult`
+  objects from its newest attempt only, ordered by `gate_index` then row id. `total` is the
+  item count and `next` is `null` because the list is unpaginated. The errors are the same as
+  `/runs`: `400` for an invalid id, `404` for an unknown job and a path-free `500` for a
+  store failure.
 - `/api/v1/sessions?project=&job=&state=` — a `SessionPage`; `project` defaults to the
   served project.
 - `/api/v1/sessions/{id}` — a `SessionDetail`: the exact `Session`, its latest capsule by
@@ -86,36 +98,121 @@ Served endpoints; every response is JSON except the two SSE streams and the stat
   `409`. Success is `200` with the completed `Switch`; a failed switch is an `ApiError` and
   never claims the executor moved. This is local-node only: there is no `node` field and no
   remote or SSH switch.
+- `POST /api/v1/jobs/{id}/retry`, `POST /api/v1/jobs/{id}/park` and
+  `POST /api/v1/jobs/{id}/cancel` — the three token-gated job actions. Each validates the
+  current state with `vowp_graph::transition` and queues exactly one
+  `vowp_core::requests::Request` on the writable, non-creating store; the supervisor applies
+  it on its next tick and the handler never changes the job row. Retry follows the CLI:
+  `failed` queues `retry_job`, `stalled` queues `retry_job` (the same `KeeperRestart` event
+  the CLI applies) and `parked` queues `resolve_job`; every other state is `409`. Park accepts
+  any non-terminal state and queues `park_job` with a reason; an empty body or an absent or
+  blank `reason` uses `"parked from the web"`, a non-empty reason is trimmed, and a reason
+  over 10,000 UTF-8 bytes or a malformed non-empty body is `400`. Cancel accepts any
+  non-terminal state and queues `cancel_job`; a terminal (`done`, `replanned`, `cancelled`)
+  job is `409` for park and cancel. Every action requires
+  `Authorization: Bearer <VOWP_API_TOKEN>`: a daemon without a token is `503`, and a missing
+  or wrong token is `401` with `WWW-Authenticate: Bearer` before the id or body is read. An
+  invalid id is `400`, an unknown job is `404`, and a store or request failure is a path-free
+  `500`. Success is `202 Accepted` with
+  `JobActionResponse { job, action, request }`, where `request` is the queued request id.
+  There is no direct state write and no other job action route.
+- `POST /api/v1/jobs/{id}/nudge`, `POST /api/v1/jobs/{id}/restart`,
+  `POST /api/v1/jobs/{id}/replan` and `POST /api/v1/jobs/{id}/fail` — the four keeper job
+  actions. Each validates the current state with `vowp_graph::transition` and queues exactly
+  one `vowp_core::requests::Request` on the writable, non-creating store; the supervisor
+  applies it on its next tick and the handler never changes the job row. Nudge
+  (`KeeperNudge { text: None }` → `nudge_job`) and restart (`KeeperRestart` →
+  `restart_job`) accept only `stalled`. Fail (`KeeperFail` → `fail_job`) accepts only
+  `stalled` and requires a JSON body `{"reason":"<text>"}`; the reason is trimmed, must be
+  non-empty and at most 10,000 UTF-8 bytes, and a missing, empty, malformed or oversized
+  body is `400`. Replan (`KeeperReplan` → `replan_job`) accepts `stalled`, `parked` and
+  `failed`. Nudge, restart and replan accept an empty body. A state the event refuses is
+  `409` with the CLI's `job <id> is <state> and cannot be <verb>` wording. Every action
+  requires `Authorization: Bearer <VOWP_API_TOKEN>`: a daemon without a token is `503`, and
+  a missing or wrong token is `401` with `WWW-Authenticate: Bearer` before the id or body is
+  read. An invalid id is `400`, an unknown job is `404`, and a store or request failure is a
+  path-free `500`. Success is `202 Accepted` with
+  `JobActionResponse { job, action, request }`. There is no direct state write and no other
+  keeper route.
+- `/api/v1/sessions/{id}/export/asif` — the token-free ASIF 0.4 (review draft) download.
+  `200` streams a deterministic `.asif.zip` with `Content-Type: application/zip`,
+  `Content-Disposition: attachment; filename="<id>.asif.zip"`, `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff`, `Content-Length` when known, `X-Vowp-Asif-Losses: <n>`
+  and `X-Vowp-Asif-Unsupported: <n>`. The package is written by the core ASIF facade into a
+  private `0700` directory under `<home>/tmp/asif-export-*` and streamed in 64 KiB chunks; the
+  directory is removed when the response ends, the client disconnects, a five-minute timeout
+  elapses or the export fails. `?report=1` or `?report=true` runs the same export, discards the
+  package and returns the `AsifReport` summary (counts, losses, unsupported operations and
+  adapter/ASIF versions); any other `report` value is `400`. An unknown session or session
+  directory is `404`; a stored session that cannot be exported (torn log, corrupt capsule) is
+  `409` with a path-free adapter code; an export over the adapter's archive/resource limits is
+  `413`; an internal failure is `500`. The route addresses any session in the served home,
+  not only the served project's list. There is no redaction list or host-path override in the
+  web: it uses the safe defaults, so host paths are scrubbed and exact secrets are not
+  detected.
+- `POST /api/v1/sessions/import/asif?branch=<id>` — the token-gated ASIF import. The Bearer
+  token is checked before the body is read: a daemon without a token is `503`, a missing or
+  wrong token is `401` with `WWW-Authenticate: Bearer`. The body is the raw archive with
+  `Content-Type: application/zip`, `application/x-zip-compressed` or
+  `application/octet-stream`; another or missing content type is `415`. No multipart parser is
+  used. The body is streamed to a private `0600` file under `<home>/tmp/asif-upload-*` with a
+  hard 272 MiB (`MAX_ASIF_ARCHIVE_BYTES`) cap and a five-minute timeout; exceeding it removes
+  the file and returns `413`. The file is handed to the same core import as
+  `vowp session import --format asif`: the package, schema and resources are validated before
+  a staging session is written, the staged log is checked, and one new ULID session is renamed
+  into place and indexed. The new session is idle, with `cwd` set to the served project's
+  registered path; the ASIF source project is kept when it exists locally and is otherwise
+  null. Nothing is overwritten, merged or auto-run: no turn, capsule, lease or job is created.
+  `branch` selects one branch when the package has more than one. Success is `201 Created`
+  with `Location: /api/v1/sessions/{id}`, an `X-Vowp-Asif-Losses` header and a schema-valid
+  `AsifImportResponse { session, report, warnings }`. Invalid package/schema/version/branch is
+  `400`; an existing target, duplicate event id or missing registered project path is `409`;
+  an internal failure is `500`. The response never echoes uploaded bytes, the uploaded
+  filename, a temporary upload/staging path or source text; the only path is the ordinary
+  `Session.cwd` field.
 - `/api/v1/cost?by=day|job|role|provider|model&since=&until=` — the exact `vowp cost --json`
   document over the served project. `by` defaults to `job`; `since` and `until` accept RFC 3339
   or `YYYY-MM-DD` (UTC midnight), and `until` is inclusive.
 
 The new wire documents are exported from `vowp_protocol::api` and `schema::all_schemas()`:
-`Health`, `Board`, `BoardRun`, `BoardLimit`, `Page<T>`, `JobPage`, `SessionPage`, `NodePage`,
-`SessionDetail`, `EventPage`, `InboxPage`, `InboxAnswerRequest`, `SessionSwitchRequest`,
-`CostReport`, `CostRow`, `CostTotal`, `ApiError` and `ApiErrorBody`. Failures use the same
-`ApiError` shape as `vowp --json` errors and map to `400` for an invalid filter, id, body or
-executor, `401` for a missing or wrong write token, `404` for an unknown session, capsule or
-inbox item, `409` for an inbox item that is not open, a switch guard or an aborted switch,
-`503` when writes are disabled and `500` for a store, config or I/O failure. Switch error
-messages stay path-free.
+`Health`, `Board`, `BoardRun`, `BoardLimit`, `Page<T>`, `JobPage`, `RunPage`,
+`GateResultPage`, `JobAction`, `JobActionResponse`, `SessionPage`, `NodePage`, `SessionDetail`,
+`EventPage`, `InboxPage`,
+`InboxAnswerRequest`, `SessionSwitchRequest`, `CostReport`, `CostRow`, `CostTotal`, `AsifReport`,
+`AsifImportResponse`, `ApiError`
+and `ApiErrorBody`. Failures use the same `ApiError` shape as `vowp --json` errors and map to
+`400` for an invalid filter, id, body, ASIF package or executor, `401` for a missing or wrong
+write token, `404` for an unknown session, capsule, inbox item or job, `409` for an inbox item
+that is not open, a switch guard, a job action guard, an aborted switch, a corrupt ASIF export
+or an ASIF import conflict, `415` for an unsupported ASIF upload content type, `413` for an
+ASIF archive/resource over a limit, `503` when writes are disabled
+and `500` for a store, config or I/O failure. Write error messages stay path-free.
 
-**Two writes, one token.** Every `GET` stays token-free and read-only. The privileged actions
-are `POST /api/v1/inbox/{id}/answer` and `POST /api/v1/sessions/{id}/switch`, and the listener
-stays loopback-only. The daemon reads the token from the `VOWP_API_TOKEN` environment
-variable at startup; a missing or empty value leaves reads working and disables both writes
-with `503`. The value is compared in constant time, is never logged, echoed, put in a URL or
-returned in a response, and rotation is a daemon restart with a new value. The pages keep it
-in `sessionStorage` and clear it on `401`. Both writes open the existing home with
-`Store::open_writable` and never create or migrate it. The switch is local-node only; a
-running session needs an explicit `force` before the switch drains and stops it.
+**Ten writes, one token.** Every `GET` stays token-free and read-only. The privileged actions
+are `POST /api/v1/inbox/{id}/answer`, `POST /api/v1/sessions/{id}/switch`,
+`POST /api/v1/sessions/import/asif`, the three
+`POST /api/v1/jobs/{id}/retry|park|cancel` writes and the four
+`POST /api/v1/jobs/{id}/nudge|restart|replan|fail` keeper writes, and the listener stays
+loopback-only. The
+daemon reads the token from the `VOWP_API_TOKEN` environment variable at startup; a missing or
+empty value leaves reads working and disables all writes with `503`. The value is compared in
+constant time, is never logged, echoed, put in a URL or returned in a response, and rotation is
+a daemon restart with a new value. The pages keep it in `sessionStorage` and clear it on
+`401`. Every write opens the existing home with `Store::open_writable` and never creates or
+migrates it. The switch is local-node only; a running session needs an explicit `force` before
+the switch drains and stops it. The job actions only queue the CLI's request; none of them
+writes a job row.
 
-Still later: every other write endpoint (job retry/park/cancel, capsule edits), the reconnect
-UI on the pages that still poll, the cost dashboard page, node add/remove/probe and the
-remaining browser pages. There are no placeholder routes for any of them. The per-session SSE
-stream is implemented and used by the session detail page; the board stream is implemented and
-used by the board page; the inbox answer form and the session switch form are implemented and
-use the two write routes.
+Still later: capsule edits, the reconnect UI on the pages that still poll, the cost dashboard
+page, node add/remove/probe, browser chat and the remaining browser pages. There are no
+placeholder routes for any of them.
+The per-session SSE stream is implemented and used by the session detail page; the board
+stream is implemented and used by the board page; the inbox answer form and the session
+switch form are implemented and use their write routes; the three job action routes are
+implemented for the `/jobs` controls and the four keeper action routes are implemented for
+the `/jobs/{id}` detail page. The session detail page carries
+the ASIF download link and loss preview, and the separate `/import` page posts one raw
+archive to the token-gated import route.
 
 Tests are hermetic: a temporary `NodePaths`, a real `127.0.0.1:0` listener, fake clocks,
 no real home, harness, tmux server or network beyond loopback. Every returned document is
@@ -169,8 +266,8 @@ the daemon reported an address: a missing daemon warns and prints no port or tun
 The browser opens the tunnel's local loopback URL, not a home URL, so the write token is never
 part of a URL. `VOWP_API_TOKEN` is inherited by the daemon from the environment `vowp up` runs
 in; the page stores the value it is given in `sessionStorage` and uses it only for the inbox
-answer and session switch writes. Reads stay token-free. Rotation is a daemon restart with a new
-value followed by an unlock; there is no token file or second store.
+answer, session switch and job action writes. Reads stay token-free. Rotation is a daemon
+restart with a new value followed by an unlock; there is no token file or second store.
 
 On its shutdown path (normal stop file, first SIGINT/SIGTERM, supervisor error or early
 startup failure) the foreground supervisor sends SIGTERM to the daemon, waits up to five
@@ -186,7 +283,10 @@ the cost dashboard and third-party tools do not have to shell out to `vowp`:
 
 - `GET /api/v1/health` — version, node name, project, schema version, supervisor heartbeat.
 - `GET /api/v1/jobs?state=&kind=&role=` — `Job` objects.
-- `GET /api/v1/jobs/{id}` — one `Job`; `/runs` and `/gates` as sub-resources.
+- `GET /api/v1/jobs/{id}` — one `Job`; `/runs` and `/gates` are its sub-resources, all
+  implemented read-only in this slice. `/runs` is a `RunPage` ordered by `started_at` then
+  `id`; `/gates` is a `GateResultPage` of the newest attempt, ordered by `gate_index` then
+  row id. Both lists are unpaginated (`next` is `null`) and an unknown job is `404`.
 - `GET /api/v1/sessions?project=&job=&state=` — `Session` objects.
 - `GET /api/v1/sessions/{id}` — metadata, latest capsule and lineage.
 - `GET /api/v1/sessions/{id}/events?after_seq=<n>&limit=<n>` — exact `EventEnvelope` lines.
@@ -197,15 +297,18 @@ the cost dashboard and third-party tools do not have to shell out to `vowp`:
 - `GET /api/v1/board/stream` — SSE `board` frames carrying the exact `Board` document when it
   changes, plus `heartbeat` frames; no cursor or resume.
 - `GET /api/v1/inbox` and `POST /api/v1/inbox/{id}/answer` — read and answer; both are
-  implemented. The answer is one of the two token-gated writes.
+  implemented. The answer is one of the token-gated writes.
 - `GET /api/v1/cost?by=day|job|role|provider|model&since=&until=` — the `vowp cost --json` shape;
   implemented in this slice.
 - `GET /api/v1/nodes` — a `NodePage` of the exact stored nodes, ordered by name; implemented
   read-only in this slice for the web-window `/nodes` page.
 - `GET /api/v1/sessions/{id}/capsules/{capsuleId}` — one capsule belonging to the session;
   implemented in this slice. The window's capsule view remains later.
-- `POST /api/v1/jobs/{id}/retry|park|cancel` — enqueue the existing
-  `vowp_core::requests::Request`; do not duplicate the state machine.
+- `POST /api/v1/jobs/{id}/retry|park|cancel` and
+  `POST /api/v1/jobs/{id}/nudge|restart|replan|fail` — enqueue the existing
+  `vowp_core::requests::Request`; implemented in this slice. The daemon validates the state
+  with `vowp_graph::transition`, queues exactly one request and never duplicates the state
+  machine or writes the job row.
 - `POST /api/v1/sessions/{id}/switch` — run the same `SessionService` switch path as
   `vowp session switch`; implemented in this slice for the local node. The v0.1 request queue
   has no switch variant, so it calls the service directly through the token-gated daemon
@@ -246,9 +349,32 @@ served in their `vowp-protocol` JSON form. The new document and transport types 
   the canonical limit class (`quota`, `credits`, `rate`, `context`, `auth` or `unavailable`) and
   `resets_at` is an RFC 3339 time or null.
 - `Page<T> { items, next, total }` for lists.
+- `JobPage` = `Page<Job>` — the `/api/v1/jobs` document; every item is an exact `Job` and
+  the list is unpaginated, so `next` is null.
+- `RunPage` = `Page<Run>` — the `/api/v1/jobs/{id}/runs` document. Every item is an exact
+  stored `Run`, ordered by `started_at` then `id`; `total` is the item count and `next` is
+  null.
+- `GateResultPage` = `Page<GateResult>` — the `/api/v1/jobs/{id}/gates` document. Every item
+  is an exact stored `GateResult` from the newest attempt, ordered by `gate_index` then row
+  id; `total` is the item count and `next` is null.
 - `NodePage` = `Page<Node>` — the `/api/v1/nodes` document. Each item is the exact stored
   `Node` (`name`, `ssh_target`, `is_local`, `capabilities`, `last_seen_at`, `created_at`),
   ordered by name; `next` is null and `Node` keeps its existing shape and schema.
+- `JobAction { retry | park | cancel | nudge | restart | replan | fail }` — the action
+  selected by one of the seven job write routes. The names are the CLI's verbs and never
+  describe a raw state transition. `nudge`, `restart` and `fail` are valid only in `stalled`;
+  `replan` is also valid in `parked` and `failed`.
+- `AsifReport { adapter_version, asif_version, asif_pin, source_session, target_session,
+  counts, loss_count, losses, unsupported }` — the `?report=1` preview document and the report
+  inside the import response. `counts` carries `events_in`, `events_out`, `resources` and
+  `capsules`; each loss has a `kind`, `stage`, optional `scope` and a path-free `message`.
+- `AsifImportResponse { session, report, warnings }` — the `201 Created` document of the ASIF
+  import. `session` is the normal registered `Session` row, `report` is the summary above and
+  `warnings` are non-fatal reindex warnings.
+- `JobActionResponse { job, action, request }` — the `202 Accepted` document of a job action.
+  `job` is the `JobId`, `action` is the queued `JobAction`, and `request` is the
+  `req:<project>:<ULID>` id the supervisor will apply. The document never carries a home path,
+  SQL text, token or secret.
 - `SessionDetail { session, latest_capsule, lineage }` — the `/api/v1/sessions/{id}` document.
   `session` is the exact `Session`, `latest_capsule` is the capsule with the highest `at_seq`
   (or null when the session has none), and `lineage` is the parent-session chain, nearest
@@ -276,9 +402,12 @@ served in their `vowp-protocol` JSON form. The new document and transport types 
   `resync`.
 
 `vowp schema` remains the source of truth; add `Health`, `Board`, `BoardRun`, `BoardLimit`, `Page`,
-`SessionDetail`, `NodePage`, `InboxAnswerRequest`, `SessionSwitchRequest` and `ApiError` to
-`all_schemas()` rather than hand-writing JSON examples. Export the concrete page instantiations
-the API serves (`JobPage`, `SessionPage`, `NodePage`, `EventPage` and `InboxPage`) and
+`JobPage`, `RunPage`, `GateResultPage`, `JobAction`, `JobActionResponse`, `SessionDetail`, `NodePage`,
+`InboxAnswerRequest`,
+`SessionSwitchRequest`, `AsifReport`, `AsifImportResponse` and `ApiError` to `all_schemas()` rather than hand-writing JSON examples.
+Export the concrete page instantiations
+the API serves (`JobPage`, `RunPage`, `GateResultPage`, `SessionPage`, `NodePage`, `EventPage`
+and `InboxPage`) and
 `CostReport` alongside their item types, and keep the SSE frame as the one explicit schema
 exception above.
 
@@ -286,7 +415,7 @@ exception above.
 
 - `vowp-store` — `Store`, `JobFilter`, `SessionFilter`, `event_rows`, `cost_totals`, `list_inbox`.
 - `vowp-core` — `Deps`, `BoardSnapshot::collect`, `SessionService` (the store-injected switch),
-  `requests::Request` and the ledger query.
+  the ASIF export/import facade, `requests::Request` and the ledger query.
 - `vowp-protocol` — every served type and `schema::all_schemas`.
 - `vowp-cli` — keep as the first client; its `--json` shapes are the reference for the API.
 - New `vowp-daemon` crate proposed: `axum` + `tokio` live here, not in `vowp-core`.
@@ -328,20 +457,31 @@ exception above.
 ## First-issue-sized slice
 
 Implemented: `crates/vowp-daemon` opens an existing node home read-only for reads
-(and writable-but-non-creating for the two writes) and serves
+(and writable-but-non-creating for the writes) and serves
 `GET /api/v1/health`, `GET /api/v1/board`, `GET /api/v1/board/stream`, `GET /api/v1/jobs`,
+`GET /api/v1/jobs/{id}`, `GET /api/v1/jobs/{id}/runs`, `GET /api/v1/jobs/{id}/gates`,
 `GET /api/v1/sessions`,
 `GET /api/v1/sessions/{id}`, `GET /api/v1/sessions/{id}/capsules/{capsuleId}`,
 `GET /api/v1/sessions/{id}/events?after_seq=`,
 `GET /api/v1/sessions/{id}/events/stream?after_seq=`,
+`GET /api/v1/sessions/{id}/export/asif?report=`,
+`POST /api/v1/sessions/import/asif?branch=`,
 `POST /api/v1/sessions/{id}/switch`, `GET /api/v1/inbox?state=`,
-`POST /api/v1/inbox/{id}/answer` and `GET /api/v1/cost?by=&since=&until=`. It binds
+`POST /api/v1/inbox/{id}/answer`,
+`POST /api/v1/jobs/{id}/retry|park|cancel|nudge|restart|replan|fail` and
+`GET /api/v1/cost?by=&since=&until=`. It binds
 `127.0.0.1:0` in tests, uses a temporary store with jobs in several states, one running job
 and a parent/child session chain with a capsule and a bounded long chain, a limit,
 open/answered inbox items, cost ledger rows from every source and a checkpoint, and asserts
 that every JSON document validates against its exported schema — including `SessionDetail`
 for the session detail, `Capsule` for the capsule read, `Board`, `BoardRun` and `BoardLimit`
-for the board, `InboxPage` for the inbox and `CostReport` for cost. The SSE tests use a real
+for the board, `JobPage` for the job list, `RunPage` and `GateResultPage` for the job
+sub-resources, `InboxPage` for the inbox and `CostReport` for cost. The job detail tests pin
+the single job, the `400` for an invalid id, the `404` for an unknown job on all three
+routes, the run order (`started_at`, then `id`), the newest-attempt gate selection and its
+gate-index order, the `/jobs/{id}` page's shell fields and its three data sources, the
+not-found text for an unknown job, and the absence of a home path, token value or the
+unrendered `worktree`, `brief`, `owns`, `cwd` and `window` fields from the page. The SSE tests use a real
 loopback listener and short injected intervals: the session stream compares exact
 `EventEnvelope` frames and appends live through `SessionLog::open`; the board stream validates
 its `board` frames against the `Board` schema, compares them with `GET /api/v1/board` apart
@@ -353,14 +493,38 @@ empty/oversized/malformed answers, unchanged token-free `GET`s, and the store ne
 home. The switch tests pin `503` without a token, `401` for a missing or wrong Bearer value
 (before the body is parsed), `200` with a schema-valid completed `Switch` and the moved session,
 `404`, the running/switching/closed/limit `409` guards and `400` for malformed bodies and
-executors. The page tests pin the switch form, `Authorization: Bearer` use, `sessionStorage`,
+executors. The job action tests pin `503` without a token, `401` for a missing or wrong Bearer
+value before the id or body is parsed, `202` with a schema-valid `JobActionResponse` and
+exactly one decoded request row for retry on failed/stalled/parked, park on ready/running and
+cancel on pending, the trimmed and default park reasons, a job row unchanged immediately after
+each success, `400` for invalid ids, malformed bodies and oversized reasons, `404` for an
+unknown job, the `409` retry/park/cancel guards with no request row, and apply each drained
+request through `requests::apply_direct` to the new state. The ASIF download tests compare the
+streamed package with a direct core export, pin every attachment header, validate the report
+preview against `AsifReport`, allow a session from another project in the same home, and pin
+the `404`, path-free `409` and `413` paths with no leftover temp directory. The ASIF import
+tests build synthetic packages with `vowp_asif::pack`, pin `503`/`401` before the body, `415`
+for another content type, `413` with the upload removed, `400` for an invalid package, `409`
+for duplicate event ids with the first session kept, `201` with a schema-valid
+`AsifImportResponse`, the idle session and `Location` header, branch selection, and the
+absence of uploaded bytes, filenames or temp paths from every response. The page tests pin the switch form,
+`Authorization: Bearer` use, `sessionStorage`,
 the force warning, the state/error line and the absence of a token in the URL. The inbox page
 test pins the answer form and its queued message. The `vowp up` tests pin the daemon child's
 `--home`/`--project`/`--port` arguments, inherited `VOWP_API_TOKEN`, the printed address, the
 exact `vowp tunnel open window --remote-port <port>` hint with the daemon's actual port, the
 detached address file and hint, SIGTERM/`down` shutdown without an orphan, and the
-warning-and-continue path when the binary is missing (including no tunnel hint). Every other
-write endpoint remains later.
+warning-and-continue path when the binary is missing (including no tunnel hint). The keeper
+job-action tests pin `503` without a token, `401` for a missing or wrong Bearer value before
+the id or body is read, exactly one schema-valid `JobActionResponse` and one decoded request
+row for nudge and restart on `stalled`, replan on `stalled`/`parked`/`failed`, and a trimmed
+`fail` reason on `stalled`; a job row unchanged immediately after every success, `400` for
+invalid ids and missing/empty/malformed/oversized fail reasons, `404` for an unknown job, the
+`409` keeper guards with no request row, and each drained request applied through
+`requests::apply_direct` to its new state. The detail-page test pins the four controls, the
+shared unlock panel, the `Authorization: Bearer` write, the exact state lists, the queued
+`202` refresh, the `401` clear and the disabled `503` line. Capsule edits, node writes and
+browser chat remain later.
 
 Tests are hermetic: temporary `NodePaths`, a fake clock, no network beyond loopback, no real
 harness and no tmux.

@@ -1,5 +1,6 @@
 //! Session capsules and harness switching.
 
+pub mod asif;
 pub mod bundle;
 pub mod capsule;
 pub mod importer;

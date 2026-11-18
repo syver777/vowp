@@ -27,7 +27,7 @@ use vowp_protocol::{
     Adapter, AdapterCapabilities, AdapterError, AdapterRun, Cost, Executor, HarnessConfig, HarnessEvent, HarnessKind,
     JobKind, JobState, NewJob, Node, NullLog, ProbeResult, Project, ProjectName, ProjectState, Release, ReleaseId,
     ReleaseState, Role, RunOutcome, RunSummary, Session, SessionId, SessionRole, StartInput, StopReason, SystemClock,
-    Timestamp,
+    Timestamp, VowpConfig,
 };
 use vowp_store::{NodePaths, Store, StoreError};
 use vowp_tmux::fake::FakeWindows;
@@ -1201,6 +1201,355 @@ impl Drop for SignalEnv {
     }
 }
 
+/// A temporary home, project and fake harness for the drain/replace handoff test.
+struct DrainEnv {
+    home: tempfile::TempDir,
+    repo: tempfile::TempDir,
+    _worktrees: tempfile::TempDir,
+    _tools: tempfile::TempDir,
+    paths: NodePaths,
+    project: ProjectName,
+    harness_pid: PathBuf,
+    starts: PathBuf,
+    signalled: PathBuf,
+}
+
+impl DrainEnv {
+    /// Creates the env and installs a harness that finishes after four seconds unless
+    /// signalled, recording every start and any terminating signal.
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temp home");
+        let repo = git_repo();
+        let worktrees = tempfile::tempdir().expect("temp worktrees");
+        let tools = tempfile::tempdir().expect("fake tools");
+        let script = tools.path().join("fake-drain.sh");
+        let harness_pid = tools.path().join("harness.pid");
+        let starts = tools.path().join("harness.starts");
+        let signalled = tools.path().join("harness.signalled");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' "$$" > "$1"
+printf 'start\n' >> "$2"
+trap 'printf term > "$3"; exit 0' INT TERM
+sleep 4
+"#,
+        )
+        .expect("fake harness script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mapping = tools.path().join("mapping.toml");
+        std::fs::write(
+            &mapping,
+            format!(
+                "name = \"fake-drain\"\ncommand = {{ argv = [\"{}\", \"{}\", \"{}\", \"{}\"], prompt_via = \"stdin\" }}\n\n[output]\nformat = \"text\"\n",
+                script.display(),
+                harness_pid.display(),
+                starts.display(),
+                signalled.display()
+            ),
+        )
+        .expect("mapping");
+
+        let mut config = VowpConfig::with_defaults_for_tests();
+        config.node.tick_secs = 1;
+        config.project.path = Some(repo.path().display().to_string());
+        config.project.worktree_root = Some(worktrees.path().display().to_string());
+        config.harnesses.insert(
+            "fake-drain".to_owned(),
+            HarnessConfig {
+                mapping: Some(mapping.display().to_string()),
+                ..HarnessConfig::default()
+            },
+        );
+        config.profiles.get_mut("worker").expect("worker profile").ladder =
+            vec![Executor::parse("cli:fake-drain").expect("executor")];
+        std::fs::write(
+            repo.path().join("vowp.toml"),
+            toml::to_string_pretty(&config).expect("config toml"),
+        )
+        .expect("write config");
+
+        let paths = NodePaths::new(home.path());
+        register_project(&paths, &config, repo.path());
+        let project = config.project.name.clone();
+        Self {
+            home,
+            repo,
+            _worktrees: worktrees,
+            _tools: tools,
+            paths,
+            project,
+            harness_pid,
+            starts,
+            signalled,
+        }
+    }
+
+    /// Inserts one pending job.
+    fn insert_job(&self, id: &str) -> vowp_protocol::Job {
+        Store::open(&self.paths)
+            .expect("store")
+            .insert_job(
+                &self.project,
+                &NewJob {
+                    id: vowp_protocol::JobId::parse(id).expect("job id"),
+                    title: format!("job {id}"),
+                    kind: JobKind::Build,
+                    role: Role::Worker,
+                    profile: None,
+                    needs: Vec::new(),
+                    owns: Vec::new(),
+                    reads: Vec::new(),
+                    gates: None,
+                    priority: None,
+                    loop_: None,
+                    brief_text: Some("Do the work.\n".to_owned()),
+                },
+                "test",
+            )
+            .expect("insert job")
+    }
+
+    /// Returns how many harness runs have started.
+    fn start_count(&self) -> usize {
+        std::fs::read_to_string(&self.starts)
+            .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+            .unwrap_or(0)
+    }
+
+    /// Returns the harness process id, when it started.
+    fn harness_pid(&self) -> Option<u32> {
+        read_pid_file(&self.harness_pid)
+    }
+
+    /// Writes the done report for a dispatched job so its run harvests to gating.
+    fn finish_job(&self, job: &vowp_protocol::Job) {
+        let worktree = job.worktree.as_deref().expect("dispatched job worktree");
+        let report = Path::new(worktree).join(&job.report);
+        std::fs::create_dir_all(report.parent().expect("report parent")).expect("report dir");
+        std::fs::write(
+            &report,
+            format!(
+                "---\njob: {}\nstatus: done\nbranch: job/{}\ncommits: []\ntests: \"fake: pass\"\n\
+                 files_changed: []\nopen_items: []\nquestions_for_owner: []\n---\n\nDone.\n",
+                job.id, job.id
+            ),
+        )
+        .expect("report");
+    }
+
+    /// Returns the job row once dispatch has assigned a worktree.
+    fn dispatched_job(&self, id: &vowp_protocol::JobId) -> Option<vowp_protocol::Job> {
+        let store = Store::open(&self.paths).ok()?;
+        let job = store.job(id).ok()??;
+        job.worktree.as_ref()?;
+        Some(job)
+    }
+
+    /// Rewrites the node config with a different tick interval.
+    fn set_node_tick_secs(&self, tick_secs: u64) {
+        std::fs::write(
+            self.home.path().join("config.toml"),
+            format!("[node]\ntick_secs = {tick_secs}\n"),
+        )
+        .expect("write node config");
+    }
+
+    /// Returns the project's last L1 tick time.
+    fn last_tick(&self) -> Option<Timestamp> {
+        Store::open_with_project(&self.paths, &self.project)
+            .ok()?
+            .loop_("l1-supervisor")
+            .ok()?
+            .and_then(|row| row.last_run_at)
+    }
+
+    /// Builds an isolated command for this home.
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env("HOME", self.home.path())
+            .env("VOWP_HOME", self.home.path())
+            .env("TMUX_TMPDIR", self.home.path().join("tmux"))
+            .env("VOWP_DAEMON_BIN", self.home.path().join("missing-vowp-daemon"))
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("VOWP_TMUX_SOCKET");
+        command
+    }
+
+    /// Runs one CLI command and captures its output.
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        self.command(env!("CARGO_BIN_EXE_vowp"))
+            .arg("--home")
+            .arg(self.home.path())
+            .arg("--project")
+            .arg(self.repo.path())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run vowp")
+    }
+}
+
+impl Drop for DrainEnv {
+    fn drop(&mut self) {
+        let _ = self.output(&["down", "--force"]);
+        common::kill_private_server_for_home(self.home.path());
+    }
+}
+
+#[test]
+fn down_drain_and_up_replace_handoff() {
+    let env = DrainEnv::new();
+    env.set_node_tick_secs(1);
+    let first = env.insert_job("drain-run");
+
+    // First supervisor: one running job, then `down --drain` must let it finish.
+    let mut supervisor = SupervisorProcess::spawn(env.home.path(), env.repo.path());
+    assert!(
+        eventually(|| env.start_count() >= 1),
+        "first harness did not start; stderr:\n{}",
+        supervisor.stderr()
+    );
+    let first_pid = env.harness_pid().expect("first harness pid");
+    assert!(
+        eventually(|| env.dispatched_job(&first.id).is_some()),
+        "the first job never received a worktree"
+    );
+    env.finish_job(&env.dispatched_job(&first.id).expect("dispatched job"));
+
+    let down = env
+        .command(env!("CARGO_BIN_EXE_vowp"))
+        .arg("--home")
+        .arg(env.home.path())
+        .arg("--project")
+        .arg(env.repo.path())
+        .args(["down", "--drain"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn down --drain");
+    assert!(
+        eventually(|| env.paths.root().join("drain").is_file()),
+        "down --drain did not write the drain marker; supervisor stderr:\n{}",
+        supervisor.stderr()
+    );
+    // A tick may already have been mid-pass when the marker appeared. Wait for that pass
+    // to finish before inserting the queued job, so the next pass starts in drain mode.
+    let before_tick = env.last_tick();
+    assert!(
+        eventually(|| env.last_tick() != before_tick),
+        "the supervisor did not complete a tick after the drain marker"
+    );
+
+    // A job inserted only after the drain marker exists must never be admitted.
+    let queued = env.insert_job("ready-during-drain");
+
+    let down_output = down.wait_with_output().expect("wait for down --drain");
+    assert!(
+        down_output.status.success(),
+        "down --drain failed: {}\n{}",
+        String::from_utf8_lossy(&down_output.stdout),
+        String::from_utf8_lossy(&down_output.stderr)
+    );
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("the supervisor exits after draining");
+    assert!(status.success(), "drained supervisor exit status: {status}");
+    assert!(
+        !env.paths.root().join("drain").exists(),
+        "a completed drain removes its marker"
+    );
+    assert!(
+        !env.signalled.exists(),
+        "drain must let the in-flight harness finish, not signal it"
+    );
+    assert!(eventually(|| !process_alive(first_pid)), "the harness finished");
+    assert_eq!(env.start_count(), 1, "the ready job was never admitted");
+    let store = Store::open(&env.paths).expect("store");
+    assert_ne!(
+        store.require_job(&queued.id).expect("queued job").state,
+        JobState::Running,
+        "the queued job never ran during the drain"
+    );
+    assert_ne!(
+        store.require_job(&first.id).expect("first job").state,
+        JobState::Running,
+        "the in-flight run was harvested"
+    );
+    drop(store);
+
+    // Second supervisor: a long tick keeps the next job queued until `up --replace`.
+    env.set_node_tick_secs(5);
+    let mut old = SupervisorProcess::spawn(env.home.path(), env.repo.path());
+    assert!(
+        eventually(|| read_pid_file(&env.home.path().join("supervisor.lock")) == Some(old.pid())),
+        "the second supervisor did not own the lock; stderr:\n{}",
+        old.stderr()
+    );
+    assert!(
+        eventually(|| env.paths.root().join("heartbeat").is_file()),
+        "the second supervisor did not tick; stderr:\n{}",
+        old.stderr()
+    );
+    assert!(
+        eventually(|| env.start_count() >= 2),
+        "the second supervisor did not dispatch the queued job; stderr:\n{}",
+        old.stderr()
+    );
+    if let Some(job) = env.dispatched_job(&queued.id) {
+        env.finish_job(&job);
+    }
+    let queued_again = env.insert_job("ready-before-replace");
+    let old_pid = old.pid();
+    let replace = env.output(&["up", "--replace", "--no-tmux"]);
+    assert!(
+        replace.status.success(),
+        "up --replace failed: {}\n{}",
+        String::from_utf8_lossy(&replace.stdout),
+        String::from_utf8_lossy(&replace.stderr)
+    );
+    let status = old
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("the replaced supervisor exits");
+    assert!(status.success(), "replaced supervisor exit status: {status}");
+
+    assert!(
+        eventually(|| read_pid_file(&env.home.path().join("supervisor.lock")).is_some()),
+        "the replacement supervisor did not publish a lock"
+    );
+    let new_pid = read_pid_file(&env.home.path().join("supervisor.lock")).expect("replacement lock pid");
+    assert_ne!(new_pid, old_pid, "up --replace started a new supervisor");
+    assert!(process_alive(new_pid), "the replacement supervisor is running");
+    assert!(
+        !env.paths.root().join("drain").exists(),
+        "the handover boundary cleared the drain marker"
+    );
+    assert!(
+        eventually(|| env.start_count() >= 3),
+        "the replacement supervisor resumed dispatch; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&replace.stdout),
+        String::from_utf8_lossy(&replace.stderr)
+    );
+    assert!(
+        !env.signalled.exists(),
+        "the replacement supervisor runs new work without signalling the old one"
+    );
+    assert!(
+        eventually(|| {
+            Store::open(&env.paths)
+                .ok()
+                .and_then(|store| store.job(&queued_again.id).ok().flatten())
+                .is_some_and(|job| job.state != JobState::Pending)
+        }),
+        "the replacement supervisor admitted the queued job"
+    );
+}
+
 #[test]
 fn up_once_runs_one_tick_with_fake_adapters() {
     let home = tempfile::tempdir().expect("temp home");
@@ -1493,6 +1842,34 @@ fn up_starts_daemon_with_home_project_port_and_token() {
     assert!(
         !env.home_path().join("web-window").exists(),
         "the address file is removed on shutdown"
+    );
+}
+
+#[test]
+fn restart_web_window_request_replaces_only_the_daemon_child() {
+    let env = common::TestEnv::new();
+    let fake = FakeDaemon::new();
+    let mut supervisor = SupervisorProcess::spawn_with(
+        env.home_path(),
+        env.project_path(),
+        &fake.envs("restart-token", env.home_path()),
+    );
+    let first_daemon = wait_for_fake_daemon(&fake, &supervisor);
+
+    let paths = NodePaths::new(env.home_path());
+    let store = Store::open_global(&paths).expect("global store");
+    vowp_core::requests::push(&store, &vowp_core::requests::Request::Wake).expect("wake request");
+    vowp_core::requests::push(&store, &vowp_core::requests::Request::RestartWebWindow).expect("restart request");
+
+    assert!(
+        eventually(|| fake.pid().is_some_and(|pid| pid != first_daemon)),
+        "the web window was not restarted; supervisor stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(fake.stopped(), "the old daemon child received its stop signal");
+    assert!(
+        !supervisor.exited(),
+        "restarting the web window must not stop the node supervisor"
     );
 }
 
@@ -2689,7 +3066,7 @@ fn migrate_requires_yes_and_reports_the_v01_backup() {
     );
 
     let store = Store::open(&env.paths()).expect("migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 2);
+    assert_eq!(store.global_schema_version().expect("version"), 7);
     let node = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT).expect("reserved project");
     assert!(
         store.project(&node).expect("lookup").is_some(),
@@ -2733,7 +3110,7 @@ fn up_migrates_with_backup_first() {
     );
 
     let store = Store::open(&env.paths()).expect("migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 2);
+    assert_eq!(store.global_schema_version().expect("version"), 7);
     let node = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT).expect("reserved project");
     assert!(
         env.paths().project_db_path(&node).is_file(),
@@ -3285,4 +3662,185 @@ fn loops_and_schedule_all_handlers_list_every_project() {
         projects.contains(&"test") && projects.contains(&"second"),
         "{schedules}"
     );
+}
+
+/// A fake `vowp agent gateway --listen` child that records its arguments and lifecycle.
+struct FakeGateway {
+    _tools: tempfile::TempDir,
+    args: PathBuf,
+    pid: PathBuf,
+    stopped: PathBuf,
+    script: PathBuf,
+}
+
+impl FakeGateway {
+    fn new() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tools = tempfile::tempdir().expect("fake gateway tools");
+        let script = tools.path().join("vowp-gateway");
+        let args = tools.path().join("gateway.args");
+        let pid = tools.path().join("gateway.pid");
+        let stopped = tools.path().join("gateway.stopped");
+        let body = r#"#!/bin/sh
+printf '%s\n' "$@" > "$FAKE_GATEWAY_ARGS"
+printf '%s\n' "$$" > "$FAKE_GATEWAY_PID"
+trap 'printf stopped > "$FAKE_GATEWAY_STOPPED"; exit 0' TERM INT
+while :; do
+  sleep 0.2 &
+  child=$!
+  wait "$child"
+done
+"#;
+        std::fs::write(&script, body).expect("fake gateway script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod gateway");
+        Self {
+            _tools: tools,
+            args,
+            pid,
+            stopped,
+            script,
+        }
+    }
+
+    fn envs(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("VOWP_GATEWAY_BIN", self.script.display().to_string()),
+            ("FAKE_GATEWAY_ARGS", self.args.display().to_string()),
+            ("FAKE_GATEWAY_PID", self.pid.display().to_string()),
+            ("FAKE_GATEWAY_STOPPED", self.stopped.display().to_string()),
+        ]
+    }
+
+    fn args(&self) -> Option<Vec<String>> {
+        let text = std::fs::read_to_string(&self.args).ok()?;
+        Some(text.lines().map(str::to_owned).collect())
+    }
+
+    fn pid(&self) -> Option<u32> {
+        read_pid_file(&self.pid)
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.is_file()
+    }
+}
+
+impl Drop for FakeGateway {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid() {
+            kill_group(pid);
+        }
+    }
+}
+
+/// Writes a node `config.toml` that enables or disables the WSS ingress.
+fn write_wss_config(env: &common::TestEnv, enabled: bool, listen: &str) {
+    let text = format!("[ingress.wss]\nenabled = {enabled}\nlisten = \"{listen}\"\n");
+    std::fs::write(env.home_path().join("config.toml"), text).expect("write node config");
+}
+
+#[test]
+fn up_starts_the_wss_gateway_when_ingress_is_enabled() {
+    let env = common::TestEnv::new();
+    write_wss_config(&env, true, "127.0.0.1:18743");
+    let fake = FakeGateway::new();
+    let mut supervisor = SupervisorProcess::spawn_with(env.home_path(), env.project_path(), &fake.envs());
+
+    assert!(
+        eventually(|| fake.args().is_some()),
+        "the fake gateway did not start; supervisor stdout:\n{}\nstderr:\n{}",
+        supervisor.stdout(),
+        supervisor.stderr()
+    );
+    assert_eq!(
+        fake.args().expect("gateway args"),
+        vec![
+            "--home".to_owned(),
+            env.home_path().display().to_string(),
+            "agent".to_owned(),
+            "gateway".to_owned(),
+            "--listen".to_owned(),
+            "127.0.0.1:18743".to_owned(),
+        ],
+        "the listener is the hidden gateway on the configured loopback address"
+    );
+    assert!(
+        eventually(|| supervisor
+            .stdout()
+            .contains("wss gateway: ws://127.0.0.1:18743/agent/v1")),
+        "the supervisor surfaces the listener; stdout:\n{}",
+        supervisor.stdout()
+    );
+    let gateway_pid = fake.pid().expect("gateway pid");
+
+    kill_signal(supervisor.pid(), "TERM");
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("SIGTERM must stop the supervisor within 15 s");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "a cancelled supervisor exits cleanly; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        eventually(|| !process_alive(gateway_pid)),
+        "the gateway child {gateway_pid} survived the supervisor"
+    );
+    assert!(
+        eventually(|| fake.stopped()),
+        "the gateway did not observe SIGTERM; stderr:\n{}",
+        supervisor.stderr()
+    );
+}
+
+#[test]
+fn up_does_not_start_the_wss_gateway_when_ingress_is_disabled() {
+    let env = common::TestEnv::new();
+    write_wss_config(&env, false, "127.0.0.1:18744");
+    let fake = FakeGateway::new();
+    let mut supervisor = SupervisorProcess::spawn_with(env.home_path(), env.project_path(), &fake.envs());
+    assert!(
+        eventually(|| supervisor.stdout().contains("supervisor running")),
+        "the supervisor did not start; stdout:\n{}\nstderr:\n{}",
+        supervisor.stdout(),
+        supervisor.stderr()
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(fake.args().is_none(), "a disabled ingress starts no gateway child");
+
+    kill_signal(supervisor.pid(), "TERM");
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("SIGTERM must stop the supervisor within 15 s");
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", supervisor.stderr());
+}
+
+#[test]
+fn up_warns_and_continues_when_the_wss_gateway_binary_is_missing() {
+    let env = common::TestEnv::new();
+    write_wss_config(&env, true, "127.0.0.1:18745");
+    let missing = env.home_path().join("missing-vowp-gateway");
+    let mut supervisor = SupervisorProcess::spawn_with(
+        env.home_path(),
+        env.project_path(),
+        &[("VOWP_GATEWAY_BIN", missing.display().to_string())],
+    );
+    assert!(
+        eventually(|| supervisor.stderr().contains("wss gateway not started")),
+        "the missing listener warns; stderr:\n{}",
+        supervisor.stderr()
+    );
+    assert!(
+        supervisor.stdout().contains("supervisor running"),
+        "the supervisor keeps running; stdout:\n{}",
+        supervisor.stdout()
+    );
+
+    kill_signal(supervisor.pid(), "TERM");
+    let status = supervisor
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("SIGTERM must stop the supervisor within 15 s");
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", supervisor.stderr());
 }

@@ -48,7 +48,11 @@ pub fn evaluate(store: &Store, now: Timestamp) -> Result<BrakeState, CoreError> 
 /// The provider condition trips only when every configured provider has an active limit;
 /// the store alone cannot know which providers exist, so this overload takes `deps`.
 pub fn evaluate_with_config(deps: &Deps, store: &Store, now: Timestamp) -> Result<BrakeState, CoreError> {
-    let providers: Vec<String> = deps.config.providers.keys().cloned().collect();
+    let providers: Vec<String> = super::reload::effective_config(deps)
+        .providers
+        .keys()
+        .cloned()
+        .collect();
     evaluate_with(store, now, &providers)
 }
 

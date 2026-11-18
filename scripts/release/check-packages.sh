@@ -17,6 +17,7 @@ CARGO=${CARGO:-cargo}
 # Publish order: dependencies first.
 CRATES=(
   vowp-protocol
+  vowp-agent
   vowp-store
   vowp-graph
   vowp-tmux
@@ -58,10 +59,10 @@ patch_args_for() {
   local deps=()
   case "$crate" in
     vowp-protocol|vowp-tmux) ;;
-    vowp-store|vowp-graph|vowp-adapters) deps=(vowp-protocol) ;;
+    vowp-agent|vowp-store|vowp-graph|vowp-adapters) deps=(vowp-protocol) ;;
     vowp-core) deps=(vowp-protocol vowp-store vowp-graph vowp-tmux vowp-adapters) ;;
-    vowp-daemon) deps=(vowp-protocol vowp-store vowp-core vowp-tmux) ;;
-    vowp-cli) deps=(vowp-protocol vowp-store vowp-graph vowp-tmux vowp-adapters vowp-core) ;;
+    vowp-daemon) deps=(vowp-protocol vowp-store vowp-graph vowp-core vowp-tmux) ;;
+    vowp-cli) deps=(vowp-protocol vowp-agent vowp-store vowp-graph vowp-tmux vowp-adapters vowp-core) ;;
     *) echo "internal error: no dependency map for $crate" >&2; exit 1 ;;
   esac
   local dep

@@ -4,11 +4,13 @@
 //! `main` explicitly because these tables live in the global file; a [`Store`] bound to a
 //! project still shares the same connection.
 
+use std::time::Duration;
+
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Row, params, params_from_iter};
 use vowp_protocol::{
-    AdviceState, BuildMode, CapacityAdvice, CapacityTarget, HarnessKind, HostSample, JobId, JobKind, NodeName,
-    ProjectName, RunId, RunUsage, Timestamp, UsageEstimate,
+    AdviceState, BuildMode, CapacityAdvice, CapacityTarget, HarnessKind, HistorySource, HostSample, JobId, JobKind,
+    NodeName, ProjectName, RunId, RunUsage, Timestamp, UsageEstimate,
 };
 
 use crate::convert::{
@@ -458,6 +460,78 @@ fn advice_from_row(raw: AdviceRow) -> Result<CapacityAdvice, StoreError> {
     })
 }
 
+/// One stored 5-minute capacity rollup.
+///
+/// A rollup is the bounded, long-lived summary of the raw `host_samples` rows in one bucket;
+/// the home keeps rollups for 30 days and raw samples for 48 hours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapacityRollup {
+    /// RFC 3339 UTC start of the bucket.
+    pub bucket: Timestamp,
+    /// Width of the bucket in seconds (300 for a stored rollup).
+    pub bucket_secs: u64,
+    /// Number of raw samples aggregated into the bucket.
+    pub samples: u32,
+    /// Smallest available-memory value in the bucket, in bytes.
+    pub mem_available_min_bytes: u64,
+    /// Mean available-memory value in the bucket, in bytes.
+    pub mem_available_avg_bytes: u64,
+    /// Largest available-memory value in the bucket, in bytes.
+    pub mem_available_max_bytes: u64,
+    /// Mean one-minute load average in the bucket.
+    pub load1_avg: f64,
+    /// Smallest free home-filesystem bytes in the bucket.
+    pub disk_free_home_min_bytes: u64,
+    /// Measurement source of the bucket.
+    pub source: HistorySource,
+}
+
+/// Raw values of one `capacity_rollups` row.
+struct RollupRow {
+    bucket: String,
+    bucket_secs: i64,
+    samples: i64,
+    mem_available_min_bytes: i64,
+    mem_available_avg_bytes: i64,
+    mem_available_max_bytes: i64,
+    load1_avg: f64,
+    disk_free_home_min_bytes: i64,
+    source: String,
+}
+
+/// Reads one capacity-rollup row.
+fn read_rollup_row(row: &Row<'_>) -> rusqlite::Result<RollupRow> {
+    Ok(RollupRow {
+        bucket: row.get(0)?,
+        bucket_secs: row.get(1)?,
+        samples: row.get(2)?,
+        mem_available_min_bytes: row.get(3)?,
+        mem_available_avg_bytes: row.get(4)?,
+        mem_available_max_bytes: row.get(5)?,
+        load1_avg: row.get(6)?,
+        disk_free_home_min_bytes: row.get(7)?,
+        source: row.get(8)?,
+    })
+}
+
+/// Converts one raw capacity-rollup row.
+fn rollup_from_row(raw: RollupRow) -> Result<CapacityRollup, StoreError> {
+    Ok(CapacityRollup {
+        bucket: ts_from_text(&raw.bucket, "capacity_rollups.bucket")?,
+        bucket_secs: u64_from_i64(raw.bucket_secs, "capacity_rollups.bucket_secs")?,
+        samples: u32_from_i64(raw.samples, "capacity_rollups.samples")?,
+        mem_available_min_bytes: u64_from_i64(raw.mem_available_min_bytes, "capacity_rollups.mem_available_min_bytes")?,
+        mem_available_avg_bytes: u64_from_i64(raw.mem_available_avg_bytes, "capacity_rollups.mem_available_avg_bytes")?,
+        mem_available_max_bytes: u64_from_i64(raw.mem_available_max_bytes, "capacity_rollups.mem_available_max_bytes")?,
+        load1_avg: raw.load1_avg,
+        disk_free_home_min_bytes: u64_from_i64(
+            raw.disk_free_home_min_bytes,
+            "capacity_rollups.disk_free_home_min_bytes",
+        )?,
+        source: enum_from_text(&raw.source, "capacity_rollups.source")?,
+    })
+}
+
 impl Store {
     /// Inserts one host sample.
     pub fn insert_host_sample(&self, sample: &HostSample) -> Result<(), StoreError> {
@@ -506,18 +580,117 @@ impl Store {
         Ok(samples)
     }
 
-    /// Deletes old host samples and returns the number removed.
+    /// Deletes host samples older than `before` and returns the number removed.
     ///
-    /// Full-rate rows older than `before` go first; every row older than `minute_before`
-    /// goes too. Minute averages are written by the lifecycle job and carry
-    /// `interval_secs >= 60`, so they survive until the second cutoff.
-    pub fn prune_host_samples(&self, before: Timestamp, minute_before: Timestamp) -> Result<u64, StoreError> {
+    /// The sampler keeps raw rows for 48 hours; older minute rows are not special-cased
+    /// because the long-lived history lives in `capacity_rollups`.
+    pub fn prune_host_samples(&self, before: Timestamp) -> Result<u64, StoreError> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM main.host_samples WHERE at < ?1", [ts_to_text(before)])?;
+        Ok(u64::try_from(removed).unwrap_or(u64::MAX))
+    }
+
+    /// Aggregates one completed host-sample bucket into `capacity_rollups`.
+    ///
+    /// The bucket is `[bucket, bucket + bucket_secs)`. A bucket with no raw samples is
+    /// skipped and nothing is written. A repeated call for the same bucket updates the row
+    /// in place, so a restart or a deferred migration cannot duplicate it; `samples` and the
+    /// aggregates are recomputed from the raw rows. Returns whether a row was written.
+    pub fn rollup_host_samples(&self, bucket: Timestamp, bucket_secs: u64) -> Result<bool, StoreError> {
+        if bucket_secs == 0 {
+            return Err(StoreError::InvalidInput(
+                "capacity rollup bucket_secs must be positive".to_owned(),
+            ));
+        }
+        self.require_capacity_rollups()?;
+        let end = bucket.plus(Duration::from_secs(bucket_secs));
+        let changed = self.conn.execute(
+            "INSERT INTO main.capacity_rollups (
+                bucket, bucket_secs, samples, mem_available_min_bytes,
+                mem_available_avg_bytes, mem_available_max_bytes, load1_avg,
+                disk_free_home_min_bytes, source
+             )
+             SELECT ?1, ?2, COUNT(*), MIN(mem_available_bytes),
+                    CAST(ROUND(AVG(mem_available_bytes)) AS INTEGER), MAX(mem_available_bytes),
+                    AVG(load1), MIN(disk_free_home_bytes),
+                    CASE WHEN MIN(source) = MAX(source) THEN MIN(source) ELSE 'mixed' END
+             FROM main.host_samples
+             WHERE at >= ?1 AND at < ?3
+             HAVING COUNT(*) > 0
+             ON CONFLICT(bucket, bucket_secs) DO UPDATE SET
+                samples = excluded.samples,
+                mem_available_min_bytes = excluded.mem_available_min_bytes,
+                mem_available_avg_bytes = excluded.mem_available_avg_bytes,
+                mem_available_max_bytes = excluded.mem_available_max_bytes,
+                load1_avg = excluded.load1_avg,
+                disk_free_home_min_bytes = excluded.disk_free_home_min_bytes,
+                source = excluded.source",
+            params![
+                ts_to_text(bucket),
+                i64_from_u64(bucket_secs, "capacity_rollups.bucket_secs")?,
+                ts_to_text(end),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Returns every stored rollup of `bucket_secs` starting at or after `since`, oldest first.
+    pub fn capacity_rollups_since(
+        &self,
+        since: Timestamp,
+        bucket_secs: u64,
+    ) -> Result<Vec<CapacityRollup>, StoreError> {
+        self.require_capacity_rollups()?;
+        let mut statement = self.conn.prepare(
+            "SELECT bucket, bucket_secs, samples, mem_available_min_bytes,
+                    mem_available_avg_bytes, mem_available_max_bytes, load1_avg,
+                    disk_free_home_min_bytes, source
+             FROM main.capacity_rollups
+             WHERE bucket >= ?1 AND bucket_secs = ?2
+             ORDER BY bucket",
+        )?;
+        let rows = statement.query_map(
+            params![
+                ts_to_text(since),
+                i64_from_u64(bucket_secs, "capacity_rollups.bucket_secs")?
+            ],
+            read_rollup_row,
+        )?;
+        let mut rollups = Vec::new();
+        for row in rows {
+            rollups.push(rollup_from_row(row?)?);
+        }
+        Ok(rollups)
+    }
+
+    /// Deletes capacity rollups older than `before` and returns the number removed.
+    ///
+    /// The sampler passes `now - 30 days`; the bucket that contains `now` is always newer
+    /// than that cutoff and is never deleted.
+    pub fn prune_capacity_rollups(&self, before: Timestamp) -> Result<u64, StoreError> {
+        self.require_capacity_rollups()?;
         let removed = self.conn.execute(
-            "DELETE FROM main.host_samples
-             WHERE at < ?2 OR (at < ?1 AND interval_secs < 60)",
-            params![ts_to_text(before), ts_to_text(minute_before)],
+            "DELETE FROM main.capacity_rollups WHERE bucket < ?1",
+            [ts_to_text(before)],
         )?;
         Ok(u64::try_from(removed).unwrap_or(u64::MAX))
+    }
+
+    /// Returns [`StoreError::MigrationRequired`] when the v7 rollup table is absent.
+    ///
+    /// A read-only handle may open a v6 home while an older supervisor runs; the history
+    /// path must then report "migrate first" instead of a raw `no such table` error.
+    fn require_capacity_rollups(&self) -> Result<(), StoreError> {
+        let found: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type = 'table' AND name = 'capacity_rollups'",
+            [],
+            |row| row.get(0),
+        )?;
+        if found == 0 {
+            return Err(StoreError::MigrationRequired);
+        }
+        Ok(())
     }
 
     /// Inserts or replaces one finished run's usage.

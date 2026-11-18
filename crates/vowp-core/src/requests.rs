@@ -85,6 +85,13 @@ pub enum Request {
     },
     /// End the supervisor's idle wait without any other effect.
     Wake,
+    /// Restart the optional `vowp-daemon` web-window child without touching any run.
+    RestartWebWindow,
+    /// Close and re-open one drained project's supervisor and store connection.
+    ReloadProject {
+        /// Project to reload.
+        project: vowp_protocol::ProjectName,
+    },
 }
 
 /// Serialises `req` and enqueues it as one `req:<ULID>` row.
@@ -147,6 +154,9 @@ pub fn apply_direct(deps: &Deps, store: &Store, req: &Request) -> Result<(), Cor
         Request::ResumeLoop { name } => set_loop_state(store, name, ActiveState::Active),
         Request::RunLoop { name } => run_loop_now(store, name),
         Request::Wake => Ok(()),
+        Request::RestartWebWindow | Request::ReloadProject { .. } => Err(CoreError::Invalid(
+            "subsystem restart requests need a running supervisor".to_owned(),
+        )),
     }?;
     deps.log
         .log(Level::Info, "requests", &format!("applied {}", kind_name(req)));
@@ -355,6 +365,8 @@ fn kind_name(req: &Request) -> &'static str {
         Request::PauseLoop { .. } => "pause_loop",
         Request::ResumeLoop { .. } => "resume_loop",
         Request::Wake => "wake",
+        Request::RestartWebWindow => "restart_web_window",
+        Request::ReloadProject { .. } => "reload_project",
     }
 }
 

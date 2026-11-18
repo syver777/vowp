@@ -1,6 +1,6 @@
 # VOWP — Virtual Open Work-to-Production
 
-VOWP is a VPS framework for AI agents to work on projects. One Linux VPS is the **home**: it owns the global database, one database per project, every session log and the supervisor. You talk to it from a laptop, desktop or phone; a registered executor node can run a turn where the work needs local context. Each agent can be Claude Code, opencode, Codex or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between harnesses, models and nodes without losing its context. Finished work moves from **Work to Production** only through guarded, reversible promotions.
+VOWP is a VPS framework for AI agents to work on projects. One Linux VPS is the **home**: it owns the global database, one database per project, every session log and the supervisor. You talk to it from a laptop, desktop or phone; a registered executor node can run a turn where the work needs local context. Each agent can be Claude Code, opencode, Codex or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between models, harnesses and surfaces without losing its context; moving to another node is an explicit export/import or `session pull`. Finished work moves from **Work to Production** only through guarded, reversible promotions.
 
 This document describes how VOWP works. The imperative spec for each crate is in the neighbouring files; `decisions.md` records the places where that spec tightens or clarifies this design.
 
@@ -182,7 +182,7 @@ gates:
   - cmd: { run: "cargo clippy --workspace --all-targets -- -D warnings", expect_exit: 0 }
   - owns_respected: true            # diff touches only `owns`
   - review: { by: verifier }        # spawns a verify job
-loop: { until: gates, max_attempts: 3, on_exhausted: escalate }
+loop: { until: gates, max_attempts: 2, on_exhausted: escalate }
 priority: 50
 state: pending
 ```
@@ -224,7 +224,7 @@ any state ──needs a human / provider blocked──► parked ──resolved�
 |---|---|---|---|
 | **L1 Supervisor** | 60 s, deterministic | Reconciles every job: process alive? new events? report present? limits? Runs gates, moves states, feeds the merge queue, dispatches ready jobs, triggers L4/L5, writes the board. | Never stops. The watchdog restarts it if it dies. |
 | **L2 Worker** | per job | Starts the job's session from its brief. When the run ends without a report, sends "you stopped before writing your report — continue" into the same session. Then gates. | 2 automatic continues, then the keeper diagnoses. |
-| **L3 Verify** | after a report | A separate verifier session reads the brief, the diff and the gate evidence, and passes or lists concrete failures. Failure creates a `fix` job with the findings. | 3 fix rounds, then escalate. |
+| **L3 Verify** | after a report | A separate verifier session reads the brief, the diff and the gate evidence, and passes or lists concrete failures. Failure creates a `fix` job with the findings. | 2 fix rounds, then escalate. |
 | **L4 Planner** | on events + 30 min heartbeat | Gets a digest (finished, failed, stalled, inbox) and acts with `vowp job add/update` and brief files: decomposes, reprioritises, reviews reports against evidence, writes checkpoint summaries. | One planner turn at a time. |
 | **L5 Keeper** | on stalls/failures + 20 min heartbeat | Diagnoses stalls (reads logs), decides nudge / restart / replan / park, writes nudges. **Takes over the planner role when the planner's harness is unavailable.** | One keeper turn at a time. |
 | **L6 Failover** | on `limit` events | Provider limit → capsule → the next ladder rung. Probes the limited provider after the reset time (one tiny call, then every 15 min) and switches back with a capsule. | Never silently moves work to a *paid* provider the profile doesn't list. Credits exhausted → park + inbox. |

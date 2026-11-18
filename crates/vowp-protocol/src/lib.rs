@@ -10,7 +10,9 @@
 #![warn(missing_docs)]
 
 pub mod adapter;
+pub mod agent;
 pub mod api;
+pub mod asif;
 pub mod capacity;
 pub mod capsule;
 pub mod catalog;
@@ -26,6 +28,7 @@ pub mod job;
 pub mod limit;
 pub mod log;
 pub mod loops;
+pub mod offload;
 pub mod ops;
 pub mod release;
 pub mod report;
@@ -42,7 +45,11 @@ pub mod vault;
 #[allow(unused_imports)]
 pub use adapter::*;
 #[allow(unused_imports)]
+pub use agent::*;
+#[allow(unused_imports)]
 pub use api::*;
+#[allow(unused_imports)]
+pub use asif::*;
 #[allow(unused_imports)]
 pub use capacity::*;
 #[allow(unused_imports)]
@@ -67,6 +74,8 @@ pub use limit::*;
 pub use log::*;
 #[allow(unused_imports)]
 pub use loops::*;
+#[allow(unused_imports)]
+pub use offload::*;
 #[allow(unused_imports)]
 pub use ops::*;
 #[allow(unused_imports)]
@@ -107,6 +116,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// from the other protocol modules.
 #[allow(unused_imports)]
 pub mod prelude {
+    pub use crate::asif::*;
     pub use crate::capsule::*;
     pub use crate::cost::*;
     pub use crate::error::*;

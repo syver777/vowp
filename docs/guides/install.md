@@ -1,11 +1,12 @@
 # Install
 
-VOWP 0.3 has two roles:
+VOWP 0.4 has two core roles and an optional third:
 
 | Role | What it is | What it owns |
 |---|---|---|
 | **home** | One Linux VPS. | The global database, every project database, all session logs and the one supervisor. |
 | **control machine** | A laptop, desktop or phone that talks to the home. | A snapshot cache, SSH tunnels and the local app configuration. It holds no truth. |
+| **agent node** | An optional Mac or Linux machine that dials the home. | Its node key, path map, harness login, worktrees and surface tokens. It holds no truth. |
 
 Most people set up the home first, then make the computer they already use the control machine. The
 phone needs no install at all: an SSH app and the owner's key are enough (see
@@ -77,6 +78,27 @@ vowp fleet status
 `~/.vowp-control/`; it installs no supervisor. `fleet status` fetches the home's snapshot and caches
 it with an `as of` time, so the answer is still useful when SSH is down.
 
+## Add an agent node
+
+A Mac or Linux machine that should run local surfaces or offloaded jobs joins as a v0.4 **agent
+node**, not as a second home. Create the node and its one-time code on the home, then enroll on
+that machine:
+
+```sh
+# on the home
+vowp node enroll mac-studio --label mac
+
+# on the Mac, with the printed code on stdin
+vowp agent enroll --target <home-ssh-target> --code-file - --project ~/src/vowp
+vowp agent status
+```
+
+The agent dials the home; the home never dials the agent. It can run in a terminal with
+`vowp agent run --foreground` or under the service manager with
+`vowp agent service install --now`.
+The WSS alternative, separate-user shape, surface rotation, bundle result and capacity history
+are in [The agent node](agent-node.md). The home remains the only writer.
+
 ## Prerequisites
 
 For a home:
@@ -142,7 +164,7 @@ archives and the npm package contain `vowp` only, so install the matching daemon
 window:
 
 ```sh
-cargo install vowp-daemon --version 0.3.0 --locked
+cargo install vowp-daemon --version 0.4.0 --locked
 vowp-daemon --help
 ```
 
@@ -185,6 +207,7 @@ The install script does not run `vowp init` for you. Run it once per checkout, o
 | `~/.vowp/secrets/` | Basic-mode secret files (mode 0600); vault mode keeps them under the vault user. |
 | `~/.vowp/backups/` | Backup directories and the pre-migration backup. Secrets are never included. |
 | `~/.vowp-control/` | Control-machine config, snapshot cache, spool, surface state and tunnel records. |
+| `~/.vowp-agent/` | Agent-node config, node key, status, spool, cache and surface tokens (0700; files 0600). |
 | `<repo>/vowp.toml` | Project configuration, committed. |
 | `<repo>/.vowp/` | Job briefs and reports, checkpoints and runtime files. Never the database. |
 

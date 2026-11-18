@@ -39,6 +39,28 @@ pub fn heartbeat_file(paths: &NodePaths) -> PathBuf {
     paths.root().join("heartbeat")
 }
 
+/// Returns the path of the cooperative drain marker (`<home>/drain`).
+///
+/// The file's content is informational (the request time); its presence is the signal.
+pub fn drain_file(paths: &NodePaths) -> PathBuf {
+    paths.root().join("drain")
+}
+
+/// Removes a drain marker, returning whether one existed.
+pub fn clear_drain(paths: &NodePaths) -> std::io::Result<bool> {
+    let path = drain_file(paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Returns whether `<home>/drain` asks the supervisor to stop admitting work.
+pub fn drain_requested(paths: &NodePaths) -> bool {
+    drain_file(paths).is_file()
+}
+
 /// Returns the path of the stopped marker (`<home>/heartbeat.stopped`).
 ///
 /// A clean shutdown removes the live heartbeat and writes this sibling file instead, so
@@ -253,6 +275,25 @@ mod tests {
         assert!(!watcher.cancelled_by_signal());
         assert!(clear_stop(&paths).expect("clear stop"));
         assert!(!stop_requested(&paths));
+    }
+
+    #[test]
+    fn drain_marker_is_independent_of_the_stop_file() {
+        let home = tempfile::tempdir().expect("temp home");
+        let paths = NodePaths::new(home.path());
+        let watcher = SignalWatcher::install(&paths).expect("install watcher");
+
+        std::fs::write(drain_file(&paths), "1700000000").expect("write drain file");
+        assert!(drain_requested(&paths));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !watcher.cancel_token().is_cancelled(),
+            "a drain must let the supervisor keep ticking"
+        );
+        assert!(!stop_requested(&paths));
+        assert!(clear_drain(&paths).expect("clear drain"));
+        assert!(!drain_requested(&paths));
+        assert!(!clear_drain(&paths).expect("clear missing drain"));
     }
 
     #[test]

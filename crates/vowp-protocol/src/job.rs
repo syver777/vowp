@@ -170,7 +170,7 @@ pub enum OnExhausted {
 
 /// Default bound on fix rounds for a job.
 fn default_max_attempts() -> u32 {
-    3
+    2
 }
 
 /// A job's bounded fix loop.

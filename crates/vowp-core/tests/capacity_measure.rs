@@ -4,19 +4,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use tempfile::tempdir;
 use vowp_adapters::proc::{ProcUsage, RunHandle, SpawnSpec, child_env};
 use vowp_adapters::stream::StreamParser;
 use vowp_core::capacity::sampler::sample_with;
-use vowp_core::capacity::{self, FakeProcFs, RunScope, scope};
+use vowp_core::capacity::{self, FakeProcFs, HistoryBucket, RunScope, scope};
 use vowp_core::gates::{GateCtx, GateRunner};
 use vowp_core::{AdapterRegistry, Deps, FixedRng, SystemGit, SystemRunner};
 use vowp_protocol::{
     Actor, AdapterRun, AdmitRequest, AdviceState, BuildMode, CapacityAdvice, CapacityTarget, CmdGate, Cost, EventBody,
-    FakeClock, Gate, HarnessEvent, HarnessKind, Job, JobId, JobKind, MemoryLog, NewJob, NodeName, Note, Project,
-    ProjectName, Role, Run, RunId, RunOutcome, RunPurpose, RunRole, RunSummary, RunUsage, StopReason, TargetMode,
-    Timestamp, TurnEnded, UsageSource, VowpConfig,
+    FakeClock, Gate, HarnessEvent, HarnessKind, HostSample, Job, JobId, JobKind, LedgerEntry, LedgerKind, MemoryLog,
+    NewJob, NodeName, Note, Project, ProjectName, Role, Run, RunId, RunOutcome, RunPurpose, RunRole, RunSummary,
+    RunUsage, SampleSource, StopReason, TargetMode, Timestamp, TurnEnded, UsageSource, VowpConfig,
 };
 use vowp_store::{NodePaths, Store};
 
@@ -43,6 +45,33 @@ fn test_store(root: &Path) -> Store {
     Store::open(&NodePaths::new(root))
         .unwrap()
         .with_clock(Arc::new(FakeClock::at(now())))
+}
+
+/// Builds one raw host sample with the fields the rollup aggregates and prunes.
+fn host_sample(at: Timestamp, mem_available: u64, load1: f64, disk_free: u64, source: SampleSource) -> HostSample {
+    HostSample {
+        at,
+        interval_secs: 5,
+        mem_total_bytes: 8_000_000_000,
+        mem_available_bytes: mem_available,
+        swap_used_bytes: 0,
+        load1,
+        load5: load1,
+        load15: load1,
+        cpu_count: 4,
+        cpu_quota_cores: None,
+        disk_free_home_bytes: disk_free,
+        disk_free_worktrees_bytes: None,
+        pressure_cpu_avg10: None,
+        pressure_mem_avg10: None,
+        pressure_io_avg10: None,
+        source,
+    }
+}
+
+/// Floors a timestamp to a whole bucket, matching the history reader.
+fn bucket_start(at: Timestamp, secs: i64) -> Timestamp {
+    Timestamp::from_unix_secs(at.unix_secs().div_euclid(secs) * secs)
 }
 
 fn insert_project(store: &Store) -> ProjectName {
@@ -224,6 +253,7 @@ fn sampler_parses_proc_meminfo_load_and_pressure() {
 fn sampler_degrades_on_non_linux() {
     let tmp = tempdir().unwrap();
     let root = tmp.path().join("node");
+    let store = test_store(&root);
     let mut fake = FakeProcFs::default();
     fake.disk.insert(root.display().to_string(), 7_000_000_000);
     let sample = sample_with(&fake, &NodePaths::new(&root), None, now(), 5).unwrap();
@@ -231,6 +261,25 @@ fn sampler_degrades_on_non_linux() {
     assert_eq!(sample.mem_total_bytes, 0);
     assert_eq!(sample.mem_available_bytes, 0);
     assert_eq!(sample.disk_free_home_bytes, 7_000_000_000);
+
+    // The rollup keeps the fallback label and the real disk number, not a fake memory read.
+    store.insert_host_sample(&sample).unwrap();
+    assert!(capacity::record_rollup(&store, now().plus(Duration::from_secs(300))).unwrap());
+    let history = capacity::read_history(
+        &store,
+        now(),
+        Some(now().minus(Duration::from_secs(3600))),
+        HistoryBucket::FiveMinutes,
+    )
+    .unwrap();
+    assert_eq!(history.points.len(), 1);
+    let point = &history.points[0];
+    assert_eq!(point.source, vowp_protocol::HistorySource::Fallback);
+    assert_eq!(point.mem_available.min, 0);
+    assert_eq!(point.mem_available.avg, 0);
+    assert_eq!(point.mem_available.max, 0);
+    assert_eq!(point.load1_avg, 0.0);
+    assert_eq!(point.disk_free_home_min, 7_000_000_000);
 }
 
 #[test]
@@ -247,29 +296,419 @@ fn sampler_prunes_old_rows() {
     .unwrap();
     sample.source = vowp_protocol::SampleSource::Fallback;
     sample.interval_secs = 5;
-    sample.at = now().minus(Duration::from_secs(31 * 24 * 60 * 60));
+    sample.at = now().minus(Duration::from_secs(49 * 60 * 60));
     store.insert_host_sample(&sample).unwrap();
-    sample.at = now().minus(Duration::from_secs(2 * 24 * 60 * 60));
+    sample.at = now().minus(Duration::from_secs(2 * 24 * 60 * 60 + 1));
     sample.interval_secs = 60;
     store.insert_host_sample(&sample).unwrap();
+    sample.at = now().minus(Duration::from_secs(47 * 60 * 60));
     sample.interval_secs = 5;
     store.insert_host_sample(&sample).unwrap();
     sample.at = now();
     sample.interval_secs = 5;
     store.insert_host_sample(&sample).unwrap();
 
+    // Raw rows live for 48 hours; the old minute row is not kept longer than the rest.
     let removed = store
-        .prune_host_samples(
-            now().minus(Duration::from_secs(24 * 60 * 60)),
-            now().minus(Duration::from_secs(30 * 24 * 60 * 60)),
-        )
+        .prune_host_samples(now().minus(Duration::from_secs(capacity::RAW_RETENTION_SECS)))
         .unwrap();
     assert_eq!(removed, 2);
     let left = store
         .host_samples_since(now().minus(Duration::from_secs(40 * 24 * 60 * 60)))
         .unwrap();
     assert_eq!(left.len(), 2);
-    assert!(left.iter().any(|sample| sample.interval_secs == 60));
+    assert!(
+        left.iter()
+            .all(|sample| sample.at >= now().minus(Duration::from_secs(48 * 60 * 60)))
+    );
+}
+
+#[test]
+fn sampler_tick_writes_one_rollup_for_the_previous_bucket() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("node");
+    let store = test_store(&root);
+    let deps = test_deps(&root);
+    let base = now();
+    store
+        .insert_host_sample(&host_sample(
+            base.minus(Duration::from_secs(10)),
+            1000,
+            1.0,
+            900,
+            SampleSource::Proc,
+        ))
+        .unwrap();
+
+    assert!(capacity::sample(&deps, &store, base).unwrap().is_some());
+    let previous = base.minus(Duration::from_secs(capacity::ROLLUP_BUCKET_SECS));
+    let rows = store.capacity_rollups_since(previous, 300).unwrap();
+    assert_eq!(rows.len(), 1, "the tick writes exactly one rollup");
+    assert_eq!(rows[0].bucket, previous);
+    assert_eq!(rows[0].samples, 1, "the current bucket's new sample is not in it");
+    assert_eq!(rows[0].mem_available_avg_bytes, 1000);
+    assert_eq!(
+        store
+            .host_samples_since(base.minus(Duration::from_secs(60)))
+            .unwrap()
+            .len(),
+        2,
+        "the tick still writes the raw sample"
+    );
+}
+
+#[test]
+fn capacity_history_buckets_raw_samples_into_five_minute_points() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let base = Timestamp::parse("2026-11-10T12:00:00Z").unwrap();
+    for (offset, mem, load, disk) in [(10, 1000, 0.5, 900), (70, 3000, 1.5, 700), (130, 2000, 2.5, 800)] {
+        store
+            .insert_host_sample(&host_sample(
+                base.plus(Duration::from_secs(offset)),
+                mem,
+                load,
+                disk,
+                SampleSource::Proc,
+            ))
+            .unwrap();
+    }
+    store
+        .insert_host_sample(&host_sample(
+            base.plus(Duration::from_secs(310)),
+            5000,
+            4.0,
+            600,
+            SampleSource::Proc,
+        ))
+        .unwrap();
+
+    let first_tick = base.plus(Duration::from_secs(7 * 60));
+    assert!(capacity::record_rollup(&store, first_tick).unwrap());
+    let history = capacity::read_history(&store, first_tick, Some(base), HistoryBucket::FiveMinutes).unwrap();
+    assert_eq!(history.generated_at, first_tick);
+    assert_eq!(history.until, first_tick);
+    assert_eq!(history.since, base);
+    assert_eq!(history.bucket_secs, 300);
+    assert_eq!(history.retention_secs, capacity::ROLLUP_RETENTION_SECS);
+    assert_eq!(history.points.len(), 1, "only the completed bucket is rolled up");
+    let point = &history.points[0];
+    assert_eq!(point.at, base);
+    assert_eq!(point.samples, 3);
+    assert_eq!(point.mem_available.min, 1000);
+    assert_eq!(point.mem_available.avg, 2000);
+    assert_eq!(point.mem_available.max, 3000);
+    assert_eq!(point.load1_avg, 1.5);
+    assert_eq!(point.disk_free_home_min, 700);
+    assert_eq!(point.source, vowp_protocol::HistorySource::Proc);
+
+    let second_tick = base.plus(Duration::from_secs(10 * 60 + 10));
+    assert!(capacity::record_rollup(&store, second_tick).unwrap());
+    let history = capacity::read_history(&store, second_tick, Some(base), HistoryBucket::FiveMinutes).unwrap();
+    assert_eq!(history.points.len(), 2);
+    assert_eq!(history.points[1].at, base.plus(Duration::from_secs(300)));
+    assert_eq!(history.points[1].samples, 1);
+    assert_eq!(history.points[1].mem_available.avg, 5000);
+}
+
+#[test]
+fn capacity_history_is_idempotent_across_a_repeated_tick() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let base = Timestamp::parse("2026-11-10T12:00:00Z").unwrap();
+    for offset in [10, 20, 30] {
+        store
+            .insert_host_sample(&host_sample(
+                base.plus(Duration::from_secs(offset)),
+                1000,
+                1.0,
+                900,
+                SampleSource::Proc,
+            ))
+            .unwrap();
+    }
+
+    let tick = base.plus(Duration::from_secs(6 * 60));
+    assert!(capacity::record_rollup(&store, tick).unwrap());
+    assert!(capacity::record_rollup(&store, tick).unwrap());
+    let rows = store.capacity_rollups_since(base, 300).unwrap();
+    assert_eq!(rows.len(), 1, "a repeated tick must not duplicate the bucket");
+    assert_eq!(rows[0].samples, 3);
+
+    // The next tick recomputes the same bucket from the raw rows, including late rows.
+    for offset in [240, 250] {
+        store
+            .insert_host_sample(&host_sample(
+                base.plus(Duration::from_secs(offset)),
+                3000,
+                3.0,
+                700,
+                SampleSource::Proc,
+            ))
+            .unwrap();
+    }
+    assert!(capacity::record_rollup(&store, tick).unwrap());
+    let rows = store.capacity_rollups_since(base, 300).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].samples, 5);
+    assert_eq!(rows[0].mem_available_avg_bytes, 1800);
+
+    // An empty bucket is a gap: it is skipped, never written as zeroes.
+    let empty_tick = base.plus(Duration::from_secs(11 * 60));
+    assert!(!capacity::record_rollup(&store, empty_tick).unwrap());
+    assert_eq!(store.capacity_rollups_since(base, 300).unwrap().len(), 1);
+}
+
+#[test]
+fn capacity_history_keeps_thirty_days_and_prunes_the_rest() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let base = now();
+    let day = 24 * 60 * 60_u64;
+
+    let old_at = base.minus(Duration::from_secs(40 * day)).plus(Duration::from_secs(10));
+    store
+        .insert_host_sample(&host_sample(old_at, 1000, 1.0, 900, SampleSource::Proc))
+        .unwrap();
+    assert!(capacity::record_rollup(&store, old_at.plus(Duration::from_secs(300))).unwrap());
+    let recent_at = base.minus(Duration::from_secs(20 * day)).plus(Duration::from_secs(10));
+    store
+        .insert_host_sample(&host_sample(recent_at, 2000, 2.0, 800, SampleSource::Proc))
+        .unwrap();
+    assert!(capacity::record_rollup(&store, recent_at.plus(Duration::from_secs(300))).unwrap());
+
+    store
+        .insert_host_sample(&host_sample(
+            base.minus(Duration::from_secs(49 * 60 * 60)),
+            3000,
+            3.0,
+            700,
+            SampleSource::Proc,
+        ))
+        .unwrap();
+    store
+        .insert_host_sample(&host_sample(
+            base.minus(Duration::from_secs(47 * 60 * 60)),
+            4000,
+            4.0,
+            600,
+            SampleSource::Proc,
+        ))
+        .unwrap();
+
+    // Raw rows now stop at 48 hours: the old rollup rows' raw sources go too.
+    let removed = store
+        .prune_host_samples(base.minus(Duration::from_secs(capacity::RAW_RETENTION_SECS)))
+        .unwrap();
+    assert_eq!(removed, 3);
+    assert_eq!(
+        store
+            .host_samples_since(base.minus(Duration::from_secs(60 * day)))
+            .unwrap()
+            .len(),
+        1,
+        "only the 47-hour-old raw sample survives"
+    );
+
+    let removed = store
+        .prune_capacity_rollups(base.minus(Duration::from_secs(capacity::ROLLUP_RETENTION_SECS)))
+        .unwrap();
+    assert_eq!(removed, 1, "the 40-day-old rollup goes");
+    let rows = store
+        .capacity_rollups_since(base.minus(Duration::from_secs(60 * day)), 300)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].bucket, bucket_start(recent_at, 300));
+
+    // The bucket that contains `now` is never deleted, even when it was just written.
+    let current = base.plus(Duration::from_secs(10));
+    store
+        .insert_host_sample(&host_sample(current, 5000, 5.0, 500, SampleSource::Proc))
+        .unwrap();
+    assert!(capacity::record_rollup(&store, base.plus(Duration::from_secs(6 * 60))).unwrap());
+    let removed = store
+        .prune_capacity_rollups(base.minus(Duration::from_secs(capacity::ROLLUP_RETENTION_SECS)))
+        .unwrap();
+    assert_eq!(removed, 0, "the current bucket stays inside the window");
+    let history = capacity::read_history(
+        &store,
+        base.plus(Duration::from_secs(6 * 60)),
+        Some(base),
+        HistoryBucket::FiveMinutes,
+    )
+    .unwrap();
+    assert_eq!(history.points.len(), 1);
+    assert_eq!(history.points[0].at, bucket_start(current, 300));
+}
+
+#[test]
+fn capacity_history_clamps_since_to_the_retained_window() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let base = now();
+    let day = 24 * 60 * 60_u64;
+    let recent_at = base.minus(Duration::from_secs(2 * day)).plus(Duration::from_secs(10));
+    store
+        .insert_host_sample(&host_sample(recent_at, 2000, 2.0, 800, SampleSource::Proc))
+        .unwrap();
+    assert!(capacity::record_rollup(&store, recent_at.plus(Duration::from_secs(300))).unwrap());
+
+    // A request older than retention starts at the oldest bucket the window can hold.
+    let history = capacity::read_history(
+        &store,
+        base,
+        Some(base.minus(Duration::from_secs(60 * day))),
+        HistoryBucket::FiveMinutes,
+    )
+    .unwrap();
+    let expected_since = bucket_start(base.minus(Duration::from_secs(capacity::ROLLUP_RETENTION_SECS)), 300);
+    assert_eq!(history.since, expected_since);
+    assert_eq!(history.until, base);
+    assert_eq!(history.points.len(), 1);
+    assert_eq!(history.points[0].at, bucket_start(recent_at, 300));
+
+    // An empty home is a clear empty document, not an error and not invented zeroes.
+    let empty = tempdir().unwrap();
+    let empty_store = test_store(&empty.path().join("node"));
+    let history = capacity::read_history(&empty_store, base, None, HistoryBucket::FiveMinutes).unwrap();
+    assert!(history.points.is_empty());
+    assert_eq!(history.since, base.minus(Duration::from_secs(24 * 60 * 60)));
+    assert_eq!(history.until, base);
+    assert_eq!(history.bucket_secs, 300);
+    assert_eq!(history.retention_secs, capacity::ROLLUP_RETENTION_SECS);
+}
+
+#[test]
+fn capacity_history_read_time_buckets_weight_by_samples() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let base = Timestamp::parse("2026-11-10T12:00:00Z").unwrap();
+
+    // Bucket 12:00 has two samples averaging 2000 bytes.
+    for offset in [10, 70] {
+        let mem = if offset == 10 { 1000 } else { 3000 };
+        store
+            .insert_host_sample(&host_sample(
+                base.plus(Duration::from_secs(offset)),
+                mem,
+                1.0,
+                900,
+                SampleSource::Proc,
+            ))
+            .unwrap();
+    }
+    // Bucket 12:05 has eight samples averaging 4000 bytes.
+    let four_thousand = 4000;
+    for index in 0..8 {
+        store
+            .insert_host_sample(&host_sample(
+                base.plus(Duration::from_secs(310 + index * 30)),
+                four_thousand,
+                2.0,
+                800,
+                SampleSource::Proc,
+            ))
+            .unwrap();
+    }
+    // Bucket 13:00 is a single fallback sample; the day point must label it mixed.
+    store
+        .insert_host_sample(&host_sample(
+            base.plus(Duration::from_secs(3600 + 10)),
+            0,
+            0.0,
+            500,
+            SampleSource::Fallback,
+        ))
+        .unwrap();
+
+    assert!(capacity::record_rollup(&store, base.plus(Duration::from_secs(5 * 60))).unwrap());
+    assert!(capacity::record_rollup(&store, base.plus(Duration::from_secs(10 * 60))).unwrap());
+    assert!(capacity::record_rollup(&store, base.plus(Duration::from_secs(65 * 60))).unwrap());
+
+    let now = base.plus(Duration::from_secs(70 * 60));
+    let hourly = capacity::read_history(&store, now, Some(base), HistoryBucket::Hour).unwrap();
+    assert_eq!(hourly.bucket_secs, 3600);
+    assert_eq!(hourly.points.len(), 2);
+    let noon = &hourly.points[0];
+    assert_eq!(noon.at, base);
+    assert_eq!(noon.samples, 10);
+    assert_eq!(noon.mem_available.min, 1000);
+    assert_eq!(noon.mem_available.max, 4000);
+    assert_eq!(noon.mem_available.avg, 3600, "(2000*2 + 4000*8) / 10");
+    assert_eq!(noon.disk_free_home_min, 800);
+    assert_eq!(noon.source, vowp_protocol::HistorySource::Proc);
+    assert_eq!(hourly.points[1].at, base.plus(Duration::from_secs(3600)));
+    assert_eq!(hourly.points[1].source, vowp_protocol::HistorySource::Fallback);
+
+    let daily = capacity::read_history(&store, now, Some(base), HistoryBucket::Day).unwrap();
+    assert_eq!(daily.bucket_secs, 86_400);
+    assert_eq!(daily.points.len(), 1);
+    let day = &daily.points[0];
+    assert_eq!(day.at, bucket_start(base, 86_400));
+    assert_eq!(day.samples, 11);
+    assert_eq!(day.mem_available.min, 0);
+    assert_eq!(day.mem_available.max, 4000);
+    assert_eq!(day.mem_available.avg, 3273);
+    assert_eq!(day.source, vowp_protocol::HistorySource::Mixed);
+}
+
+#[test]
+fn capacity_history_is_read_only_and_writes_no_ledger_row() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("node");
+    let paths = NodePaths::new(&root);
+    let store = test_store(&root);
+    let base = now();
+    store
+        .insert_host_sample(&host_sample(
+            base.plus(Duration::from_secs(10)),
+            2000,
+            2.0,
+            800,
+            SampleSource::Proc,
+        ))
+        .unwrap();
+    assert!(capacity::record_rollup(&store, base.plus(Duration::from_secs(6 * 60))).unwrap());
+    store
+        .append_ledger(&LedgerEntry {
+            id: None,
+            ts: base,
+            kind: LedgerKind::Note,
+            project: None,
+            job_id: None,
+            run_id: None,
+            session_id: None,
+            role: None,
+            provider: None,
+            harness: None,
+            model: None,
+            cost: None,
+            summary: "history read must not add a row".to_owned(),
+            detail: serde_json::json!({}),
+        })
+        .unwrap();
+
+    let read_only = Store::open_read_only(&paths, None).unwrap();
+    let history = capacity::read_history(
+        &read_only,
+        base.plus(Duration::from_secs(6 * 60)),
+        Some(base),
+        HistoryBucket::FiveMinutes,
+    )
+    .unwrap();
+    assert_eq!(history.points.len(), 1);
+    assert_eq!(history.points[0].samples, 1);
+
+    assert_eq!(
+        read_only
+            .ledger_since(&vowp_store::LedgerFilter::default())
+            .unwrap()
+            .len(),
+        1,
+        "the history read wrote no ledger row"
+    );
+    assert_eq!(read_only.host_samples_since(base).unwrap().len(), 1);
+    assert_eq!(read_only.capacity_rollups_since(base, 300).unwrap().len(), 1);
 }
 
 #[test]
@@ -425,17 +864,36 @@ fn scope_begin_measures_a_real_child() {
     let run_id = RunId::new();
     insert_run(&store, &job, &run_id, &NodeName::parse("local").unwrap());
     let deps = test_deps(&root);
+    // A fixed short child races the scope setup: under load the first sample can run
+    // after `sleep 0.2` has exited and read zeros. Keep a real child alive and busy until
+    // the scope has observed it, then poll for the measurement instead of betting on one
+    // sample.
     let mut child = std::process::Command::new("sh")
-        .args(["-c", "sleep 0.2"])
+        .args(["-c", "while :; do :; done"])
         .spawn()
         .unwrap();
     let scope = RunScope::begin(&deps, &run_id, child.id()).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    let sample = scope.sample().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut sample = scope.sample().unwrap();
+    while sample.peak_rss_bytes == 0 || sample.cpu_usec == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the real child was not measured within 10s: {sample:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        sample = scope.sample().unwrap();
+    }
     assert!(sample.peak_rss_bytes > 0, "no memory measured: {sample:?}");
+    assert!(sample.cpu_usec > 0, "no CPU measured: {sample:?}");
+    let _ = child.kill();
     let _ = child.wait();
     let usage = scope.finish(&store, BuildMode::Unknown).unwrap();
     assert!(usage.peak_rss_bytes > 0);
+    assert!(usage.cpu_usec > 0, "the usage row lost the child's CPU: {usage:?}");
+    assert!(
+        matches!(usage.source, UsageSource::Cgroup | UsageSource::ProcTree),
+        "the usage row did not come from a real scope: {usage:?}"
+    );
     assert_eq!(usage.run_id, run_id);
 }
 

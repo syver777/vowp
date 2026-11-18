@@ -1,27 +1,35 @@
 # v0.3 design notes — the daemon and the browser
 
-Status: planned for v0.3, **not** part of v0.2. These notes were moved here by the v0.2 spec
+Status: shipped in 0.3.0; the `/jobs` page and the three job-action routes merged after the tag. The
+notes mark each implemented slice; the rest is design. These notes were moved here by the v0.2 spec
 (`docs/design/v0.2/home-and-surfaces.md`) because v0.2's surfaces are the opencode/Claude apps and
 `vowp chat`, and v0.2 opens no **public** HTTP/SSE API or public port. Its only listeners are the
 loopback-only secret paste page and the app server joined through an SSH tunnel.
+
+0.3.0 implements the daemon read API and both SSE streams, the token-gated inbox-answer and
+local-session-switch writes, the web/PWA window and the phone board. The current tree also carries
+the post-tag `/jobs` page and the three token-gated job actions. The 0.3.0 inventory is in
+[`CHANGELOG.md`](../../../CHANGELOG.md) and the
+[`0.3.0` release notes](../../release/0.3.0.md).
 
 ## Why they moved
 
 v0.2 is one home with the apps people already use. The phone needs an SSH app and `vowp chat`, not a
 browser board. A loopback HTTP+SSE API, a web/PWA window and a phone browser board would each be a
-second client stack before the transport, leases and app surfaces are proven. They are deliberately
-sequenced after the v0.2 release.
+second client stack before the transport, leases and app surfaces are proven. They were deliberately
+sequenced after the v0.2 release; the first browser surface shipped in 0.3.0.
 
 ## The notes
 
-| Note | What it covers | First slice |
+| Note | What it covers | Implemented surface |
 |---|---|---|
-| [`http-api.md`](http-api.md) | A loopback HTTP + SSE API for jobs, sessions, events, board, inbox and cost, with a stable wire contract. | Read-only `health`, `jobs`, `sessions` and a per-session event tail. |
-| [`web-window.md`](web-window.md) | A web/PWA window: nodes, sessions, session view with an executor switcher and capsule view, and the board. | Static shell and a read-only board page. |
-| [`phone-board.md`](phone-board.md) | A phone-friendly board on the same API. | Responsive board cards with polling. |
+| [`http-api.md`](http-api.md) | A loopback HTTP + SSE API for jobs, sessions, events, board, inbox and cost, with a stable wire contract. | The read endpoints, the per-session and board SSE streams and the five token-gated writes (inbox answer, local switch, job retry/park/cancel). The rest is design. |
+| [`web-window.md`](web-window.md) | A web/PWA window: nodes, sessions, session view with an executor switcher and capsule view, and the board. | The board, sessions, capsule, cost, inbox, nodes and jobs pages, the cost chart, the write forms and the PWA shell. The rest is design. |
+| [`phone-board.md`](phone-board.md) | A phone-friendly board on the same API. | The responsive `/board` card layout on the same PWA shell. The rest is design. |
 
-`acp-adapter.md` and `cost-dashboard.md` stay in [`../v0.2/`](../v0.2/README.md) as deferred design
-notes; they are not v0.2 delivery and do not belong to this browser/API group.
+`acp-adapter.md` and `cost-dashboard.md` stay in [`../v0.2/`](../v0.2/README.md) as notes whose first
+slices shipped in 0.3.0; the remaining slices are design. They are not part of this browser/API
+group.
 
 ## What v0.3 inherits from v0.2
 
@@ -39,16 +47,23 @@ notes; they are not v0.2 delivery and do not belong to this browser/API group.
 
 ## Dependency order
 
+The v0.2 dependency chain shipped in 0.3.0:
+
 ```
 v0.2 release
     │
     ▼
-http-api.md ──► web-window.md ──► phone-board.md
+http-api.md (implemented in 0.3.0)
     │
-    └────────► cost-dashboard.md (v0.2 design note, later slice)
+    ▼
+web-window.md (implemented in 0.3.0) ──► phone-board.md (implemented in 0.3.0)
+    │
+    └────────► cost-dashboard.md (cost page and API in 0.3.0; later slices design)
 
-acp-adapter.md (independent after the ACP protocol version is pinned)
+acp-adapter.md (first slice in 0.3.0; streaming chunks, permission UI and receipts remain design)
 ```
+
+The remaining work extends the same API and window; it does not reopen the v0.2 transport decision.
 
 ## See also
 

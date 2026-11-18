@@ -420,6 +420,7 @@ case "$1" in
     case "$2" in
       set) exit 0 ;;
       start)
+        printf '%s\n' "$OPENCODE_CONFIG_DIR" > "$XDG_STATE_HOME/config-dir.txt"
         nohup sleep 60 >/dev/null 2>&1 &
         pid=$!
         printf '%s\n' "$pid" > "$state/fake.pid"
@@ -571,6 +572,27 @@ fn opencode_host_starts_and_stops_with_fake_server() {
     );
     let health = retry_transient(|| host.health(&handle)).expect("health after stop");
     assert!(!health.ok);
+}
+
+#[test]
+fn opencode_host_sets_the_orchestrator_config_dir() {
+    let tmp = tempdir().expect("temp dir");
+    let fake = FakeOpencode::start();
+    let script = tmp.path().join("opencode");
+    write_script(&script, &fake_opencode_script(fake.port(), "2.0.28"));
+    let host = OpencodeHost::new(&script).with_startup(Duration::from_secs(5));
+    let request = host_request(&tmp, Some(fake.port()));
+    std::fs::create_dir_all(&request.workdir).expect("orchestrator dir");
+
+    let handle = retry_transient(|| host.start(&request)).expect("start opencode host");
+    let recorded = request.workdir.join(".opencode/state/config-dir.txt");
+    let config_dir = std::fs::read_to_string(&recorded).expect("the fake recorded OPENCODE_CONFIG_DIR");
+    assert_eq!(
+        config_dir.trim(),
+        request.workdir.display().to_string(),
+        "OpenCode V2 must load opencode.json and AGENTS.md from the orchestrator directory"
+    );
+    retry_transient(|| host.stop(&handle)).expect("stop opencode host");
 }
 
 #[test]

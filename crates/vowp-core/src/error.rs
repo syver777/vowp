@@ -6,6 +6,8 @@
 //! The `From<CoreError> for ServiceError` conversion is the boundary the loops use when a
 //! session operation fails.
 
+use vowp_asif::import::{BRANCH_AMBIGUOUS, BRANCH_UNKNOWN, TARGET_EXISTS};
+use vowp_asif::{ExitClass, VowpAsifError, codes};
 use vowp_protocol::{AdapterError, ErrorKind, LimitEvent, ProtocolError, ServiceError};
 use vowp_tmux::TmuxError;
 
@@ -24,6 +26,19 @@ pub enum CoreError {
     /// A harness adapter failed.
     #[error(transparent)]
     Adapter(#[from] AdapterError),
+    /// The ASIF adapter refused or failed a translation.
+    ///
+    /// The message is the adapter's path-free explanation and carries its stable code.
+    /// [`CoreError::kind`] returns the class derived from that code and exit class.
+    #[error("asif {code}: {message}")]
+    Asif {
+        /// Stable `vowp-asif` error code.
+        code: String,
+        /// Path-free adapter explanation.
+        message: String,
+        /// Error class used for `--json` output and exit-code mapping.
+        class: ErrorKind,
+    },
     /// The tmux window manager failed.
     #[error(transparent)]
     Tmux(#[from] TmuxError),
@@ -87,6 +102,7 @@ impl CoreError {
             Self::Graph(err) => err.kind(),
             Self::Protocol(err) => err.kind(),
             Self::Adapter(err) => adapter_kind(err),
+            Self::Asif { class, .. } => *class,
             Self::Tmux(err) => tmux_kind(err),
             Self::Io { .. } | Self::Git { .. } => ErrorKind::Io,
             Self::Command(_) | Self::CapsuleInvalid(_) => ErrorKind::Internal,
@@ -107,6 +123,25 @@ impl From<CoreError> for ServiceError {
             CoreError::Cancelled => Self::Cancelled,
             CoreError::NotFound(message) => Self::NotFound(message),
             other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+impl From<VowpAsifError> for CoreError {
+    fn from(error: VowpAsifError) -> Self {
+        let class = match error.code.as_str() {
+            TARGET_EXISTS | codes::EVENT_ID_DUPLICATE => ErrorKind::Conflict,
+            BRANCH_AMBIGUOUS | BRANCH_UNKNOWN => ErrorKind::InvalidInput,
+            _ => match error.exit {
+                ExitClass::Internal | ExitClass::Success => ErrorKind::Internal,
+                ExitClass::InvalidInput => ErrorKind::InvalidInput,
+                ExitClass::Refused => ErrorKind::Refused,
+            },
+        };
+        Self::Asif {
+            code: error.code,
+            message: error.message,
+            class,
         }
     }
 }

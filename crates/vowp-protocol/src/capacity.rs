@@ -59,6 +59,71 @@ pub struct HostSample {
     pub source: SampleSource,
 }
 
+/// Where a [`CapacityPoint`] came from.
+///
+/// A 5-minute rollup is `proc` or `fallback` when every raw sample in its bucket had that
+/// source, and `mixed` otherwise. A read-time bucket that aggregates points with different
+/// sources is also `mixed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource {
+    /// Read from `/proc` and the cgroup filesystem.
+    Proc,
+    /// Only the portable reads (`statvfs`, `sysctl`) were available.
+    Fallback,
+    /// The bucket mixes raw sample sources.
+    Mixed,
+}
+
+/// Minimum, mean and maximum available memory in one capacity history point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityMemory {
+    /// Smallest available-memory value in the bucket, in bytes.
+    pub min: u64,
+    /// Sample-weighted mean available memory in the bucket, in bytes.
+    pub avg: u64,
+    /// Largest available-memory value in the bucket, in bytes.
+    pub max: u64,
+}
+
+/// One bucket of the node's capacity history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityPoint {
+    /// RFC 3339 UTC start of the bucket.
+    pub at: Timestamp,
+    /// Raw host samples aggregated into the bucket.
+    pub samples: u32,
+    /// Available-memory extrema and mean.
+    pub mem_available: CapacityMemory,
+    /// Sample-weighted one-minute load average.
+    pub load1_avg: f64,
+    /// Smallest free home-filesystem bytes in the bucket.
+    pub disk_free_home_min: u64,
+    /// Measurement source of the bucket.
+    pub source: HistorySource,
+}
+
+/// A bounded history of the node's measured capacity.
+///
+/// Points are 5-minute rollups by default; a caller may ask for read-time `1h` or `1d`
+/// aggregation. `since` is clamped to the retained window and `points` is empty when the
+/// home has no rollups in range. A missing bucket stays a gap rather than a zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityHistory {
+    /// When the document was generated.
+    pub generated_at: Timestamp,
+    /// Start of the requested window after clamping to the retained window.
+    pub since: Timestamp,
+    /// End of the window; equal to `generated_at`.
+    pub until: Timestamp,
+    /// Bucket width in seconds: 300, 3600 or 86400.
+    pub bucket_secs: u64,
+    /// Rollup retention in seconds (30 days).
+    pub retention_secs: u64,
+    /// Points in ascending `at` order; empty when nothing is retained in range.
+    pub points: Vec<CapacityPoint>,
+}
+
 /// Where a [`RunUsage`] row came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

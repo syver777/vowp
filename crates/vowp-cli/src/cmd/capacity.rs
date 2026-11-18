@@ -1,14 +1,27 @@
 //! `vowp capacity` — measured, admitted capacity. Spec: §6.5 of the v0.2 spec.
 //!
 //! `show` and `report` read the node report; `set` writes one target history row and refuses
-//! an owner target above the advice unless `--override` is given (exit 5). The same report
-//! renderer feeds the `capacity` tmux window.
+//! an owner target above the advice unless `--override` is given (exit 5). `reload` validates
+//! the on-disk config with `--check`, or asks the running supervisor to apply it and prints
+//! the effective provider caps and target. The same report renderer feeds the `capacity`
+//! tmux window.
+
+use std::collections::BTreeMap;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
+use serde::Serialize;
 use time::{Date, macros::format_description};
 use vowp_core::CapacityManager;
-use vowp_protocol::{CapacityReport, CapacityTarget, TargetMode, Timestamp};
+use vowp_core::capacity::reload::{self, ReloadOutcome};
+use vowp_core::capacity::{HistoryBucket, read_history};
+use vowp_protocol::{
+    CapacityHistory, CapacityReport, CapacityTarget, HistorySource, ProtocolError, SessionId, TargetMode, Timestamp,
+};
+use vowp_store::Store;
 
+use crate::node_ctx::NodeRole;
 use crate::output::Table;
 use crate::{CliError, Ctx, IoStreams};
 
@@ -29,6 +42,10 @@ pub enum CapacityCommand {
     Report(CapacityReportArgs),
     /// Write one capacity target row.
     Set(CapacitySetArgs),
+    /// Validate or apply the on-disk provider caps and target without a restart.
+    Reload(CapacityReloadArgs),
+    /// Read the bounded capacity rollup history.
+    History(CapacityHistoryArgs),
 }
 
 /// Arguments for `vowp capacity show`.
@@ -66,6 +83,35 @@ pub struct CapacitySetArgs {
     pub by: Option<String>,
 }
 
+/// Arguments for `vowp capacity reload`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct CapacityReloadArgs {
+    /// Validate and print the on-disk values without writing or asking the supervisor.
+    #[arg(long)]
+    pub check: bool,
+}
+
+/// Arguments for `vowp capacity history`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct CapacityHistoryArgs {
+    /// Start of the window (duration or date); defaults to 24h.
+    #[arg(long, value_name = "DUR|DATE")]
+    pub since: Option<String>,
+    /// Bucket width: `5m` (stored), `1h` or `1d` (read-time); defaults to 5m.
+    #[arg(long, value_name = "5m|1h|1d")]
+    pub bucket: Option<String>,
+}
+
+/// The JSON and human shape of `vowp capacity reload`.
+#[derive(Debug, Clone, Serialize)]
+struct ReloadOutput {
+    /// True for `--check`; false when a running supervisor was asked to apply.
+    checked: bool,
+    /// The reload outcome returned by the checker or the supervisor.
+    #[serde(flatten)]
+    outcome: ReloadOutcome,
+}
+
 /// Runs `vowp capacity`.
 pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &CapacityArgs) -> Result<i32, CliError> {
     match &args.command {
@@ -79,8 +125,192 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &CapacityArgs) -> Result<i32
             print_report(ctx, io, &report)?;
         }
         CapacityCommand::Set(args) => set(ctx, io, args)?,
+        CapacityCommand::Reload(args) => reload(ctx, io, args)?,
+        CapacityCommand::History(args) => history(ctx, io, args)?,
     }
     Ok(0)
+}
+
+/// Runs `capacity reload`: check the file locally or ask the running supervisor to apply it.
+fn reload(ctx: &Ctx, io: &mut dyn IoStreams, args: &CapacityReloadArgs) -> Result<(), CliError> {
+    if args.check {
+        return reload_check(ctx, io);
+    }
+    if crate::ctx::supervisor_pid(ctx.paths()).is_none() {
+        return Err(CliError::Guard(format!(
+            "supervisor is not running at {}; start it with `vowp up` and retry (capacity reload never restarts it)",
+            ctx.paths().root().display()
+        )));
+    }
+    let store = ctx.store()?;
+    let token = SessionId::new().as_str().to_owned();
+    let request = format!("{}{}", reload::request_prefix(ctx.project()), token);
+    store.kv_set(&request, "1")?;
+    vowp_core::requests::push(&store, &vowp_core::Request::Wake)?;
+
+    let result_key = reload::result_key(&token);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let outcome = loop {
+        if let Some(text) = store.kv_get(&result_key)? {
+            let outcome: ReloadOutcome = serde_json::from_str(&text)
+                .map_err(|error| CliError::Invalid(format!("invalid reload result: {error}")))?;
+            let _ = store.kv_delete(&result_key)?;
+            break outcome;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Conflict(format!(
+                "supervisor did not apply the reload within 5 s; the request stays queued at {request}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if let Some(error) = &outcome.error {
+        return Err(CliError::Protocol(ProtocolError::Config(error.clone())));
+    }
+    print_reload(ctx, io, false, &outcome)
+}
+
+/// Runs `capacity reload --check` without writing any row or touching the supervisor.
+fn reload_check(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<(), CliError> {
+    let store = ctx.fleet_store()?;
+    let preview = reload::preview(ctx.deps(), &store, ctx.clock().now())?;
+    let outcome = ReloadOutcome {
+        applied: false,
+        config_path: Some(preview.config_path),
+        provider_caps: preview.provider_caps,
+        target: Some(preview.target),
+        changed: preview.changed,
+        pending: preview.pending,
+        error: None,
+    };
+    print_reload(ctx, io, true, &outcome)
+}
+
+/// Runs `capacity history`: a read-only view of the retained 5-minute rollups.
+fn history(ctx: &Ctx, io: &mut dyn IoStreams, args: &CapacityHistoryArgs) -> Result<(), CliError> {
+    let bucket = match args.bucket.as_deref() {
+        None => HistoryBucket::FiveMinutes,
+        Some(value) => HistoryBucket::parse(value)
+            .ok_or_else(|| CliError::Invalid(format!("unknown --bucket {value:?}; use 5m, 1h or 1d")))?,
+    };
+    let now = ctx.clock().now();
+    let requested = args.since.as_deref().map(|value| parse_since(value, now)).transpose()?;
+    let store = match ctx.role() {
+        NodeRole::Home => Store::open_read_only(ctx.paths(), None)?,
+        NodeRole::Control => {
+            return Err(CliError::NotFound(
+                "this is a control machine; the home holds the database".to_owned(),
+            ));
+        }
+        NodeRole::Uninitialised => {
+            return Err(CliError::NotFound(
+                "vowp home is not initialised; run `vowp setup` or `vowp init`".to_owned(),
+            ));
+        }
+    };
+    let history = read_history(&store, now, requested, bucket)?;
+    if let Some(requested) = requested
+        && requested < history.since
+    {
+        writeln!(
+            io.err(),
+            "note: --since is before the retained window; showing since {}",
+            history.since.as_rfc3339()
+        )?;
+    }
+    if ctx.json() {
+        crate::output::print_json(io, &history)?;
+        return Ok(());
+    }
+    print_history(ctx, io, &history)?;
+    Ok(())
+}
+
+/// Prints one `CapacityHistory` as the documented table and the cost footer.
+fn print_history(ctx: &Ctx, io: &mut dyn IoStreams, history: &CapacityHistory) -> Result<(), CliError> {
+    let mut table = Table::new(&["AT", "SAMPLES", "MEM_MIN/AVG/MAX", "LOAD1", "DISK_MIN", "SOURCE"]);
+    for point in &history.points {
+        table.row(vec![
+            point.at.as_rfc3339(),
+            point.samples.to_string(),
+            format!(
+                "{} / {} / {}",
+                format_bytes(point.mem_available.min),
+                format_bytes(point.mem_available.avg),
+                format_bytes(point.mem_available.max)
+            ),
+            format!("{:.2}", point.load1_avg),
+            format_bytes(point.disk_free_home_min),
+            history_source_label(point.source).to_owned(),
+        ]);
+    }
+    writeln!(io.out(), "{}", table.render(ctx.color()))?;
+    if history.points.is_empty() {
+        writeln!(io.out(), "history: no rollups in the window")?;
+    }
+    writeln!(
+        io.out(),
+        "window: since {} (bucket {}s, retention {}s)",
+        history.since.as_rfc3339(),
+        history.bucket_secs,
+        history.retention_secs
+    )?;
+    writeln!(io.out(), "cost: vowp cost --by day")?;
+    Ok(())
+}
+
+/// Returns the documented label of one history point's source.
+fn history_source_label(source: HistorySource) -> &'static str {
+    match source {
+        HistorySource::Proc => "proc",
+        HistorySource::Fallback => "fallback",
+        HistorySource::Mixed => "mixed",
+    }
+}
+
+/// Prints one reload result as JSON or as the human reload card.
+fn print_reload(ctx: &Ctx, io: &mut dyn IoStreams, checked: bool, outcome: &ReloadOutcome) -> Result<(), CliError> {
+    if ctx.json() {
+        crate::output::print_json(
+            io,
+            &ReloadOutput {
+                checked,
+                outcome: outcome.clone(),
+            },
+        )?;
+        return Ok(());
+    }
+    if let Some(path) = &outcome.config_path {
+        writeln!(io.out(), "config: {path}")?;
+    }
+    if let Some(target) = &outcome.target {
+        print_target(io, target)?;
+    }
+    if outcome.provider_caps.is_empty() {
+        writeln!(io.out(), "providers: none configured")?;
+    } else {
+        let caps = outcome
+            .provider_caps
+            .iter()
+            .map(|(provider, cap)| format!("{provider}={cap}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(io.out(), "providers: {caps}")?;
+    }
+    let state = if let Some(error) = &outcome.error {
+        format!("failed: {error}")
+    } else if outcome.pending {
+        "pending; the on-disk config differs from the applied config".to_owned()
+    } else if outcome.applied {
+        "applied".to_owned()
+    } else {
+        "current".to_owned()
+    };
+    writeln!(io.out(), "reload: {state}")?;
+    if !outcome.changed.is_empty() {
+        writeln!(io.out(), "changed: {}", outcome.changed.join(", "))?;
+    }
+    Ok(())
 }
 
 /// Renders `capacity show`; also the body of the `capacity` tmux window.
@@ -93,8 +323,17 @@ pub(crate) fn show(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<(), CliError> {
 
 /// Prints one report as JSON or as the human capacity card.
 pub(crate) fn print_report(ctx: &Ctx, io: &mut dyn IoStreams, report: &CapacityReport) -> Result<(), CliError> {
+    let (provider_caps, reload_pending) = provider_status(ctx)?;
     if ctx.json() {
-        crate::output::print_json(io, report)?;
+        let mut value = serde_json::to_value(report).map_err(ProtocolError::from)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "provider_caps".to_owned(),
+                serde_json::to_value(&provider_caps).map_err(ProtocolError::from)?,
+            );
+            object.insert("reload_pending".to_owned(), serde_json::Value::Bool(reload_pending));
+        }
+        crate::output::print_json(io, &value)?;
         return Ok(());
     }
     let target = &report.target;
@@ -146,6 +385,25 @@ pub(crate) fn print_report(ctx: &Ctx, io: &mut dyn IoStreams, report: &CapacityR
                 .unwrap_or_else(|| "-".to_owned())
         )?;
     }
+    if provider_caps.is_empty() {
+        writeln!(io.out(), "providers: none configured")?;
+    } else {
+        let caps = provider_caps
+            .iter()
+            .map(|(provider, cap)| format!("{provider}={cap}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(io.out(), "providers: {caps}")?;
+    }
+    writeln!(
+        io.out(),
+        "reload: {}",
+        if reload_pending {
+            "pending; run `vowp capacity reload`"
+        } else {
+            "current"
+        }
+    )?;
     writeln!(
         io.out(),
         "running: {} run(s), RAM p90 {}, CPU p90 {:.2}",
@@ -309,6 +567,21 @@ fn print_target(io: &mut dyn IoStreams, target: &CapacityTarget) -> Result<(), C
         writeln!(io.out(), "reason: {}", target.reason)?;
     }
     Ok(())
+}
+
+/// Returns the applied provider caps and whether the on-disk config still differs.
+///
+/// Before the supervisor has published its first reload state, the CLI's startup config is
+/// the best available view and no reload is pending.
+fn provider_status(ctx: &Ctx) -> Result<(BTreeMap<String, u32>, bool), CliError> {
+    let store = ctx.fleet_store()?;
+    let state = reload::read_state(&store, ctx.project())?;
+    let pending = reload::pending(ctx.deps(), &store)?;
+    let caps = match state {
+        Some(state) => state.provider_caps,
+        None => ctx.config().provider_caps(),
+    };
+    Ok((caps, pending))
 }
 
 /// Returns the lowercase target-mode name.

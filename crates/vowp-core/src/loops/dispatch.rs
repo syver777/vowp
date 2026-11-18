@@ -171,9 +171,22 @@ pub(crate) fn create_child_job(
     kind: JobKind,
     findings: &[String],
 ) -> Result<Job, CoreError> {
-    let id = JobId::parse(&super::l2_worker::child_id(parent, kind)?)?;
-    if let Some(existing) = store.job(&id)? {
-        return Ok(existing);
+    // A retry can reset the parent's attempt counter, so the natural child id may already
+    // name a finished fix. Reusing that row would make the supervisor send NeedsSatisfied to
+    // a terminal job. Keep any live child, but allocate a fresh suffix after a terminal one
+    // so this round gets its own instructions and run.
+    let base = super::l2_worker::child_id(parent, kind)?;
+    let mut id = JobId::parse(&base)?;
+    let mut suffix = 1u32;
+    loop {
+        match store.job(&id)? {
+            None => break,
+            Some(existing) if !existing.state.is_terminal() => return Ok(existing),
+            Some(_) => {
+                suffix += 1;
+                id = JobId::parse(&format!("{base}-r{suffix}"))?;
+            }
+        }
     }
     // A forced-gating parent may not have a worktree yet; never write the child brief into
     // the supervisor's current directory (that would dirty the source tree).

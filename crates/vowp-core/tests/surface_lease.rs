@@ -21,7 +21,7 @@ use vowp_protocol::{
     SessionId, SessionRole, SessionState, Surface, SurfaceId, SurfaceKind, SwitchReason, SwitchState, Timestamp,
 };
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
-use vowp_store::{NodePaths, Store, StoreError};
+use vowp_store::{NodePaths, Store, StoreError, hash_lease_token};
 use vowp_tmux::fake::FakeWindows;
 
 fn ts() -> Timestamp {
@@ -210,8 +210,9 @@ fn lease_acquire_is_one_holder() {
     assert_eq!(lease.holder, "laptop");
     assert_eq!(lease.surface_kind, SurfaceKind::Chat);
     assert_eq!(lease.surface_id.as_ref(), Some(&first.id));
-    assert_eq!(lease.token.len(), 52, "two ULIDs, 160 random bits");
-    assert_eq!(guard.token(), lease.token);
+    assert_eq!(lease.token.len(), 64, "the row stores the SHA-256 hash");
+    assert_eq!(lease.token, hash_lease_token(guard.token()));
+    assert_ne!(guard.token(), lease.token, "the plaintext token is not stored");
 
     let second = surface(SurfaceKind::Opencode, "phone", ts());
     let error = match acquire(&deps, &store, &session, &second) {
@@ -279,7 +280,7 @@ fn stale_lease_free_after_sixty_seconds() {
 
     let lease = store.lease(&session).expect("lease").expect("held");
     assert_eq!(lease.holder, "phone");
-    assert_eq!(new_guard.token(), lease.token);
+    assert_eq!(hash_lease_token(new_guard.token()), lease.token);
     let notes: Vec<String> = read_events(&deps, &session)
         .into_iter()
         .filter_map(|event| match event.body() {
@@ -322,10 +323,10 @@ fn takeover_cuts_old_surface_within_two_seconds() {
         check_lease_with(&store, &session, Some(&old_token)).is_err(),
         "the old surface is cut off immediately"
     );
-    assert!(
-        check_lease_with(&store, &session, Some(&token_of(&store, &session))).is_ok(),
-        "the new surface holds the live lease"
-    );
+    let current = store.lease(&session).expect("lease").expect("held");
+    assert_eq!(current.holder, "phone", "the new surface holds the live lease");
+    assert_eq!(current.token.len(), 64);
+    assert_ne!(current.token, old_token.as_str());
 }
 
 #[test]
@@ -571,7 +572,9 @@ fn follow_mode_prints_new_events_and_refuses_writes() {
         check_lease_with(&store, &session, Some(&old_token)).is_err(),
         "follow mode cannot write"
     );
-    assert!(check_lease_with(&store, &session, Some(&token_of(&store, &session))).is_ok());
+    let current = store.lease(&session).expect("lease").expect("held");
+    assert_eq!(current.holder, "phone");
+    assert_eq!(current.token.len(), 64);
 }
 
 #[test]
@@ -640,19 +643,20 @@ fn lease_sweep_does_not_drop_a_heartbeated_lease() {
     let session = create_session(&service, &tmp, None);
     let store = deps.open_store().expect("store");
     let target = surface(SurfaceKind::Chat, "laptop", ts());
-    let _guard = acquire(&deps, &store, &session, &target).expect("lease");
+    let guard = acquire(&deps, &store, &session, &target).expect("lease");
 
     clock.advance(STALE_AFTER + Duration::from_secs(1));
     let before = clock.now().minus(STALE_AFTER);
     let stale = store.stale_leases(before).expect("stale snapshot");
     assert_eq!(stale.len(), 1, "the row is stale at the snapshot");
-    let token = stale[0].token.clone();
+    let token_hash = stale[0].token.clone();
+    let token = guard.token().to_owned();
 
     // A heartbeat between the SELECT and the DELETE must keep the lease.
     assert!(store.heartbeat_lease(&session, &token, clock.now()).expect("heartbeat"));
     assert!(
         !store
-            .release_stale_lease(&session, &token, before)
+            .release_stale_lease(&session, &token_hash, before)
             .expect("conditional release"),
         "the conditional delete must not remove a refreshed lease"
     );
@@ -787,14 +791,14 @@ fn stale_acquire_boundary_is_exactly_sixty_seconds() {
         Err(CoreError::Store(StoreError::Conflict(_))) => {}
         Err(other) => panic!("expected a conflict, got {other:?}"),
     }
-    assert_eq!(token_of(&store, &session), old_token);
+    assert_eq!(token_of(&store, &session), hash_lease_token(&old_token));
 
     clock.advance(Duration::from_millis(1));
     let exactly = surface(SurfaceKind::Chat, "phone", clock.now());
     let new_guard = acquire(&deps, &store, &session, &exactly).expect("exactly 60 s is stale");
 
     assert_eq!(store.lease(&session).expect("lease").expect("held").holder, "phone");
-    assert_eq!(new_guard.token(), token_of(&store, &session));
+    assert_eq!(hash_lease_token(new_guard.token()), token_of(&store, &session));
     let notes: Vec<String> = read_events(&deps, &session)
         .into_iter()
         .filter_map(|event| match event.body() {
@@ -904,12 +908,12 @@ fn concurrent_acquire_never_writes_a_losing_token() {
 
         let winner = winners.pop().expect("winner");
         assert!(
-            seen.iter().all(|token| token == winner.token()),
+            seen.iter().all(|token| token == &hash_lease_token(winner.token())),
             "round {round}: a losing acquire exposed its token: {seen:?}"
         );
         assert_eq!(
             token_of(&store, &session),
-            winner.token(),
+            hash_lease_token(winner.token()),
             "round {round}: the winner keeps the row"
         );
         winner.release().expect("release winner");
@@ -932,7 +936,8 @@ fn detach_hands_over_the_token_without_releasing() {
 
     assert_eq!(detached, token);
     let lease = store.lease(&session).expect("lease").expect("detach keeps the row");
-    assert_eq!(lease.token, detached);
+    assert_eq!(lease.token, hash_lease_token(&detached));
+    assert_ne!(lease.token, detached, "the row never stores the plaintext");
     assert!(
         store.release_lease(&session, &detached).expect("release detached"),
         "the caller can release the token it owns"

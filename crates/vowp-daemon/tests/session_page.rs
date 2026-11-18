@@ -20,9 +20,9 @@ use vowp_daemon::{ApiState, select_project, serve_with_shutdown};
 use vowp_protocol::api::{EventPage, SessionDetail, SessionPage};
 use vowp_protocol::capsule::CAPSULE_VERSION;
 use vowp_protocol::{
-    Actor, AssistantMessage, Capsule, CapsuleDecision, CapsuleFile, CapsuleId, CapsuleState, CapsuleTelemetry,
-    CapsuleTrigger, Clock, EventBody, EventEnvelope, EventSource, EventType, Executor, ExecutorRef, FakeClock,
-    FileRole, HarnessKind, JobId, JobKind, NewJob, NodeName, Project, ProjectName, Role, Session, SessionId,
+    Actor, AsifReport, AssistantMessage, Capsule, CapsuleDecision, CapsuleFile, CapsuleId, CapsuleState,
+    CapsuleTelemetry, CapsuleTrigger, Clock, EventBody, EventEnvelope, EventSource, EventType, Executor, ExecutorRef,
+    FakeClock, FileRole, HarnessKind, JobId, JobKind, NewJob, NodeName, Project, ProjectName, Role, Session, SessionId,
     SessionRole, SessionState, Timestamp, ToolCall, UserMessage, VowpConfig,
 };
 use vowp_store::session_log::{NewEvent, SessionLog};
@@ -394,9 +394,10 @@ fn assert_shell(page: &HttpResponse, fixture: &Fixture) {
     let home = fixture.paths.root().display().to_string();
     assert!(!page.body.contains(&home), "page leaked the home path");
     let lowered = page.body.to_ascii_lowercase();
-    // The switch form legitimately carries the token unlock and Authorization code; only
-    // actual secret values and unrelated secret formats are forbidden.
-    for forbidden in ["secret", "api_key", "apikey"] {
+    // The switch form and the export card legitimately carry the token unlock and the
+    // "exact secrets are not detected" warning; only unrelated secret formats are
+    // forbidden.
+    for forbidden in ["api_key", "apikey"] {
         assert!(
             !lowered.contains(forbidden),
             "session page must not mention {forbidden:?}"
@@ -711,4 +712,46 @@ fn session_page_streams_events_and_falls_back_to_polling() {
         page.body.contains("let after = lastSeq;"),
         "the polling fallback must resume at the last rendered sequence"
     );
+}
+
+#[test]
+fn sessions_page_detail_has_the_asif_download_link() {
+    let fixture = Fixture::new();
+    let server = Server::start(&fixture);
+
+    let page = get(server.address, &format!("/sessions/{}", fixture.session_id));
+    assert_shell(&page, &fixture);
+    for needle in [
+        // The sessions nav gains the separate import action; the detail page keeps the
+        // read-only download and its loss preview.
+        "<a href=\"/import\">Import</a>",
+        "id=\"export-panel\"",
+        "id=\"export-link\"",
+        "download",
+        "\"/export/asif\"",
+        "?report=1",
+        "Preview declared losses",
+        "No declared losses.",
+        "Host paths are scrubbed",
+        "not lossless",
+        "vowp session export --format asif --redact-file",
+        "exportLink.href = \"/api/v1/sessions/\"",
+    ] {
+        assert!(page.body.contains(needle), "detail page is missing {needle:?}");
+    }
+    assert!(
+        !page.body.contains("FormData"),
+        "the export card must not upload anything"
+    );
+
+    // The link target is the actual read route: the preview returns a schema-shaped
+    // report for the fixture session.
+    let response = get(
+        server.address,
+        &format!("/api/v1/sessions/{}/export/asif?report=1", fixture.session_id),
+    );
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let report: AsifReport = serde_json::from_str(&response.body).expect("AsifReport");
+    assert_eq!(report.source_session.as_deref(), Some(fixture.session_id.as_str()));
+    assert_eq!(report.loss_count as usize, report.losses.len());
 }

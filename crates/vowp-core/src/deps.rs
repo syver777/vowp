@@ -62,6 +62,15 @@ pub struct Deps {
 }
 
 impl Deps {
+    /// Returns the live effective config, including a reload applied after startup.
+    ///
+    /// `Deps::config` remains the immutable startup snapshot for callers that need the
+    /// document they were constructed with. Dispatch and capacity read this method so a
+    /// provider-cap or target change takes effect without rebuilding `Deps`.
+    pub fn config_now(&self) -> Arc<VowpConfig> {
+        crate::capacity::reload::effective_config(self)
+    }
+
     /// Opens a fresh store connection for the current thread.
     ///
     /// Each thread owns its connection: SQLite connections are not shared across threads.

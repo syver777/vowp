@@ -92,13 +92,18 @@ impl Store {
     /// Inserts or updates one node row, keyed by name.
     pub fn upsert_node(&self, node: &Node) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO main.nodes (name, ssh_target, is_local, capabilities, last_seen_at, created_at, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(name) DO UPDATE SET
                ssh_target = excluded.ssh_target,
                is_local = excluded.is_local,
                capabilities = excluded.capabilities,
-               last_seen_at = excluded.last_seen_at",
+               last_seen_at = excluded.last_seen_at,
+               kind = CASE
+                 WHEN excluded.is_local = 1 THEN 'home'
+                 WHEN nodes.kind = 'home' THEN 'ssh'
+                 ELSE nodes.kind
+               END",
             params![
                 node.name.as_str(),
                 node.ssh_target,
@@ -106,6 +111,7 @@ impl Store {
                 json_to_text(&node.capabilities)?,
                 opt_ts_to_text(node.last_seen_at),
                 ts_to_text(node.created_at),
+                if node.is_local { "home" } else { "ssh" },
             ],
         )?;
         Ok(())

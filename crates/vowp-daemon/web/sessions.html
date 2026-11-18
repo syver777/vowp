@@ -130,6 +130,18 @@
     cursor: pointer;
   }
   .switch-form button:disabled { opacity: .6; cursor: progress; }
+  .export-preview {
+    margin: .35rem 0 0;
+    padding: .35rem .75rem;
+    border: 1px solid var(--accent);
+    border-radius: .4rem;
+    background: var(--card);
+    color: var(--accent);
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .export-preview:disabled { opacity: .6; cursor: progress; }
   .switch-check { display: flex; gap: .5rem; align-items: flex-start; font-weight: 600; }
   .switch-check input { margin-top: .25rem; }
   .warning { margin: 0; color: var(--warn); font-weight: 600; }
@@ -154,6 +166,7 @@
       <nav class="page-nav" aria-label="Pages">
         <a href="/">← Board</a>
         <a href="/sessions" aria-current="page">Sessions</a>
+        <a href="/import">Import</a>
         <a href="/cost">Cost</a>
         <a href="/inbox">Inbox</a>
       </nav>
@@ -237,6 +250,14 @@
         <button id="switch-submit" type="submit">Switch executor</button>
       </form>
       <p id="switch-status" class="switch-status" role="status" aria-live="polite" hidden></p>
+    </div>
+
+    <div class="card" id="export-panel" aria-labelledby="export-heading">
+      <h2 id="export-heading">Export ASIF</h2>
+      <p><a id="export-link" class="session-link" download href="/api/v1/sessions/{id}/export/asif">Download .asif.zip</a></p>
+      <button id="export-preview" class="export-preview" type="button">Preview declared losses</button>
+      <p id="export-status" class="switch-status" role="status" aria-live="polite" hidden></p>
+      <p class="muted">Host paths are scrubbed. Exact secrets are not detected; use the CLI <span class="mono">vowp session export --format asif --redact-file &lt;file&gt;</span> for a specific redaction list. The export is semantic interchange with declared losses, not lossless.</p>
     </div>
 
     <div class="card" id="capsule-panel" aria-labelledby="capsule-heading">
@@ -365,6 +386,9 @@
   const switchForce = document.getElementById("switch-force");
   const switchSubmit = document.getElementById("switch-submit");
   const switchStatus = document.getElementById("switch-status");
+  const exportLink = document.getElementById("export-link");
+  const exportPreview = document.getElementById("export-preview");
+  const exportStatus = document.getElementById("export-status");
 
   const sessionId = pathSessionId();
   const detailMode = sessionId !== null;
@@ -565,6 +589,38 @@
       showSwitchStatus("Could not switch the session (" + detail + ").", "error");
     } finally {
       switchSubmit.disabled = false;
+    }
+  }
+
+  async function previewLosses() {
+    clearError();
+    exportPreview.disabled = true;
+    exportStatus.hidden = false;
+    exportStatus.dataset.state = "working";
+    exportStatus.textContent = "Previewing declared losses…";
+    try {
+      const response = await fetch(
+        "/api/v1/sessions/" + encodeURIComponent(sessionId) + "/export/asif?report=1"
+      );
+      if (!response.ok) {
+        exportStatus.dataset.state = "error";
+        exportStatus.textContent = "Could not preview losses (" + (await errorDetail(response)) + ").";
+        return;
+      }
+      const report = await response.json();
+      const losses = Array.isArray(report.losses) ? report.losses : [];
+      const kinds = losses.map((loss) => loss.kind).filter(Boolean);
+      exportStatus.dataset.state = "done";
+      exportStatus.textContent =
+        kinds.length === 0
+          ? "No declared losses."
+          : String(report.loss_count ?? kinds.length) + " losses: " + kinds.join(", ");
+    } catch (error) {
+      const detail = error && error.message ? error.message : "the daemon may be down";
+      exportStatus.dataset.state = "error";
+      exportStatus.textContent = "Could not preview losses (" + detail + ").";
+    } finally {
+      exportPreview.disabled = false;
     }
   }
 
@@ -1045,6 +1101,7 @@
   }
 
   switchForm.addEventListener("submit", submitSwitch);
+  exportPreview.addEventListener("click", previewLosses);
   switchUnlockForm.addEventListener("submit", (event) => {
     event.preventDefault();
     const value = switchToken.value.trim();
@@ -1062,6 +1119,7 @@
   if (detailMode) {
     heading.textContent = "Session";
     subtitle.textContent = "Session " + sessionId;
+    exportLink.href = "/api/v1/sessions/" + encodeURIComponent(sessionId) + "/export/asif";
     listView.hidden = true;
     detailView.hidden = false;
     liveLine.hidden = false;

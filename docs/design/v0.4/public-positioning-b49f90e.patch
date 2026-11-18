@@ -1,0 +1,253 @@
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-11-13 12:45:47.712721492 +0100
++++ b/README.md	2026-11-13 12:45:47.716721502 +0100
+@@ -6,18 +6,19 @@
+ single merge queue. You talk to it from the apps you already use; the VPS owns the truth.
+ 
+ VOWP is not another agent harness and not a model. It drives the harnesses you already run — Claude
+-Code, opencode, Codex and other CLI agents — through their documented headless interfaces, keeps
+-their logins out of the loop, and gives them a shared home, history and delivery process. It is MIT
+-licensed.
++Code and opencode through their documented headless interfaces, ACP servers through the protocol, and
++Codex or another CLI agent through the generic mapping adapter. The mapping is configuration you pin
++and test. VOWP keeps harness logins out of the loop and gives the agents a shared home, history and
++delivery process. It is MIT licensed.
+ 
+ ## What you get
+ 
+ | Capability | What it means |
+ |---|---|
+ | **One home on a VPS** | The VPS owns the global DB, one DB per project, every session log, the supervisor and the snapshot. |
+-| **Interchangeable sessions** | A session is a harness-neutral append-only log. Switch model, harness, node or surface with a capsule; the history stays. |
++| **Interchangeable sessions** | A session is a harness-neutral append-only log. Switch model, harness or surface with a capsule; move a session to another node with an explicit export/import or `session pull`; the history stays. |
+ | **A built-in session database** | SQLite is the truth for decisions: jobs, gates, runs, costs, leases, capacity, schedules and inbox. Content stays in plain files. |
+-| **Fleet and worker tracking** | Register executor nodes, track workers and see the whole fleet in one snapshot. |
++| **Fleet and worker tracking** | Register executor nodes, see the node registry and the project board's worker slots, and read the fleet snapshot for projects, runs, capacity, limits and inbox. |
+ | **Systematic execution** | Jobs form a DAG; deterministic L1–L9 loops keep it moving; cron and interval schedules make the work orderly. |
+ | **Harness and provider freedom** | Claude Code, opencode, Codex/generic CLI; profile ladders, provider limits and failover. Stock harnesses, no forks. |
+ | **Any surface** | opencode desktop, Claude app, `vowp chat` or MCP; SSH tunnels and no public port. |
+@@ -86,9 +87,10 @@
+ terminal chat fallback, or the MCP server the app calls. Every session has one append-only log and at
+ most one surface with the lease to write to it; every other surface follows read-only.
+ 
+-The home opens no public port. The opencode app server and the one-time secret page listen on
+-loopback and are reached through an SSH tunnel. A phone needs an SSH app and the owner's key, nothing
+-else. See [Home and surfaces](docs/concepts/home-and-surfaces.md) for the full model.
++VOWP opens no public port. The home is reached over SSH; the opencode app server, the daemon and the
++one-time secret page listen on loopback and are reached through an SSH tunnel. A phone needs an SSH
++app and the owner's key, nothing else. See [Home and surfaces](docs/concepts/home-and-surfaces.md)
++for the full model.
+ 
+ ## What the supervisor does
+ 
+@@ -174,10 +176,10 @@
+   mode does not separate the value from the agent's user; the harness runs as that same user.
+ - Injection is by name through a harness's `env_pass` list. The promoter does not add a secret
+   environment to deploy commands in this build.
+-- Exact-value redaction covers session-service and remote-ingest events, the snapshot, capsules and
+-  the finished report and run mirror. It does **not** cover the supervisor log, gate command evidence,
+-  ledger rows, the switch turn path or the `session watch` importer in this build, so a command that
+-  prints a secret can still persist it there.
++- Exact-value redaction covers session-service and remote-ingest events, the snapshot, capsules, gate
++  command evidence, ledger details and the finished report and run mirror. It does **not** cover the
++  supervisor log, the `session switch` turn path or the `session watch` importer in this build, so a
++  command that prints a secret can still persist it there.
+ - **The honest limit:** any agent that can run arbitrary code inside a process that holds a secret can
+   print it. Vault mode keeps the files out of the runtime user's direct readable tree, but the helper
+   that reads them is a broad trust boundary. Neither mode encrypts the store at rest. Harness logins
+diff -ruN a/docs/concepts/overview.md b/docs/concepts/overview.md
+--- a/docs/concepts/overview.md	2026-11-13 12:45:47.753721597 +0100
++++ b/docs/concepts/overview.md	2026-11-13 12:45:47.756721605 +0100
+@@ -215,7 +215,7 @@
+ 
+ ## What is deliberately deferred
+ 
+-- The browser cost dashboard.
++- The full browser cost dashboard; a basic loopback cost page and `/api/v1/cost` ship.
+ - More than one home, replication, leader election and multi-VPS scheduling.
+ - Multi-user accounts, quotas, roles or audit.
+ - Windows support and a native VOWP desktop app.
+diff -ruN a/docs/concepts/what-is-vowp.md b/docs/concepts/what-is-vowp.md
+--- a/docs/concepts/what-is-vowp.md	2026-11-13 12:45:47.731721541 +0100
++++ b/docs/concepts/what-is-vowp.md	2026-11-13 12:58:37.129824531 +0100
+@@ -25,7 +25,8 @@
+ ## The shape
+ 
+ - **Home (the VPS).** The only writer. It owns the global DB, the project DBs, the session logs, the
+-  supervisor, the snapshot, the capacity sampler and the schedules. It opens no public port.
++  supervisor, the snapshot, the capacity sampler and the schedules. VOWP opens no public port; the
++  home is reached over SSH.
+ - **Control machine.** A laptop, desktop or phone. It talks to the home over SSH, caches a snapshot
+   and opens tunnels. It holds no truth.
+ - **Surface.** Where a person talks to a session now: the opencode desktop app, a Claude app,
+@@ -38,9 +39,9 @@
+ ### 1. Interchangeable sessions
+ 
+ Every conversation is a universal, harness-neutral session with a stable id and an append-only
+-`log.jsonl` on the home. A session can move between models, harnesses, nodes and surfaces; a capsule
+-carries the context and the lease rules prevent two writers. The history does not belong to the
+-harness.
++`log.jsonl` on the home. A session can move between models, harnesses and surfaces; a capsule
++carries the context and the lease rules prevent two writers. Moving to another node is an explicit
++export/import or `session pull`; the history does not belong to the harness.
+ 
+ ### 2. A built-in database for the work
+ 
+@@ -51,9 +52,9 @@
+ ### 3. A fleet of workers on nodes
+ 
+ One supervisor ticks every active project in fairness order. Nodes are registered and tracked; the
+-snapshot shows projects, jobs, workers, capacity, provider limits, inbox and orchestrators. A broken
+-project parks alone. Capacity is measured, not guessed; brakes stop new runs and never kill running
+-work.
++fleet read model shows projects, jobs, runs, capacity, provider limits, inbox and orchestrators, the
++project board shows worker slots, and `vowp node ls` shows the node registry. A broken project parks
++alone. Capacity is measured, not guessed; brakes stop new runs and never kill running work.
+ 
+ ### 4. Systematic graphs, loops and schedules
+ 
+@@ -64,9 +65,10 @@
+ 
+ ### 5. Harness and provider freedom
+ 
+-Claude Code, opencode, Codex and other CLI agents are driven through their documented headless
+-interfaces. A model is a rung in a profile ladder, with fallbacks and shared provider limits. VOWP
+-does not fork a harness, scrape a TUI, or read a login token.
++Claude Code and opencode are driven through their documented headless interfaces, ACP servers through
++the protocol, and Codex or another CLI agent through the generic mapping adapter. The mapping is
++configuration you pin and test. A model is a rung in a profile ladder, with fallbacks and shared
++provider limits. VOWP does not fork a harness, scrape a TUI, or read a login token.
+ 
+ ## What runs where
+ 
+@@ -81,7 +83,7 @@
+ 
+ - Not a VPS provider: you own the server, the domain and the bill.
+ - Not a harness: it does not embed a model or replace Claude Code, opencode or Codex.
+-- Not a public service: the home opens no public port; access is SSH with your key.
++- Not a public service: VOWP opens no public port; the home is reached over SSH with your key.
+ - Not multi-home in 0.3: one home per installation. Teams and replication are out of scope.
+ - Not a substitute for review: gates and evidence make the work checkable; a human still owns the
+   promotion decision.
+diff -ruN a/docs/design/plan.md b/docs/design/plan.md
+--- a/docs/design/plan.md	2026-11-13 12:45:47.768721636 +0100
++++ b/docs/design/plan.md	2026-11-13 12:45:47.775721654 +0100
+@@ -1,6 +1,6 @@
+ # VOWP — Virtual Open Work-to-Production
+ 
+-VOWP is a VPS framework for AI agents to work on projects. One Linux VPS is the **home**: it owns the global database, one database per project, every session log and the supervisor. You talk to it from a laptop, desktop or phone; a registered executor node can run a turn where the work needs local context. Each agent can be Claude Code, opencode, Codex or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between harnesses, models and nodes without losing its context. Finished work moves from **Work to Production** only through guarded, reversible promotions.
++VOWP is a VPS framework for AI agents to work on projects. One Linux VPS is the **home**: it owns the global database, one database per project, every session log and the supervisor. You talk to it from a laptop, desktop or phone; a registered executor node can run a turn where the work needs local context. Each agent can be Claude Code, opencode, Codex or another harness. Work is planned as a **graph** of jobs. Deterministic **loops** keep it moving. Each job runs in a **tmux window** you can watch from any terminal. Every conversation is a **universal session** that can move between models, harnesses and surfaces without losing its context; moving to another node is an explicit export/import or `session pull`. Finished work moves from **Work to Production** only through guarded, reversible promotions.
+ 
+ This document describes how VOWP works. The imperative spec for each crate is in the neighbouring files; `decisions.md` records the places where that spec tightens or clarifies this design.
+ 
+diff -ruN a/docs/guides/operating.md b/docs/guides/operating.md
+--- a/docs/guides/operating.md	2026-11-13 12:45:47.794721702 +0100
++++ b/docs/guides/operating.md	2026-11-13 12:45:47.799721716 +0100
+@@ -160,9 +160,9 @@
+ 
+ Never log or paste prompts, environment values or secret-looking strings. Exact injected values are
+ replaced with `[REDACTED:<NAME>]` on the session-service and remote-ingest event paths, in the
+-snapshot, in capsules, and in a finished job report and run mirror. The supervisor log, gate command
+-evidence, ledger rows, the `session switch` harness events and the `session watch` importer are
+-written without that redaction, and a report or run mirror is still raw while its turn runs. Treat
++snapshot, in capsules, in command-gate evidence, in ledger details, and in a finished job report and
++run mirror. The supervisor log, the `session switch` harness events and the `session watch` importer
++are written without that redaction, and a report or run mirror is still raw while its turn runs. Treat
+ session logs, the databases and every file under `~/.vowp` as sensitive: they can contain prompts,
+ tool output and file contents. The coverage is stated exactly in the
+ [security model](../security.md#redaction).
+diff -ruN a/docs/roadmap.md b/docs/roadmap.md
+--- a/docs/roadmap.md	2026-11-13 12:45:47.819721767 +0100
++++ b/docs/roadmap.md	2026-11-13 12:45:47.822721775 +0100
+@@ -37,7 +37,7 @@
+ 
+ The home is the only writer. A control machine, app or MCP server sends commands or streams events;
+ it never opens a database over the network. The only listeners are loopback-only: the opencode app
+-server joined through an SSH tunnel and the one-time secret paste page.
++server joined through an SSH tunnel, the `vowp-daemon` API/window and the one-time secret paste page.
+ 
+ ## What is deliberately not in v0.3
+ 
+@@ -45,11 +45,12 @@
+   separate installation.
+ - **No public HTTP or SSE API.** The v0.3 daemon API binds loopback and is reached through SSH; there
+   is no public listener.
+-- **No cost dashboard.** The ACP adapter ships in v0.3; the cost dashboard remains deferred.
++- **No full cost dashboard.** The ACP adapter ships in v0.3; a basic loopback cost page and
++  `/api/v1/cost` ship, while the broader cost-dashboard design remains deferred.
+ - **No cross-node live sync.** v0.3 adds explicit session pull; there is no automatic directory sync.
+ - **No multi-user accounts, quotas, roles or audit.** One operator per home is the supported shape.
+ - **No VPS metrics history, parallel fan-out policies or hosted relay.** These need identity,
+-  policy or infrastructure that v0.2 does not provide.
++  policy or infrastructure that v0.3 does not provide.
+ - **No IANA time zones.** Schedules and limit resets use UTC or a fixed offset such as `+02:00`.
+ - **No phone push notifications, shell completions, native GUI or Windows support.** The supported
+   platforms are Linux and macOS.
+@@ -65,8 +66,9 @@
+ 
+ ## v0.3 — the API, the window and the reach
+ 
+-These items were the v0.3 plan. The API, window, phone board, ACP adapter and explicit session pull
+-ship in 0.3.0; the remaining rows are deferred.
++These items were the v0.3 plan. The read API and two token-gated writes, the window, the phone
++board, the ACP adapter and explicit session pull ship in 0.3.0; job actions, the jobs page and the
++rest of the API remain follow-ups.
+ 
+ | Item | What it adds | Design note |
+ |---|---|---|
+diff -ruN a/docs/security.md b/docs/security.md
+--- a/docs/security.md	2026-11-13 12:45:47.839721818 +0100
++++ b/docs/security.md	2026-11-13 12:45:47.846721836 +0100
+@@ -61,9 +61,9 @@
+ |---|---|
+ | **One writer per session** | `sessions/<id>/log.jsonl` is appended only on the home, by the session service or the hidden `session ingest` path. `seq` has no gaps or duplicates; ingest is idempotent by event id. |
+ | **The home is authoritative** | A control machine and the apps and MCP instance on it never write a VOWP DB file; their commands route to the home. On the home, the `vowp mcp` server reads and writes the home database directly, and every write tool checks the session lease. A control machine keeps only a snapshot cache, a spool and local surface/tunnel state. |
+-| **No public listener** | The supervisor opens no public HTTP, SSE or API port. The opencode app host and the one-time secret paste page listen on loopback only, and a control machine reaches both through an SSH tunnel; the secret vector is one-time. Claude Remote Control opens no local port: it connects outbound to claude.ai from the home. |
++| **No public listener** | The supervisor opens no public HTTP, SSE or API port. The opencode app host, the loopback `vowp-daemon` API/window and the one-time secret paste page listen on loopback only, and a control machine reaches them through an SSH tunnel; the secret vector is one-time. Claude Remote Control opens no local port: it connects outbound to claude.ai from the home. |
+ | **Two daemon writes** | The loopback daemon serves every read without a token. `POST /api/v1/inbox/{id}/answer` and the local `POST /api/v1/sessions/{id}/switch` require `Authorization: Bearer <VOWP_API_TOKEN>`; a daemon started without the variable answers `503` and writes nothing. The token is read at startup, compared in constant time, never logged, echoed or put in a URL, and rotation is a daemon restart. |
+-| **No credentials in configuration** | `vowp.toml` holds no token values; `env_pass` contains environment-variable **names**; `HarnessConfig` has no value fields. VOWP stores the values it manages in the secret store, and a listed `env_pass` name may also be forwarded from the process environment (see [Secrets](#secrets)). `vowp doctor` reports presence by name and never calls the network. This covers configuration and argv, not every stored byte: exact-value redaction covers the session-service and remote-ingest event paths and the snapshot, but `supervisor.log`, gate evidence, ledger rows, the switch turn path and the `session watch` importer are written unredacted and can hold a value a command printed (see [Redaction](#redaction)). |
++| **No credentials in configuration** | `vowp.toml` holds no token values; `env_pass` contains environment-variable **names**; `HarnessConfig` has no value fields. VOWP stores the values it manages in the secret store, and a listed `env_pass` name may also be forwarded from the process environment (see [Secrets](#secrets)). `vowp doctor` reports presence by name and never calls the network. This covers configuration and argv, not every stored byte: exact-value redaction covers the session-service and remote-ingest event paths, the snapshot, capsules, command-gate evidence, ledger details and the finished report/run mirror, but `supervisor.log`, the switch turn path and the `session watch` importer are written unredacted and can hold a value a command printed (see [Redaction](#redaction)). |
+ | **Stock binaries only** | Adapters spawn `claude`, `opencode` or a configured CLI exactly as a user would. No client spoofing, no "sign in with Claude" inside VOWP, no token forwarding. The optional `session watch` importer reads transcript JSONL read-only; it does not read auth files. |
+ | **cwd allow-list** | Before a run, the session layer checks that the working directory is inside the job worktree, the project path, the worktree root, `[node].cwd_allow` or the VOWP-owned orchestrator root `<VOWP_HOME>/orchestrators/<name>/`. Anything else, including paths elsewhere under `VOWP_HOME`, is refused. |
+ | **Worktree isolation** | One worktree per job on branch `job/<id>`. The `owns_respected` gate checks the diff and uncommitted files against the job's globs; dispatch-time locks prevent overlapping owners from running together. |
+@@ -161,17 +161,18 @@
+   `SessionLog::append`;
+ - the serialized snapshot before writing;
+ - a capsule body after the writer returns and before the caller sees it;
++- command-gate evidence, including the output tail and a spilled blob, before the row and blob are
++  written;
++- the ledger summary and the string values of `detail_json` before the row is written;
+ - the job report and latest run mirror after each turn finishes.
+ 
+-It is **not** applied to the supervisor log, gate command evidence, ledger `detail_json`, the
+-`session switch` turn path or the `session watch` importer: the supervisor log writer appends
+-directly, the gate runner inserts `GateResult.evidence` directly, the ledger writer appends `detail`
+-directly, and those two session paths write the harness event and imported transcript `raw` without
+-`redact_event`. A supervisor line, command gate, ledger row or event on those paths that contains an
+-injected value can therefore store it in plain text. The report and run mirror are raw during the
+-turn and only rewritten when it ends. Avoid commands that echo secret values, and treat all of these
+-files as sensitive. This is a known gap tracked as a follow-up; do not rely on event/snapshot
+-redaction to cover it.
++It is **not** applied to the supervisor log, the `session switch` turn path or the `session watch`
++importer: the supervisor log writer appends directly, and those two session paths write the harness
++event and imported transcript `raw` without `redact_event`. A supervisor line or event on those paths
++that contains an injected value can therefore store it in plain text. The report and run mirror are
++raw during the turn and only rewritten when it ends. Avoid commands that echo secret values, and
++treat all of these files as sensitive. This is a known gap tracked as a follow-up; do not rely on
++event/snapshot redaction to cover it.
+ 
+ The redactor never logs a value or its prefix; it logs only the name. The `secret_scan` gate scans the
+ changed paths and added lines of a job diff, and the merge queue scans its rebased candidate when
+@@ -191,9 +192,9 @@
+ as the harness, so a harness that reads `~/.vowp/secrets/<NAME>` can recover the value. Neither mode
+ encrypts the store at rest, and neither can make a secret unreadable to code that is given it. VOWP
+ keeps values out of configuration and git, and redacts exact injected values on the session-service
+-and remote-ingest event paths, in the snapshot, in capsules and in the finished report and run
+-mirror. It does **not** keep them out of every database row or every log: the supervisor log, gate
+-command evidence, ledger `detail_json`, the switch turn path and the `session watch` importer are
++and remote-ingest event paths, in the snapshot, in capsules, in command-gate evidence, in ledger
++details and in the finished report and run mirror. It does **not** keep them out of every database
++row or every log: the supervisor log, the switch turn path and the `session watch` importer are
+ written without redaction. Treat the databases and the home as sensitive. Redaction is a backstop
+ for the places listed above, not a guarantee.
+ 

@@ -240,7 +240,7 @@ fn check_schema(paths: &vowp_store::NodePaths, checks: &mut Checks) {
         match Store::open_read_only(paths, Some(&project.name))
             .and_then(|project_store| project_store.project_schema_version())
         {
-            Ok(1) => {}
+            Ok(version) if version == vowp_store::PROJECT_SCHEMA_VERSION => {}
             Ok(version) => problems.push(format!("{}: project schema {version}", project.name)),
             Err(error) => problems.push(format!("{}: {error}", project.name)),
         }
@@ -249,7 +249,10 @@ fn check_schema(paths: &vowp_store::NodePaths, checks: &mut Checks) {
         checks.push(
             "schema",
             CheckStatus::Ok,
-            format!("global {global}, {count} project database(s) at version 1"),
+            format!(
+                "global {global}, {count} project database(s) at version {}",
+                vowp_store::PROJECT_SCHEMA_VERSION
+            ),
         );
     } else {
         checks.push("schema", CheckStatus::Fail, problems.join("; "));

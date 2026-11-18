@@ -1,6 +1,7 @@
 # VOWP design specification — index
 
-Status: current for v0.3 (the v0.2 home and surface specification remains the binding base).
+Status: current for the implemented v0.3 surface and the v0.4 ASIF slice (the v0.2 home and
+surface specification remains the binding base).
 
 This directory describes how VOWP works: architecture, types, database schema, behavioural contracts
 and the command line. The **v0.1 implementation spec** is still the base; the **v0.2 spec** in
@@ -49,7 +50,7 @@ ambiguous or wrong, open an issue rather than inventing a different design.
 | `crates/vowp-cli.md` | The `vowp` binary: module layout, context and routing, output, exit codes, remote execution, MCP, setup. |
 | `adapters.md` | Adapter behaviour: claude-code and opencode mappings, cli mapping-file format, limit/credit/auth/context classification, cost receipts, fixtures. |
 | `loops.md` | L1–L9, the job state-machine transition table, gates, merge queue, failover, inbox, watchdog, schedules, drills. |
-| `sessions.md` | Canonical event log, reindex, capsule writer, switch protocol, v0.2 surfaces/leases/takeover, remote execution, app hosts, export/import bundle. |
+| `sessions.md` | Canonical event log, reindex, capsule writer, switch protocol, v0.2 surfaces/leases/takeover, remote execution, app hosts, export/import bundle, v0.3 pulls and the v0.4 ASIF interchange. |
 | `cli.md` | Every command: arguments, flags, human and `--json` output, exit codes, `--node` over ssh, home/control routing. |
 | `job-map.md` | The job kinds, ownership and dispatch map used by the supervisor. |
 
@@ -62,7 +63,17 @@ ambiguous or wrong, open an issue rather than inventing a different design.
 | [`v0.2/cross-node-sync.md`](v0.2/cross-node-sync.md) | updated for v0.2 | The v0.1 bundle move; v0.2 remote execution supersedes "move the session", leaving directory sync to v0.3. |
 | [`v0.2/acp-adapter.md`](v0.2/acp-adapter.md) | deferred | Agent Client Protocol adapter design; not v0.2 delivery. |
 | [`v0.2/cost-dashboard.md`](v0.2/cost-dashboard.md) | deferred | Cost dashboard on the v0.3 daemon API; not v0.2 delivery. |
-| [`v0.3/README.md`](v0.3/README.md) | planned | Daemon HTTP+SSE API, web window and phone browser board. |
+| [`v0.3/README.md`](v0.3/README.md) | shipped in 0.3.0 | Daemon HTTP+SSE API, web window and phone browser board. |
+
+## v0.4 design notes
+
+| File | Status | What it covers |
+|---|---|---|
+| [`v0.4/asif-integration.md`](v0.4/asif-integration.md) | **implemented for the ASIF slice** | ASIF 0.4 (review draft) interchange: the pinned adapter, core facade, `session export/import --format asif`, declared losses and strict mode, remote streams, the daemon download/report/import routes and the `/import` page. |
+| [`v0.4/hardening.md`](v0.4/hardening.md) | implemented in the tree; [security checklist and rollback drill recorded](../releases/v0.4-hardening.md), owner live Mac smoke test pending | Phase-4 hardening: optional WSS ingress behind a loopback listener, launchd/systemd-user service install, rotation UX, bundle result, separate user, bounded metrics history, and the phase-exit review, owner live Mac smoke test and rollback gates. |
+| [`v0.4/live-upgrade-and-drain.md`](v0.4/live-upgrade-and-drain.md) | accepted design, queued | Live binary/schema upgrade, cooperative drain and selective subsystem restart. |
+| [`v0.4/local-orchestrator.md`](v0.4/local-orchestrator.md) | draft; Phase 0/1 implemented | The Mac-side local surface and outbound local agent (offload, path map, result return). |
+| [`v0.4/public-positioning-review.md`](v0.4/public-positioning-review.md) | private review note | Public-claim qualifications and the wording not applied to the public tree. |
 
 ## Vocabulary (one meaning everywhere)
 
@@ -85,7 +96,19 @@ database split, the snapshot/fleet read model, measured capacity, sessions on su
 and remote execution, app hosts, MCP, the chat fallback, control machines, secrets, lifecycle/backup
 and AI-first setup. That is not a claim that every item in the v0.2 specification has shipped: the
 architecture and roadmap record the remaining follow-ups (for example gate/ledger redaction,
-deploy-command secret injection and the duplicate `session watch` session). The public HTTP+SSE
-daemon, web window, phone browser board, ACP adapter, cost dashboard, multi-user accounts and
-multi-home sync remain planned (v0.3 or later) and are marked as such in
+deploy-command secret injection and the duplicate `session watch` session).
+
+The v0.3 daemon, web window, phone board, ACP adapter and pull/divergence slice are implemented
+and shipped in 0.3.0; the post-tag tree adds the jobs page and its three token-gated actions. The
+v0.4 ASIF interchange slice is implemented in the tree and documented in
+[`v0.4/asif-integration.md`](v0.4/asif-integration.md). ASIF 0.4 is a review draft, so that slice
+does not claim conformance, a lossless exchange, portable continuation or native-harness import.
+The v0.4 local agent and Phase 3 (including `v4-local-3h-offline-cache`) are shipped in this tree,
+and the phase-4 hardening build (WSS, service, rotation UX, bundle result, separate user and
+capacity history) and its documentation are implemented in the tree. The security review checklist
+and the rollback drill are recorded in
+[`releases/v0.4-hardening.md`](../releases/v0.4-hardening.md); the owner live Mac smoke test is
+pending the owner's run and record. Phase 4 is complete in the tree. It is not a completed release.
+The live-upgrade/drain slice is queued. Multi-user accounts, multi-home sync and the remaining
+roadmap items are still planned, as marked in
 [`../roadmap.md`](../roadmap.md).

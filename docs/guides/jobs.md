@@ -22,7 +22,7 @@ vowp job add \
   --reads "crates/vowp-protocol/**,docs/design/**" \
   --gates rust_build \
   --priority 50 \
-  --max-attempts 3 \
+  --max-attempts 2 \
   --brief-file /tmp/example-brief.md
 ```
 
@@ -38,7 +38,7 @@ vowp job add \
 | `--reads glob,…` | Paths the job should read (not a lock). |
 | `--gates <set\|short,…>` | A named set from `[gates]` or short gate names; defaults depend on the kind. |
 | `--priority n` | Higher runs first among ready jobs; default 50. |
-| `--max-attempts n` | Fix rounds before `on_exhausted`; default 3. |
+| `--max-attempts n` | Fix rounds before `on_exhausted`; default 2. |
 | `--brief-file <path>` / `--brief -` | Brief body from a file or stdin. Without either, a template brief is written. |
 
 The command validates the id and the dependency graph (unknown needs and cycles are rejected) and
@@ -215,9 +215,11 @@ A `review` gate is not evaluated by the command-gate runner. It is satisfied by 
    `reads` = the original's `owns` plus `reads`, `owns: []`, gates `[report]` and a `verifies` edge.
 2. The verifier runs in the original's worktree, read-only by policy, in its own session.
 3. Pass → the original moves to `merging`.
-4. Fail → a `<id>-fix-<attempt>` job is created with the findings, a `fixes` edge and the original's
-   `owns`, role and worktree. When it finishes, the original re-runs its command gates (including a new
-   verify).
+4. Fail → a `<id>-fix-<attempt>` job is created with the verifier's findings, a `fixes` edge and the
+   original's `owns`, role and worktree. The supervisor copies those findings into the fix brief and
+   starts the fix node; it does not reuse a terminal fix child from an earlier round. If recovery finds
+   one, it allocates a fresh `<id>-fix-<attempt>-rN` child. When the fix finishes, the original re-runs
+   its command gates (including a new verify).
 5. After `max_attempts` fix rounds, `on_exhausted` applies: `escalate` creates a decision job and an
    inbox item; `park` parks the job; `fail` fails it and wakes the keeper.
 

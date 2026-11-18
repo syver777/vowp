@@ -30,7 +30,8 @@ pub struct Classified {
     pub http_status: Option<u16>,
 }
 
-const CREDITS_PATTERN: &str = r"(?i)insufficient[ _](?:balance|credits?|funds)|payment required|credit balance (?:is )?too low|\b402\b|out of credits";
+const CREDITS_PATTERN: &str =
+    r"(?i)insufficient[ _](?:balance|credits?|funds)|payment required|credit balance (?:is )?too low|out of credits";
 const AUTH_PATTERN: &str = r"(?i)invalid api key|incorrect api key|unauthorized|\b401\b|please run /login|not logged in|oauth token (?:has )?(?:expired|revoked)|authentication[_ ](?:error|failed)|permission_denied";
 const QUOTA_PATTERN: &str = r"(?i)usage limit|hit your (?:\w+[ -])*limit|limit (?:reached|exceeded)|out of (?:extra )?usage|quota|limit will reset|resets? (?:at )?\d|usage_limit|weekly limit|session limit|5-hour limit";
 const RATE_PATTERN: &str = r"(?i)rate[_ ]limit|\b429\b|\b529\b|overloaded|too many requests|\bbusy\b";

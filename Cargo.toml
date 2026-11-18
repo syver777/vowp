@@ -6,12 +6,13 @@ members = [
   "crates/vowp-graph",
   "crates/vowp-tmux",
   "crates/vowp-adapters",
+  "crates/vowp-agent",
   "crates/vowp-core",
   "crates/vowp-daemon",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -59,6 +60,14 @@ name = "vowp"
 path = "crates/vowp-cli/src/main.rs"
 
 [[test]]
+name = "agent"
+path = "crates/vowp-cli/tests/agent.rs"
+
+[[test]]
+name = "asif"
+path = "crates/vowp-cli/tests/asif.rs"
+
+[[test]]
 name = "board"
 path = "crates/vowp-cli/tests/board.rs"
 
@@ -101,6 +110,18 @@ path = "crates/vowp-cli/tests/job.rs"
 [[test]]
 name = "loops"
 path = "crates/vowp-cli/tests/loops.rs"
+
+[[test]]
+name = "mcp"
+path = "crates/vowp-cli/tests/mcp.rs"
+
+[[test]]
+name = "offload"
+path = "crates/vowp-cli/tests/offload.rs"
+
+[[test]]
+name = "orchestrator"
+path = "crates/vowp-cli/tests/orchestrator.rs"
 
 [[test]]
 name = "maint"
@@ -147,7 +168,7 @@ name = "up"
 path = "crates/vowp-cli/tests/up.rs"
 
 # The version test lives under scripts/release/ so it can be updated with the release
-# version. It asserts the actual package version (0.3.0).
+# version. It asserts the actual package version (0.4.0).
 [[test]]
 name = "version"
 path = "scripts/release/version-test.rs"
@@ -161,15 +182,18 @@ signal-hook = "0.4.6"
 thiserror = "2.0.21"
 time = "0.3.45"
 toml = "1.2.1"
-vowp-adapters = { version = "0.3.0", path = "crates/vowp-adapters" }
-vowp-core = { version = "0.3.0", path = "crates/vowp-core" }
-vowp-graph = { version = "0.3.0", path = "crates/vowp-graph" }
-vowp-protocol = { version = "0.3.0", path = "crates/vowp-protocol" }
-vowp-store = { version = "0.3.0", path = "crates/vowp-store" }
-vowp-tmux = { version = "0.3.0", path = "crates/vowp-tmux" }
+vowp-adapters = { version = "0.4.0", path = "crates/vowp-adapters" }
+vowp-agent = { version = "0.4.0", path = "crates/vowp-agent" }
+vowp-core = { version = "0.4.0", path = "crates/vowp-core" }
+vowp-graph = { version = "0.4.0", path = "crates/vowp-graph" }
+vowp-protocol = { version = "0.4.0", path = "crates/vowp-protocol" }
+vowp-store = { version = "0.4.0", path = "crates/vowp-store" }
+vowp-tmux = { version = "0.4.0", path = "crates/vowp-tmux" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+ed25519-dalek = "2"
 tempfile = "3.27.0"
+vowp-asif = "=0.1.1"

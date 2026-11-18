@@ -43,6 +43,17 @@ pub struct DispatchChoice {
     pub node: Option<NodeName>,
 }
 
+/// Returns true when one job of `role` is actually running.
+///
+/// The caller (tick step 8) passes every graph job in `running`, not just live rows. Only
+/// [`JobState::Running`] means the job's run is active, so a `Ready` row of the same role must
+/// not block itself or later candidates.
+fn role_is_running(running: &[Job], role: Role) -> bool {
+    running
+        .iter()
+        .any(|job| job.role == role && job.state == JobState::Running)
+}
+
 /// Plans which ready jobs to dispatch now, in acceptance order.
 ///
 /// Candidates run by priority (descending), creation time (ascending) and id (ascending).
@@ -50,7 +61,9 @@ pub struct DispatchChoice {
 /// every rung is limited, when its provider has no capacity, or when its ownership patterns
 /// overlap a running job or a choice already made. Planner and keeper jobs consume no slot,
 /// but at most one of each role is chosen per call and none is chosen while a job of that
-/// role is already running. Accepted choices keep their lock for the rest of the call.
+/// role is actually [`JobState::Running`]. Non-running rows in `running` (including ready
+/// planner or keeper jobs) do not block their role. Accepted choices keep their lock for the
+/// rest of the call.
 pub fn plan_dispatch(graph: &Graph, running: &[Job], caps: &DispatchCaps) -> Vec<DispatchChoice> {
     let mut candidates: Vec<&Job> = graph.jobs().filter(|job| job.state == JobState::Ready).collect();
     candidates.sort_by(|a, b| {
@@ -64,8 +77,8 @@ pub fn plan_dispatch(graph: &Graph, running: &[Job], caps: &DispatchCaps) -> Vec
     let mut free_workers = caps.free_workers;
     let mut free_verifiers = caps.free_verifiers;
     let mut provider_left = caps.provider_free.clone();
-    let mut planner_running = running.iter().any(|job| job.role == Role::Planner);
-    let mut keeper_running = running.iter().any(|job| job.role == Role::Keeper);
+    let mut planner_running = role_is_running(running, Role::Planner);
+    let mut keeper_running = role_is_running(running, Role::Keeper);
     let mut planner_chosen = false;
     let mut keeper_chosen = false;
     let mut choices = Vec::new();

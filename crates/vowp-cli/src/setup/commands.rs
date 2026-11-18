@@ -679,6 +679,7 @@ fn ensure_home_config(
             providers: config.providers,
             harnesses: config.harnesses,
             capsule: config.capsule,
+            ingress: vowp_protocol::IngressConfig::default(),
         };
         let text = toml::to_string_pretty(&node_file)
             .map_err(|error| vowp_protocol::ProtocolError::Config(error.to_string()))?;

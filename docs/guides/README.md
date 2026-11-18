@@ -1,13 +1,15 @@
 # Guides
 
 These guides take one VPS **home** and the machines that talk to it from installation to a running
-fleet. They describe the v0.3 behaviour on `main`: every command shown is implemented and every path
-is the one the binary uses. VOWP is a VPS framework for AI agents to work on projects; the home is the
-always-on VPS, and the control machine is only a surface.
+fleet. They describe the behaviour on `main`: every command shown is implemented and every path
+is the one the binary uses. VOWP is a VPS framework for AI agents to work on projects; the home is
+the always-on VPS, and the control machine is only a surface. The v0.4 agent node adds a Mac or
+Linux peer that dials the home, runs a local surface or an offloaded job, and returns the result.
 
 > **Status: current.** The home, control machine, sessions over surfaces, capacity, secrets,
-> lifecycle and backup commands in these guides are implemented. For the shortest install path,
-> start with [Install](install.md), which uses the same `vowp setup` commands as the README prompt.
+> lifecycle, backup and agent-node commands in these guides are implemented. For the shortest
+> install path, start with [Install](install.md), which uses the same `vowp setup` commands as the
+> README prompt.
 
 | Guide | Start here if you want to… |
 |---|---|
@@ -19,6 +21,7 @@ always-on VPS, and the control machine is only a surface.
 | [Using your phone](phone.md) | Reach the home from an SSH app and continue the same session. |
 | [Running a home on a VPS](vps.md) | Prepare the server, register projects, run under systemd and lock down SSH. |
 | [Control machines and extra machines](multi-node.md) | Set up the laptop or phone side, open tunnels and use `--node`. |
+| [The agent node](agent-node.md) | Enroll a Mac or Linux node, run it as a service, pair or rotate surfaces, deploy WSS, return a bundle or read capacity history. |
 | [Schedules](schedules.md) | Run a job, loop or command on a cron or interval schedule. |
 
 The vocabulary is the one in the [v0.2 home and surface specification](../design/v0.2/home-and-surfaces.md):
