@@ -10,12 +10,16 @@ every scene cut, and 199 sound effects are placed at the exact times the scenes 
 |---|---|
 | [`vowp-explainer.mp4`](vowp-explainer.mp4) | The two-minute explainer, 1920×1080, 30 fps, H.264, AAC stereo at −14 LUFS. Sized for X and other social posts. |
 | [`vowp-loop.gif`](vowp-loop.gif) | The verify → fix → inbox scene as a looping GIF. |
+| [`vowp-harness-switch.mp4`](vowp-harness-switch.mp4) | A 39-second clip: one session moves from Claude Code on Fable 5.2 to the Antigravity CLI on Gemini 4 Neon, then a profile ladder fails over and back. Same style and sound. |
+| [`../images/vowp-social.png`](../images/vowp-social.png) | The 1280×640 link-preview card (GitHub social preview, X, Slack). |
 | [`../images/`](../images/) | One 1280×720 still per scene, used by the README and the wiki. |
 | [`src/pixkit.py`](src/pixkit.py) | Palette, font and primitives: panels, chips, DB cylinders, servers, laptops, job nodes. |
 | [`src/scenes.py`](src/scenes.py) | The thirteen scenes, each a function of time, and the still time used for each diagram. |
 | [`src/render_stills.py`](src/render_stills.py) | Writes `docs/images/vowp-*.png`. |
 | [`src/render_video.py`](src/render_video.py) | Pipes frames to `ffmpeg` with dither dissolves between scenes. |
 | [`src/sound.py`](src/sound.py) | The cue sheet (read from the scenes), the chiptune synth, the effects and the mixer. |
+| [`src/switch_scenes.py`](src/switch_scenes.py), [`src/sound_switch.py`](src/sound_switch.py) | The five scenes and the soundtrack of the harness-switch clip. |
+| [`src/render_social.py`](src/render_social.py) | Draws the link-preview card. |
 
 ## Scenes
 
@@ -41,6 +45,11 @@ Needs Python 3 with Pillow and NumPy, and `ffmpeg` on `PATH`.
 python3 -I docs/media/src/render_stills.py docs/images
 python3 -I docs/media/src/render_video.py /tmp/vowp-silent.mp4 --gif loop docs/media/vowp-loop.gif
 python3 -I docs/media/src/sound.py /tmp/vowp-sound --only A --mux /tmp/vowp-silent.mp4 docs/media/vowp-explainer.mp4
+
+# the harness-switch clip and the link-preview card
+python3 -I docs/media/src/render_video.py /tmp/vowp-switch-silent.mp4 --scenes switch_scenes
+python3 -I docs/media/src/sound_switch.py /tmp/vowp-switch.wav --mux /tmp/vowp-switch-silent.mp4 docs/media/vowp-harness-switch.mp4
+python3 -I docs/media/src/render_social.py docs/images/vowp-social.png
 ```
 
 Each step takes under a minute on a laptop. To change a picture, edit its scene in `scenes.py`; the

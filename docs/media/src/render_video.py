@@ -1,8 +1,10 @@
 """Render the VOWP explainer video (and a short GIF of one scene) with ffmpeg.
 
 usage: python3 -I render_video.py OUT.mp4 [--fps 30] [--scale 3] [--gif SCENE OUT.gif]
+                                          [--scenes MODULE]   (default: scenes)
 """
 import argparse
+import importlib
 import os
 import subprocess
 import sys
@@ -13,7 +15,18 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from pixkit import BAYER4  # noqa: E402
-from scenes import SCENES, draw_scene, W, H  # noqa: E402
+from scenes import W, H  # noqa: E402
+
+SCENES, draw_scene = None, None
+
+
+def use(module):
+    global SCENES, draw_scene
+    m = importlib.import_module(module)
+    SCENES, draw_scene = m.SCENES, m.draw_scene
+
+
+use("scenes")
 
 FADE = 0.4  # seconds of dither dissolve at the start of each scene
 
@@ -55,7 +68,9 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--scale", type=int, default=3)
     ap.add_argument("--gif", nargs=2, metavar=("SCENE", "OUT"))
+    ap.add_argument("--scenes", default="scenes", help="scene module, e.g. switch_scenes")
     a = ap.parse_args()
+    use(a.scenes)
 
     sw, sh = W * a.scale, H * a.scale
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
