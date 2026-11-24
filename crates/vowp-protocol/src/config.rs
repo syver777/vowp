@@ -228,13 +228,18 @@ pub struct ProjectConfig {
     pub push: bool,
 }
 
-/// What to do when a provider reports exhausted credits.
+/// What to do when a provider reports exhausted credits or an authentication failure.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OnCreditsExhausted {
     /// Park affected jobs and raise an inbox item; never switch silently.
     #[default]
     Park,
+    /// Move the affected session to the next healthy rung declared in its ladder.
+    ///
+    /// This is an explicit owner opt-in: the fallback rung is a provider the owner
+    /// listed and pays for. Authentication failures follow the same policy.
+    Next,
 }
 
 /// One model price entry, in USD per million tokens.
@@ -260,7 +265,7 @@ pub struct ProviderConfig {
     /// Concurrent runs allowed for this provider.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
-    /// Credits-exhaustion policy; v0.1 only parks.
+    /// Credits/auth exhaustion policy; defaults to `park`.
     #[serde(default)]
     pub on_credits_exhausted: OnCreditsExhausted,
     /// Price table keyed by model name.

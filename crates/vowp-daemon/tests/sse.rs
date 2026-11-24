@@ -9,15 +9,17 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use vowp_daemon::{ApiState, select_project, serve_with_shutdown};
-use vowp_protocol::api::Board;
+use vowp_protocol::api::{Board, CostReport, InboxPage, JobPage, NodePage};
 use vowp_protocol::{
-    Actor, Clock, EventBody, EventEnvelope, EventSource, FakeClock, HarnessKind, JobId, JobKind, NewJob, NodeName,
-    Project, ProjectName, Role, Session, SessionId, SessionRole, SessionState, Timestamp, UserMessage, VowpConfig,
+    Actor, Clock, Cost, EventBody, EventEnvelope, EventSource, Evidence, FakeClock, Gate, GateResult, HarnessKind,
+    InboxId, InboxItem, InboxKind, InboxState, JobId, JobKind, LedgerEntry, LedgerKind, NewJob, Node, NodeName,
+    Project, ProjectName, Role, Run, RunId, RunPurpose, RunRole, Session, SessionId, SessionRole, SessionState,
+    Timestamp, Tokens, UserMessage, VowpConfig,
 };
 use vowp_store::session_log::{NewEvent, SessionLog};
 use vowp_store::{NodePaths, StateChange, Store};
@@ -143,10 +145,14 @@ impl Fixture {
 }
 
 /// A temporary home whose board has no live runs, so only a row change moves it.
+///
+/// The same rows back the jobs-list and job-detail stream tests: the pending job changes
+/// state, gains runs and gains gate results through real writable store calls.
 struct BoardStreamFixture {
     _tmp: TempDir,
     paths: NodePaths,
     project: ProjectName,
+    node: NodeName,
     pending_job: JobId,
 }
 
@@ -164,7 +170,7 @@ impl BoardStreamFixture {
         std::fs::create_dir_all(&project_dir).expect("project dir");
 
         let mut config = VowpConfig::with_defaults_for_tests();
-        config.node.name = node;
+        config.node.name = node.clone();
         config.project.name = project.clone();
         config.project.path = Some(project_dir.display().to_string());
         config.validate().expect("valid fixture config");
@@ -202,6 +208,7 @@ impl BoardStreamFixture {
             _tmp: tmp,
             paths,
             project,
+            node,
             pending_job: pending.id,
         }
     }
@@ -221,6 +228,234 @@ impl BoardStreamFixture {
             .expect("complete pending job");
         drop(store);
     }
+
+    /// Adds one unfinished worker run to the pending job.
+    fn add_run(&self) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .insert_run(&Run {
+                id: RunId::new(),
+                job_id: Some(self.pending_job.clone()),
+                session_id: None,
+                role: RunRole::Worker,
+                purpose: RunPurpose::Start,
+                profile: None,
+                rung: 0,
+                executor: None,
+                provider: None,
+                node: self.node.clone(),
+                native_session_id: None,
+                pid: None,
+                window: None,
+                cwd: None,
+                started_at: epoch().plus(Duration::from_secs(1)),
+                ended_at: None,
+                exit_code: None,
+                outcome: None,
+                limit_kind: None,
+                cost: Cost::unknown(),
+                detail: String::new(),
+            })
+            .expect("run row");
+        drop(store);
+    }
+
+    /// Adds one passing gate result to the pending job's first attempt.
+    fn add_gate_result(&self) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .insert_gate_result(&GateResult {
+                id: None,
+                job_id: self.pending_job.clone(),
+                run_id: None,
+                attempt: 0,
+                gate_index: 0,
+                gate: Gate::OwnsRespected(true),
+                passed: true,
+                evidence: Evidence::OwnsRespected {
+                    changed: Vec::new(),
+                    violations: Vec::new(),
+                },
+                output_blob: None,
+                duration_ms: 1,
+                ts: epoch(),
+            })
+            .expect("gate result row");
+        drop(store);
+    }
+}
+
+/// A temporary home with one cost row, one open inbox item and one local node.
+///
+/// The writable helpers add a second cost row, another open item and another node, answer
+/// the open item, move a node's last-seen time and remove the project database. The same rows
+/// back the cost, inbox and nodes stream tests.
+struct LivePagesFixture {
+    _tmp: TempDir,
+    paths: NodePaths,
+    project: ProjectName,
+    inbox_id: InboxId,
+    node_name: NodeName,
+}
+
+impl LivePagesFixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = NodePaths::new(tmp.path());
+        let clock = FakeClock::at(epoch());
+        let store = Store::open(&paths)
+            .expect("open store")
+            .with_clock(Arc::new(clock.clone()));
+        let project = ProjectName::parse("live-proj").expect("project name");
+        let node = NodeName::parse("test-node").expect("node name");
+        let project_dir = tmp.path().join("project");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+
+        let mut config = VowpConfig::with_defaults_for_tests();
+        config.node.name = node.clone();
+        config.project.name = project.clone();
+        config.project.path = Some(project_dir.display().to_string());
+        config.validate().expect("valid fixture config");
+        store
+            .upsert_project(&Project {
+                name: project.clone(),
+                path: project_dir.display().to_string(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                config: serde_json::to_value(&config).expect("config JSON"),
+                created_at: clock.now(),
+                updated_at: clock.now(),
+            })
+            .expect("project row");
+
+        store
+            .upsert_node(&Node {
+                name: node.clone(),
+                ssh_target: None,
+                is_local: true,
+                capabilities: json!({ "vowp": "0.5.0", "probe_ok": true }),
+                last_seen_at: Some(epoch()),
+                created_at: epoch(),
+            })
+            .expect("node row");
+
+        let inbox_id = InboxId::new();
+        store
+            .insert_inbox(&open_item(&project, inbox_id.clone(), "open question"))
+            .expect("inbox row");
+        append_cost_row(&store, &project, "job-a", 0.5, epoch());
+        drop(store);
+
+        Self {
+            _tmp: tmp,
+            paths,
+            project,
+            inbox_id,
+            node_name: node,
+        }
+    }
+
+    /// Adds one receipt row for `job`.
+    fn add_cost_row(&self, job: &str, usd: f64) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        append_cost_row(&store, &self.project, job, usd, epoch().plus(Duration::from_secs(60)));
+        drop(store);
+    }
+
+    /// Adds one open inbox item.
+    fn add_inbox_item(&self, title: &str) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .insert_inbox(&open_item(&self.project, InboxId::new(), title))
+            .expect("inbox row");
+        drop(store);
+    }
+
+    /// Adds one remote node without an SSH target.
+    fn add_remote_node(&self, name: &str) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .upsert_node(&Node {
+                name: NodeName::parse(name).expect("node name"),
+                ssh_target: None,
+                is_local: false,
+                capabilities: json!({ "vowp": "0.5.0", "probe_ok": true }),
+                last_seen_at: Some(epoch()),
+                created_at: epoch(),
+            })
+            .expect("node row");
+        drop(store);
+    }
+
+    /// Answers the fixture's open item through the same store call the web write uses.
+    fn answer_open_item(&self) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .answer_inbox(&self.inbox_id, "yes", "web")
+            .expect("answer inbox item");
+        drop(store);
+    }
+
+    /// Moves the fixture node's last-seen time forward.
+    fn touch_node(&self) {
+        let store = Store::open(&self.paths).expect("open writable store");
+        store
+            .touch_node_seen(&self.node_name, epoch().plus(Duration::from_secs(120)))
+            .expect("touch node");
+        drop(store);
+    }
+
+    /// Removes the attached project database, making the next snapshot read fail.
+    fn remove_project_database(&self) {
+        std::fs::remove_file(self.paths.project_db_path(&self.project)).expect("remove project database");
+    }
+}
+
+/// Builds one open inbox item for `project`.
+fn open_item(project: &ProjectName, id: InboxId, title: &str) -> InboxItem {
+    InboxItem {
+        id,
+        project: Some(project.clone()),
+        job_id: None,
+        kind: InboxKind::Question,
+        title: title.to_owned(),
+        body: format!("{title} body"),
+        options: vec!["yes".to_owned(), "no".to_owned()],
+        state: InboxState::Open,
+        answer: None,
+        answered_by: None,
+        created_at: epoch(),
+        answered_at: None,
+    }
+}
+
+/// Appends one known-USD cost ledger row for `job`.
+fn append_cost_row(store: &Store, project: &ProjectName, job: &str, usd: f64, at: Timestamp) {
+    store
+        .append_ledger(&LedgerEntry {
+            id: None,
+            ts: at,
+            kind: LedgerKind::Cost,
+            project: Some(project.clone()),
+            job_id: Some(JobId::parse(job).expect("job id")),
+            run_id: None,
+            session_id: None,
+            role: Some(RunRole::Worker),
+            provider: Some("test-provider".to_owned()),
+            harness: None,
+            model: Some("test-model".to_owned()),
+            cost: Some(Cost::receipt(
+                usd,
+                Tokens {
+                    input: 100,
+                    output: 10,
+                    ..Tokens::default()
+                },
+            )),
+            summary: "run cost".to_owned(),
+            detail: json!({}),
+        })
+        .expect("cost ledger row");
 }
 
 fn append(log: &SessionLog, text: &str) -> vowp_store::session_log::AppendedEvent {
@@ -376,6 +611,7 @@ struct SseClient {
     eof: bool,
     status: u16,
     content_type: Option<String>,
+    headers: Vec<(String, String)>,
 }
 
 enum ChunkState {
@@ -424,6 +660,14 @@ impl SseClient {
         let chunked = head.lines().any(|line| {
             line.to_ascii_lowercase().starts_with("transfer-encoding:") && line.to_ascii_lowercase().contains("chunked")
         });
+        let headers: Vec<(String, String)> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
         let raw = raw.split_off(head_end + 4);
         Self {
             stream,
@@ -434,7 +678,16 @@ impl SseClient {
             eof: false,
             status,
             content_type: Some(content_type),
+            headers,
         }
+    }
+
+    /// Returns one response header value, matched case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     /// Returns the next complete frame, or `None` when the connection closes or `timeout`
@@ -601,6 +854,12 @@ fn assert_no_home_or_token(text: &str, home: &str) {
     );
 }
 
+/// Asserts that `text` contains no home path; a job snapshot legitimately carries token
+/// usage counters, so the word "token" is not a secret marker in this slice.
+fn assert_no_home(text: &str, home: &str) {
+    assert!(!text.contains(home), "response leaked the home path: {text}");
+}
+
 /// Asserts that `value` validates against the exported schema for `name`.
 fn assert_schema(name: &str, value: &Value) {
     let schema =
@@ -715,6 +974,394 @@ fn board_stream_closes_when_a_snapshot_cannot_be_collected() {
         client.next_frame(Duration::from_secs(5)).is_none(),
         "the board stream must close cleanly after a collect error"
     );
+}
+
+#[test]
+fn jobs_stream_sends_initial_changed_snapshots_and_no_store() {
+    let fixture = BoardStreamFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+    let home = fixture.paths.root().display().to_string();
+    let path = "/api/v1/jobs/stream?state=pending";
+
+    let mut client = SseClient::open(server.address, path);
+    assert_eq!(client.status, 200);
+    let content_type = client.content_type.as_deref().unwrap_or_default();
+    assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+    assert_eq!(
+        client.header("cache-control"),
+        Some("no-store"),
+        "the jobs stream must not be cached"
+    );
+
+    let first = client.next_frame(Duration::from_secs(5)).expect("initial jobs frame");
+    assert_eq!(first.event.as_deref(), Some("jobs"));
+    assert_no_home_or_token(&first.data, &home);
+    let first_value = first.json();
+    assert_schema("JobPage", &first_value);
+    let first_page: JobPage = serde_json::from_value(first_value).expect("JobPage");
+    assert_eq!(first_page.total, 1);
+    assert_eq!(first_page.items[0].id, fixture.pending_job);
+    let response = get(server.address, "/api/v1/jobs?state=pending");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let served: JobPage = serde_json::from_str(&response.body).expect("served JobPage");
+    assert_eq!(
+        first_page, served,
+        "the first frame must be the exact filtered API page"
+    );
+
+    // A moving clock alone never sends a frame; the short heartbeat interval is next.
+    let heartbeat = client.next_frame(Duration::from_secs(2)).expect("first heartbeat");
+    assert_eq!(heartbeat.event.as_deref(), Some("heartbeat"));
+    assert_no_home_or_token(&heartbeat.data, &home);
+
+    fixture.complete_pending_job();
+    let changed = next_snapshot_frame(&mut client, "jobs");
+    assert_no_home_or_token(&changed.data, &home);
+    let changed_value = changed.json();
+    assert_schema("JobPage", &changed_value);
+    let changed_page: JobPage = serde_json::from_value(changed_value).expect("JobPage");
+    assert_eq!(changed_page.total, 0, "the pending job moved out of the filtered list");
+    assert!(changed_page.items.is_empty());
+
+    let response = get(server.address, "/api/v1/jobs?state=pending");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let current: JobPage = serde_json::from_str(&response.body).expect("current JobPage");
+    assert_eq!(changed_page, current);
+
+    let bad = get(server.address, "/api/v1/jobs/stream?state=nope");
+    assert_eq!(bad.status, 400, "body: {}", bad.body);
+    assert_no_home_or_token(&bad.body, &home);
+    let error: Value = serde_json::from_str(&bad.body).expect("ApiError JSON");
+    assert_eq!(error["error"]["kind"], "invalid_input", "{}", bad.body);
+
+    drop(client);
+}
+
+#[test]
+fn job_stream_sends_snapshots_for_state_run_and_gate_changes() {
+    let fixture = BoardStreamFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+    let home = fixture.paths.root().display().to_string();
+    let path = format!("/api/v1/jobs/{}/stream", fixture.pending_job);
+
+    let mut client = SseClient::open(server.address, &path);
+    assert_eq!(client.status, 200);
+    let content_type = client.content_type.as_deref().unwrap_or_default();
+    assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+    assert_eq!(
+        client.header("cache-control"),
+        Some("no-store"),
+        "the job stream must not be cached"
+    );
+
+    let first = client.next_frame(Duration::from_secs(5)).expect("initial job frame");
+    assert_eq!(first.event.as_deref(), Some("job"));
+    assert_no_home(&first.data, &home);
+    let first_value = first.json();
+    assert_schema("Job", &first_value["job"]);
+    assert_schema("RunPage", &first_value["runs"]);
+    assert_schema("GateResultPage", &first_value["gates"]);
+    assert_eq!(first_value["job"]["id"], fixture.pending_job.as_str());
+    assert_eq!(first_value["job"]["state"], "pending");
+    assert_eq!(first_value["runs"]["total"], 0);
+    assert_eq!(first_value["gates"]["total"], 0);
+
+    let heartbeat = client.next_frame(Duration::from_secs(2)).expect("first heartbeat");
+    assert_eq!(heartbeat.event.as_deref(), Some("heartbeat"));
+    assert_no_home(&heartbeat.data, &home);
+
+    fixture.add_gate_result();
+    let gate_frame = next_snapshot_frame(&mut client, "job");
+    assert_no_home(&gate_frame.data, &home);
+    let gate_value = gate_frame.json();
+    assert_schema("GateResultPage", &gate_value["gates"]);
+    assert_eq!(gate_value["gates"]["total"], 1);
+    assert_eq!(gate_value["runs"]["total"], 0);
+
+    fixture.add_run();
+    let run_frame = next_snapshot_frame(&mut client, "job");
+    assert_no_home(&run_frame.data, &home);
+    let run_value = run_frame.json();
+    assert_schema("RunPage", &run_value["runs"]);
+    assert_eq!(run_value["runs"]["total"], 1);
+    assert_eq!(run_value["gates"]["total"], 1);
+
+    fixture.complete_pending_job();
+    let state_frame = next_snapshot_frame(&mut client, "job");
+    assert_no_home(&state_frame.data, &home);
+    let state_value = state_frame.json();
+    assert_schema("Job", &state_value["job"]);
+    assert_eq!(state_value["job"]["state"], "done");
+    assert_eq!(state_value["runs"]["total"], 1);
+    assert_eq!(state_value["gates"]["total"], 1);
+
+    drop(client);
+}
+
+#[test]
+fn job_stream_rejects_unknown_jobs_and_bad_ids_before_streaming() {
+    let fixture = BoardStreamFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_secs(60));
+    let home = fixture.paths.root().display().to_string();
+
+    let missing = get(server.address, "/api/v1/jobs/missing-job/stream");
+    assert_eq!(missing.status, 404, "body: {}", missing.body);
+    assert!(
+        !missing
+            .content_type
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("text/event-stream"),
+        "an unknown job must not start a stream"
+    );
+    assert_no_home_or_token(&missing.body, &home);
+    let error: Value = serde_json::from_str(&missing.body).expect("ApiError JSON");
+    assert_eq!(error["error"]["kind"], "not_found", "{}", missing.body);
+
+    let invalid = get(server.address, "/api/v1/jobs/Not_Valid/stream");
+    assert_eq!(invalid.status, 400, "body: {}", invalid.body);
+    assert_no_home_or_token(&invalid.body, &home);
+    let error: Value = serde_json::from_str(&invalid.body).expect("ApiError JSON");
+    assert_eq!(error["error"]["kind"], "invalid_input", "{}", invalid.body);
+}
+
+#[test]
+fn cost_stream_sends_one_initial_snapshot_then_changed_only_frames() {
+    let fixture = LivePagesFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+    let home = fixture.paths.root().display().to_string();
+
+    let mut client = SseClient::open(server.address, "/api/v1/cost/stream?by=job");
+    assert_eq!(client.status, 200);
+    let content_type = client.content_type.as_deref().unwrap_or_default();
+    assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+    assert_eq!(
+        client.header("cache-control"),
+        Some("no-store"),
+        "the cost stream must not be cached"
+    );
+
+    let first = next_snapshot_frame(&mut client, "cost");
+    assert_no_home(&first.data, &home);
+    let first_value = first.json();
+    assert_schema("CostReport", &first_value);
+    let first_report: CostReport = serde_json::from_value(first_value).expect("CostReport");
+    assert_eq!(first_report.total.runs, 1);
+    let response = get(server.address, "/api/v1/cost?by=job");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let served: CostReport = serde_json::from_str(&response.body).expect("served CostReport");
+    assert_eq!(first_report, served, "the first frame must be the exact cost report");
+
+    // An unchanged report sends no duplicate frame; the next frame is the heartbeat.
+    let heartbeat = client.next_frame(Duration::from_secs(2)).expect("first heartbeat");
+    assert_eq!(
+        heartbeat.event.as_deref(),
+        Some("heartbeat"),
+        "a stable report must not resend a cost frame: {}",
+        heartbeat.data
+    );
+    assert_no_home(&heartbeat.data, &home);
+
+    fixture.add_cost_row("job-b", 0.25);
+    let changed = next_snapshot_frame(&mut client, "cost");
+    assert_no_home(&changed.data, &home);
+    let changed_value = changed.json();
+    assert_schema("CostReport", &changed_value);
+    let changed_report: CostReport = serde_json::from_value(changed_value).expect("CostReport");
+    assert_eq!(changed_report.total.runs, 2);
+    assert_eq!(changed_report.total.usd, Some(0.75));
+    let response = get(server.address, "/api/v1/cost?by=job");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let current: CostReport = serde_json::from_str(&response.body).expect("current CostReport");
+    assert_eq!(changed_report, current);
+
+    drop(client);
+}
+
+#[test]
+fn inbox_stream_carries_the_state_filter_and_updates() {
+    let fixture = LivePagesFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+    let home = fixture.paths.root().display().to_string();
+
+    let mut client = SseClient::open(server.address, "/api/v1/inbox/stream?state=open");
+    assert_eq!(client.status, 200);
+    let content_type = client.content_type.as_deref().unwrap_or_default();
+    assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+    assert_eq!(
+        client.header("cache-control"),
+        Some("no-store"),
+        "the inbox stream must not be cached"
+    );
+
+    let first = next_snapshot_frame(&mut client, "inbox");
+    assert_no_home(&first.data, &home);
+    let first_value = first.json();
+    assert_schema("InboxPage", &first_value);
+    let first_page: InboxPage = serde_json::from_value(first_value).expect("InboxPage");
+    assert_eq!(first_page.total, 1);
+    assert_eq!(first_page.items[0].id, fixture.inbox_id);
+    assert_eq!(first_page.items[0].state, InboxState::Open);
+    let response = get(server.address, "/api/v1/inbox?state=open");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let served: InboxPage = serde_json::from_str(&response.body).expect("served InboxPage");
+    assert_eq!(first_page, served, "the first frame must be the exact open page");
+
+    let heartbeat = client.next_frame(Duration::from_secs(2)).expect("first heartbeat");
+    assert_eq!(heartbeat.event.as_deref(), Some("heartbeat"));
+
+    fixture.answer_open_item();
+    let changed = next_snapshot_frame(&mut client, "inbox");
+    assert_no_home(&changed.data, &home);
+    let changed_value = changed.json();
+    assert_schema("InboxPage", &changed_value);
+    let changed_page: InboxPage = serde_json::from_value(changed_value).expect("InboxPage");
+    assert_eq!(changed_page.total, 0, "the answered item left the open filter");
+    assert!(changed_page.items.is_empty());
+    let response = get(server.address, "/api/v1/inbox?state=open");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let current: InboxPage = serde_json::from_str(&response.body).expect("current InboxPage");
+    assert_eq!(changed_page, current);
+
+    let bad = get(server.address, "/api/v1/inbox/stream?state=nope");
+    assert_eq!(bad.status, 400, "body: {}", bad.body);
+    assert!(
+        !bad.content_type
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("text/event-stream"),
+        "an invalid state must not start a stream"
+    );
+    assert_no_home(&bad.body, &home);
+    let error: Value = serde_json::from_str(&bad.body).expect("ApiError JSON");
+    assert_eq!(error["error"]["kind"], "invalid_input", "{}", bad.body);
+
+    drop(client);
+}
+
+#[test]
+fn nodes_stream_sends_initial_nodes_and_updates() {
+    let fixture = LivePagesFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+    let home = fixture.paths.root().display().to_string();
+
+    let mut client = SseClient::open(server.address, "/api/v1/nodes/stream");
+    assert_eq!(client.status, 200);
+    let content_type = client.content_type.as_deref().unwrap_or_default();
+    assert!(content_type.starts_with("text/event-stream"), "{content_type}");
+    assert_eq!(
+        client.header("cache-control"),
+        Some("no-store"),
+        "the nodes stream must not be cached"
+    );
+
+    let first = next_snapshot_frame(&mut client, "nodes");
+    assert_no_home(&first.data, &home);
+    let first_value = first.json();
+    assert_schema("NodePage", &first_value);
+    let first_page: NodePage = serde_json::from_value(first_value).expect("NodePage");
+    assert_eq!(first_page.total, 1);
+    assert_eq!(first_page.items[0].name, fixture.node_name);
+    assert_eq!(first_page.items[0].last_seen_at, Some(epoch()));
+
+    let heartbeat = client.next_frame(Duration::from_secs(2)).expect("first heartbeat");
+    assert_eq!(
+        heartbeat.event.as_deref(),
+        Some("heartbeat"),
+        "an unchanged node page must not resend a nodes frame: {}",
+        heartbeat.data
+    );
+
+    fixture.touch_node();
+    let changed = next_snapshot_frame(&mut client, "nodes");
+    assert_no_home(&changed.data, &home);
+    let changed_value = changed.json();
+    assert_schema("NodePage", &changed_value);
+    let changed_page: NodePage = serde_json::from_value(changed_value).expect("NodePage");
+    assert_eq!(changed_page.total, 1);
+    assert_eq!(
+        changed_page.items[0].last_seen_at,
+        Some(epoch().plus(Duration::from_secs(120)))
+    );
+    let response = get(server.address, "/api/v1/nodes");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    let current: NodePage = serde_json::from_str(&response.body).expect("current NodePage");
+    assert_eq!(changed_page, current);
+
+    drop(client);
+}
+
+#[test]
+fn live_streams_never_emit_a_per_row_frame() {
+    let fixture = LivePagesFixture::new();
+    fixture.add_cost_row("job-b", 0.25);
+    fixture.add_inbox_item("second question");
+    fixture.add_remote_node("second-node");
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_millis(50));
+
+    let mut cost = SseClient::open(server.address, "/api/v1/cost/stream?by=job");
+    let cost_frame = next_snapshot_frame(&mut cost, "cost");
+    let cost_value = cost_frame.json();
+    let rows = cost_value["rows"]
+        .as_array()
+        .expect("a cost frame is one CostReport with a rows array");
+    assert_eq!(rows.len(), 2, "one frame must carry every grouped row");
+    assert_eq!(cost_value["total"]["runs"].as_u64(), Some(2));
+    assert_schema("CostReport", &cost_value);
+
+    let mut inbox = SseClient::open(server.address, "/api/v1/inbox/stream?state=open");
+    let inbox_frame = next_snapshot_frame(&mut inbox, "inbox");
+    let inbox_value = inbox_frame.json();
+    let items = inbox_value["items"]
+        .as_array()
+        .expect("an inbox frame is one InboxPage with an items array");
+    assert_eq!(items.len(), 2, "one frame must carry every open item");
+    assert_eq!(inbox_value["total"].as_u64(), Some(2));
+    assert_schema("InboxPage", &inbox_value);
+
+    let mut nodes = SseClient::open(server.address, "/api/v1/nodes/stream");
+    let nodes_frame = next_snapshot_frame(&mut nodes, "nodes");
+    let nodes_value = nodes_frame.json();
+    let items = nodes_value["items"]
+        .as_array()
+        .expect("a nodes frame is one NodePage with an items array");
+    assert_eq!(items.len(), 2, "one frame must carry every node row");
+    assert_eq!(nodes_value["total"].as_u64(), Some(2));
+    assert_schema("NodePage", &nodes_value);
+
+    drop(cost);
+    drop(inbox);
+    drop(nodes);
+}
+
+#[test]
+fn streams_end_cleanly_when_the_store_is_unavailable() {
+    let fixture = LivePagesFixture::new();
+    let server = Server::start_for(&fixture.paths, Duration::from_millis(10), Duration::from_secs(60));
+    let mut client = SseClient::open(server.address, "/api/v1/nodes/stream");
+    assert_eq!(client.status, 200);
+    let first = next_snapshot_frame(&mut client, "nodes");
+    assert_eq!(first.event.as_deref(), Some("nodes"));
+
+    fixture.remove_project_database();
+    assert!(
+        client.next_frame(Duration::from_secs(5)).is_none(),
+        "the nodes stream must close cleanly after a store read error"
+    );
+
+    drop(client);
+}
+
+/// Returns the next snapshot frame of `event`, ignoring any interleaved heartbeats.
+fn next_snapshot_frame(client: &mut SseClient, event: &str) -> SseFrame {
+    loop {
+        let frame = client.next_frame(Duration::from_secs(5)).expect("snapshot frame");
+        match frame.event.as_deref() {
+            Some("heartbeat") => continue,
+            Some(kind) if kind == event => return frame,
+            other => panic!("unexpected stream frame {other:?}: {}", frame.data),
+        }
+    }
 }
 
 #[test]

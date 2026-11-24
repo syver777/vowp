@@ -27,7 +27,9 @@ use vowp_protocol::{
 };
 use vowp_store::{Store, SurfaceToken};
 
-use crate::cli::{SurfaceCommand, SurfaceLsArgs, SurfacePairArgs, SurfaceRevokeArgs, SurfaceRotateArgs};
+use crate::cli::{
+    SurfaceCommand, SurfaceLsArgs, SurfacePairArgs, SurfaceRenameArgs, SurfaceRevokeArgs, SurfaceRotateArgs,
+};
 use crate::node_ctx::NodeRole;
 use crate::output::{Table, local_time_at, print_json};
 use crate::{CliError, Ctx, IoStreams};
@@ -46,7 +48,31 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &SurfaceCommand, node: Op
         SurfaceCommand::Ls(args) => list(ctx, io, args, node),
         SurfaceCommand::Revoke(args) => revoke(ctx, io, args),
         SurfaceCommand::Rotate(args) => rotate(ctx, io, args, node),
+        SurfaceCommand::Rename(args) => rename(ctx, io, args),
     }
+}
+
+/// Saves a friendly name for a surface (or restores the default with `--clear`).
+fn rename(ctx: &Ctx, io: &mut dyn IoStreams, args: &SurfaceRenameArgs) -> Result<i32, CliError> {
+    require_home(ctx)?;
+    let id = parse_surface_id(&args.id)?;
+    let store = ctx.fleet_store()?;
+    let label = match (&args.label, args.clear) {
+        (Some(_), true) | (None, false) => {
+            return Err(CliError::Invalid(
+                "surface rename needs either a label or --clear".to_owned(),
+            ));
+        }
+        (label, _) => label.as_deref(),
+    };
+    store.set_surface_label(&id, label)?;
+    let saved = store.surface_label(&id)?.unwrap_or_default();
+    if ctx.json() {
+        print_json(io, &serde_json::json!({"surface": id, "label": saved}))?;
+    } else {
+        writeln!(io.out(), "surface {id} is now called {saved}")?;
+    }
+    Ok(0)
 }
 
 fn pair(ctx: &Ctx, io: &mut dyn IoStreams, args: &SurfacePairArgs, node: Option<&str>) -> Result<i32, CliError> {
@@ -72,6 +98,9 @@ fn pair(ctx: &Ctx, io: &mut dyn IoStreams, args: &SurfacePairArgs, node: Option<
             create_pending_surface(&store, &node, &session, kind, args.app.as_deref(), now)?
         }
     };
+    if let Some(label) = &args.label {
+        store.set_surface_label(&pending.surface.id, Some(label))?;
+    }
     append_index(ctx, &pending.surface.id)?;
     if let Some(old) = &replace {
         append_index(ctx, old)?;
@@ -129,7 +158,9 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, _args: &SurfaceLsArgs, node: Option<&
             continue;
         }
         let tokens = store.list_surface_tokens(&id)?;
-        entries.push(SurfaceEntry::from_row(row, &tokens, now));
+        let mut entry = SurfaceEntry::from_row(row, &tokens, now);
+        entry.label = store.surface_label(&id)?;
+        entries.push(entry);
     }
     entries.sort_by(|left, right| left.id.0.cmp(&right.id.0));
 
@@ -137,7 +168,9 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, _args: &SurfaceLsArgs, node: Option<&
         print_json(io, &entries)?;
         return Ok(0);
     }
-    let mut table = Table::new(&["ID", "NODE", "KIND", "STATE", "SCOPES", "PREFIX", "EXPIRES", "OVERLAP"]);
+    let mut table = Table::new(&[
+        "ID", "NODE", "KIND", "STATE", "SCOPES", "PREFIX", "EXPIRES", "OVERLAP", "LABEL",
+    ]);
     for entry in &entries {
         table.row(vec![
             entry.id.to_string(),
@@ -154,6 +187,7 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, _args: &SurfaceLsArgs, node: Option<&
                 })
                 .unwrap_or_else(|| "-".to_owned()),
             overlap_cell(entry, now, ctx.tz_offset_minutes()),
+            entry.label.clone().unwrap_or_else(|| "-".to_owned()),
         ]);
     }
     writeln!(io.out(), "{}", table.render(ctx.color()))?;
@@ -508,6 +542,9 @@ struct SurfaceEntry {
     node: NodeName,
     kind: SurfaceKind,
     state: SurfaceState,
+    /// Saved friendly name (or the derived default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     scopes: Vec<SurfaceScope>,
     /// Display prefix of the newest active token; never the token.
     prefix: Option<String>,
@@ -541,6 +578,7 @@ impl SurfaceEntry {
             node: row.surface.node,
             kind: row.surface.kind,
             state: row.surface.state,
+            label: None,
             scopes: row.scopes,
             prefix: row.prefix,
             expires_at: latest_expiry,

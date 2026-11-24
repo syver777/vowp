@@ -25,7 +25,7 @@ use vowp_protocol::{
     OrchestratorApp, OrchestratorCommand, OrchestratorError, OrchestratorNodeState, OrchestratorResult, Project,
     ProjectName, SessionId, SessionRole, Surface, SurfaceId, SurfaceKind, Timestamp, VowpConfig,
 };
-use vowp_store::{NodeCredential, NodePaths, Store, hash_lease_token};
+use vowp_store::{NodeCredential, NodePath, NodePaths, Store, hash_lease_token};
 
 use vowp_core::CoreError;
 use vowp_core::agent::auth;
@@ -167,6 +167,22 @@ impl TestEnv {
         store
             .set_node_status(node, NodeStatus::Revoked, "", store.clock().now())
             .expect("revoked node");
+    }
+
+    /// Reports the test project's checkout on `node`, as a live agent would.
+    fn map_project(&self, node: &NodeName) {
+        let store = self.store();
+        let root = self.project_path().display().to_string();
+        store
+            .upsert_node_path(&NodePath {
+                node: node.clone(),
+                project: self.project_name().clone(),
+                local_root: root.clone(),
+                worktree_root: root,
+                allow: Vec::new(),
+                updated_at: store.clock().now(),
+            })
+            .expect("node path map");
     }
 
     /// Returns one orchestrator's directory below the temporary home.
@@ -1874,20 +1890,47 @@ fn orchestrator_card_contains_no_path_or_secret() {
     assert_eq!(info.card.project.as_ref(), Some(env.project_name()));
 }
 
-/// Returns the built `vowp` binary next to the test harness.
+/// Returns the built `vowp` binary, resolving from `CARGO_BIN_EXE_vowp` or the workspace
+/// target directory so the lookup works regardless of Cargo's test-binary layout.
 fn vowp_binary() -> std::path::PathBuf {
-    let exe = std::env::current_exe().expect("test executable");
-    let candidate = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("target directory")
-        .join("vowp");
-    assert!(
-        candidate.is_file(),
-        "build the vowp binary first; missing {}",
-        candidate.display()
-    );
-    candidate
+    if let Some(path) = option_env!("CARGO_BIN_EXE_vowp").map(std::path::PathBuf::from)
+        && path.is_file()
+    {
+        return path;
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.is_absolute() { dir } else { manifest.join(dir) }
+        }
+        None => manifest.join("target"),
+    };
+    let name = format!("vowp{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates: Vec<std::path::PathBuf> = ["debug", "release"]
+        .iter()
+        .map(|profile| target.join(profile).join(&name))
+        .collect();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent().and_then(std::path::Path::parent)
+    {
+        candidates.push(dir.join(&name));
+    }
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    static BUILD: std::sync::Once = std::sync::Once::new();
+    BUILD.call_once(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let _ = std::process::Command::new(cargo)
+            .args(["build", "--quiet", "--bin", "vowp"])
+            .current_dir(&manifest)
+            .status();
+    });
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    panic!("build the vowp binary first; missing {}", candidates[0].display());
 }
 
 #[test]
@@ -1924,6 +1967,100 @@ fn orchestrator_chat_cli_round_trip() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("(chat, running)"), "{stdout}");
     assert_eq!(read_json(&state_path(&dir))["state"], "running");
+}
+
+#[test]
+fn orchestrator_move_requires_exactly_one_target_and_never_ssh_redirects() {
+    let env = TestEnv::new();
+    let (code, stdout, stderr) = env.run(&["orchestrator", "move", "missing"]);
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("exactly one of --node <NAME> or --home"), "{stderr}");
+
+    let (code, stdout, stderr) = env.run(&["orchestrator", "move", "missing", "--home", "--node", "mac-studio"]);
+    assert_eq!(code, 2, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("not both"), "{stderr}");
+
+    // The global `--node` is the move target, not an SSH redirect: an unknown orchestrator
+    // is a local NotFound (exit 3), not a remote SSH failure (exit 7).
+    let (code, stdout, stderr) = env.run(&["orchestrator", "move", "missing", "--node", "mac-studio"]);
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("orchestrator missing"), "{stderr}");
+    assert!(
+        !stderr.starts_with("remote:"),
+        "the command was SSH-redirected: {stderr}"
+    );
+}
+
+#[test]
+fn orchestrator_move_preserves_the_session_between_home_and_an_agent() {
+    let env = TestEnv::new();
+    let node = env.agent_node("mac-studio");
+    env.map_project(&node);
+    let agent = FakeAgent::start(env.home_path(), &node);
+
+    let (code, stdout, stderr) = env.run(&["orchestrator", "new", "--name", "mover", "--app", "chat"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let dir = env.orchestrator_dir("mover");
+    let session = read_json(&state_path(&dir))["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let (code, card, stderr) = env.run_json(&["orchestrator", "move", "mover", "--node", node.as_str()]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(card["name"], "mover");
+    assert_eq!(card["session_id"], session);
+    assert_eq!(card["node"], "mac-studio");
+    assert_eq!(card["state"], "running");
+    let state = read_json(&state_path(&dir));
+    assert_eq!(state["session_id"], session);
+    assert_eq!(state["node"], "mac-studio");
+    assert_eq!(state["state"], "running");
+    assert!(matches!(
+        agent.commands().last(),
+        Some(OrchestratorCommand::Start { name, .. }) if name == "mover"
+    ));
+
+    let (code, card, stderr) = env.run_json(&["orchestrator", "move", "mover", "--home"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(card["name"], "mover");
+    assert_eq!(card["session_id"], session);
+    assert!(card["node"].is_null(), "the moved card still names a node: {card}");
+    assert_eq!(card["state"], "running");
+    let state = read_json(&state_path(&dir));
+    assert_eq!(state["session_id"], session);
+    assert!(state["node"].is_null(), "the state still names a node: {state}");
+    assert_eq!(state["state"], "running");
+    let commands = agent.commands();
+    assert!(matches!(
+        commands.first(),
+        Some(OrchestratorCommand::Start { name, .. }) if name == "mover"
+    ));
+    assert!(matches!(
+        commands.last(),
+        Some(OrchestratorCommand::Stop { name, .. }) if name == "mover"
+    ));
+}
+
+#[test]
+fn orchestrator_move_to_a_revoked_node_keeps_the_home_host_running() {
+    let env = TestEnv::new();
+    let node = env.agent_node("mac-studio");
+    let (code, stdout, stderr) = env.run(&["orchestrator", "new", "--name", "mover", "--app", "chat"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let dir = env.orchestrator_dir("mover");
+    let session = read_json(&state_path(&dir))["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    env.revoke_node(&node);
+
+    let (code, stdout, stderr) = env.run(&["orchestrator", "move", "mover", "--node", node.as_str()]);
+    assert_eq!(code, 5, "stdout: {stdout}\nstderr: {stderr}");
+    let state = read_json(&state_path(&dir));
+    assert_eq!(state["session_id"], session);
+    assert!(state["node"].is_null(), "a refused move changed the placement: {state}");
+    assert_eq!(state["state"], "running");
 }
 
 #[test]
@@ -2011,4 +2148,471 @@ fn orchestrator_session_is_visible_to_fleet_snapshot() {
     assert_eq!(snapshot.orchestrators.len(), 1, "{:?}", snapshot.orchestrators);
     assert_eq!(snapshot.orchestrators[0].name, "snap");
     assert_eq!(snapshot.orchestrators[0].app, OrchestratorApp::Chat);
+}
+
+/// A runtime-assembled marker password; no secret-shaped literal is committed.
+fn endpoint_password(label: &str) -> String {
+    format!("vowp-test-{label}-{}", "E".repeat(20))
+}
+
+/// Writes one private `orchestrator.json` for an endpoint test.
+fn write_endpoint_state(env: &TestEnv, name: &str, node: Option<NodeName>) -> (PathBuf, SessionId) {
+    let dir = env.orchestrator_dir(name);
+    std::fs::create_dir_all(&dir).expect("orchestrator dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("orchestrator mode");
+    let session = SessionId::new();
+    let value = serde_json::json!({
+        "name": name,
+        "app": "opencode",
+        "session_id": session,
+        "project": null,
+        "executor": null,
+        "state": "running",
+        "created_at": Timestamp::now(),
+        "join": {
+            "desktop": format!("vowp orchestrator resume {name}"),
+            "phone": format!("vowp chat {session}"),
+            "chat": format!("vowp chat --agent --session {session}"),
+        },
+        "surface_id": null,
+        "node": node,
+        "last_request_id": null,
+    });
+    std::fs::write(state_path(&dir), serde_json::to_vec(&value).expect("state JSON")).expect("orchestrator.json");
+    std::fs::set_permissions(state_path(&dir), std::fs::Permissions::from_mode(0o600)).expect("state mode");
+    (dir, session)
+}
+
+/// Writes one live `host.json` shaped like the opencode host's own file.
+fn write_endpoint_host(dir: &Path, port: u16) {
+    let value = serde_json::json!({
+        "kind": "opencode",
+        "name": "endpoint",
+        "pid": std::process::id(),
+        "port": port,
+        "url": format!("http://127.0.0.1:{port}"),
+        "started_at": Timestamp::now(),
+        "workdir": dir.display().to_string(),
+        "service_json": dir.join(".opencode/state/opencode/service.json").display().to_string(),
+        "native_session_id": "ses_cli_endpoint",
+        "vowp_session": SessionId::new(),
+    });
+    std::fs::write(dir.join("host.json"), serde_json::to_vec(&value).expect("host JSON")).expect("host.json");
+    std::fs::set_permissions(dir.join("host.json"), std::fs::Permissions::from_mode(0o600)).expect("host mode");
+}
+
+/// Writes the private opencode `service.json` below `dir`.
+fn write_endpoint_service(dir: &Path, url: &str, port: u16, password: &str) {
+    let path = dir.join(".opencode/state/opencode/service.json");
+    let parent = path.parent().expect("service parent");
+    std::fs::create_dir_all(parent).expect("service dir");
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).expect("service dir mode");
+    let value = serde_json::json!({
+        "version": "2.0.28",
+        "url": url,
+        "port": port,
+        "pid": std::process::id(),
+        "password": password,
+    });
+    std::fs::write(&path, serde_json::to_vec(&value).expect("service JSON")).expect("service.json");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("service mode");
+}
+
+#[test]
+fn orchestrator_endpoint_json_reports_home_and_node_locations() {
+    let env = TestEnv::new();
+    let (home_dir, home_session) = write_endpoint_state(&env, "home-main", None);
+    let password = endpoint_password("home");
+    write_endpoint_host(&home_dir, 45111);
+    write_endpoint_service(&home_dir, "http://127.0.0.1:45111", 45111, &password);
+    let node = env.agent_node("mac-studio");
+    write_endpoint_state(&env, "mac-main", Some(node));
+
+    let (code, value, stderr) = env.run_json(&["orchestrator", "endpoint", "home-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["name"], "home-main");
+    assert_eq!(value["location"], "home");
+    assert!(value["node"].is_null(), "{value}");
+    assert_eq!(value["session_id"], home_session.as_str());
+    assert_eq!(value["state"], "running");
+    assert_eq!(value["url"], "http://127.0.0.1:45111");
+    assert_eq!(value["native_session_id"], "ses_cli_endpoint");
+    assert_eq!(value["auth"]["header"], "Authorization");
+    assert_eq!(value["auth"]["scheme"], "Basic");
+    assert_eq!(value["auth"]["username"], "opencode");
+    assert_eq!(value["auth"]["password"], password);
+
+    let (code, node_value, stderr) = env.run_json(&["orchestrator", "endpoint", "mac-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(node_value["name"], "mac-main");
+    assert_eq!(node_value["location"], "node");
+    assert_eq!(node_value["node"], "mac-studio");
+    assert_eq!(node_value["state"], "running");
+    assert!(node_value["url"].is_null(), "{node_value}");
+    assert!(node_value["native_session_id"].is_null(), "{node_value}");
+    assert!(node_value["auth"].is_null(), "{node_value}");
+
+    // The global `--node` is not an SSH redirect for this inspection command: it is
+    // consumed locally and the home record is still read from this home.
+    let (code, value, stderr) = env.run_json(&["--node", "mac-studio", "orchestrator", "endpoint", "home-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["location"], "home");
+    assert_eq!(value["url"], "http://127.0.0.1:45111");
+
+    let (code, stdout, stderr) = env.run(&["orchestrator", "endpoint", "mac-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("vowp agent orchestrator endpoint mac-main --json"),
+        "the human output points at the agent machine: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&password),
+        "the human output carries no password: {stdout}"
+    );
+}
+
+#[test]
+fn orchestrator_endpoint_remote_never_returns_auth() {
+    let env = TestEnv::new();
+    let node = env.agent_node("mac-studio");
+    let (dir, _session) = write_endpoint_state(&env, "mac-main", Some(node));
+    // Bait: a node record's home directory has no local host, and even a stray service
+    // file must not become credentials in the metadata-only document.
+    let password = endpoint_password("remote");
+    write_endpoint_host(&dir, 45112);
+    write_endpoint_service(&dir, "http://127.0.0.1:45112", 45112, &password);
+
+    let (code, value, stderr) = env.run_json(&["orchestrator", "endpoint", "mac-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["location"], "node");
+    assert!(value["auth"].is_null(), "a remote endpoint has no auth: {value}");
+    assert!(value["url"].is_null(), "a remote endpoint has no url: {value}");
+    assert!(value["native_session_id"].is_null(), "{value}");
+    let text = value.to_string();
+    assert!(!text.contains(&password), "the remote document carries no password");
+    assert!(!text.contains("45112"), "the remote document carries no port");
+
+    let (code, text, stderr) = env.run(&["orchestrator", "endpoint", "mac-main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        text.contains("vowp agent orchestrator endpoint mac-main --json"),
+        "the owner is told where to run the local command: {text}"
+    );
+    assert!(!text.contains(&password), "the human output carries no password");
+
+    let (code, _stdout, stderr) = env.run(&["orchestrator", "endpoint", "missing"]);
+    assert_eq!(code, 3, "an unknown orchestrator is not found: {stderr}");
+}
+
+#[test]
+fn orchestrator_endpoint_redacts_a_corrupt_private_file_error() {
+    let env = TestEnv::new();
+    let (dir, _session) = write_endpoint_state(&env, "corrupt-main", None);
+    write_endpoint_host(&dir, 45113);
+    let password = endpoint_password("corrupt");
+    let service = dir.join(".opencode/state/opencode/service.json");
+    let parent = service.parent().expect("service parent");
+    std::fs::create_dir_all(parent).expect("service dir");
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).expect("service dir mode");
+    std::fs::write(
+        &service,
+        format!("{{\"url\":\"http://127.0.0.1:45113\",\"password\":\"{password}\","),
+    )
+    .expect("corrupt service");
+    std::fs::set_permissions(&service, std::fs::Permissions::from_mode(0o600)).expect("service mode");
+
+    let (code, stdout, stderr) = env.run(&["--json", "orchestrator", "endpoint", "corrupt-main"]);
+    assert_ne!(code, 0, "a corrupt service file is an error; stdout: {stdout}");
+    let text = format!("{stdout}\n{stderr}");
+    assert!(
+        text.contains("corrupt-main"),
+        "the error names the orchestrator: {text}"
+    );
+    for forbidden in [
+        password.as_str(),
+        service.to_str().expect("service path"),
+        dir.to_str().expect("orchestrator dir"),
+        "45113",
+        "127.0.0.1",
+        "service.json",
+    ] {
+        assert!(!text.contains(forbidden), "the error leaked a forbidden value: {text}");
+    }
+
+    // A corrupt home record names the orchestrator, never its path.
+    let (broken, _session) = write_endpoint_state(&env, "broken", None);
+    std::fs::write(state_path(&broken), b"{\"name\":").expect("corrupt record");
+    std::fs::set_permissions(state_path(&broken), std::fs::Permissions::from_mode(0o600)).expect("record mode");
+    let (code, stdout, stderr) = env.run(&["orchestrator", "endpoint", "broken"]);
+    let text = format!("{stdout}\n{stderr}");
+    assert_eq!(code, 2, "a corrupt home record is invalid input: {text}");
+    assert!(text.contains("broken"), "the error names the orchestrator: {text}");
+    for forbidden in [
+        broken.to_str().expect("broken dir"),
+        state_path(&broken).to_str().expect("record path"),
+        "orchestrator.json",
+    ] {
+        assert!(!text.contains(forbidden), "the error leaked a forbidden value: {text}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `vowp orchestrator attach` and the owner/access view of `endpoint`
+// ---------------------------------------------------------------------------
+
+/// Writes a live home-hosted orchestrator bound to a real session in the test project.
+fn live_attach_target(env: &TestEnv, name: &str, password: &str) -> SessionId {
+    let session = vowp_core::session::service::SessionService::new(deps(env))
+        .create_session(vowp_protocol::NewSession {
+            project: Some(env.project_name().clone()),
+            job_id: None,
+            role: SessionRole::Orchestrator,
+            title: format!("orchestrator {name}"),
+            cwd: PathBuf::from("."),
+            parent: None,
+            executor: None,
+        })
+        .expect("session");
+    let (dir, _unused) = write_endpoint_state(env, name, None);
+    let mut state = read_json(&state_path(&dir));
+    state["session_id"] = serde_json::json!(session);
+    state["project"] = serde_json::json!(env.project_name());
+    std::fs::write(state_path(&dir), serde_json::to_vec(&state).expect("state JSON")).expect("orchestrator.json");
+    std::fs::set_permissions(state_path(&dir), std::fs::Permissions::from_mode(0o600)).expect("state mode");
+    write_endpoint_host(&dir, 45901);
+    write_endpoint_service(&dir, "http://127.0.0.1:45901", 45901, password);
+    session
+}
+
+fn lease_row(env: &TestEnv, session: &SessionId) -> Option<vowp_store::repo_surfaces::OwnerRecord> {
+    env.store().ownership(session).expect("ownership")
+}
+
+#[test]
+fn orchestrator_attach_json_prints_a_clean_grant_and_the_notice_goes_to_stderr() {
+    let env = TestEnv::new();
+    let password = endpoint_password("attach-json");
+    let session = live_attach_target(&env, "main", &password);
+
+    // The in-process stdin is empty, so the hold ends at once and releases the lease.
+    let (code, stdout, stderr) = env.run(&[
+        "--json",
+        "orchestrator",
+        "attach",
+        "main",
+        "--holder",
+        "opencode-desktop",
+        "--label",
+        "StackSpirit · macbook",
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let value: Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|error| panic!("stdout is not JSON: {error}: {stdout}"));
+    let token = value["token"].as_str().expect("token");
+    assert_eq!(token.len(), 52);
+    assert_eq!(value["owner"]["kind"], "desktop_ui");
+    assert_eq!(value["owner"]["holder"], "opencode-desktop");
+    assert_eq!(value["owner"]["label"], "StackSpirit · macbook");
+    assert_eq!(value["endpoint"]["access"], "owner");
+    assert_eq!(value["endpoint"]["url"], "http://127.0.0.1:45901");
+    assert_eq!(
+        value["endpoint"]["auth"]["password"], password,
+        "the JSON path keeps the password"
+    );
+    assert!(value["expires_at"].is_string() && value["surface_id"].is_string());
+    assert!(
+        stderr.contains("attach: holding ownership; close stdin to release"),
+        "the hold notice is on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("closing stdin releases"),
+        "the warning is on stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("holding ownership"),
+        "stdout stays JSON only: {stdout}"
+    );
+    assert!(
+        !stderr.contains(token) && !stderr.contains(&password),
+        "stderr never carries a secret"
+    );
+    assert!(lease_row(&env, &session).is_none(), "EOF on stdin released the lease");
+}
+
+#[test]
+fn orchestrator_attach_human_block_has_the_grant_fields_and_no_password() {
+    let env = TestEnv::new();
+    let password = endpoint_password("attach-human");
+    live_attach_target(&env, "main", &password);
+    let (code, stdout, stderr) = env.run(&["orchestrator", "attach", "main", "--holder", "ui"]);
+    assert_eq!(code, 0, "{stderr}");
+    for key in [
+        "surface: ",
+        "holder: ui",
+        "token: ",
+        "access: owner",
+        "url: http://127.0.0.1:45901",
+        "expires: ",
+    ] {
+        assert!(stdout.contains(key), "missing {key:?}: {stdout}");
+    }
+    assert!(
+        !stdout.contains(&password),
+        "the human block never prints the password: {stdout}"
+    );
+    assert!(!stderr.contains(&password));
+}
+
+#[test]
+fn orchestrator_attach_refuses_node_hosted_stopped_and_live_owner() {
+    let env = TestEnv::new();
+    let password = endpoint_password("attach-refuse");
+    let node = env.agent_node("mac-studio");
+    write_endpoint_state(&env, "mac-main", Some(node));
+    let (code, stdout, stderr) = env.run(&["orchestrator", "attach", "mac-main", "--holder", "ui"]);
+    assert_ne!(code, 0, "a node-hosted orchestrator is refused: {stdout}");
+    assert!(stderr.contains("mac-main") && stderr.contains("node"), "{stderr}");
+
+    let (dir, _session) = write_endpoint_state(&env, "stopped", None);
+    let mut state = read_json(&state_path(&dir));
+    state["state"] = serde_json::json!("stopped");
+    std::fs::write(state_path(&dir), serde_json::to_vec(&state).expect("state JSON")).expect("orchestrator.json");
+    let (code, _stdout, stderr) = env.run(&["orchestrator", "attach", "stopped", "--holder", "ui"]);
+    assert_ne!(code, 0);
+    assert!(stderr.contains("vowp orchestrator resume stopped"), "{stderr}");
+
+    let session = live_attach_target(&env, "main", &password);
+    let core = Orchestrator::new(deps(&env));
+    let held = core.attach("main", "first-ui", None, false).expect("first attach");
+    let (code, _stdout, stderr) = env.run(&["orchestrator", "attach", "main", "--holder", "second-ui"]);
+    assert_ne!(code, 0, "a live owner refuses an attach without --takeover");
+    assert!(stderr.contains("first-ui"), "{stderr}");
+    assert!(!stderr.contains(&password) && !stderr.contains(&held.grant().token));
+    let (code, _stdout, stderr) = env.run(&["orchestrator", "attach", "main", "--holder", "second-ui", "--takeover"]);
+    assert_eq!(code, 0, "{stderr}");
+    drop(held);
+    let _ = session;
+}
+
+#[test]
+fn orchestrator_endpoint_reports_owner_and_access_for_a_surface() {
+    let env = TestEnv::new();
+    let password = endpoint_password("endpoint-owner");
+    let session = live_attach_target(&env, "main", &password);
+    let core = Orchestrator::new(deps(&env));
+    let guard = core
+        .attach("main", "opencode-desktop", Some("StackSpirit"), false)
+        .expect("attach");
+    let surface = guard.grant().surface_id.to_string();
+
+    let (code, value, stderr) = env.run_json(&["orchestrator", "endpoint", "main"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["access"], "read_only", "no caller identity is read-only");
+    assert_eq!(value["owner"]["holder"], "opencode-desktop");
+    assert_eq!(value["owner"]["session_id"], session.as_str());
+    let (code, value, stderr) = env.run_json(&["orchestrator", "endpoint", "main", "--surface", &surface]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["access"], "owner");
+
+    let (code, text, stderr) = env.run(&["orchestrator", "endpoint", "main", "--surface", &surface]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(text.contains("access: owner"), "{text}");
+    assert!(
+        text.contains("owner: StackSpirit (desktop-ui) holder opencode-desktop"),
+        "{text}"
+    );
+    assert!(text.contains("mode interactive state active"), "{text}");
+    assert!(
+        !text.contains(&password),
+        "the human output carries no password: {text}"
+    );
+
+    let (code, text, _stderr) = env.run(&["orchestrator", "endpoint", "main", "--surface", "not-an-id"]);
+    assert_eq!(code, 2, "a malformed surface id is invalid input: {text}");
+    drop(guard);
+}
+
+#[test]
+fn attach_holds_the_lease_until_stdin_closes_and_then_releases_it() {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let env = TestEnv::new();
+    let password = endpoint_password("attach-hold");
+    let session = live_attach_target(&env, "main", &password);
+    let mut child = Command::new(vowp_binary())
+        .args([
+            "--home",
+            &env.home_path().display().to_string(),
+            "--project",
+            &env.project_path().display().to_string(),
+            "--json",
+            "orchestrator",
+            "attach",
+            "main",
+            "--holder",
+            "ui-child",
+        ])
+        .env("NO_COLOR", "1")
+        .env_remove("VOWP_HOME")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vowp orchestrator attach");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    // The grant is one pretty-printed JSON document; the process keeps stdout open, so parse
+    // exactly one value instead of reading to end-of-file.
+    let grant: Value = serde_json::Deserializer::from_reader(&mut stdout)
+        .into_iter::<Value>()
+        .next()
+        .expect("a grant document")
+        .expect("the grant is JSON");
+    let token = grant["token"].as_str().expect("token").to_owned();
+
+    // While stdin is open the lease is held and belongs to this grant.
+    let held = lease_row(&env, &session).expect("the attach process holds the lease");
+    assert_eq!(held.lease.token, hash_lease_token(&token));
+    assert_eq!(held.lease.holder, "ui-child");
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "the process keeps running while stdin is open"
+    );
+    assert!(lease_row(&env, &session).is_some());
+
+    drop(child.stdin.take()); // EOF
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the attach process did not exit after stdin closed"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "attach exits 0 after release: {status:?}");
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).expect("rest of stdout");
+    assert!(rest.trim().is_empty(), "stdout carries only the grant: {rest:?}");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr")
+        .read_to_string(&mut stderr)
+        .expect("stderr");
+    assert!(
+        stderr.contains("attach: holding ownership; close stdin to release"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&token) && !stderr.contains(&password));
+    assert!(
+        lease_row(&env, &session).is_none(),
+        "closing stdin released the lease row"
+    );
 }

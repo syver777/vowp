@@ -946,6 +946,7 @@ fn class_names_round_trip_through_the_parser() {
         CatalogClass::ClosedSession,
         CatalogClass::RunOutput,
         CatalogClass::Worktree,
+        CatalogClass::JobWindow,
         CatalogClass::Sample,
         CatalogClass::Cache,
     ] {

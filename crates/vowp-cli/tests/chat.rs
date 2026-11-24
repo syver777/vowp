@@ -1278,10 +1278,26 @@ fn fake_ssh(env: &common::TestEnv) -> PathBuf {
     dir
 }
 
+/// Writes the prompt to an agent chat child, tolerating a child that already exited.
+///
+/// `vowp chat --agent` exits 3 before reading stdin when the agent has no paired
+/// surface. On a loaded machine the child can win the race, so its stdin pipe has no
+/// reader by the time the test writes and `write_all` reports `EPIPE`. That only means
+/// the prompt was never delivered; the caller still asserts the real exit code and
+/// stderr. Any other write error is a genuine failure.
+fn write_prompt(child: &mut Child, input: &str) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        // The child is already gone, so nobody can read the prompt.
+        return;
+    }
+    let stdin = child.stdin.as_mut().expect("stdin");
+    if let Err(error) = stdin.write_all(input.as_bytes()) {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "write prompt: {error}");
+    }
+}
+
 /// Runs `vowp chat --agent` with a private agent home and fake ssh.
 fn run_agent_chat(env: &common::TestEnv, agent_dir: &Path, session: &str, input: &str) -> (i32, String, String) {
-    use std::io::Write as _;
-
     let bin = fake_ssh(env);
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
     let mut child = env
@@ -1298,12 +1314,7 @@ fn run_agent_chat(env: &common::TestEnv, agent_dir: &Path, session: &str, input:
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn agent chat");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write prompt");
+    write_prompt(&mut child, input);
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait for agent chat");
     (
@@ -1326,8 +1337,6 @@ fn run_agent_chat_without_home(
     session: &str,
     input: &str,
 ) -> (i32, String, String) {
-    use std::io::Write as _;
-
     let mut command = env.command(env!("CARGO_BIN_EXE_vowp"));
     command
         .env("HOME", mac_home)
@@ -1348,12 +1357,7 @@ fn run_agent_chat_without_home(
         command.env("VOWP_CONTROL_HOME", control);
     }
     let mut child = command.spawn().expect("spawn agent chat without a home");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write prompt");
+    write_prompt(&mut child, input);
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait for agent chat");
     (
@@ -1503,6 +1507,32 @@ fn chat_agent_requires_a_paired_surface() {
     assert_eq!(code, 3, "{stderr}");
     assert!(stderr.contains("paired surface"), "{stderr}");
     assert!(!stderr.contains("not implemented"), "{stderr}");
+}
+
+#[test]
+fn write_prompt_tolerates_a_child_that_already_exited() {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 7"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn immediate exit");
+    // Poll instead of `wait`: `wait` closes stdin, while `try_wait` leaves the pipe
+    // open on our side so the writer takes the same EPIPE path as the flaky run.
+    assert!(
+        wait_until(Duration::from_secs(5), || matches!(child.try_wait(), Ok(Some(_)))),
+        "the immediate child should exit"
+    );
+    let status = child.try_wait().expect("poll immediate exit").expect("child exited");
+    assert_eq!(status.code(), Some(7));
+
+    // The child closed stdin before this large write: the shared writer must skip or
+    // absorb EPIPE. The old `.expect("write prompt")` path panicked here.
+    write_prompt(&mut child, &"a prompt nobody reads\n".repeat(64 * 1024));
+
+    let status = child.wait().expect("wait after prompt");
+    assert_eq!(status.code(), Some(7), "the writer leaves the child's status untouched");
 }
 
 #[test]

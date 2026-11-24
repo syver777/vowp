@@ -49,6 +49,11 @@ Exported by `vowp schema GcReport` and generated from the protocol types in
           "type": "string"
         },
         {
+          "const": "job_window",
+          "description": "Tagged `job-<id>` tmux windows whose job is no longer active.",
+          "type": "string"
+        },
+        {
           "const": "sample",
           "description": "Host samples.",
           "type": "string"

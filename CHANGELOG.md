@@ -12,6 +12,49 @@ features deliberately left out of v0.4 are in [`docs/roadmap.md`](docs/roadmap.m
 
 ## [Unreleased]
 
+The six v0.5 slices are implemented and gated in the tree. The workspace version is now `0.5.1-dev`;
+`0.5.0` is the private snapshot tag (`snapshot/0.5.0-private`), not a release. No release date has
+been cut and the latest public release remains 0.4.0 (2026-11-18).
+
+### Changed
+
+- The workspace, crate, packaging and version-test strings now report `0.5.1-dev`, so
+  `vowp --version` prints `vowp 0.5.1-dev` instead of `vowp 0.4.0`.
+
+### Added
+
+- **v0.5 Slice 1 — live snapshot streams.** `GET /api/v1/jobs/stream`,
+  `GET /api/v1/jobs/{id}/stream`, `GET /api/v1/cost/stream`, `GET /api/v1/inbox/stream` and
+  `GET /api/v1/nodes/stream` send one initial snapshot and then changed-only frames with
+  heartbeats, `Cache-Control: no-store` and the existing polling fallback; the `/jobs`,
+  `/jobs/{id}`, `/cost`, `/inbox` and `/nodes` pages reconnect with bounded backoff and refresh
+  after keeper actions. See [`docs/design/v0.5/live-streams.md`](docs/design/v0.5/live-streams.md).
+- **v0.5 Slice 2 — orchestrator move.** `vowp orchestrator move <name> (--node <n> | --home)`
+  validates the target, stops the old host, releases its lease, writes a handoff capsule and
+  starts the orchestrator on the target with the **same `SessionId`** and home log; the agent
+  consumes the move as a `Start`, and the session row's node and cwd follow it. See
+  [`docs/design/v0.4/local-orchestrator.md`](docs/design/v0.4/local-orchestrator.md) §5.7.
+- **v0.5 Slice 3 — orchestrator endpoint discovery.** `vowp orchestrator endpoint <name> --json`
+  and `vowp agent orchestrator endpoint <name> --json` return the typed `OrchestratorEndpoint`
+  document. The app password appears only in the explicit local command's `--json` output, never
+  in a card, snapshot, log or error. See
+  [`docs/design/v0.5/orchestrator-endpoint.md`](docs/design/v0.5/orchestrator-endpoint.md).
+- **v0.5 Slice 4 — one-step project bootstrap.** `vowp project add` accepts `--git <url>`,
+  `--init` and `--orchestrator <app>`, clones with argv-only git and a credential-free
+  environment, initialises only an uninitialised checkout, registers it and returns one
+  `{project,path,initialized,orchestrator}` summary. See
+  [`docs/design/v0.5/project-bootstrap.md`](docs/design/v0.5/project-bootstrap.md).
+- **v0.5 Slice 5 — encrypted vault mode.** `vowp secret upgrade --encrypted` stores basic-mode
+  values as age ciphertext under `~/.vowp/secrets/encrypted/` with a mode-0600 `age.key`;
+  `vowp secret set <NAME> --stdin` reads a value without a TTY, and `vowp secret ls --json`
+  reports `mode`. `systemd-creds` is not implemented. See
+  [`docs/design/v0.5/vault-encrypted.md`](docs/design/v0.5/vault-encrypted.md).
+- **v0.5 Slice 6 — pooled cluster capacity.** Admission checks home runs against home and an
+  eligible offloaded run against the online worker node's slots and headroom; `capacity report`,
+  `fleet status` and the snapshot carry an additive `cluster` card with
+  `online_worker_nodes`, `target_workers`, `busy_workers`, CPU, memory and free disk. See
+  [`docs/concepts/capacity.md`](docs/concepts/capacity.md#cluster-capacity).
+
 ## [0.4.0] - 2026-11-18
 
 The v0.4 feature set: outbound Mac and Linux agent nodes, paired local `vowp chat` and opencode

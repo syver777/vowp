@@ -1883,3 +1883,172 @@ fn backup_to_offsite_rotates_default_backups() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Secrets: non-interactive set and the `ls --json` mode wrapper
+// ---------------------------------------------------------------------------
+
+/// Runs one command in-process with `input` on stdin.
+fn run_with_stdin(env: &common::TestEnv, args: &[&str], input: &str) -> (i32, String, String) {
+    let mut full = vec![
+        "vowp".to_owned(),
+        "--home".to_owned(),
+        env.home_path().display().to_string(),
+        "--project".to_owned(),
+        env.project_path().display().to_string(),
+    ];
+    full.extend(args.iter().map(|value| (*value).to_owned()));
+    let mut io = BufferIo::new(input);
+    let code = vowp_cli::run(full, &mut io);
+    (code, io.stdout(), io.stderr())
+}
+
+/// Fails when any regular file below `root` contains `value` as an exact byte string.
+fn assert_no_plaintext_below(root: &Path, value: &str) {
+    let needle = value.as_bytes();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).expect("walk home") {
+            let entry = entry.expect("home entry");
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).expect("home metadata");
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).expect("home file");
+                assert!(
+                    !bytes.windows(needle.len()).any(|window| window == needle),
+                    "plaintext secret value found in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn secret_set_stdin_and_ls_json_report_the_mode_without_values() {
+    let env = common::TestEnv::new();
+    let secrets = env.home_path().join("secrets");
+    std::fs::create_dir_all(&secrets).expect("secrets dir");
+    std::fs::write(secrets.join("mode"), "encrypted\n").expect("mode file");
+    let value = "cli-stdin-secret-4f2a";
+
+    let (code, stdout, stderr) = run_with_stdin(
+        &env,
+        &["secret", "set", "CLI_STDIN_KEY", "--stdin"],
+        &format!("{value}\n"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stdout.contains(value), "stdout carried the value: {stdout}");
+    assert!(!stderr.contains(value), "stderr carried the value: {stderr}");
+    assert!(
+        stdout.contains("CLI_STDIN_KEY saved") && stdout.contains("4f2a"),
+        "{stdout}"
+    );
+
+    let (code, document, stderr) = env.run_json(&["secret", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(document["mode"], "encrypted");
+    let listed = document["secrets"].as_array().expect("secrets array");
+    assert_eq!(listed.len(), 1, "{document}");
+    assert_eq!(listed[0]["name"], "CLI_STDIN_KEY");
+    assert_eq!(listed[0]["last4"], "4f2a");
+    assert!(listed[0]["created_at"].as_str().is_some(), "{document}");
+    assert!(listed[0]["updated_at"].as_str().is_some(), "{document}");
+    let text = document.to_string();
+    assert!(!text.contains(value), "the JSON document carried the value: {text}");
+
+    assert_no_plaintext_below(env.home_path(), value);
+    assert!(
+        secrets.join("encrypted/CLI_STDIN_KEY").is_file(),
+        "the ciphertext is stored under secrets/encrypted"
+    );
+    assert!(!secrets.join("CLI_STDIN_KEY").exists());
+
+    let (code, stdout, stderr) = env.run(&["secret", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("CLI_STDIN_KEY"), "{stdout}");
+    assert!(stdout.contains("storage: encrypted"), "{stdout}");
+    assert!(!stdout.contains(value), "{stdout}");
+}
+
+#[test]
+fn secret_ls_json_is_an_object_and_rm_keeps_its_shape() {
+    let env = common::TestEnv::new();
+    let value = "basic-cli-value-7c8d";
+    let (code, stdout, stderr) = run_with_stdin(
+        &env,
+        &["secret", "set", "BASIC_CLI_KEY", "--stdin"],
+        &format!("{value}\r\n"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stdout.contains(value), "{stdout}");
+    assert!(!stderr.contains(value), "{stderr}");
+
+    let (code, document, stderr) = env.run_json(&["secret", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    let object = document.as_object().expect("`ls --json` is one object");
+    assert_eq!(object.len(), 2, "{document}");
+    assert_eq!(document["mode"], "basic");
+    let listed = document["secrets"].as_array().expect("secrets array");
+    assert_eq!(listed.len(), 1, "{document}");
+    assert_eq!(listed[0]["name"], "BASIC_CLI_KEY");
+    assert_eq!(listed[0]["last4"], "7c8d");
+    assert!(!document.to_string().contains(value));
+
+    let (code, removed, stderr) = env.run_json(&["secret", "rm", "BASIC_CLI_KEY", "--yes"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        removed,
+        serde_json::json!({"name": "BASIC_CLI_KEY", "removed": true}),
+        "`secret rm --json` keeps its name/removed shape"
+    );
+}
+
+#[test]
+fn secret_set_stdin_refuses_an_empty_value() {
+    let env = common::TestEnv::new();
+    let (code, stdout, stderr) = run_with_stdin(&env, &["secret", "set", "EMPTY_KEY", "--stdin"], "\n");
+    assert_eq!(code, 2, "an empty value is invalid input: {stderr}");
+    assert!(!stdout.contains("EMPTY_KEY saved"), "{stdout}");
+    assert!(stderr.contains("must not be empty"), "{stderr}");
+}
+
+#[test]
+fn secret_upgrade_encrypted_switches_the_mode_and_keeps_metadata() {
+    let env = common::TestEnv::new();
+    let value = "upgrade-cli-value-9e1f";
+    let (code, _stdout, stderr) = run_with_stdin(
+        &env,
+        &["secret", "set", "UPGRADE_CLI_KEY", "--stdin"],
+        &format!("{value}\n"),
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, before, stderr) = env.run_json(&["secret", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(before["mode"], "basic");
+    assert_eq!(before["secrets"][0]["last4"], "9e1f");
+    let created_at = before["secrets"][0]["created_at"].clone();
+    let updated_at = before["secrets"][0]["updated_at"].clone();
+
+    let (code, stdout, stderr) = env.run(&["secret", "upgrade", "--encrypted"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("secrets: encrypted"), "{stdout}");
+    assert!(!stdout.contains(value) && !stderr.contains(value));
+
+    let (code, after, stderr) = env.run_json(&["secret", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(after["mode"], "encrypted");
+    assert_eq!(after["secrets"][0]["name"], "UPGRADE_CLI_KEY");
+    assert_eq!(after["secrets"][0]["last4"], "9e1f");
+    assert_eq!(after["secrets"][0]["created_at"], created_at);
+    assert_eq!(after["secrets"][0]["updated_at"], updated_at);
+    assert_no_plaintext_below(env.home_path(), value);
+    assert!(env.home_path().join("secrets/encrypted/UPGRADE_CLI_KEY").is_file());
+    assert!(!env.home_path().join("secrets/UPGRADE_CLI_KEY").exists());
+
+    let (code, stdout, stderr) = env.run(&["secret", "upgrade", "--encrypted"]);
+    assert_eq!(code, 0, "the second upgrade is idempotent: {stderr}");
+    assert!(stdout.contains("secrets: encrypted"), "{stdout}");
+}

@@ -348,21 +348,47 @@ pub(crate) fn default_branch(deps: &Deps) -> &str {
 
 /// Returns the provider limits that are in force at `now`, keyed by provider.
 ///
-/// A quota/rate row whose reset time has passed stays blocking while its probe-back is
-/// still owed: the preferred rung returns only after a successful probe (loops.md §8.5).
+/// A quota/rate/unavailable row blocks while its reset is in the future. An owed probe-back
+/// adds a **bounded** block until its deadline (loops.md §8.5); once the deadline passes the
+/// provider is eligible again even when no probe has succeeded, so a lost probe cannot park a
+/// healthy sibling rung forever. `credits` and `auth` stay sticky until the owner resolves
+/// them.
 pub(crate) fn limited_map(store: &Store, now: Timestamp) -> Result<BTreeMap<String, Option<Timestamp>>, CoreError> {
     let mut limited = BTreeMap::new();
     for limit in store.active_limits(now)? {
         limited.insert(limit.provider, limit.resets_at);
     }
     for (key, value) in store.kv_prefix("probe_back:")? {
-        if value != "1" {
+        if value == "0" {
             continue;
         }
-        let provider = key.trim_start_matches("probe_back:");
-        if store.limit_for(provider)?.is_some() {
-            limited.insert(provider.to_owned(), None);
+        let Some(provider) = key.strip_prefix("probe_back:") else {
+            continue;
+        };
+        let Some(limit) = store.limit_for(provider)? else {
+            // A probe-back mark without a row has nothing to probe; ignore it.
+            continue;
+        };
+        if matches!(
+            limit.kind,
+            vowp_protocol::LimitRowKind::Credits | vowp_protocol::LimitRowKind::Auth
+        ) {
+            continue;
         }
+        let Some(until) = l6_failover::probe_back_until(store, &limit, &value)? else {
+            continue;
+        };
+        if until <= now {
+            // The bounded window is over; the active reset (if any) already came from
+            // `active_limits` above.
+            continue;
+        }
+        let block_until = limited
+            .get(provider)
+            .copied()
+            .flatten()
+            .map_or(until, |reset| reset.max(until));
+        limited.insert(provider.to_owned(), Some(block_until));
     }
     for (key, _) in store.kv_prefix("probe_pending:")? {
         limited.insert(key.trim_start_matches("probe_pending:").to_owned(), None);

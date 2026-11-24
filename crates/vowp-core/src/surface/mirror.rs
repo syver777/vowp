@@ -13,8 +13,9 @@
 use serde::{Deserialize, Serialize};
 use vowp_protocol::{
     Actor, AssistantMessage, AssistantReasoning, Capsule, Cost, CostSource, ErrorEvent, ErrorKind, EventBody,
-    EventEnvelope, EventSource, EventType, HarnessKind, Lease, Note, OrchestratorApp, Session, SessionId, StopReason,
-    Timestamp, ToolCall, ToolResult, TurnEnded, TurnStarted, UserMessage,
+    EventEnvelope, EventSource, EventType, HarnessKind, Lease, Note, OrchestratorApp, OwnershipMode, Session,
+    SessionId, SessionOwner, StopReason, SurfaceKind, Timestamp, ToolCall, ToolResult, TurnEnded, TurnStarted,
+    UserMessage,
 };
 use vowp_store::Store;
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
@@ -117,6 +118,9 @@ pub fn mirror_from_host(
 ) -> Result<MirrorReport, CoreError> {
     store.require_session(session)?;
     let harness = harness_for(host.kind());
+    // Fence: a mirror may only write for the owner it belongs to. The epoch seen here must
+    // still be the live one before every append, so a takeover mid-pass stops the pass.
+    let fence = mirror_fence(store, session, host.kind(), None)?;
     let batch = host.transcript_since(handle, cursor)?;
     let mut report = MirrorReport {
         events: 0,
@@ -136,6 +140,7 @@ pub fn mirror_from_host(
             report.duplicates += 1;
             continue;
         };
+        mirror_fence(store, session, host.kind(), Some(fence))?;
         let source = EventSource {
             harness,
             model: entry.model.clone(),
@@ -178,6 +183,57 @@ pub fn mirror_from_host(
     Ok(report)
 }
 
+/// The owner kinds a mirror of `app` may write for.
+///
+/// The app's own surface, its MCP server and a mirror surface belong to the same app; every
+/// other kind (a desktop UI, another app, a worker job) is a different writer.
+fn mirror_owner_kinds(app: OrchestratorApp) -> &'static [SurfaceKind] {
+    match app {
+        OrchestratorApp::Opencode => &[SurfaceKind::Opencode, SurfaceKind::Mcp, SurfaceKind::Mirror],
+        OrchestratorApp::ClaudeCode => &[SurfaceKind::ClaudeCode, SurfaceKind::Mcp, SurfaceKind::Mirror],
+        OrchestratorApp::Chat => &[SurfaceKind::Chat, SurfaceKind::Mirror],
+    }
+}
+
+/// Refuses a mirror pass whose app does not match the live owner of the session.
+///
+/// `seen` is the epoch observed at the start of the pass: `None` for the first check, and
+/// `Some(first result)` for later ones. Returns the owner epoch seen now (`None` when the
+/// session has no owner). No owner is allowed (the app host has not acquired yet); an owner
+/// of another kind, a job owner, or a changed epoch is a refusal.
+fn mirror_fence(
+    store: &Store,
+    session: &SessionId,
+    app: OrchestratorApp,
+    seen: Option<Option<u64>>,
+) -> Result<Option<u64>, CoreError> {
+    let Some(record) = store.ownership(session)? else {
+        return match seen {
+            Some(Some(_)) => Err(CoreError::Refused(
+                "mirror stopped: the session owner was released during the pass".to_owned(),
+            )),
+            _ => Ok(None),
+        };
+    };
+    if record.mode != OwnershipMode::Interactive || !mirror_owner_kinds(app).contains(&record.lease.surface_kind) {
+        let name = record.label.as_deref().unwrap_or(&record.lease.holder);
+        return Err(CoreError::Refused(format!(
+            "mirror refused: session is owned by {name} ({}, epoch {}), not this app",
+            record.lease.surface_kind.display_name(),
+            record.epoch
+        )));
+    }
+    if let Some(Some(epoch)) = seen
+        && epoch != record.epoch
+    {
+        return Err(CoreError::Refused(format!(
+            "mirror stopped: owner epoch changed from {epoch} to {} during the pass",
+            record.epoch
+        )));
+    }
+    Ok(Some(record.epoch))
+}
+
 /// Everything a new surface needs to continue a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResumeContext {
@@ -189,6 +245,9 @@ pub struct ResumeContext {
     pub tail: Vec<EventEnvelope>,
     /// Current lease, when one exists.
     pub lease: Option<Lease>,
+    /// The session's owner (live, stale or job), without any token.
+    #[serde(default)]
+    pub owner: Option<SessionOwner>,
 }
 
 /// Builds the resume context for a surface.
@@ -214,6 +273,7 @@ pub fn resume_context(
         capsule,
         tail: select_tail(events, tail_turns),
         lease,
+        owner: store.session_owner(session, deps.clock.now())?,
     })
 }
 

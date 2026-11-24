@@ -949,3 +949,68 @@ fn schema_snapshot_exports_versioned_schema() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(stdout.lines().any(|line| line == "Snapshot"), "{stdout}");
 }
+
+#[test]
+fn fleet_status_human_lists_active_owners() {
+    let env = common::TestEnv::new();
+    let (code, stdout, stderr) = env.run(&["session", "new", "--title", "owned by a UI"]);
+    assert_eq!(code, 0, "{stderr}");
+    let id = stdout.trim().to_owned();
+    let (code, token, stderr) = env.run(&[
+        "session",
+        "lease",
+        &id,
+        "--acquire",
+        "desktop-ui",
+        "--holder",
+        "StackSpirit",
+        "--label",
+        "Desk UI",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let token = token.trim().to_owned();
+    // A second session nobody owns must not appear in the owner list.
+    let (code, other, stderr) = env.run(&["session", "new", "--title", "unowned"]);
+    assert_eq!(code, 0, "{stderr}");
+    let other = other.trim().to_owned();
+
+    let (code, human, stderr) = env.run(&["fleet", "status", "--refresh"]);
+    assert_eq!(code, 0, "{stderr}");
+    let owners = human
+        .split("owners:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no owners section in:\n{human}"));
+    let line = owners
+        .lines()
+        .find(|line| line.contains(&id))
+        .unwrap_or_else(|| panic!("owner line for {id} missing:\n{owners}"));
+    for expected in [
+        "Desk UI",
+        "desktop-ui",
+        "interactive",
+        "StackSpirit@",
+        "active",
+        "idle",
+        "heartbeat",
+    ] {
+        assert!(line.contains(expected), "{expected:?} missing from {line:?}");
+    }
+    assert!(
+        !owners.contains(&other),
+        "an unowned session is not an owner line:\n{owners}"
+    );
+    assert!(!human.contains(&token), "the plaintext token must never be printed");
+
+    let (code, value, stderr) = env.run_json(&["fleet", "status", "--refresh"]);
+    assert_eq!(code, 0, "{stderr}");
+    let card = value["snapshot"]["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .find(|card| card["id"] == id.as_str())
+        .expect("session card");
+    assert_eq!(card["owner"]["kind"], "desktop_ui");
+    assert_eq!(card["owner"]["label"], "Desk UI");
+    assert!(card["active_surface"].is_null());
+    assert!(!value.to_string().contains(&token));
+}

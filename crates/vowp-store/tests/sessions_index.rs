@@ -256,6 +256,68 @@ fn session_index_and_natives() {
 }
 
 #[test]
+fn set_session_location_updates_only_node_and_cwd() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session(SessionState::Running);
+    session.last_seq = 7;
+    session.log_bytes = 1234;
+    fixture.store.upsert_session(&session).expect("insert session");
+    let capsule = capsule(&session, 6, fixture.clock.now());
+    fixture
+        .store
+        .insert_capsule(&capsule, "sessions/capsule.json")
+        .expect("insert capsule");
+
+    let before = fixture.store.require_session(&session.id).expect("session");
+    assert_eq!(before.last_seq, 7);
+    assert_eq!(before.log_bytes, 1234);
+    assert_eq!(before.last_capsule_id, Some(capsule.capsule_id.clone()));
+
+    let target = NodeName::parse("mac-studio").expect("target node");
+    fixture.clock.advance(Duration::from_secs(9));
+    fixture
+        .store
+        .set_session_location(&session.id, &target, ".")
+        .expect("set location");
+
+    let mut expected = before.clone();
+    expected.node = target;
+    expected.cwd = ".".to_owned();
+    expected.updated_at = fixture.clock.now();
+    assert_eq!(
+        fixture.store.require_session(&session.id).expect("moved session"),
+        expected,
+        "only node, cwd and updated_at may change"
+    );
+}
+
+#[test]
+fn set_session_location_refuses_an_unknown_session() {
+    let fixture = Fixture::new();
+    let missing = SessionId::new();
+    let error = fixture
+        .store
+        .set_session_location(&missing, &NodeName::parse("local").expect("node"), ".")
+        .expect_err("an unknown session is refused");
+    assert!(
+        matches!(error, vowp_store::StoreError::NotFound { .. }),
+        "got {error:?}"
+    );
+    assert_eq!(
+        fixture.store.session(&missing).expect("lookup"),
+        None,
+        "a refused location write inserted a row"
+    );
+    assert!(
+        fixture
+            .store
+            .list_sessions(&SessionFilter::default())
+            .expect("list")
+            .is_empty()
+    );
+}
+
+#[test]
 fn finish_switch_links_capsule() {
     let fixture = Fixture::new();
     let session = fixture.session(SessionState::Idle);

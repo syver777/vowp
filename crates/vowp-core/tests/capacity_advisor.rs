@@ -721,3 +721,139 @@ fn node_supervisor_tick_writes_capacity_advice() {
         "a node tick must write the Capacity inbox item"
     );
 }
+
+#[test]
+fn advisor_does_not_propose_one_worker_on_an_idle_big_box() {
+    let (_tmp, deps, store, project, _job) = fixture();
+    let mut host = sample(now(), 23 * GIB + GIB / 2, 20 * GIB, Some(8.0));
+    host.cpu_count = 8;
+    store.insert_host_sample(&host).unwrap();
+    // Cache-inflated peaks (9.6 GiB) around a ~1.5 GiB working set.
+    for index in 0..5_u64 {
+        store
+            .upsert_run_usage(&RunUsage {
+                run_id: RunId::new(),
+                project: project.clone(),
+                job_id: None,
+                job_kind: Some(JobKind::Build),
+                role: RunRole::Worker,
+                harness: Some(HarnessKind::Opencode),
+                model: Some("deepseek/deepseek-flash".to_owned()),
+                provider: Some("deepseek".to_owned()),
+                node: NodeName::parse("local").unwrap(),
+                started_at: now().minus(Duration::from_secs(600 - index)),
+                ended_at: now().minus(Duration::from_secs(590 - index)),
+                duration_ms: 10_000,
+                peak_rss_bytes: 9 * GIB + 600 * 1024 * 1024,
+                anon_peak_bytes: Some(GIB + GIB / 2),
+                file_peak_bytes: Some(8 * GIB),
+                kernel_peak_bytes: None,
+                cpu_usec: 1_000_000,
+                mean_cpu_cores: 1.0,
+                max_cpu_cores: 2.0,
+                build_mode: BuildMode::Unknown,
+                source: UsageSource::Cgroup,
+                oom_killed: false,
+                exit_code: Some(0),
+            })
+            .unwrap();
+    }
+    capacity::recompute(&store, now()).unwrap();
+    let advice = capacity::maybe_advise(&deps, &store, now(), capacity::AdviceTrigger::Timer)
+        .unwrap()
+        .expect("advice");
+    assert!(advice.proposed_target > 1, "proposed {}", advice.proposed_target);
+}
+
+fn keep_first_advice(deps: &Deps, store: &Store) -> vowp_protocol::CapacityAdvice {
+    let advice = capacity::maybe_advise(deps, store, now(), capacity::AdviceTrigger::Timer)
+        .unwrap()
+        .expect("first advice");
+    store
+        .answer_inbox(advice.inbox_id.as_ref().expect("linked item"), "keep", "owner")
+        .unwrap();
+    advice
+}
+
+fn open_capacity_items(store: &Store) -> usize {
+    store
+        .list_inbox(Some(vowp_protocol::InboxState::Open))
+        .unwrap()
+        .iter()
+        .filter(|item| item.title.starts_with("Capacity:") && item.state == vowp_protocol::InboxState::Open)
+        .count()
+}
+
+#[test]
+fn kept_pair_suppresses_timer_ticks_and_routine_triggers() {
+    let (_tmp, deps, store, project, _job) = fixture();
+    store.insert_host_sample(&healthy_sample(now())).unwrap();
+    seed_estimate(&store, &project, GIB, 1.0);
+    let kept = keep_first_advice(&deps, &store);
+    assert_eq!(open_capacity_items(&store), 0);
+
+    for tick in 1..=4_u32 {
+        let later = now().plus(ADVICE_INTERVAL * tick);
+        store.insert_host_sample(&healthy_sample(later)).unwrap();
+        for trigger in [
+            capacity::AdviceTrigger::Timer,
+            capacity::AdviceTrigger::Idle,
+            capacity::AdviceTrigger::NewProject,
+        ] {
+            assert!(
+                capacity::maybe_advise(&deps, &store, later, trigger).unwrap().is_none(),
+                "{trigger:?} must not re-ask the kept ({}, {}) pair",
+                kept.current_target,
+                kept.proposed_target
+            );
+        }
+    }
+    assert_eq!(open_capacity_items(&store), 0);
+}
+
+#[test]
+fn oom_after_keep_raises_a_fresh_item() {
+    let (_tmp, deps, store, project, _job) = fixture();
+    store.insert_host_sample(&healthy_sample(now())).unwrap();
+    seed_estimate(&store, &project, GIB, 1.0);
+    keep_first_advice(&deps, &store);
+
+    let later = now().plus(Duration::from_secs(60));
+    assert!(
+        capacity::maybe_advise(&deps, &store, later, capacity::AdviceTrigger::Brake)
+            .unwrap()
+            .is_none(),
+        "a non-disk brake does not repeat a kept pair"
+    );
+    let oom = capacity::maybe_advise(&deps, &store, later, capacity::AdviceTrigger::Oom)
+        .unwrap()
+        .expect("an OOM kill always raises advice");
+    assert_eq!(oom.state, AdviceState::Open);
+    assert_eq!(open_capacity_items(&store), 1);
+}
+
+#[test]
+fn lower_proposal_after_keep_raises_a_fresh_item() {
+    let (_tmp, deps, store, project, _job) = fixture();
+    store.insert_host_sample(&healthy_sample(now())).unwrap();
+    seed_estimate(&store, &project, GIB, 1.0);
+    let kept = keep_first_advice(&deps, &store);
+
+    // The CPU quota shrinks: the proposal (and with it the pair) is no longer the kept one.
+    let later = now().plus(ADVICE_INTERVAL);
+    store
+        .insert_host_sample(&sample(later, 8 * GIB, 6 * GIB, Some(1.0)))
+        .unwrap();
+    let advice = capacity::maybe_advise(&deps, &store, later, capacity::AdviceTrigger::Brake)
+        .unwrap()
+        .expect("changed proposal raises advice");
+    assert!(
+        advice.proposed_target < kept.proposed_target || advice.current_target != kept.current_target,
+        "kept ({}, {}) vs new ({}, {})",
+        kept.current_target,
+        kept.proposed_target,
+        advice.current_target,
+        advice.proposed_target
+    );
+    assert_eq!(open_capacity_items(&store), 1);
+}

@@ -21,11 +21,12 @@ crates/vowp-core/src/
                   l4_planner.rs l5_keeper.rs l6_failover.rs l7_inbox.rs l8_watchdog.rs digest.rs prompts.rs
   promote/        mod.rs guards.rs bank.rs promoter.rs releases_log.rs
   agent/          mod.rs code.rs enroll.rs auth.rs gateway.rs pair.rs spool.rs dispatch.rs result.rs
-  capacity/       mod.rs sampler.rs history.rs admit.rs advisor.rs brakes.rs estimates.rs fair.rs scope.rs targets.rs usage.rs
+  capacity/       mod.rs sampler.rs history.rs admit.rs advisor.rs brakes.rs cluster.rs estimates.rs fair.rs scope.rs targets.rs usage.rs
   surface/        mod.rs lease.rs native.rs orchestrator.rs mirror.rs opencode_host.rs claude_remote.rs
                   takeover.rs follow.rs
+  vault/          mod.rs request.rs
 tests/            session_*.rs, gates_*.rs, ledger_*.rs, schedules_*.rs, loops_*.rs, drills_*.rs, promote_*.rs,
-                  agent.rs, offload_dispatch.rs, offload_result.rs, offload_e2e.rs, capacity_measure.rs
+                  agent.rs, offload_dispatch.rs, offload_result.rs, offload_e2e.rs, capacity_measure.rs, vault.rs
 tests/fixtures/   shared recorded fixtures are copied from the vowp-adapters fixtures
 ```
 
@@ -46,6 +47,7 @@ pub enum CoreError {
     #[error("switch aborted: {0}")]            SwitchAborted(String),
     #[error("provider limited: {0:?}")]        Limited(vowp_protocol::LimitEvent),
     #[error("refused: {0}")]                   Refused(String),   // cwd allow-list, guard failures that must not be worked around
+    #[error("cwd_missing: working directory {0} does not exist")] CwdMissing(String), // leaf gone but inside an allowed root
     #[error("guard failed: {name}: {detail}")] Guard { name: String, detail: String },
     #[error("not found: {0}")]                 NotFound(String),
     #[error("invalid: {0}")]                   Invalid(String),
@@ -184,7 +186,7 @@ existing home with `Store::open_writable` and passes that handle, so a web switc
 rows and events as the CLI but cannot create or migrate a home.
 
 `run_turn` algorithm (numbered, normative):
-1. Check `cwd` against the allow-list (`Refused` otherwise). Resolve adapter via `AdapterRegistry::get`; missing → `ServiceError::Failed("harness not installed")`.
+1. Check `cwd` against the allow-list: `CwdMissing` when the leaf is gone but its deepest existing ancestor is inside a root, `Refused` when the path escapes the root through `..` or a symlink. Resolve adapter via `AdapterRegistry::get`; missing → `ServiceError::Failed("harness not installed")`.
 2. Open the session's `SessionLog` (lockfile; a second concurrent writer → `Conflict`). Append **first** `session.executor` (attach; every run, not only the first on an executor) and **then** `turn.started` (turn = last turn + 1); the attach carries `native_session_id` from `session_natives` if resuming the same harness; if the session has no native session on this harness and a capsule exists, the prompt is `seed_prompt(capsule, tail, tail_turns, prompt)` where `tail` = the events of the last `[capsule].tail_turns` complete turns; else `prompt`.
 3. Append the `user.message`; insert the `runs` row (`started_at=now`, `purpose`, `profile`, `rung`, `window`); `Adapter::start(StartInput{ resume, prompt, cwd, env: configured env_pass values, … })`.
 4. Loop on `run.events()` with `recv_timeout(200 ms)`: append each event through `SessionLog::append` (blob spill >8192 B), update `sessions.last_seq`/`updated_at` and `session_events` index every 20 events and at the end; poll `cancel` → `interrupt()`.
@@ -960,9 +962,9 @@ them together is a phase-exit activity, not part of this suite.
 ### 9.4 Orchestrators on a local node (`surface/orchestrator.rs`)
 
 The v0.2 manager still owns the home-hosted orchestrator: a project-local directory, an app
-config, one surface lease, an optional host and the lease keeper. The v0.4 slice adds the node
-record and the home state machine; the agent-side materialization and app start are the next
-slice (3g).
+config, one surface lease, an optional host and the lease keeper. The v0.4 slice added the node
+record and the home state machine; the agent-side materialization and app start landed with the
+v0.4 Phase 3 and v0.5 move jobs, and the agent crate is documented separately.
 
 ```rust
 pub trait OrchestratorTransport: Send + Sync {
@@ -975,6 +977,8 @@ pub const COMMAND_RESULT_TIMEOUT: Duration;                        // 5 seconds
 pub fn create(&self, req: &NewOrchestrator) -> Result<OrchestratorInfo, CoreError>;               // home
 pub fn create_on_node(&self, req: &NewOrchestrator, node: Option<NodeName>)
     -> Result<OrchestratorInfo, CoreError>;
+pub fn move_to_node(&self, name: &str, target: Option<NodeName>) -> Result<OrchestratorInfo, CoreError>;
+pub fn endpoint(&self, name: &str) -> Result<OrchestratorEndpoint, CoreError>;
 pub fn resume(&self, name: &str) -> Result<OrchestratorInfo, CoreError>;
 pub fn stop(&self, name: &str) -> Result<(), CoreError>;
 pub fn resume_all(&self) -> Result<Vec<OrchestratorInfo>, CoreError>;
@@ -1011,6 +1015,17 @@ home path.
   `AgentFrame::OrchestratorResult` calls `apply_result` before publishing the result.
 - `stop` on a node orchestrator sends `Stop` (the agent maps it to `SurfaceDetach`), releases
   any home lease, writes `stopped` and stops no local host and no agent process.
+- `move_to_node` is the v0.5 move. The target is validated before anything stops: an unknown,
+  pending, revoked or offline node is refused, and a project-bound orchestrator needs a path map
+  for its project on the target. The current host is then stopped and its lease released, a
+  handoff capsule is written when the session has content beyond its creation and placement
+  notes (a capsule failure is logged and does not abort), and the record is re-materialized on
+  the target with the **same `session_id`**. A home target resumes the local host; an agent
+  target sends the landed `Start` and the agent binds the existing paired surface. After the old
+  host stops, `Store::set_session_location` updates only `sessions.node`, `sessions.cwd` and
+  `updated_at`; `last_seq`, `log_bytes`, the log and every event are unchanged. Moving to the
+  current placement is idempotent (a live host is returned unchanged, a stopped one is resumed),
+  and a no-op writes no row.
 - `CommandSpool` is the default transport. It writes the frame under
   `agent-commands/<node>/<request_id>.json` and waits up to `COMMAND_RESULT_TIMEOUT` for
   `agent-results/<node>/<request_id>.json`; a result that arrives later is applied by
@@ -1022,6 +1037,18 @@ home path.
 - `redact_text` replaces absolute paths with `<path>` and obvious `key=value` secrets with
   `<redacted>`, and caps the text at 512 characters. Every result detail and error message
   passes through it before `orchestrator.json` or a log sees it.
+- `endpoint(name)` returns the `OrchestratorEndpoint` discovery document. The base fields
+  come from the record/card. A node-hosted orchestrator is metadata only: no SSH, socket or
+  node file is opened, and `url`, `native_session_id` and `auth` are `None`. A home-hosted
+  orchestrator with a live host reads the app's private 0600 state through the new defaulted
+  `AppHost::endpoint` method. `OpencodeHost` returns the canonical
+  `http://127.0.0.1:<port>` URL, the native app session id from `host.json` and Basic auth
+  (header `Authorization`, scheme `Basic`, username `opencode`, the service password).
+  `ClaudeRemoteHost` and `chat` keep the default `None` because they expose no loopback
+  endpoint. A stopped host, an absent service file or a stale service pid leaves the three
+  endpoint values `None`. A zero port is refused as a typed invalid error rather than
+  returning a guessed endpoint. A non-loopback URL, a corrupt file or a too-wide file is a
+  typed error whose message names only the orchestrator and the failure class.
 
 Named tests (in `crates/vowp-cli/tests/orchestrator.rs`): `orchestrator_new_with_a_node_creates_a_card_and_sends_start`,
 `orchestrator_new_refuses_an_unknown_or_revoked_node`,
@@ -1032,6 +1059,30 @@ Named tests (in `crates/vowp-cli/tests/orchestrator.rs`): `orchestrator_new_with
 `orchestrator_apply_result_correlates_the_late_node_result` and
 `orchestrator_card_contains_no_path_or_secret`. All use a temporary home, a fake app host or
 a fake command transport, and no real tmux, app, network or home directory.
+
+The v0.5 move tests live in `crates/vowp-core/tests/orchestrator_move.rs`:
+`move_preserves_the_session_and_keeps_one_log_across_home_and_agent`,
+`orchestrator_move_updates_the_session_location_to_the_target_node`,
+`orchestrator_move_home_restores_the_session_location`,
+`orchestrator_move_to_an_unmapped_or_offline_node_leaves_the_session_row_unchanged`,
+`orchestrator_move_does_not_clobber_last_seq_or_log_bytes`,
+`moving_between_agent_nodes_releases_the_old_node_lease`,
+`move_refuses_unknown_pending_and_revoked_nodes_before_stopping_the_host`,
+`move_to_the_current_placement_is_idempotent_and_resumes_a_stopped_record`,
+`move_refuses_a_project_that_the_target_node_has_not_mapped`,
+`move_writes_no_capsule_for_a_session_with_only_its_creation_event` and
+`move_continues_when_the_handoff_capsule_fails`. The store tests
+`set_session_location_updates_only_node_and_cwd` and
+`set_session_location_refuses_an_unknown_session` live in
+`crates/vowp-store/tests/sessions_index.rs`. They use temporary homes and git repositories.
+
+The endpoint tests live in `crates/vowp-core/tests/orchestrator_endpoint.rs`:
+`orchestrator_endpoint_home_is_metadata_only_for_a_node`,
+`orchestrator_endpoint_home_reads_the_live_local_service_file`,
+`orchestrator_endpoint_stopped_or_unknown_has_no_credentials` and
+`orchestrator_card_snapshot_and_ls_never_contain_the_endpoint_password`. They use a
+temporary home, a private live `host.json`/`service.json` and the test process id; no app,
+socket, SSH or real home is opened. Spec: `docs/design/v0.5/orchestrator-endpoint.md`.
 
 ## 10. Capacity history (v0.4 Phase 4)
 
@@ -1086,6 +1137,44 @@ and `capacity_history_is_read_only` in `crates/vowp-cli/tests/capacity.rs`;
 `capacity_history_json_matches_the_exported_schema` in
 `crates/vowp-protocol/tests/schema.rs`; the schema migration test is
 `capacity_rollups_migrates_v6_to_v7_with_a_backup` in `crates/vowp-store/tests/migrate.rs`.
+
+### 10.1 Cluster totals (`capacity/cluster.rs`)
+
+Spec: `docs/design/v0.5/scope.md` §6. The module is read-only and additive; it never replaces the
+per-home cards.
+
+```rust
+pub fn build(deps: &Deps, store: &Store, now: Timestamp) -> Result<ClusterCapacity, CoreError>;
+pub(crate) fn online_workers(store: &Store, now: Timestamp) -> Result<Vec<NodeCard>, CoreError>;
+pub(crate) fn is_online_worker(card: &NodeCard) -> bool;
+pub(crate) fn home_running(store: &Store, home: &NodeName) -> Result<u32, CoreError>;
+```
+
+- A worker counts only when its card is `NodeKind::Agent`, `NodeStatus::Active` and
+  `NodePresence::Online` (an under-30-second heartbeat). A legacy SSH node and the home row are
+  never counted here.
+- `target_workers` starts at the home target and adds each counted node's `max_slots`;
+  `busy_workers` starts at the home's open runs and adds each node's `busy_slots`. CPU, total and
+  available memory and free work-disk are saturating sums; a missing sample contributes nothing.
+  A single-machine home reports `online_worker_nodes = 0`, and its numeric totals come from the
+  latest home sample (or are zero before one exists).
+- `capacity::admit::report` and `fleet::build` call `build`, so `CapacityReport.cluster`,
+  `CapacitySnapshot.cluster` and the snapshot's capacity card carry the same document. Both
+  fields are `serde(default)`, so a document written before the field existed still parses.
+- The per-host admission split is documented in
+  [`docs/concepts/capacity.md`](../../concepts/capacity.md#cluster-capacity): a home run is
+  admitted against the home target and headroom; an eligible offloaded run is admitted against
+  the chosen online worker node's slots and headroom, while provider limits stay global.
+
+Named tests: `four_worker_home_plus_four_worker_node_admits_eight_runs`,
+`offline_node_falls_back_to_the_home_target`,
+`report_and_snapshot_carry_combined_cluster_totals` and
+`a_single_home_reports_no_worker_nodes_and_its_own_totals` in
+`crates/vowp-core/tests/cluster_capacity.rs`; and
+`capacity_report_and_fleet_status_show_cluster_totals` in
+`crates/vowp-cli/tests/capacity.rs` (the CLI module compiled through the
+`capacity_admit` target). They use temporary homes and stored node cards; no network, SSH or real
+node is touched.
 
 ## 11. `offload` — pure offload eligibility (v0.4 Phase 2)
 
@@ -1152,5 +1241,55 @@ Tests (`tests/offload.rs`, values only, no store, tmux or network):
 `no_eligible_node_is_a_waiting_reason_not_a_failure` and
 `missing_origin_or_base_facts_are_refusals`.
 
-## 12. Out of scope (v0.2)
+## 12. `vault` — secret storage, injection and redaction
+
+Spec: `docs/design/v0.2/home-and-surfaces.md` §9 and §13.2, and
+`docs/design/v0.5/vault-encrypted.md` for the encrypted mode.
+
+```rust
+pub mod vault {
+    pub fn mode(deps: &Deps) -> Result<VaultMode, CoreError>;          // vault | basic | encrypted; missing = basic
+    pub fn write_secret(deps: &Deps, name: &SecretName, value: &str) -> Result<SecretInfo, CoreError>;
+    pub fn remove_secret(deps: &Deps, name: &SecretName) -> Result<bool, CoreError>;
+    pub fn list_secrets(deps: &Deps) -> Result<Vec<SecretInfo>, CoreError>;   // index rows only
+    pub fn read_value_for_exec(deps: &Deps, name: &SecretName) -> Result<Option<String>, CoreError>;
+    pub fn env_for(deps: &Deps, req: &TurnRequest) -> Result<Vec<(String, String)>, CoreError>;
+    pub fn env_for_names(deps: &Deps, names: &[String]) -> Result<Vec<(String, String)>, CoreError>;
+    pub fn upgrade(deps: &Deps) -> Result<Upgrade, CoreError>;                 // basic -> vault user
+    pub fn upgrade_encrypted(deps: &Deps) -> Result<EncryptedUpgrade, CoreError>; // basic -> encrypted
+    pub struct Redactor { /* exact values, longest first */ }
+    impl Redactor { pub fn load(deps: &Deps) -> Result<Self, CoreError>; pub fn redact(&self, text: &str) -> String; }
+}
+pub enum Upgrade { AlreadyVault, AlreadyEncrypted, Switched, NeedsCommand(String), NoSudo(String) }
+pub enum EncryptedUpgrade { AlreadyEncrypted, Switched }
+```
+
+- **Basic** writes `<home>/secrets/<NAME>` through a same-directory temporary file, fsync and
+  rename, mode 0600; the directory is 0700. A secret file that is a symlink, not a regular file
+  or not mode 0600 is refused on read.
+- **Vault user** writes and removes through the installed `__vault-admin` helper as
+  `vowp-vault`; `read_value_for_exec` reads the vault directory directly, falls back to
+  `__vault-exec`, and uses the mode-aware path when the helper cannot read the owner's mode
+  file. `upgrade` either moves every basic value through the helper and writes the mode file,
+  or returns the exact sudo command the owner must run. In encrypted mode it reports
+  `Upgrade::AlreadyEncrypted` instead of switching away from the ciphertext.
+- **Encrypted** (v0.5) generates `<home>/secrets/age.key` (an age X25519 identity, mode 0600) on
+  the first write, encrypts each value to `<home>/secrets/encrypted/<NAME>` (mode 0600), and
+  keeps the index metadata unchanged. A missing, unreadable or wrong key is a typed error on
+  both read and write; there is no plaintext fallback and no silent empty value.
+  `upgrade_encrypted` refuses vault-user mode, encrypts every value before deleting any
+  plaintext, writes the mode file last and is idempotent when already encrypted.
+- The **index** lives in the global `secret_index` table (name, `last4`, timestamps); values
+  never enter the database. Legacy `kv` rows under `secret:<NAME>` are migrated once.
+- `Redactor` loads the exact stored values (decrypting them in encrypted mode), longest first,
+  and replaces exact occurrences with `[REDACTED:<NAME>]`. `redact_event`, `redact_capsule`,
+  `redact_job_artifacts`, `redact_text` and the byte-oriented `redact_bytes` cover the event,
+  snapshot, capsule, report/run-mirror, gate-evidence and ledger paths.
+
+Tests: `tests/vault.rs` covers basic round trips and metadata, legacy migration, the one-time
+request page (including malformed POSTs, preconnects and timeouts), exact-value redaction,
+environment injection, the mode file, the vault-user upgrade, and the encrypted round trip, key
+failure, upgrade and redaction cases.
+
+## 13. Out of scope (v0.2)
 HTTP+SSE daemon, ACP, cross-node live sync, IANA timezone schedules, notification hooks (ntfy), automatic price-table download.

@@ -86,6 +86,7 @@ fn caps(profiles: &[(&str, Profile)], free_workers: u32, free_verifiers: u32) ->
             .map(|(name, profile)| ((*name).to_owned(), profile.clone()))
             .collect::<BTreeMap<_, _>>(),
         now: at(1_700_000_500),
+        overrides: HashMap::new(),
     }
 }
 
@@ -192,4 +193,25 @@ fn a_finished_planner_does_not_block_a_ready_planner() {
     let choices = plan_dispatch(&graph, &[finished, ready.clone()], &caps(&roles(), 0, 0));
 
     assert_eq!(ids(&choices), vec![ready.id]);
+}
+
+#[test]
+fn pinned_executor_beats_the_profile_ladder_and_waits_while_limited() {
+    let worker = job("pin-me", JobState::Ready, Role::Worker, "worker", 10, 100, &[]);
+    let graph = graph_of(vec![worker.clone()]);
+    let profiles = [("worker", one_rung("opencode:deepseek/deepseek-flash"))];
+    let pin = executor("claude-code:claude-sonnet-5-5@high");
+
+    let mut pinned = caps(&profiles, 1, 0);
+    pinned.overrides.insert(worker.id.clone(), pin.clone());
+    let choices = plan_dispatch(&graph, std::slice::from_ref(&worker), &pinned);
+    assert_eq!(choices.len(), 1);
+    assert_eq!(choices[0].executor, pin);
+    assert_eq!(choices[0].provider, pin.provider());
+
+    pinned.limited.insert(pin.provider(), None);
+    assert!(plan_dispatch(&graph, std::slice::from_ref(&worker), &pinned).is_empty());
+
+    let unpinned = plan_dispatch(&graph, std::slice::from_ref(&worker), &caps(&profiles, 1, 0));
+    assert_eq!(unpinned[0].executor, executor("opencode:deepseek/deepseek-flash"));
 }

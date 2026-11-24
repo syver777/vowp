@@ -11,7 +11,7 @@ Exported by `vowp schema QueueJobCard` and generated from the protocol types in
 {
   "$defs": {
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {
@@ -191,6 +191,20 @@ Exported by `vowp schema QueueJobCard` and generated from the protocol types in
     "kind": {
       "$ref": "#/$defs/JobKind",
       "description": "Job kind."
+    },
+    "needs": {
+      "description": "Upstream jobs this job needs, from the job graph.",
+      "items": {
+        "$ref": "#/$defs/JobId"
+      },
+      "type": "array"
+    },
+    "planned_executor": {
+      "description": "Executor the job will dispatch on: its explicit override, else the first\nnon-limited rung of its profile ladder.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "priority": {
       "description": "Dispatch priority.",

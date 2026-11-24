@@ -11,7 +11,7 @@ Exported by `vowp schema FleetQueueRow` and generated from the protocol types in
 {
   "$defs": {
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {

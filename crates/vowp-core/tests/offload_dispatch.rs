@@ -863,3 +863,182 @@ fn a_home_placed_job_is_never_queued() {
             .is_empty()
     );
 }
+
+/// Reads the job owner row of `session`.
+fn owner_of(fixture: &Fixture, session: &vowp_protocol::SessionId) -> Option<vowp_store::repo_surfaces::OwnerRecord> {
+    fixture.store.ownership(session).expect("ownership")
+}
+
+#[test]
+fn run_lease_is_job_mode_and_survives_past_sixty_seconds() {
+    let fixture = fixture(FixtureOptions::default());
+    enqueue(&fixture);
+    let claimed = claim(&fixture);
+    let (payload, token, expires) = assign_parts(&claimed[0]);
+    let owner = owner_of(&fixture, &payload.session_id).expect("the claim writes an owner");
+    assert_eq!(owner.mode, vowp_protocol::OwnershipMode::Job);
+    assert_eq!(
+        owner.expires_at,
+        Some(expires),
+        "the owner expires with the issued lease"
+    );
+    assert_eq!(expires, ts().plus(RUN_LEASE_TTL));
+
+    // Two minutes of silence is far past the 60 s interactive window.
+    fixture.clock.advance(Duration::from_secs(120));
+    let swept = vowp_core::surface::sweep_leases(&fixture.deps, &fixture.store, fixture.clock.now()).expect("sweep");
+    assert_eq!(swept, 0, "the interactive sweep ignores job rows");
+    let owner = owner_of(&fixture, &payload.session_id).expect("owner survives the sweep");
+    assert_eq!(
+        owner.state_at(fixture.clock.now()),
+        vowp_protocol::OwnershipState::Active
+    );
+    vowp_core::surface::check_lease_with(&fixture.store, &payload.session_id, Some(token))
+        .expect("the run still writes after sixty seconds");
+}
+
+#[test]
+fn node_disconnect_keeps_the_job_owner_until_the_assignment_expires() {
+    let fixture = fixture(FixtureOptions::default());
+    enqueue(&fixture);
+    let claimed = claim(&fixture);
+    let (payload, token, _) = assign_parts(&claimed[0]);
+    dispatch::accept(
+        &fixture.deps,
+        &fixture.store,
+        &fixture.node,
+        &claimed[0].assignment.id,
+        &payload.run_id,
+        1,
+        fixture.clock.now(),
+    )
+    .expect("accept");
+    dispatch::disconnect_node(
+        &fixture.deps,
+        &fixture.store,
+        &fixture.node,
+        "transport dropped",
+        fixture.clock.now(),
+    )
+    .expect("disconnect");
+
+    fixture.clock.advance(Duration::from_secs(300));
+    let still = dispatch::sweep_expired(&fixture.deps, &fixture.store, &fixture.node, fixture.clock.now())
+        .expect("sweep before expiry");
+    assert!(still.is_empty(), "a disconnected run is not fenced before its expiry");
+    let assignment = fixture
+        .store
+        .assignment(&claimed[0].assignment.id)
+        .expect("read")
+        .expect("row");
+    assert_eq!(assignment.state, AgentAssignmentState::Disconnected);
+    let owner = owner_of(&fixture, &payload.session_id).expect("the job owner stays");
+    assert_eq!(
+        owner.state_at(fixture.clock.now()),
+        vowp_protocol::OwnershipState::Active
+    );
+    vowp_core::surface::check_lease_with(&fixture.store, &payload.session_id, Some(token))
+        .expect("the reconnecting run can still write");
+}
+
+#[test]
+fn expired_assignment_fences_the_run_and_releases_the_owner() {
+    let fixture = fixture(FixtureOptions::default());
+    enqueue(&fixture);
+    let claimed = claim(&fixture);
+    let (payload, token, _) = assign_parts(&claimed[0]);
+    fixture.clock.advance(RUN_LEASE_TTL + Duration::from_secs(1));
+    let owner = owner_of(&fixture, &payload.session_id).expect("expired owner row is still visible");
+    assert_eq!(
+        owner.state_at(fixture.clock.now()),
+        vowp_protocol::OwnershipState::Expired
+    );
+    vowp_core::surface::check_lease_with(&fixture.store, &payload.session_id, Some(token))
+        .expect_err("an expired owner is read-only even with the right token");
+
+    let lost =
+        dispatch::sweep_expired(&fixture.deps, &fixture.store, &fixture.node, fixture.clock.now()).expect("sweep");
+    assert_eq!(lost.len(), 1);
+    assert_eq!(lost[0].state, AgentAssignmentState::Lost);
+    assert!(
+        owner_of(&fixture, &payload.session_id).is_none(),
+        "the owner is released"
+    );
+    let run = fixture.store.require_run(&payload.run_id).expect("run");
+    assert_eq!(run.outcome, Some(vowp_protocol::RunOutcome::Error));
+    assert_eq!(ready_job(&fixture).state, JobState::Ready);
+}
+
+#[test]
+fn an_expired_owner_fences_a_run_whose_assignment_row_was_renewed() {
+    let fixture = fixture(FixtureOptions::default());
+    enqueue(&fixture);
+    let claimed = claim(&fixture);
+    let (payload, _, _) = assign_parts(&claimed[0]);
+    // The assignment row is renewed (for example by a RunState on a connection that did not
+    // see the token) but nothing renewed the owner.
+    fixture.clock.advance(RUN_LEASE_TTL + Duration::from_secs(1));
+    fixture
+        .store
+        .renew_assignment(
+            &claimed[0].assignment.id,
+            fixture.clock.now(),
+            fixture.clock.now().plus(RUN_LEASE_TTL),
+            "renewed",
+        )
+        .expect("renew assignment");
+
+    let lost =
+        dispatch::sweep_expired(&fixture.deps, &fixture.store, &fixture.node, fixture.clock.now()).expect("sweep");
+    assert_eq!(lost.len(), 1, "the expired owner fences its run");
+    assert!(owner_of(&fixture, &payload.session_id).is_none());
+}
+
+#[test]
+fn a_late_lose_never_releases_an_interactive_owner() {
+    let fixture = fixture(FixtureOptions::default());
+    enqueue(&fixture);
+    let claimed = claim(&fixture);
+    let (payload, _, _) = assign_parts(&claimed[0]);
+    let surface = SurfaceId::new();
+    fixture
+        .store
+        .upsert_surface(&Surface {
+            id: surface.clone(),
+            kind: SurfaceKind::Opencode,
+            node: fixture.node.clone(),
+            holder: "laptop".to_owned(),
+            app: Some("opencode".to_owned()),
+            cwd: None,
+            metadata: serde_json::json!({}),
+            created_at: ts(),
+            last_seen_at: ts(),
+        })
+        .expect("surface");
+    fixture
+        .store
+        .take_lease(&vowp_protocol::Lease {
+            session_id: payload.session_id.clone(),
+            surface_id: Some(surface),
+            surface_kind: SurfaceKind::Opencode,
+            node: fixture.node.clone(),
+            holder: "laptop".to_owned(),
+            token: "t".repeat(52),
+            acquired_at: ts(),
+            heartbeat_at: ts(),
+        })
+        .expect("interactive lease");
+
+    dispatch::lose(
+        &fixture.deps,
+        &fixture.store,
+        &fixture.node,
+        &payload.run_id,
+        1,
+        "late fence",
+        ts(),
+    )
+    .expect("lose");
+    let owner = owner_of(&fixture, &payload.session_id).expect("the interactive owner survives");
+    assert_eq!(owner.mode, vowp_protocol::OwnershipMode::Interactive);
+}

@@ -334,8 +334,8 @@ cancelled one is kept for seven days. The branch stays. Check the job's terminal
 the report.
 
 **`vowp gc --class ...` exits 2.** The class name is wrong. Use `production`, `truth`, `open_work`,
-`secrets`, `closed_session`, `run_output`, `worktree`, `sample` or `cache` (a hyphen is accepted for
-`open-work`).
+`secrets`, `closed_session`, `run_output`, `worktree`, `job_window`, `sample` or `cache` (a hyphen is
+accepted for `open-work`).
 
 ## Schedules
 

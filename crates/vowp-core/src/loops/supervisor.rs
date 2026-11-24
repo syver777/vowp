@@ -18,9 +18,9 @@ use vowp_graph::{
 };
 use vowp_protocol::{
     ActiveState, CancelToken, GateResult, InboxId, InboxItem, InboxKind, InboxState, Job, JobId, JobKind, JobState,
-    Level, LimitRowKind, LoopBounds, NewSession, Node, NodeFile, ParkedReason, Profile, ProjectEntry, ProjectName,
-    ProjectState, Run, RunId, RunPurpose, SessionId, SessionRole, Timestamp, VowpConfig, Worker, WorkerKind,
-    WorkerState,
+    LedgerEntry, LedgerKind, Level, LimitRowKind, LoopBounds, NewSession, Node, NodeFile, OnCreditsExhausted,
+    ParkedReason, Profile, ProjectEntry, ProjectName, ProjectState, Run, RunId, RunPurpose, SessionId, SessionRole,
+    SessionState, Timestamp, VowpConfig, Worker, WorkerKind, WorkerState,
 };
 use vowp_store::{CrossDbReconcile, JobFilter, MigrationReport, Store};
 
@@ -543,7 +543,8 @@ impl Supervisor {
     fn step_reconcile(&mut self, _now: Timestamp) -> Result<String, CoreError> {
         let (open, active) = self.open_runs_snapshot()?;
         let count = reconcile::orphaned_runs(&self.deps, &self.store, &open, &active)?;
-        Ok(format!("{count} orphaned run(s)"))
+        let closed = reconcile::stale_job_windows(&self.deps, &self.store, &self.project)?;
+        Ok(format!("{count} orphaned run(s); {closed} stale job window(s)"))
     }
 
     /// Returns whether `<home>/drain` asks this project to admit no new work.
@@ -607,10 +608,16 @@ impl Supervisor {
                 self.mark_run_harvested(&run.id)?;
                 continue;
             }
+            // L6 owns the credits/auth policy; this direct park is only the backstop
+            // for the default `park`. With the explicit `next` opt-in L6 has already
+            // switched the session or queued its own no-healthy-rung park request,
+            // which this step applied above, so parking here would undo the owner's
+            // choice and duplicate the notice (loops.md §8.3).
             if matches!(
                 run.limit_kind,
                 Some(vowp_protocol::LimitKind::Credits) | Some(vowp_protocol::LimitKind::Auth)
             ) && let Some(provider) = super::l6_failover::provider_of(&run)
+                && self.credits_policy(&provider) == OnCreditsExhausted::Park
             {
                 let reason = if run.limit_kind == Some(vowp_protocol::LimitKind::Credits) {
                     ParkedReason::Credits
@@ -740,6 +747,20 @@ impl Supervisor {
             )?;
         }
         Ok(parked)
+    }
+
+    /// Returns the effective credits/auth policy for a provider.
+    ///
+    /// Both limit kinds share the one `[providers.<name>].on_credits_exhausted`
+    /// setting. A provider with no table, or a table without the key, uses the
+    /// documented `park` default.
+    fn credits_policy(&self, provider: &str) -> OnCreditsExhausted {
+        self.deps
+            .config
+            .providers
+            .get(provider)
+            .map(|config| config.on_credits_exhausted)
+            .unwrap_or_default()
     }
 
     /// Returns the provider of a job's current rung.
@@ -1093,7 +1114,7 @@ impl Supervisor {
                                 .results
                                 .iter()
                                 .filter(|gate| !gate.passed)
-                                .map(dispatch::gate_finding)
+                                .map(|gate| dispatch::gate_finding(&job, gate))
                                 .collect::<Vec<_>>();
                             self.apply_with(&job.id, JobEvent::GatesFailed, None, findings, None)?;
                         }
@@ -1285,7 +1306,7 @@ impl Supervisor {
                 let mut findings = results
                     .iter()
                     .filter(|result| !result.passed)
-                    .map(dispatch::gate_finding)
+                    .map(|result| dispatch::gate_finding(&current, result))
                     .collect::<Vec<_>>();
                 if findings.is_empty() {
                     findings.push(format!("merge checks failed for {}", current.id));
@@ -1352,6 +1373,15 @@ impl Supervisor {
                 .into_iter()
                 .collect::<BTreeMap<String, Profile>>(),
             now,
+            overrides: {
+                let mut pins = HashMap::new();
+                for job in jobs.iter().filter(|job| job.state == JobState::Ready) {
+                    if let Some(executor) = super::dispatch::job_executor_override(&self.store, &job.id)? {
+                        pins.insert(job.id.clone(), executor);
+                    }
+                }
+                pins
+            },
         };
         let choices = plan_dispatch(&graph, &jobs, &caps);
         let mut dispatched = 0;
@@ -1490,17 +1520,66 @@ impl Supervisor {
         )
     }
 
-    /// Returns the newest session of `role` for this project.
+    /// Returns the newest usable session of `role` for this project.
+    ///
+    /// A role session is bound to the cwd it was created in. When that cwd no longer exists
+    /// (for example a planner job's worktree removed after its job finished), the session can
+    /// never run a turn again, so retrying it would wedge every planner/keeper tick. Such a
+    /// session is retired (closed) with one ledger note naming it; the search continues to an
+    /// older healthy session, or the caller creates a fresh one in the project checkout.
     fn find_role_session(&self, role: SessionRole) -> Result<Option<SessionId>, CoreError> {
-        Ok(self
-            .store
-            .list_sessions(&vowp_store::SessionFilter {
+        let sessions = self.store.list_sessions(&vowp_store::SessionFilter {
+            project: Some(self.project.clone()),
+            ..vowp_store::SessionFilter::default()
+        })?;
+        for session in sessions {
+            if session.role != Some(role) || session.state == SessionState::Closed {
+                continue;
+            }
+            if !Path::new(&session.cwd).is_dir() {
+                self.retire_role_session(&session, role)?;
+                continue;
+            }
+            return Ok(Some(session.id));
+        }
+        Ok(None)
+    }
+
+    /// Closes a role session whose recorded cwd is gone and records one ledger note.
+    ///
+    /// Closing clears the role binding: [`Supervisor::find_role_session`] skips closed
+    /// sessions, so the stale session is never retried and a fresh one is created instead.
+    fn retire_role_session(&self, session: &vowp_protocol::Session, role: SessionRole) -> Result<(), CoreError> {
+        self.store
+            .set_session_state(&session.id, SessionState::Closed, session.executor.as_ref())?;
+        self.ledger.record(
+            &self.store,
+            LedgerEntry {
+                id: None,
+                ts: self.deps.clock.now(),
+                kind: LedgerKind::Note,
                 project: Some(self.project.clone()),
-                ..vowp_store::SessionFilter::default()
-            })?
-            .into_iter()
-            .find(|session| session.role == Some(role))
-            .map(|session| session.id))
+                job_id: session.job_id.clone(),
+                run_id: None,
+                session_id: Some(session.id.clone()),
+                role: None,
+                provider: None,
+                harness: None,
+                model: None,
+                cost: None,
+                summary: format!(
+                    "retired stale {role:?} session {}: cwd {} is gone",
+                    session.id, session.cwd
+                ),
+                detail: serde_json::json!({
+                    "reason": "cwd_missing",
+                    "session": session.id.as_str(),
+                    "cwd": session.cwd,
+                    "role": format!("{role:?}").to_lowercase(),
+                }),
+            },
+        )?;
+        Ok(())
     }
 
     /// Records a loop row after a planner/keeper turn starts.
@@ -1640,6 +1719,7 @@ impl Supervisor {
         })?;
         self.transitions.push((job.id.clone(), from, JobState::Failed));
         self.repeat_guards.remove(&job.id);
+        reconcile::close_job_window(&self.deps, &self.project, &job.id);
         let decision = dispatch::create_decision_job(&self.deps, &self.store, job)?;
         self.apply_with(&decision.id, JobEvent::NeedsSatisfied, None, Vec::new(), None)?;
         let failed = self.store.require_job(&job.id)?;
@@ -1789,6 +1869,11 @@ impl Supervisor {
         let mut findings = findings;
         for effect in applied.effects.clone() {
             self.execute_effect(job_id, &effect, choice.as_ref(), &mut findings)?;
+        }
+        // The state row is durable before the view goes; a crash in between leaves the window
+        // for the reconcile step or startup to close on the next pass.
+        if !applied.to.needs_window() {
+            reconcile::close_job_window(&self.deps, &self.project, job_id);
         }
         Ok(applied)
     }
@@ -2222,6 +2307,15 @@ impl Supervisor {
             .profiles
             .get(&job.profile)
             .ok_or_else(|| CoreError::NotFound(format!("profile {}", job.profile)))?;
+        if let Some(executor) = super::dispatch::job_executor_override(&self.store, &job.id)? {
+            return Ok(DispatchChoice {
+                job_id: job.id.clone(),
+                provider: executor.provider(),
+                executor,
+                rung: 0,
+                node: profile.node.clone(),
+            });
+        }
         let limited = super::limited_map(&self.store, self.deps.clock.now())?
             .into_iter()
             .collect::<HashMap<_, _>>();

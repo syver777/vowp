@@ -362,6 +362,24 @@ impl Store {
         Ok(sessions)
     }
 
+    /// Moves the session index row to `node` and `cwd`, stamping `updated_at` from the clock.
+    ///
+    /// This is deliberately separate from [`Store::upsert_session`]: that method rewrites
+    /// every column, including `last_seq` and `log_bytes`, so a placement-only change must
+    /// not use it. Only `node`, `cwd` and `updated_at` change here; the log position, the
+    /// last capsule, the state, the executor and every project/job column stay exactly as
+    /// they were. An unknown session is [`StoreError::NotFound`] and inserts no row.
+    pub fn set_session_location(&self, id: &SessionId, node: &NodeName, cwd: &str) -> Result<(), StoreError> {
+        let changed = self.conn.execute(
+            "UPDATE main.sessions SET node = ?1, cwd = ?2, updated_at = ?3 WHERE id = ?4",
+            params![node.as_str(), cwd, ts_to_text(self.clock().now()), id.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::not_found("session", id.as_str()));
+        }
+        Ok(())
+    }
+
     /// Sets the session state and current executor, stamping `updated_at` from the clock.
     ///
     /// Passing `None` clears the executor, as the detach step of a switch requires.

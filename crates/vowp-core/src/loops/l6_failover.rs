@@ -12,8 +12,8 @@ use std::time::Duration;
 use serde_json::json;
 use vowp_protocol::{
     CancelToken, CapsuleTrigger, Executor, ExecutorRef, HarnessKind, LedgerEntry, LedgerKind, Limit, LimitEvent,
-    LimitKind, LimitRowKind, NewSession, ParkedReason, Profile, Run, RunOutcome, RunPurpose, RunRole, RunSummary,
-    SessionId, SessionRole, SessionState, SwitchReason, SwitchRequest, Timestamp,
+    LimitKind, LimitRowKind, NewSession, OnCreditsExhausted, ParkedReason, Profile, Run, RunOutcome, RunPurpose,
+    RunRole, RunSummary, SessionId, SessionRole, SessionState, SwitchReason, SwitchRequest, Timestamp,
 };
 use vowp_store::{SessionFilter, Store};
 
@@ -129,6 +129,10 @@ impl Failover {
                 RunOutcome::Ok => {
                     store.kv_set(&format!("fail_streak:{provider}"), "0")?;
                     store.kv_set(&format!("rate_streak:{provider}"), "0")?;
+                    // A successful turn is proof the provider works: drop the temporary
+                    // failover marks it may still carry. Credits/auth are owner-resolved and
+                    // stay sticky until the inbox answer clears them.
+                    self.clear_recovered_marks(store, run, &provider)?;
                     Ok(FailoverAction::None)
                 }
                 RunOutcome::Stalled => Ok(FailoverAction::None),
@@ -186,6 +190,70 @@ impl Failover {
                 provider: provider.to_owned(),
             });
         }
+        self.advance_to_next_rung(store, run, provider)
+    }
+
+    /// Credits and auth keep `park` as the default; an explicit provider opt-in advances.
+    fn on_credits_or_auth(
+        &self,
+        store: &Store,
+        run: &Run,
+        summary: &RunSummary,
+        provider: &str,
+        credits: bool,
+    ) -> Result<FailoverAction, CoreError> {
+        let kind = if credits {
+            LimitRowKind::Credits
+        } else {
+            LimitRowKind::Auth
+        };
+        let detail = summary
+            .limit
+            .as_ref()
+            .map(|limit| limit.message.clone())
+            .unwrap_or_else(|| {
+                if credits {
+                    "credits exhausted".to_owned()
+                } else {
+                    "authentication failed".to_owned()
+                }
+            });
+        // The row is written for both policies: the owner must be able to see why the
+        // rung changed, and a parked job still needs its limit recorded.
+        self.write_limit(store, run, provider, kind, None, &detail, None, None)?;
+        let policy = self
+            .deps
+            .config
+            .providers
+            .get(provider)
+            .map(|provider| provider.on_credits_exhausted)
+            .unwrap_or_default();
+        let kind_name = if credits { "credits" } else { "auth" };
+        match policy {
+            OnCreditsExhausted::Park => {
+                self.mark_provider(store, provider, kind_name, false)?;
+                self.request_park(store, provider, kind_name)?;
+                Ok(FailoverAction::ParkProvider {
+                    provider: provider.to_owned(),
+                })
+            }
+            OnCreditsExhausted::Next => {
+                // The owner opted into using the declared fallback rung. The provider is
+                // still marked (and probe-able), then the session takes the same
+                // next-rung path as a quota limit.
+                self.mark_provider(store, provider, kind_name, true)?;
+                self.advance_to_next_rung(store, run, provider)
+            }
+        }
+    }
+
+    /// Switches the run's session to the next healthy declared rung, or parks the provider.
+    ///
+    /// Shared by a quota limit and the explicit credits/auth opt-in. The caller has
+    /// already written the limit row; this records the switch ledger and returns the
+    /// decision the supervisor applies.
+    fn advance_to_next_rung(&self, store: &Store, run: &Run, provider: &str) -> Result<FailoverAction, CoreError> {
+        let now = store.clock().now();
         let next = self.next_rung(run, store, now)?;
         let Some((rung, executor, node)) = next else {
             self.request_park(store, provider, "provider_blocked")?;
@@ -226,39 +294,6 @@ impl Failover {
                 })
             }
         }
-    }
-
-    /// Credits and auth both park every job whose current rung uses the provider.
-    fn on_credits_or_auth(
-        &self,
-        store: &Store,
-        run: &Run,
-        summary: &RunSummary,
-        provider: &str,
-        credits: bool,
-    ) -> Result<FailoverAction, CoreError> {
-        let kind = if credits {
-            LimitRowKind::Credits
-        } else {
-            LimitRowKind::Auth
-        };
-        let detail = summary
-            .limit
-            .as_ref()
-            .map(|limit| limit.message.clone())
-            .unwrap_or_else(|| {
-                if credits {
-                    "credits exhausted".to_owned()
-                } else {
-                    "authentication failed".to_owned()
-                }
-            });
-        self.write_limit(store, run, provider, kind, None, &detail, None, None)?;
-        self.mark_provider(store, provider, if credits { "credits" } else { "auth" }, false)?;
-        self.request_park(store, provider, if credits { "credits" } else { "auth" })?;
-        Ok(FailoverAction::ParkProvider {
-            provider: provider.to_owned(),
-        })
     }
 
     /// Writes the deterministic rate backoff and lowers the provider concurrency cap.
@@ -483,8 +518,9 @@ impl Failover {
         match result {
             Ok(result) => match result.summary.outcome {
                 RunOutcome::Ok => {
-                    store.clear_limit(provider)?;
                     let _ = store.record_probe(provider, store.clock().now(), true);
+                    store.clear_limit(provider)?;
+                    clear_mark_keys(store, provider)?;
                     self.record_limit_ledger(store, provider, "provider back", json!({"probe": "ok"}), None)?;
                     Ok(ProbeVerdict::Available)
                 }
@@ -515,10 +551,12 @@ impl Failover {
                             cap_until: existing.cap_until,
                         })?;
                     }
+                    self.extend_probe_back(store, provider)?;
                     Ok(ProbeVerdict::StillLimited { resets_at })
                 }
                 _ => {
                     let _ = store.record_probe(provider, store.clock().now(), false);
+                    self.extend_probe_back(store, provider)?;
                     Ok(ProbeVerdict::Failed(format!(
                         "probe ended with {:?}",
                         result.summary.outcome
@@ -527,6 +565,7 @@ impl Failover {
             },
             Err(error) => {
                 let _ = store.record_probe(provider, store.clock().now(), false);
+                self.extend_probe_back(store, provider)?;
                 Ok(ProbeVerdict::Failed(error.to_string()))
             }
         }
@@ -615,11 +654,31 @@ impl Failover {
                 Some(Some(resets_at)) => *resets_at > now,
                 None => false,
             };
+            // A stale `unavailable` mark (its 15-minute window has passed) must never
+            // outrank a healthy sibling rung. The map is already bounded, but this guard
+            // keeps a residual mark from turning the whole ladder into `None`.
+            if blocked && self.stale_unavailable(store, &provider, now)? {
+                return Ok(Some((index, executor.clone(), profile.node.clone())));
+            }
             if !blocked {
                 return Ok(Some((index, executor.clone(), profile.node.clone())));
             }
         }
         Ok(None)
+    }
+
+    /// Returns true when the provider's only remaining block is an expired `unavailable` row.
+    fn stale_unavailable(&self, store: &Store, provider: &str, now: Timestamp) -> Result<bool, CoreError> {
+        let Some(limit) = store.limit_for(provider)? else {
+            return Ok(false);
+        };
+        if limit.kind != LimitRowKind::Unavailable || !limit.resets_at.is_some_and(|at| at <= now) {
+            return Ok(false);
+        }
+        match store.kv_get(&format!("probe_back:{provider}"))? {
+            Some(value) => Ok(probe_back_until(store, &limit, &value)?.is_none_or(|until| until <= now)),
+            None => Ok(true),
+        }
     }
 
     /// Returns the configured profile of a run.
@@ -746,9 +805,68 @@ impl Failover {
     /// Remembers which providers have limit rows and whether probe-back applies.
     fn mark_provider(&self, store: &Store, provider: &str, kind: &str, probe_back: bool) -> Result<(), CoreError> {
         store.kv_set(&format!("limit:{provider}"), kind)?;
-        store.kv_set(&format!("probe_back:{provider}"), if probe_back { "1" } else { "0" })?;
+        if probe_back {
+            let now = store.clock().now();
+            let limit = store.limit_for(provider)?;
+            let fail_streak = limit.as_ref().map(|limit| limit.probe_fail_streak).unwrap_or(0);
+            // The probe-back hold starts when the reset arrives (the probe is due then),
+            // or now when the row carries no reset. It is still bounded: the rate clock
+            // gives 10 minutes at first, doubling per failed probe up to one hour.
+            let anchor = limit
+                .and_then(|limit| limit.resets_at)
+                .map_or(now, |reset| reset.max(now));
+            let until = anchor.plus(probe_back_delay(fail_streak));
+            store.kv_set(&format!("probe_back_until:{provider}"), &until.as_rfc3339())?;
+            store.kv_set(&format!("probe_back:{provider}"), "1")?;
+        } else {
+            store.kv_set(&format!("probe_back:{provider}"), "0")?;
+            store.kv_delete(&format!("probe_back_until:{provider}"))?;
+        }
         // A limit/failover event is an unseen planner event (loops.md §7 due rule a).
         super::l4_planner::raise_wake(store, "planner")?;
+        Ok(())
+    }
+
+    /// Clears the temporary marks of a provider after a successful run.
+    ///
+    /// A `credits` or `auth` row is deliberately left in place: only the owner's inbox
+    /// answer resolves it. The boolean reports whether a limit row was removed.
+    fn clear_recovered_marks(&self, store: &Store, run: &Run, provider: &str) -> Result<bool, CoreError> {
+        if let Some(limit) = store.limit_for(provider)?
+            && matches!(limit.kind, LimitRowKind::Credits | LimitRowKind::Auth)
+        {
+            return Ok(false);
+        }
+        let cleared = store.clear_limit(provider)?;
+        clear_mark_keys(store, provider)?;
+        if cleared {
+            self.record_limit_ledger(
+                store,
+                provider,
+                "provider recovered",
+                json!({"reason": "ok run"}),
+                Some(run),
+            )?;
+        }
+        Ok(cleared)
+    }
+
+    /// Extends a still-owed probe-back mark after a failed probe.
+    ///
+    /// The deadline grows 10 minutes per failed probe up to one hour, the same clock the
+    /// rate backoff uses, so the block is bounded even when no probe ever succeeds.
+    fn extend_probe_back(&self, store: &Store, provider: &str) -> Result<(), CoreError> {
+        let owed = store
+            .kv_get(&format!("probe_back:{provider}"))?
+            .is_some_and(|value| value != "0");
+        if !owed {
+            return Ok(());
+        }
+        let Some(limit) = store.limit_for(provider)? else {
+            return Ok(());
+        };
+        let until = store.clock().now().plus(probe_back_delay(limit.probe_fail_streak));
+        store.kv_set(&format!("probe_back_until:{provider}"), &until.as_rfc3339())?;
         Ok(())
     }
 
@@ -826,7 +944,54 @@ pub fn provider_of(run: &Run) -> Option<String> {
         .or_else(|| run.executor.as_ref().map(Executor::provider))
 }
 
-/// Finds the newest session of `role` for a project.
+/// Returns the bounded probe-back window for `probe_fail_streak` failed probes.
+///
+/// The window starts at the rate backoff base (10 minutes) and doubles with each failed
+/// probe, capped at one hour. It is deliberately finite: a probe that never succeeds must
+/// not block a provider forever.
+fn probe_back_delay(probe_fail_streak: u32) -> Duration {
+    let shift = probe_fail_streak.min(6);
+    let secs = RATE_BASE
+        .as_secs()
+        .saturating_mul(1_u64 << shift)
+        .min(RATE_MAX.as_secs());
+    Duration::from_secs(secs.max(1))
+}
+
+/// Returns when an owed probe-back mark stops blocking, if it is owed.
+///
+/// New marks store the deadline in `probe_back_until:<provider>`. A legacy `1` mark has no
+/// deadline, so its bounded window starts at the limit row's `since`; a timestamp written
+/// directly into `probe_back:<provider>` is accepted too.
+pub(crate) fn probe_back_until(store: &Store, limit: &Limit, value: &str) -> Result<Option<Timestamp>, CoreError> {
+    if value == "0" {
+        return Ok(None);
+    }
+    if let Some(text) = store.kv_get(&format!("probe_back_until:{}", limit.provider))? {
+        if let Some(at) = super::parse_ts(&text) {
+            return Ok(Some(at));
+        }
+    }
+    if let Some(at) = super::parse_ts(value) {
+        return Ok(Some(at));
+    }
+    Ok(Some(limit.since.plus(probe_back_delay(limit.probe_fail_streak))))
+}
+
+/// Removes every temporary mark key of `provider`.
+pub(crate) fn clear_mark_keys(store: &Store, provider: &str) -> Result<(), CoreError> {
+    store.kv_delete(&format!("limit:{provider}"))?;
+    store.kv_delete(&format!("probe_back:{provider}"))?;
+    store.kv_delete(&format!("probe_back_until:{provider}"))?;
+    store.kv_delete(&format!("probe_pending:{provider}"))?;
+    store.kv_delete(&format!("park:{provider}"))?;
+    Ok(())
+}
+
+/// Finds the newest usable session of `role` for a project.
+///
+/// Closed sessions are skipped: L1 closes a role session whose recorded cwd is gone, and a
+/// retired session must not keep a probe-back hand-off pending forever.
 fn role_session(
     store: &Store,
     project: &vowp_protocol::ProjectName,
@@ -838,7 +1003,7 @@ fn role_session(
             ..SessionFilter::default()
         })?
         .into_iter()
-        .find(|session| session.role == Some(role)))
+        .find(|session| session.role == Some(role) && session.state != vowp_protocol::SessionState::Closed))
 }
 
 /// Maps one limit event kind to its row kind (used by tests and callers).

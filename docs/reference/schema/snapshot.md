@@ -134,6 +134,19 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
           "$ref": "#/$defs/BrakeState",
           "description": "Brake state."
         },
+        "cluster": {
+          "$ref": "#/$defs/ClusterCapacity",
+          "default": {
+            "busy_workers": 0,
+            "cpu_cores": 0,
+            "disk_free_bytes": 0,
+            "mem_available_bytes": 0,
+            "mem_total_bytes": 0,
+            "online_worker_nodes": 0,
+            "target_workers": 0
+          },
+          "description": "Additive totals across Home and the online worker nodes."
+        },
         "measured": {
           "anyOf": [
             {
@@ -221,6 +234,63 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
         "set_by",
         "set_at",
         "reason"
+      ],
+      "type": "object"
+    },
+    "ClusterCapacity": {
+      "description": "Additive cluster-wide totals across Home and the online worker nodes.\n\nThis card never replaces the per-Home fields: `CapacityReport`, `CapacitySnapshot` and\n`Snapshot` keep their existing Home values and carry this document alongside them. A\nsingle-machine home reports `online_worker_nodes = 0` and totals equal to its own Home\ncapacity.",
+      "properties": {
+        "busy_workers": {
+          "description": "Home running runs plus each online worker node's `busy_slots`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpu_cores": {
+          "description": "Logical CPU cores across Home and every online worker node.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "disk_free_bytes": {
+          "description": "Free work filesystem bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mem_available_bytes": {
+          "description": "Memory available to new work in bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mem_total_bytes": {
+          "description": "Total physical memory in bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "online_worker_nodes": {
+          "description": "Number of online, active agent worker nodes (Home is not counted).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target_workers": {
+          "description": "Home `target_workers` plus each online worker node's `max_slots`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "online_worker_nodes",
+        "target_workers",
+        "busy_workers",
+        "cpu_cores",
+        "mem_total_bytes",
+        "mem_available_bytes",
+        "disk_free_bytes"
       ],
       "type": "object"
     },
@@ -488,7 +558,7 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
       "type": "object"
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {
@@ -923,6 +993,41 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
         }
       ]
     },
+    "OwnershipMode": {
+      "description": "How an owner holds a session: as a person's surface or as a worker job run.",
+      "oneOf": [
+        {
+          "const": "interactive",
+          "description": "A person's surface; liveness is its heartbeat.",
+          "type": "string"
+        },
+        {
+          "const": "job",
+          "description": "A worker-node job run; liveness is the run's `expires_at`.",
+          "type": "string"
+        }
+      ]
+    },
+    "OwnershipState": {
+      "description": "Liveness of an owner, derived at read time from its mode and timestamps.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "An interactive heartbeat younger than 60 seconds, or an unexpired job.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "An interactive owner whose heartbeat is 60 seconds old or older.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "A job owner whose `expires_at` has passed.",
+          "type": "string"
+        }
+      ]
+    },
     "ProjectName": {
       "description": "Project name slug, for example `vowp`.\n\n`_node` is the reserved project that owns project-less session runs.",
       "type": "string"
@@ -1061,6 +1166,20 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
           "$ref": "#/$defs/JobKind",
           "description": "Job kind."
         },
+        "needs": {
+          "description": "Upstream jobs this job needs, from the job graph.",
+          "items": {
+            "$ref": "#/$defs/JobId"
+          },
+          "type": "array"
+        },
+        "planned_executor": {
+          "description": "Executor the job will dispatch on: its explicit override, else the first\nnon-limited rung of its profile ladder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "priority": {
           "description": "Dispatch priority.",
           "format": "int32",
@@ -1159,6 +1278,30 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
           "minimum": 0,
           "type": "integer"
         },
+        "billing_mode": {
+          "description": "`subscription`, `api` or `free`, when the executor is known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "Known context window of the model in tokens, when configured.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "description": "Cost so far in USD; only for API-priced providers, absent for subscriptions.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "executor": {
           "description": "Executor string, when known.",
           "type": [
@@ -1201,6 +1344,33 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
             }
           ],
           "description": "Session the job runs in, when any."
+        },
+        "tokens_cache_read": {
+          "description": "Prompt-cache read tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_input": {
+          "description": "Non-cached input tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_output": {
+          "description": "Output tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1230,6 +1400,97 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
     "SessionId": {
       "description": "Session id: 26-character ULID.",
       "type": "string"
+    },
+    "SessionOwner": {
+      "description": "The read projection of a session's ownership record (its one `leases` row).\n\nIt never carries a lease token, a token hash, or an engine password.",
+      "properties": {
+        "acquired_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the owner acquired the session."
+        },
+        "activity": {
+          "$ref": "#/$defs/SurfaceActivity",
+          "default": "idle",
+          "description": "Whether the session is idle, running or waiting."
+        },
+        "epoch": {
+          "default": 0,
+          "description": "Monotonic counter the store bumps on every acquire or takeover.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Expiry of a job owner; `None` for an interactive owner."
+        },
+        "heartbeat_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Last heartbeat."
+        },
+        "holder": {
+          "description": "Human-visible holder name.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SurfaceKind",
+          "description": "Kind of client that owns the session."
+        },
+        "label": {
+          "default": null,
+          "description": "Friendly saved surface name, for example `\"StackSpirit · macbook\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/OwnershipMode",
+          "default": "interactive",
+          "description": "Interactive surface or job run."
+        },
+        "node": {
+          "$ref": "#/$defs/NodeName",
+          "description": "Node the owner runs on."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "Session the owner holds."
+        },
+        "state": {
+          "$ref": "#/$defs/OwnershipState",
+          "default": "active",
+          "description": "Liveness at the time the projection was built."
+        },
+        "surface_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SurfaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Surface instance id; `None` for a job run with no paired surface."
+        }
+      },
+      "required": [
+        "session_id",
+        "kind",
+        "holder",
+        "node",
+        "acquired_at",
+        "heartbeat_at"
+      ],
+      "type": "object"
     },
     "SessionRole": {
       "description": "The role a session serves. User sessions exist for `vowp session new`.\n\nDefined in the event module because [`SessionCreated`] needs it; the session domain\nrows use the same role vocabulary.",
@@ -1340,6 +1601,18 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
           "$ref": "#/$defs/NodeName",
           "description": "Node the session runs on."
         },
+        "owner": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionOwner"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The session's owner (its one lease row), including stale and job owners.\n\nAuthoritative; `active_surface` stays `null` for compatibility with older readers.\nNever carries a token or a password."
+        },
         "project": {
           "anyOf": [
             {
@@ -1448,6 +1721,26 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
       ],
       "type": "object"
     },
+    "SurfaceActivity": {
+      "description": "What the owner of a session is doing right now.",
+      "oneOf": [
+        {
+          "const": "idle",
+          "description": "No turn is running.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A turn or run is in progress.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "The session is blocked, waiting for an answer or a limit to clear.",
+          "type": "string"
+        }
+      ]
+    },
     "SurfaceId": {
       "description": "A surface instance id (ULID, 26 characters).",
       "type": "string"
@@ -1488,6 +1781,11 @@ Exported by `vowp schema Snapshot` and generated from the protocol types in
         {
           "const": "agent",
           "description": "A v0.4 local surface attached through a `vowp agent`.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_ui",
+          "description": "A desktop UI that talks to an orchestrator's app engine itself.\n\nWire spelling `desktop_ui`; the store and the CLI spell it `desktop-ui`.",
           "type": "string"
         }
       ]

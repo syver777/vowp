@@ -18,9 +18,10 @@ use std::time::Duration;
 
 use time::{OffsetDateTime, UtcOffset, macros::format_description};
 use vowp_protocol::{
-    Actor, EventBody, EventSource, HarnessKind, IngestAck, Lease, LeaseMode, Note, SessionId, Surface, SurfaceId,
-    SurfaceInfo, SurfaceKind, Timestamp,
+    Actor, EventBody, EventSource, HarnessKind, IngestAck, Lease, LeaseMode, Note, OwnershipState, Session, SessionId,
+    SessionOwner, SessionRole, Surface, SurfaceActivity, SurfaceId, SurfaceInfo, SurfaceKind, Timestamp,
 };
+use vowp_store::repo_surfaces::OwnerRecord;
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
 use vowp_store::{Store, StoreError, hash_lease_token};
 
@@ -150,11 +151,11 @@ impl LeaseGuard {
         store.upsert_surface(&req.surface)?;
 
         let outcome = store.transaction(|tx| {
-            let previous = tx.lease(&req.session)?;
-            if let Some(previous) = &previous
-                && !is_stale(now, previous.heartbeat_at)
+            let previous = tx.ownership(&req.session)?;
+            if let Some(record) = &previous
+                && record.is_live_at(now)
             {
-                return Ok(AcquireOutcome::Live(previous.clone()));
+                return Ok(AcquireOutcome::Live(record.lease.clone()));
             }
             let lease = Lease {
                 session_id: req.session.clone(),
@@ -258,33 +259,132 @@ impl Drop for LeaseGuard {
     }
 }
 
-/// Checks that the caller holds the live lease of `session`.
+/// Checks that the caller owns `session` and may write it.
 ///
-/// Reads `VOWP_LEASE_TOKEN`, which `chat` and `session ingest` set from the grant. A
-/// session without a lease (a job session) passes.
+/// Reads `VOWP_LEASE_TOKEN`, which `chat` and `session ingest` set from the grant. See
+/// [`check_lease_with`] for the rule.
 pub fn check_lease(deps: &Deps, store: &Store, session: &SessionId) -> Result<(), CoreError> {
+    let _ = deps;
     let token = std::env::var("VOWP_LEASE_TOKEN").ok();
-    let lease = store.lease(session)?;
-    match (lease, token) {
-        (None, _) => Ok(()),
-        (Some(lease), Some(token)) if lease_token_matches(&lease, &token) => {
-            let _ = deps;
+    check_lease_with(store, session, token.as_deref())
+}
+
+/// Checks an explicit lease token against the session's owner.
+///
+/// The rule depends on the session's role and the owner's liveness:
+///
+/// - an owner whose token matches and who is live (a fresh interactive heartbeat or an
+///   unexpired job) passes; a matching token on a stale or expired owner is refused;
+/// - another or a missing token is refused with the read-only notice;
+/// - a session with no owner row is refused when it is interactive (`User`, `Orchestrator`,
+///   or no role and no job); a local `Planner`, `Keeper`, `Worker` or `Verifier` session
+///   still passes, preserving the supervisor's own runs.
+pub fn check_lease_with(store: &Store, session: &SessionId, token: Option<&str>) -> Result<(), CoreError> {
+    let now = store.clock().now();
+    let Some(record) = store.ownership(session)? else {
+        let row = store.require_session(session)?;
+        return if is_interactive_session(&row) {
+            Err(CoreError::Refused(NO_OWNER_NOTICE.to_owned()))
+        } else {
             Ok(())
+        };
+    };
+    match token {
+        Some(token) if lease_token_matches(&record.lease, token) => {
+            if record.is_live_at(now) {
+                Ok(())
+            } else {
+                Err(CoreError::Refused(not_live_notice(&record, now)))
+            }
         }
-        (Some(lease), _) => Err(CoreError::Refused(read_only_notice(&lease))),
+        _ => Err(CoreError::Refused(read_only_notice(&record.lease))),
     }
 }
 
-/// Checks an explicit lease token; `None` means "no lease required".
-pub fn check_lease_with(store: &Store, session: &SessionId, token: Option<&str>) -> Result<(), CoreError> {
-    let Some(lease) = store.lease(session)? else {
-        return Ok(());
-    };
-    match token {
-        None => Ok(()),
-        Some(token) if lease_token_matches(&lease, token) => Ok(()),
-        Some(_) => Err(CoreError::Refused(read_only_notice(&lease))),
+/// Builds the token-free [`vowp_protocol::LeaseStatus`] of an ownership record at `now`.
+///
+/// `token` is always `None`; only `session lease --acquire` sets it, after building this.
+pub fn lease_status(record: &OwnerRecord, now: Timestamp) -> vowp_protocol::LeaseStatus {
+    let owner = record.to_owner(now);
+    vowp_protocol::LeaseStatus {
+        held: true,
+        holder: Some(owner.holder),
+        kind: Some(owner.kind),
+        node: Some(owner.node),
+        acquired_at: Some(owner.acquired_at),
+        heartbeat_at: Some(owner.heartbeat_at),
+        token: None,
+        mode: Some(owner.mode),
+        state: Some(owner.state),
+        epoch: Some(owner.epoch),
+        expires_at: owner.expires_at,
+        label: owner.label,
+        activity: Some(owner.activity),
     }
+}
+
+/// The refusal for an interactive session that nobody owns.
+pub const NO_OWNER_NOTICE: &str = "session has no owner; acquire one";
+
+/// The marker every stop/handoff notice starts with, so a surface can recognise it.
+pub const OWNERSHIP_CONFLICT: &str = "ownership_conflict";
+
+/// Returns whether a session is a person's session (needs an owner to be written).
+fn is_interactive_session(session: &Session) -> bool {
+    match session.role {
+        Some(SessionRole::User | SessionRole::Orchestrator) => true,
+        Some(SessionRole::Planner | SessionRole::Keeper | SessionRole::Worker | SessionRole::Verifier) => false,
+        None => session.job_id.is_none(),
+    }
+}
+
+/// What a takeover of the current owner needs from the person asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakeoverConfirmation {
+    /// No live owner: acquiring is not a takeover.
+    NotNeeded,
+    /// A live idle (or waiting) owner: one confirmation is enough.
+    Single,
+    /// A live owner that is mid-turn: the person must confirm a second time.
+    Extra,
+}
+
+/// Returns the confirmation a takeover of `session` needs at `now`.
+pub fn takeover_confirmation(
+    store: &Store,
+    session: &SessionId,
+    now: Timestamp,
+) -> Result<TakeoverConfirmation, CoreError> {
+    Ok(match store.session_owner(session, now)? {
+        Some(owner) if owner.state == OwnershipState::Active => match owner.activity {
+            SurfaceActivity::Running => TakeoverConfirmation::Extra,
+            SurfaceActivity::Idle | SurfaceActivity::Waiting => TakeoverConfirmation::Single,
+        },
+        _ => TakeoverConfirmation::NotNeeded,
+    })
+}
+
+/// Builds the stop/handoff notice a surface that lost ownership receives.
+///
+/// It starts with [`OWNERSHIP_CONFLICT`] and names the new owner (label when known) and the
+/// epoch; it never carries a token.
+pub fn stop_notice(new_owner: &SessionOwner) -> String {
+    let name = new_owner.label.as_deref().unwrap_or(&new_owner.holder);
+    format!(
+        "{OWNERSHIP_CONFLICT}: session taken over by {name} ({}, mode {}), owner epoch {}; stop writing",
+        new_owner.kind.display_name(),
+        new_owner.mode,
+        new_owner.epoch
+    )
+}
+
+/// Returns the refusal for a matching token whose owner is no longer live.
+fn not_live_notice(record: &OwnerRecord, now: Timestamp) -> String {
+    format!(
+        "this surface is read-only; its ownership is {} (holder {}); take the session over to write",
+        record.state_at(now),
+        record.lease.holder
+    )
 }
 
 /// Returns whether `token` is the plaintext token behind the stored `lease` hash.
@@ -330,9 +430,10 @@ pub fn acquire_agent_lease(
     let tail_seq = session_row.last_seq;
     let takeover = mode == LeaseMode::Takeover;
     let outcome = store.transaction(|tx| {
-        let previous = tx.lease(session)?;
+        let record = tx.ownership(session)?;
+        let previous = record.as_ref().map(|record| record.lease.clone());
         if let Some(previous) = &previous
-            && is_live(now, previous)
+            && record.as_ref().is_some_and(|record| record.is_live_at(now))
             && !takeover
         {
             return Ok(AgentLeaseAcquire::Conflict(LeaseConflict {
@@ -442,7 +543,10 @@ pub fn revocation_ack_for(
     match store.lease(session)? {
         Some(lease) if lease_token_matches(&lease, token) => Ok(None),
         Some(lease) => Ok(Some(IngestAck::LeaseRevoked {
-            reason: "session taken over".to_owned(),
+            reason: match store.session_owner(session, store.clock().now())? {
+                Some(owner) => stop_notice(&owner),
+                None => format!("{OWNERSHIP_CONFLICT}: session taken over"),
+            },
             by: lease.holder,
             at: lease.acquired_at,
             last_seq,
@@ -454,14 +558,6 @@ pub fn revocation_ack_for(
             last_seq,
         })),
     }
-}
-
-/// Returns whether a lease heartbeat is at least [`STALE_AFTER`] old.
-///
-/// Exactly [`STALE_AFTER`] is stale, matching the card rule that an active surface has a
-/// heartbeat *younger* than sixty seconds.
-fn is_stale(now: Timestamp, heartbeat_at: Timestamp) -> bool {
-    now.since(heartbeat_at) >= STALE_AFTER
 }
 
 /// Returns the exclusive `before` bound for the store's stale-lease queries.
@@ -481,6 +577,12 @@ pub fn sweep_leases(deps: &Deps, store: &Store, now: Timestamp) -> Result<u32, C
     let before = stale_before(now);
     let mut dropped = 0_u32;
     for lease in store.stale_leases(before)? {
+        // A running orchestrator keeps its stale row so the owner card still names the
+        // paired surface (state `stale`) instead of dropping to `null` while a sleeping
+        // laptop is away. An explicit release or a takeover still removes it.
+        if is_live_orchestrator(store, &lease.session_id)? {
+            continue;
+        }
         if store.release_stale_lease(&lease.session_id, &lease.token, before)? {
             dropped = dropped.saturating_add(1);
         }
@@ -493,6 +595,43 @@ pub fn sweep_leases(deps: &Deps, store: &Store, now: Timestamp) -> Result<u32, C
         );
     }
     Ok(dropped)
+}
+
+/// Returns whether `session` is an orchestrator that is still running or switching.
+fn is_live_orchestrator(store: &Store, session: &SessionId) -> Result<bool, CoreError> {
+    Ok(store.session(session)?.is_some_and(|row| {
+        row.role == Some(SessionRole::Orchestrator)
+            && matches!(
+                row.state,
+                vowp_protocol::SessionState::Running | vowp_protocol::SessionState::Switching
+            )
+    }))
+}
+
+/// Renews the interactive lease of every running orchestrator paired to `node`.
+///
+/// The node agent calls this on each heartbeat: while the agent is connected and the
+/// orchestrator session is running, the paired surface (OpenCode desktop) still owns it,
+/// so its lease heartbeat is advanced and the owner stays `active`. Returns how many
+/// leases were renewed.
+pub fn renew_running_orchestrator_leases(
+    store: &Store,
+    node: &vowp_protocol::NodeName,
+    now: Timestamp,
+) -> Result<u32, CoreError> {
+    let mut renewed = 0_u32;
+    for lease in store.list_leases()? {
+        let Some(surface) = lease.surface_id.as_ref() else {
+            continue;
+        };
+        if lease.node != *node || !is_live_orchestrator(store, &lease.session_id)? {
+            continue;
+        }
+        if store.heartbeat_surface_lease(&lease.session_id, surface, node, now)? {
+            renewed = renewed.saturating_add(1);
+        }
+    }
+    Ok(renewed)
 }
 
 /// Appends one free-form note event and indexes it.
@@ -525,6 +664,7 @@ pub(crate) fn surface_kind_name(kind: SurfaceKind) -> &'static str {
         SurfaceKind::Mirror => "mirror",
         SurfaceKind::Api => "api",
         SurfaceKind::Agent => "agent",
+        SurfaceKind::DesktopUi => "desktop-ui",
     }
 }
 

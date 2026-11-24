@@ -1481,7 +1481,14 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionLsArgs) -> Result<i32, 
     }
 
     let now = ctx.clock().now();
-    let mut table = Table::new(&["ID", "TITLE", "EXECUTOR", "NODE", "STATE", "LAST", "UPDATED", "EVENTS"]);
+    let owners: std::collections::HashMap<SessionId, vowp_protocol::SessionOwner> = store
+        .list_session_owners(now)?
+        .into_iter()
+        .map(|owner| (owner.session_id.clone(), owner))
+        .collect();
+    let mut table = Table::new(&[
+        "ID", "TITLE", "EXECUTOR", "NODE", "STATE", "OWNER", "LAST", "UPDATED", "EVENTS",
+    ]);
     for session in &sessions {
         let last = last_event(&store, session)
             .map(|event| local_time_at(event.ts, now, ctx.tz_offset_minutes()))
@@ -1496,6 +1503,10 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionLsArgs) -> Result<i32, 
                 .unwrap_or_else(|| "-".to_owned()),
             session.node.to_string(),
             state_name(session.state).to_owned(),
+            owners
+                .get(&session.id)
+                .map(owner_cell)
+                .unwrap_or_else(|| "-".to_owned()),
             last,
             local_time_at(session.updated_at, now, ctx.tz_offset_minutes()),
             session.last_seq.to_string(),
@@ -1503,6 +1514,47 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionLsArgs) -> Result<i32, 
     }
     writeln!(io.out(), "{}", table.render(ctx.color()))?;
     Ok(0)
+}
+
+/// Returns the compact `OWNER` cell: name, state and activity (never a token).
+fn owner_cell(owner: &vowp_protocol::SessionOwner) -> String {
+    let name = owner.label.as_deref().unwrap_or(&owner.holder);
+    format!("{name} [{}/{}]", owner.state, owner.activity)
+}
+
+/// Prints the `owner:` block of `session show`.
+fn write_owner_block(
+    io: &mut dyn IoStreams,
+    owner: Option<&vowp_protocol::SessionOwner>,
+    tz_offset_minutes: i32,
+    now: Timestamp,
+) -> Result<(), CliError> {
+    let Some(owner) = owner else {
+        writeln!(io.out(), "owner: none")?;
+        return Ok(());
+    };
+    writeln!(io.out(), "owner:")?;
+    writeln!(io.out(), "  name: {}", owner.label.as_deref().unwrap_or("-"))?;
+    writeln!(io.out(), "  holder: {}", owner.holder)?;
+    writeln!(io.out(), "  kind: {}", owner.kind.store_name())?;
+    writeln!(io.out(), "  node: {}", owner.node)?;
+    writeln!(io.out(), "  mode: {}", owner.mode)?;
+    writeln!(io.out(), "  state: {}", owner.state)?;
+    writeln!(io.out(), "  activity: {}", owner.activity)?;
+    writeln!(io.out(), "  epoch: {}", owner.epoch)?;
+    writeln!(
+        io.out(),
+        "  heartbeat: {}",
+        local_time_at(owner.heartbeat_at, now, tz_offset_minutes)
+    )?;
+    if let Some(expires) = owner.expires_at {
+        writeln!(
+            io.out(),
+            "  expires: {}",
+            local_time_at(expires, now, tz_offset_minutes)
+        )?;
+    }
+    Ok(())
 }
 
 /// Shows one session, its executor history, switches and optional capsule/events.
@@ -1555,10 +1607,12 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionShowArgs) -> Result<i32
             switches: Vec<&'a vowp_protocol::Switch>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             events: Vec<EventEnvelope>,
+            owner: Option<vowp_protocol::SessionOwner>,
         }
         print_json(
             io,
             &Show {
+                owner: store.session_owner(&session.id, ctx.clock().now())?,
                 session: &session,
                 capsule: capsule.as_ref(),
                 switches: if args.lineage {
@@ -1596,6 +1650,12 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &SessionShowArgs) -> Result<i32
     )?;
     writeln!(io.out(), "node: {}", session.node)?;
     writeln!(io.out(), "cwd: {}", session.cwd)?;
+    write_owner_block(
+        io,
+        store.session_owner(&session.id, now)?.as_ref(),
+        ctx.tz_offset_minutes(),
+        now,
+    )?;
     writeln!(
         io.out(),
         "executor: {}",

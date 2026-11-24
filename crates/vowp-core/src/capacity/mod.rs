@@ -6,6 +6,7 @@
 pub mod admit;
 pub mod advisor;
 pub mod brakes;
+pub mod cluster;
 pub mod estimates;
 pub mod fair;
 pub mod history;
@@ -18,6 +19,7 @@ pub mod usage;
 pub use admit::{CapacityManager, admit, request_for};
 pub use advisor::{AdviceTrigger, maybe_advise};
 pub use brakes::evaluate;
+pub use cluster::build as cluster_capacity;
 pub use estimates::{estimate_for, recompute};
 pub use fair::order;
 pub use history::{

@@ -11,6 +11,20 @@ use vowp_store::Store;
 use crate::CoreError;
 use crate::deps::Deps;
 
+/// Returns the kv key holding a job's explicit executor override.
+pub fn job_executor_key(job: &JobId) -> String {
+    format!("job_executor:{job}")
+}
+
+/// Reads a job's explicit executor override (`vowp job set-executor`), when one is set.
+///
+/// An unparsable stored value is ignored so a hand-edited row cannot block dispatch.
+pub fn job_executor_override(store: &Store, job: &JobId) -> Result<Option<vowp_protocol::Executor>, CoreError> {
+    Ok(store
+        .kv_get(&job_executor_key(job))?
+        .and_then(|value| vowp_protocol::Executor::parse(&value).ok()))
+}
+
 /// Returns false when the job must wait; writes the waiting reason to `jobs.note`.
 ///
 /// The body builds the node-wide admission request, asks the capacity manager, records
@@ -220,6 +234,10 @@ pub(crate) fn create_child_job(
     body.push_str(&format!(
         "Fix exactly these problems in the same worktree, re-run the failing commands, commit, and update {report}. Do not widen scope."
     ));
+    if let Some(note) = super::l2_worker::failing_report_note(findings, &report) {
+        body.push('\n');
+        body.push_str(&note);
+    }
 
     let mut owns = parent.owns.clone();
     if kind == JobKind::Merge {
@@ -325,7 +343,15 @@ pub(crate) fn create_decision_job(_deps: &Deps, store: &Store, parent: &Job) -> 
 }
 
 /// Formats one failed gate result as a fix-prompt finding.
-pub(crate) fn gate_finding(result: &vowp_protocol::GateResult) -> String {
+///
+/// A report-gate finding names the failing job and its report path, so a fix worker knows
+/// which file failed even though its own report is a different file.
+pub(crate) fn gate_finding(job: &Job, result: &vowp_protocol::GateResult) -> String {
+    gate_finding_for(job.id.as_str(), &job.report, result)
+}
+
+/// Formats a gate result for the job `job_id` whose report lives at `report`.
+fn gate_finding_for(job_id: &str, report: &str, result: &vowp_protocol::GateResult) -> String {
     use vowp_protocol::Evidence;
     match &result.evidence {
         Evidence::Cmd {
@@ -360,7 +386,11 @@ pub(crate) fn gate_finding(result: &vowp_protocol::GateResult) -> String {
             if !missing_fields.is_empty() {
                 parts.push(format!("missing fields: {}", missing_fields.join(", ")));
             }
-            format!("gate {} (report): {}", result.gate_index, parts.join("; "))
+            format!(
+                "gate {} (report) for {job_id} at {report}: {}",
+                result.gate_index,
+                parts.join("; ")
+            )
         }
         Evidence::OwnsRespected { violations, .. } => format!(
             "gate {} (owns_respected): changed outside owns: {}",
@@ -388,5 +418,55 @@ pub(crate) fn gate_finding(result: &vowp_protocol::GateResult) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vowp_protocol::{Evidence, GateResult, Timestamp};
+
+    fn report_failure() -> GateResult {
+        GateResult {
+            id: None,
+            job_id: JobId::parse("parent-job").unwrap(),
+            run_id: None,
+            attempt: 1,
+            gate_index: 0,
+            gate: Gate::Report(ReportGate::default()),
+            passed: false,
+            evidence: Evidence::Report {
+                front_matter: None,
+                missing_fields: vec!["commits".into(), "tests".into()],
+                problems: Vec::new(),
+            },
+            output_blob: None,
+            duration_ms: 0,
+            ts: Timestamp::from_unix_secs(0),
+        }
+    }
+
+    #[test]
+    fn report_finding_names_job_and_report_path() {
+        let path = ".vowp/jobs/parent-job/report.md";
+        let finding = gate_finding_for("parent-job", path, &report_failure());
+        assert_eq!(
+            finding,
+            "gate 0 (report) for parent-job at .vowp/jobs/parent-job/report.md: missing fields: commits, tests"
+        );
+    }
+
+    #[test]
+    fn fix_brief_tells_worker_to_edit_failing_report_and_own() {
+        let path = ".vowp/jobs/parent-job/report.md";
+        let findings = vec![gate_finding_for("parent-job", path, &report_failure())];
+        let own = ".vowp/jobs/parent-job-fix-1/report.md";
+        let note =
+            super::super::l2_worker::failing_report_note(&findings, own).expect("a report finding yields a note");
+        assert!(note.contains(path), "{note}");
+        assert!(note.contains("edit"), "{note}");
+        assert!(note.contains(own), "{note}");
+        let none = super::super::l2_worker::failing_report_note(&["gate 1 (cargo test) exited Some(1):".into()], own);
+        assert!(none.is_none());
     }
 }

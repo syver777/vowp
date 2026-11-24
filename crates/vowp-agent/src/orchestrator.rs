@@ -27,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use vowp_protocol::{
-    NodeName, OrchestratorApp, OrchestratorCommand, OrchestratorError, OrchestratorNodeState, OrchestratorResult,
-    ProjectName, SessionId, SurfaceId, Timestamp,
+    EndpointAccess, NodeName, OrchestratorApp, OrchestratorAuth, OrchestratorCommand, OrchestratorEndpoint,
+    OrchestratorError, OrchestratorLocation, OrchestratorNodeState, OrchestratorResult, ProjectName, SessionId,
+    SurfaceId, Timestamp,
 };
 
 use crate::client::validate_surface_id;
@@ -42,6 +43,8 @@ pub const ORCHESTRATORS_DIR: &str = "orchestrators";
 pub const ORCHESTRATOR_CONFIG_FILE: &str = "config.json";
 /// Private host state and pid file name.
 pub const ORCHESTRATOR_HOST_FILE: &str = "host.json";
+/// Private hint file holding the last app-side session id seen by the bridge.
+pub const ORCHESTRATOR_NATIVE_SESSION_FILE: &str = "native-session.json";
 /// The app-facing standing instruction file name.
 pub const ORCHESTRATOR_AGENTS_FILE: &str = "AGENTS.md";
 /// The app-facing opencode MCP and instruction config file name.
@@ -363,6 +366,11 @@ impl OrchestratorHost {
         Ok(Self::dir(state_dir, name)?.join(ORCHESTRATOR_HOST_FILE))
     }
 
+    /// Returns one orchestrator's private native-session hint path.
+    pub fn native_session_path(state_dir: &Path, name: &str) -> Result<PathBuf, OrchestratorError> {
+        Ok(Self::dir(state_dir, name)?.join(ORCHESTRATOR_NATIVE_SESSION_FILE))
+    }
+
     /// Reads one materialized config, tightening a file left wider than 0600.
     pub fn config(&self, name: &str) -> Result<Option<OrchestratorConfig>, OrchestratorError> {
         let path = Self::config_path(&self.state_dir, name)?;
@@ -384,6 +392,101 @@ impl OrchestratorHost {
     /// Reads one host state/pid file.
     pub fn state(&self, name: &str) -> Result<Option<OrchestratorHostState>, OrchestratorError> {
         read_host_state(&Self::host_path(&self.state_dir, name)?)
+    }
+
+    /// Returns the recorded host when its process-group leader is still alive.
+    ///
+    /// A state file whose pid is gone is stale; a caller that must decide between an
+    /// idempotent duplicate and a move never treats it as a live host.
+    pub fn live_state(&self, name: &str) -> Result<Option<OrchestratorHostState>, OrchestratorError> {
+        Ok(self.state(name)?.filter(|state| state.pid.is_some_and(process_alive)))
+    }
+
+    /// Returns the local discovery document for one orchestrator.
+    ///
+    /// The base fields come from `config.json` and the recorded host state. The live
+    /// loopback `url` and `auth` come from the 0600 app service file named by
+    /// `service_json`; a stopped host, an app without a loopback endpoint (Claude or chat),
+    /// or a missing service file leaves them `None` rather than guessing. An unknown name
+    /// is a typed `not_found`; every error names the failure class and never a path, port,
+    /// password, token or pair link.
+    pub fn endpoint(&self, name: &str) -> Result<OrchestratorEndpoint, OrchestratorError> {
+        validate_name(name)?;
+        let config = self
+            .config(name)
+            .map_err(|error| endpoint_error(name, error))?
+            .ok_or_else(|| {
+                OrchestratorError::new(
+                    "not_found",
+                    format!("there is no local record for orchestrator {name}"),
+                    false,
+                )
+            })?;
+        let recorded = self.state(name).map_err(|error| endpoint_error(name, error))?;
+        let live = recorded.as_ref().filter(|state| state.pid.is_some_and(process_alive));
+        let state = match (live, recorded.as_ref()) {
+            (Some(live), _) => live.state,
+            (None, Some(recorded)) if recorded.state == OrchestratorNodeState::Failed => OrchestratorNodeState::Failed,
+            _ => OrchestratorNodeState::Stopped,
+        };
+        let session = live
+            .and_then(|live| live.session.clone())
+            .or_else(|| config.session.clone())
+            .ok_or_else(|| endpoint_error(name, config_error("the local orchestrator has no paired session")))?;
+        let mut endpoint = OrchestratorEndpoint {
+            name: name.to_owned(),
+            app: config.app,
+            session_id: session,
+            location: OrchestratorLocation::Node,
+            node: self.node_name(),
+            state,
+            url: None,
+            native_session_id: None,
+            auth: None,
+            // The agent cannot see the home database, so it never reports an owner.
+            owner: None,
+            access: EndpointAccess::ReadOnly,
+        };
+        if live.is_none() || config.app != OrchestratorApp::Opencode {
+            return Ok(endpoint);
+        }
+        if let Some(service_json) = config.service_json.as_deref()
+            && let Some(service) =
+                read_service_endpoint(Path::new(service_json)).map_err(|error| endpoint_error(name, error))?
+        {
+            endpoint.url = Some(service.url);
+            endpoint.native_session_id = service.native_session_id.filter(|id| !id.trim().is_empty());
+            endpoint.auth = Some(service.auth);
+        }
+        // The app's own service file wins when it names a session. Otherwise the bridge's
+        // last observed app-side id is the only honest value; when neither exists the field
+        // stays null rather than guessing the newest app session.
+        if endpoint.native_session_id.is_none() {
+            endpoint.native_session_id =
+                read_native_session_id(&self.state_dir, name).map_err(|error| endpoint_error(name, error))?;
+        }
+        Ok(endpoint)
+    }
+
+    /// Returns the binding the next start or resume would use, without changing the config.
+    ///
+    /// The pairing file written when the surface was paired is the home-issued authority:
+    /// when the local config names a surface, its `surfaces/<id>/session` value wins over a
+    /// stale `config.session`. A revoked, `needs_pair` or missing surface is ignored, and
+    /// the one remaining active pairing is used instead. More than one active pairing
+    /// without a configured surface is `surface_ambiguous`; none is `None`, which a start
+    /// reports as `surface_missing` and never replaces with a locally minted session id.
+    pub fn resolve_current_binding(&self, name: &str) -> Result<Option<SurfaceBinding>, OrchestratorError> {
+        validate_name(name)?;
+        if let Some(config) = self.config(name)? {
+            if let Some(surface) = config.surface.as_ref() {
+                validate_surface_id(surface).map_err(|_| config_error("the configured surface id is not a ULID"))?;
+                if let Some(binding) = pairing_binding(&self.state_dir, surface)? {
+                    return Ok(Some(binding));
+                }
+            }
+        }
+        single_active_pairing(&self.state_dir)
     }
 
     /// Prepares a `Start` or `Resume` without attaching the surface.
@@ -437,7 +540,12 @@ impl OrchestratorHost {
         // host instead of spawning a second one.
         match self.state(&name) {
             Ok(Some(state)) if state.pid.is_some_and(process_alive) => {
-                let binding = match binding_from(config.session.clone(), config.surface.clone()) {
+                // The running host's own record is the authority for a duplicate; the
+                // config may already name a newer pairing that a move will apply.
+                let binding = match binding_from(
+                    state.session.clone().or(config.session.clone()),
+                    state.surface.clone().or(config.surface.clone()),
+                ) {
                     Ok(binding) => binding,
                     Err(error) => {
                         return PrepareOutcome::Failed(failed_result(
@@ -459,7 +567,7 @@ impl OrchestratorHost {
             }
             Ok(Some(_)) => {
                 self.release_stdin(&name);
-                let _ = fs::remove_file(Self::host_path(&self.state_dir, &name).unwrap_or_default());
+                remove_host_state(&self.state_dir, &name);
             }
             Ok(None) => {}
             Err(error) => {
@@ -505,6 +613,9 @@ impl OrchestratorHost {
         let name = name.clone();
         let capture_output = config.app == OrchestratorApp::Opencode || service_json.is_some();
 
+        // A fresh app process creates a fresh app-side session; an id left from a previous
+        // run must never be reported for it.
+        clear_native_session(&state_dir, &name);
         self.release_stdin(&name);
         let spawned = match spawn_app(
             &program,
@@ -533,7 +644,7 @@ impl OrchestratorHost {
         {
             stop_process(pid, Duration::from_millis(0));
             let _ = child.wait();
-            let _ = fs::remove_file(Self::host_path(&state_dir, &name).unwrap_or_default());
+            remove_host_state(&state_dir, &name);
             return PrepareOutcome::Failed(failed_result(&request_id, OrchestratorNodeState::Failed, error));
         }
         let started_at = Timestamp::now();
@@ -558,7 +669,7 @@ impl OrchestratorHost {
             let Some(service_json) = service_json.as_deref() else {
                 stop_process(pid, Duration::from_millis(0));
                 let _ = child.wait();
-                let _ = fs::remove_file(Self::host_path(&state_dir, &name).unwrap_or_default());
+                remove_host_state(&state_dir, &name);
                 return PrepareOutcome::Failed(failed_result(
                     &request_id,
                     OrchestratorNodeState::Failed,
@@ -568,7 +679,7 @@ impl OrchestratorHost {
             if let Err(error) = wait_for_service(service_json, &mut child, startup, capture.as_ref()) {
                 stop_process(pid, Duration::from_millis(0));
                 let _ = child.wait();
-                let _ = fs::remove_file(Self::host_path(&state_dir, &name).unwrap_or_default());
+                remove_host_state(&state_dir, &name);
                 return PrepareOutcome::Failed(failed_result(&request_id, OrchestratorNodeState::Failed, error));
             }
         }
@@ -651,6 +762,9 @@ impl OrchestratorHost {
         let state = match self.state(&name) {
             Ok(Some(state)) => state,
             Ok(None) => {
+                // A crash can leave the hint without `host.json`; an explicit stop still
+                // clears it so a later start cannot report the old app session.
+                clear_native_session(&self.state_dir, &name);
                 let mut result = OrchestratorResult::accepted(&request_id, OrchestratorNodeState::Stopped);
                 result.detail = Some("the host was not running".to_owned());
                 return result;
@@ -681,7 +795,7 @@ impl OrchestratorHost {
             }
         }
         self.release_stdin(&name);
-        let _ = fs::remove_file(Self::host_path(&self.state_dir, &name).unwrap_or_default());
+        remove_host_state(&self.state_dir, &name);
         let mut result = OrchestratorResult::accepted(&request_id, OrchestratorNodeState::Stopped);
         result.detail = Some(if detach_failed {
             "the host stopped; the home detach frame could not be sent".to_owned()
@@ -747,7 +861,7 @@ impl OrchestratorHost {
                 stop_process(pid, self.stop_grace);
             }
             self.release_stdin(&state.name);
-            let _ = fs::remove_file(Self::host_path(&self.state_dir, &state.name).unwrap_or_default());
+            remove_host_state(&self.state_dir, &state.name);
         }
     }
 
@@ -812,7 +926,7 @@ impl OrchestratorHost {
             if clean {
                 let _ = fs::remove_dir_all(&dir);
             } else {
-                let _ = fs::remove_file(dir.join(ORCHESTRATOR_HOST_FILE));
+                remove_host_state(&self.state_dir, name);
             }
         }
     }
@@ -888,7 +1002,8 @@ impl OrchestratorHost {
                     .to_string(),
             );
         }
-        self.write_config(&config)?;
+        // The caller resolves the pairing before writing, so a move never persists a
+        // stale `session` or `surface` from the previous placement.
         Ok(config)
     }
 
@@ -1070,7 +1185,7 @@ impl OrchestratorHost {
             stop_process(pid, self.stop_grace);
         }
         self.release_stdin(name);
-        let _ = fs::remove_file(Self::host_path(&self.state_dir, name).unwrap_or_default());
+        remove_host_state(&self.state_dir, name);
     }
 
     fn set_state(
@@ -1086,6 +1201,7 @@ impl OrchestratorHost {
         current.detail = detail.map(|text| redact_detail(&text));
         if state == OrchestratorNodeState::Stopped || state == OrchestratorNodeState::Failed {
             current.pid = None;
+            clear_native_session(&self.state_dir, name);
         }
         write_host_state(&self.state_dir, &current)
     }
@@ -1133,53 +1249,95 @@ pub fn validate_name(name: &str) -> Result<(), OrchestratorError> {
 }
 
 fn resolve_binding(state_dir: &Path, config: &mut OrchestratorConfig) -> Result<SurfaceBinding, OrchestratorError> {
-    if let (Some(surface), Some(session)) = (config.surface.clone(), config.session.clone()) {
+    // The home-issued pairing file wins over a stale `config.session`: a move keeps the
+    // home's session id and re-materializes the local config around it.
+    if let Some(surface) = config.surface.clone() {
         validate_surface_id(&surface).map_err(|_| config_error("the configured surface id is not a ULID"))?;
-        return Ok(SurfaceBinding { surface, session });
-    }
-    if config.surface.is_some() || config.session.is_some() {
-        return Err(config_error("the local config has only half of a surface binding"));
-    }
-    let mut found = Vec::new();
-    let dir = AgentConfig::surfaces_dir(state_dir);
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            let Some(surface) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let surface = SurfaceId(surface.to_owned());
-            if validate_surface_id(&surface).is_err() {
-                continue;
-            }
-            let session = match fs::read_to_string(path.join(crate::config::SURFACE_SESSION_FILE)) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
-            let Ok(session) = SessionId::parse(session.trim()) else {
-                continue;
-            };
-            found.push(SurfaceBinding { surface, session });
-        }
-    }
-    match found.len() {
-        0 => Err(import_error(
-            "surface_missing",
-            "pair a surface for this orchestrator before starting it",
-        )),
-        1 => {
-            // invariant: `found` has exactly one element here.
-            let binding = found.pop().unwrap_or(SurfaceBinding {
-                surface: SurfaceId(String::new()),
-                session: SessionId::new(),
-            });
+        if let Some(binding) = pairing_binding(state_dir, &surface)? {
             config.surface = Some(binding.surface.clone());
             config.session = Some(binding.session.clone());
-            Ok(binding)
+            return Ok(binding);
         }
+        // A revoked, needs_pair or missing surface is never started again.
+    }
+    config.surface = None;
+    config.session = None;
+    let Some(binding) = single_active_pairing(state_dir)? else {
+        return Err(import_error(
+            "surface_missing",
+            "pair a surface for this orchestrator before starting it",
+        ));
+    };
+    config.surface = Some(binding.surface.clone());
+    config.session = Some(binding.session.clone());
+    Ok(binding)
+}
+
+/// Returns the home-issued binding stored beside one surface, when it is still active.
+fn pairing_binding(state_dir: &Path, surface: &SurfaceId) -> Result<Option<SurfaceBinding>, OrchestratorError> {
+    let dir = AgentConfig::surface_dir(state_dir, surface);
+    if !dir.is_dir() || !pairing_is_active(&dir) {
+        return Ok(None);
+    }
+    let path = dir.join(crate::config::SURFACE_SESSION_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(config_error("the paired surface binding could not be read")),
+    };
+    let Ok(session) = SessionId::parse(text.trim()) else {
+        return Ok(None);
+    };
+    Ok(Some(SurfaceBinding {
+        surface: surface.clone(),
+        session,
+    }))
+}
+
+/// Returns whether one surface directory may be attached by an orchestrator.
+///
+/// A `session` file is written only after a successful pairing, so a directory that has
+/// one is usable even when it predates the local `state` file. An explicit `needs_pair`
+/// or `revoked` state is dead and is never selected, whatever else the directory holds.
+fn pairing_is_active(dir: &Path) -> bool {
+    match fs::read_to_string(dir.join(crate::surface_state::SURFACE_STATE_FILE)) {
+        Ok(text) => !matches!(text.trim(), "needs_pair" | "revoked"),
+        Err(_) => true,
+    }
+}
+
+/// Returns the one active paired surface, or refuses an ambiguous set.
+fn single_active_pairing(state_dir: &Path) -> Result<Option<SurfaceBinding>, OrchestratorError> {
+    let mut found = Vec::new();
+    let dir = AgentConfig::surfaces_dir(state_dir);
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(config_error("the paired surface directory could not be read")),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !pairing_is_active(&path) {
+            continue;
+        }
+        let Some(surface) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let surface = SurfaceId(surface.to_owned());
+        if validate_surface_id(&surface).is_err() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path.join(crate::config::SURFACE_SESSION_FILE)) else {
+            continue;
+        };
+        let Ok(session) = SessionId::parse(text.trim()) else {
+            continue;
+        };
+        found.push(SurfaceBinding { surface, session });
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
         _ => Err(OrchestratorError::new(
             "surface_ambiguous",
             "more than one paired surface could own this orchestrator; set one in the local config",
@@ -1531,6 +1689,59 @@ struct ServiceState {
     url: Option<String>,
     #[serde(default)]
     password: String,
+    /// App-side session id, when the app's own service file carries one.
+    #[serde(default)]
+    native_session_id: Option<String>,
+}
+
+/// The private endpoint values read from an app's service file.
+struct ServiceEndpoint {
+    url: String,
+    native_session_id: Option<String>,
+    auth: OrchestratorAuth,
+}
+
+/// Reads the live loopback endpoint from the 0600 app service file.
+///
+/// A missing file is `Ok(None)`: a stopped host has no endpoint. Every failure is typed
+/// and path-free; the service path, port and password never appear in the message.
+fn read_service_endpoint(path: &Path) -> Result<Option<ServiceEndpoint>, OrchestratorError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(config_error("the app service.json could not be read")),
+    };
+    if !metadata.is_file() {
+        return Err(config_error("the app service.json is not a regular file"));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(config_error("the app service.json is wider than 0600"));
+    }
+    let bytes = fs::read(path).map_err(|_| config_error("the app service.json could not be read"))?;
+    let state: ServiceState =
+        serde_json::from_slice(&bytes).map_err(|_| config_error("the app service.json is not valid JSON"))?;
+    if state.password.is_empty() {
+        return Err(config_error("the app service.json has no service password"));
+    }
+    let url = state.url.as_deref().unwrap_or_default();
+    let port = state
+        .port
+        .filter(|port| *port != 0)
+        .or_else(|| url_port(url))
+        .ok_or_else(|| config_error("the app service.json has no usable loopback port"))?;
+    if !url.is_empty() && !(url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")) {
+        return Err(config_error("the app service.json does not name a loopback URL"));
+    }
+    Ok(Some(ServiceEndpoint {
+        url: format!("http://127.0.0.1:{port}"),
+        native_session_id: state.native_session_id,
+        auth: OrchestratorAuth {
+            header: "Authorization".to_owned(),
+            scheme: "Basic".to_owned(),
+            username: "opencode".to_owned(),
+            password: state.password,
+        },
+    }))
 }
 
 fn read_service(path: &Path) -> Result<(), OrchestratorError> {
@@ -1571,6 +1782,62 @@ fn url_port(url: &str) -> Option<u16> {
     let (_, port) = url.rsplit_once(':')?;
     let port = port.trim_end_matches('/');
     port.parse::<u16>().ok().filter(|port| *port != 0)
+}
+
+/// The private hint the bridge writes beside `host.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NativeSessionState {
+    native_session_id: String,
+}
+
+/// Writes one app-side session id 0600 beside the host state.
+///
+/// The bridge calls this on first sight and whenever the app switches to another session.
+/// The file carries only the id: never the service URL, password or any local path.
+pub(crate) fn write_native_session_file(path: &Path, native_session_id: &str) -> Result<(), AgentError> {
+    let id = native_session_id.trim();
+    if id.is_empty() || id.chars().any(char::is_control) {
+        return Err(AgentError::Config(
+            "the app reported an unusable native session id".to_owned(),
+        ));
+    }
+    let value = NativeSessionState {
+        native_session_id: id.to_owned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&value)
+        .map_err(|error| AgentError::Config(format!("the native session hint could not be encoded: {error}")))?;
+    write_atomic_private(path, &bytes)
+}
+
+/// Reads one app-side session id hint, tightening a file left wider than 0600.
+fn read_native_session_id(state_dir: &Path, name: &str) -> Result<Option<String>, OrchestratorError> {
+    let path = OrchestratorHost::native_session_path(state_dir, name)?;
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            let state: NativeSessionState = serde_json::from_slice(&bytes)
+                .map_err(|_| config_error("the local native session hint is not valid JSON"))?;
+            let id = state.native_session_id.trim();
+            Ok((!id.is_empty()).then(|| id.to_owned()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(config_error("the local native session hint could not be read")),
+    }
+}
+
+/// Removes one app-side session id hint; a missing file is not an error.
+fn clear_native_session(state_dir: &Path, name: &str) {
+    if let Ok(path) = OrchestratorHost::native_session_path(state_dir, name) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Removes the pid/state file and the native-session hint of one stopped host.
+fn remove_host_state(state_dir: &Path, name: &str) {
+    if let Ok(path) = OrchestratorHost::host_path(state_dir, name) {
+        let _ = fs::remove_file(path);
+    }
+    clear_native_session(state_dir, name);
 }
 
 fn read_host_state(path: &Path) -> Result<Option<OrchestratorHostState>, OrchestratorError> {
@@ -1630,6 +1897,15 @@ fn failed_result(request_id: &str, state: OrchestratorNodeState, error: Orchestr
 
 fn config_error(message: &str) -> OrchestratorError {
     OrchestratorError::new("config_invalid", message, false)
+}
+
+/// Adds the orchestrator name to an endpoint read failure, keeping its code and class.
+fn endpoint_error(name: &str, error: OrchestratorError) -> OrchestratorError {
+    OrchestratorError::new(
+        &error.code,
+        format!("orchestrator {name}: {}", error.message),
+        error.retryable,
+    )
 }
 
 fn import_error(code: &str, message: &str) -> OrchestratorError {

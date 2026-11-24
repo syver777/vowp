@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vowp_protocol::{CmdGate, Gate, GateResult, InboxKind, Job, JobId, JobKind, JobState, LedgerEntry, LedgerKind};
-use vowp_store::{JobFilter, Store};
+use vowp_store::{JobFilter, StateChange, Store};
 
 use crate::CoreError;
 use crate::deps::{CommandSpec, Deps, RebaseResult};
@@ -229,11 +229,47 @@ impl MergeQueue {
                 );
             }
             let _ = self.deps.git.branch_delete(&repo, &branch);
+            self.settle_superseded_parent(store, job);
             let _ = self.deps.windows.kill_window(
                 &vowp_tmux::session_name_for_project(job.project.as_str()),
                 &super::window_name(&job.id),
             );
             return Ok(MergeStep::Merged(job.id.clone()));
+        }
+    }
+
+    /// Settles the parent of a merged `<parent>-decision` job.
+    ///
+    /// A decision job replaces its parent's remaining work, so a parent left `stalled`,
+    /// `failed` or `fixing` would show as a ghost running or blocked job forever. It is moved
+    /// to `replanned` with a note naming the decision job. Failures are logged, never raised:
+    /// the merge itself already landed.
+    fn settle_superseded_parent(&self, store: &Store, job: &Job) {
+        let Some(parent_id) = job.id.as_str().strip_suffix("-decision").filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let Ok(parent_id) = JobId::parse(parent_id) else {
+            return;
+        };
+        let result = store.job(&parent_id).and_then(|parent| {
+            let Some(parent) = parent else { return Ok(()) };
+            if !matches!(parent.state, JobState::Stalled | JobState::Failed | JobState::Fixing) {
+                return Ok(());
+            }
+            let change = StateChange {
+                note: Some(format!("superseded: decision job {} merged cleanly", job.id)),
+                parked_reason: None,
+            };
+            store
+                .set_job_state(&parent.id, JobState::Replanned, &change)
+                .map(|_| ())
+        });
+        if let Err(error) = result {
+            self.deps.log.log(
+                vowp_protocol::Level::Warn,
+                "merge",
+                &format!("cannot settle superseded parent {parent_id}: {error}"),
+            );
         }
     }
 

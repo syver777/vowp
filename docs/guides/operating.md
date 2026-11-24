@@ -118,6 +118,12 @@ The report shows the host sample, the current target and advice, running usage, 
 per-project estimates and waiting jobs. A job that is ready but not running shows its reason on the
 board and in `fleet queue`; a provider limit and a capacity brake are different causes.
 
+When an agent worker node is online, `capacity show`, `capacity report` and `fleet status` add a
+`cluster:` line: online worker nodes, pooled busy/target workers, summed CPU, available/total RAM
+and free disk. The home target still governs runs on the home; an eligible offloaded run is
+admitted against the chosen worker node's slots and headroom. The full rule is in
+[Capacity](../concepts/capacity.md#cluster-capacity).
+
 The AI keeper proposes a target every 30 minutes and on events, as a `decision` inbox item. It never
 changes the target itself. The owner answers, and the orchestrator applies it with
 `vowp capacity set`. If a run is OOM-killed, the supervisor records it, parks that job with a notice
@@ -252,6 +258,7 @@ Every file VOWP creates belongs to a lifecycle class:
 | `closed_session` | Full log and blobs of a closed session. Kept 30 days, then compacted to capsule + summary. |
 | `run_output` | `runs/*.jsonl`, `*.stderr`. 14 days; gzip after 1 day. |
 | `worktree` | Merged jobs removed after merge; failed or cancelled jobs kept 7 days, branch kept. |
+| `job_window` | Tagged `job-<id>` tmux windows whose job is done, cancelled, failed, parked or replanned. Listed by `gc`; `--apply` closes them. |
 | `sample` | Host samples: 24 h full rate, 30 days as 1-minute averages. |
 | `cache` | Control snapshot cache and `tmp/`. Disposable. |
 
@@ -259,13 +266,26 @@ Every file VOWP creates belongs to a lifecycle class:
 vowp gc
 vowp gc --class run_output
 vowp gc --apply
+vowp gc --older-than 7d
+vowp gc --older-than 7d --class closed_session --apply
 ```
 
-`vowp gc` is a dry run by default: it lists files per class, bytes and a sample of paths, and changes
-nothing. `--apply` deletes only `closed_session` (after writing a final capsule and `summary.md`),
-`run_output`, `worktree`, `sample` and expired `cache` entries. It never deletes production, truth,
+`vowp gc` is a dry run by default: it lists files per class, bytes and a sample of paths, plus the
+files and bytes an `--apply` would collect now, and changes nothing. `--apply` deletes only
+`closed_session` (after writing a final capsule and `summary.md`), `run_output`, `worktree`, `sample`
+and expired `cache` entries, and closes `job_window` entries. It never deletes production, truth,
 open work or secrets. The nightly `gc-nightly` schedule runs `vowp gc --apply` once per day per
-project.
+project, so it closes orphan job windows too.
+
+`--older-than <duration>` shortens the window for `closed_session` and `run_output` only, for one
+explicit pass; it does not change the defaults or the nightly schedule. Durations are a positive whole
+number followed by `s`, `m`, `h`, `d` or `w` (`36h`, `7d`, `2w`); zero, negative, malformed and
+larger-than-ten-year values exit 2. With `--class`, only `closed_session` and `run_output` accept the
+override. A dry run prints `ELIGIBLE` and `ELIGIBLE BYTES` next to each class, so review those before
+adding `--apply`. The pass refuses and lists any session with a live lease, a job that still holds its
+lock (running, stalled, gating, reviewing, fixing or merging), or a running orchestrator. Compaction
+still leaves the session row, capsule and `summary.md`, so `vowp reindex` and `vowp session show`
+continue to work for every remaining session.
 
 After compaction, `session show --events` and `session tail` on that session exit 3 with
 `session compacted to capsule <id>; use 'session show --capsule'`. `session show --capsule` and
@@ -276,21 +296,30 @@ full-log replay after compaction.
 
 ```sh
 vowp secret set <NAME>
+vowp secret set <NAME> --stdin
 vowp secret ls
 vowp secret request <NAME>
 vowp secret rm <NAME> --yes
 vowp secret upgrade
+vowp secret upgrade --encrypted
 ```
 
 `set` reads a hidden prompt (there is no argument for the value), writes atomically with mode 0600
-and records only the last four characters in the index. `request` starts a one-time page bound to
-`127.0.0.1` with a random token and a ten-minute expiry; through a control-machine tunnel the owner's
-browser sees a local URL. The AI sees `NAME saved, ends in …last4`, never the value.
+and records only the last four characters in the index. `set --stdin` reads the value from the
+process stdin instead, so a script or an SSH pipe needs no TTY; it strips one trailing newline and
+refuses an empty value. `request` starts a one-time page bound to `127.0.0.1` with a random token
+and a ten-minute expiry; through a control-machine tunnel the owner's browser sees a local URL. The
+AI sees `NAME saved, ends in …last4`, never the value.
 
 `upgrade` prints the exact sudo command that creates the vault user and moves the files. Without
-sudo, VOWP continues in basic mode with the same injection and redaction. The honest limits, the
-injection path and the redaction coverage are in the [security model](../security.md#secrets) and
-[Running a home on a VPS](vps.md#secrets).
+sudo, VOWP continues in basic mode with the same injection and redaction. `upgrade --encrypted`
+instead stores basic-mode values as age ciphertext under `~/.vowp/secrets/encrypted/` with a
+mode-0600 `~/.vowp/secrets/age.key`; it encrypts before deleting plaintext, writes the mode file
+last, refuses vault mode and does not use `systemd-creds`. `secret ls --json` reports the active
+`mode` (`basic`, `vault_user` or `encrypted`) with no values.
+
+The honest limits, the injection path and the redaction coverage are in the
+[security model](../security.md#secrets) and [Running a home on a VPS](vps.md#secrets).
 
 ## Orchestrators
 
@@ -298,6 +327,8 @@ injection path and the redaction coverage are in the [security model](../securit
 vowp orchestrator new --name main --app chat --executor <executor>
 vowp orchestrator new --name main --app opencode --project <project>
 vowp orchestrator ls
+vowp orchestrator move main --node <node>
+vowp orchestrator move main --home
 vowp orchestrator stop main
 vowp orchestrator resume main
 ```
@@ -311,8 +342,85 @@ port and connects outbound to claude.ai) and prints desktop, phone and `vowp cha
 instructions. `stop` stops the host and releases the lease; the session stays. `resume` starts it
 again. A host that cannot start is marked `degraded` and does not stop the supervisor.
 
+`move` switches an existing orchestrator between this home and an enrolled local agent node without
+changing its `SessionId` or its session log on the home. Use `--node <node>` to run the app on that
+node and `--home` to bring it back; exactly one is required. The current host stops, its lease is
+released, a handoff capsule is written on the same session when it has context, and the app is
+started at the target. The target is checked before anything stops, so an unknown, pending or
+revoked node, or a project the node has not mapped, leaves the current host running. Moving to the
+placement the orchestrator already uses is a no-op, or resumes a stopped record there. A
+project-bound orchestrator needs its project path mapped on the target node, and the node needs a
+paired surface for the session. Put the global `--home <DIR>` flag before `orchestrator move`;
+after the command, `--home` is the target switch.
+
 The join instructions use generic `<home-ssh-target>` and `<session>` placeholders; the control
 machine supplies the concrete target. The fallback is always `vowp chat <session-id>`.
+
+To connect a local UI client to the orchestrator's app process, ask for the endpoint document:
+
+```sh
+vowp orchestrator endpoint main --json            # on the home: location home or node
+vowp agent orchestrator endpoint main --json      # on the agent machine that runs the app
+```
+
+A home-hosted live opencode host returns a loopback `url`, the native app session id and Basic
+`auth`; the password is in that explicit `--json` document only. A stopped host, Claude Remote
+Control and `chat` return null endpoint values. A node-hosted record on the home is metadata only;
+run the agent command on that machine to get its local auth. These commands never open SSH, a
+tunnel, a browser or the node's files.
+
+### Who owns the orchestrator's session
+
+The endpoint document also carries `owner` (the recorded owner of the session, active, stale or
+expired, or `null`) and `access`. `access` is `read_only` unless you pass the live owner's surface
+id:
+
+```sh
+vowp orchestrator endpoint main --surface <surface-id>   # access: owner only for the live owner
+```
+
+A UI that must write attaches first. `attach` creates a `desktop-ui` surface, prints a one-time grant
+(surface id, lease token, `access`, `url` and expiry) and then **holds the lease in the foreground**,
+heartbeating until its stdin reaches end-of-file, when it releases the lease:
+
+```sh
+vowp orchestrator attach main --holder opencode-desktop --label "StackSpirit · macbook"
+vowp orchestrator attach main --holder opencode-desktop --takeover --json
+```
+
+The UI process must start `attach` as a child and keep it alive while the UI writes; closing its stdin
+releases the lease. No detached keeper exists for an attached UI in this release, so a UI that exits
+without a live `attach` simply has no lease. Treat the grant like a secret: the token is printed once,
+on stdout, and the hold notice goes to stderr so `--json` stays parseable. `attach` works only on a
+home-hosted orchestrator with a live app endpoint: a node-hosted orchestrator is refused, a stopped
+host asks you to run `vowp orchestrator resume <name>` first, and `--node` is not an SSH redirect.
+
+If another surface owns the session (the orchestrator's own app host normally does while it runs),
+`attach` refuses unless you pass `--takeover`, or unless that owner is stale (no heartbeat for 60
+seconds). A takeover replaces the lease, increments the owner
+epoch, writes a capsule and tells the old surface to stop; the old surface keeps following read-only.
+`vowp chat` asks before taking a live lease (`/takeover`, or `--takeover` at start) and `/follow`
+returns to read-only. A UI that only observes does not attach; it asks `endpoint` for `owner` and
+`access: read_only` and uses read routes only.
+
+To see who owns a session:
+
+```sh
+vowp fleet status          # an owners: section, one line per owned recent session
+vowp session lease <id>    # holder, kind, node, mode, state, activity, epoch, expiry
+vowp session show <id>     # an owner: block, or owner: none
+```
+
+Each `fleet status` line shows the session id, title, label, kind and mode, `holder@node`, state,
+activity and, for an interactive owner, `heartbeat <age>`; a job shows `expires in <span>` or
+`expired`. Nothing in these views prints a token or password. A running job is owned in `job` mode
+for the life of the run (renewed by run activity, not by the 60-second window); taking it over from
+a person's surface fences the run, writes a capsule and leaves the job `ready`.
+
+**Limits.** Ownership is recorded and cooperative: a UI that calls the app's HTTP API directly with
+the engine password is not stopped by it. The loopback engine proxy that would enforce it is **planned
+and deferred**, and there is no node-side proxy, so `vowp agent orchestrator endpoint` reports
+`read_only` with no home owner view. See [home and surfaces](../concepts/home-and-surfaces.md#who-owns-a-session).
 
 ## Migration and upgrades
 

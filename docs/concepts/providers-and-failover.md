@@ -75,14 +75,34 @@ acts on the classified event.
 | Kind | Typical signal | Action |
 |---|---|---|
 | `quota` | "You've hit your limit · resets …" | Record the reset time (+2 min margin), hand the session to the next unlisted rung with a capsule, probe back after the reset. If no rung remains, park the job with `ProviderBlocked` and one inbox notice. |
-| `credits` | 402 / insufficient balance | Record `credits` with no reset time, park every job whose **current** rung uses that provider, open one inbox item, stop dispatching to it. Never switch to another paid provider. |
+| `credits` | 402 / insufficient balance | Record `credits` with no reset time. `on_credits_exhausted = "park"` (default): park every job whose **current** rung uses that provider, open one inbox item, stop dispatching to it, never switch. `"next"`: still record the row, then move the affected session to the next healthy rung declared in its ladder; if none is healthy, park as above. |
 | `rate` | 429 / overloaded | Back off with jitter (10 min doubling to 60 min, ±20 %), lower that provider's concurrency cap until the reset, and delay the continue run without consuming a continue. |
-| `auth` | 401 / login expired | Record `auth`, park jobs on that provider, open an inbox item asking the owner to log in with the harness's own login. No retries. |
+| `auth` | 401 / login expired | Record `auth`, then apply the same provider policy as credits: `park` (default) parks jobs on that provider and opens an inbox item asking the owner to log in with the harness's own login; `next` advances to the next healthy declared rung. No retries in place. |
 | `context` | Context window overflow | Write a capsule, start a fresh native session on the same harness seeded with it, and continue. The continue count is unchanged. |
 
 A crash or error without a limit signal is not a provider limit. It goes through the normal L2 continue
 path: two automatic continues, then the keeper. Three consecutive crashes or errors from the same
-provider with no limit classification mark that provider `unavailable` for 15 minutes.
+provider with no limit classification mark that provider `unavailable` for 15 minutes. That row is
+temporary: an expired `unavailable` row no longer blocks the rung, and an `ok` run clears it at once.
+
+### Mark lifetimes
+
+L6 records a provider limit in two places: the global `limits` row (kind, reset, detail) and the mark
+keys `limit:<provider>`, `probe_back:<provider>`, `probe_back_until:<provider>` and `park:<provider>`.
+The marks have different lifetimes:
+
+| Mark | Lifetime |
+|---|---|
+| `quota`, `rate`, `unavailable` | While `resets_at` is in the future. |
+| probe-back | A bounded window starting at the reset (or at the mark when no reset is known): 10 minutes at first, doubling after each failed probe, capped at 60 minutes. When the deadline passes the provider becomes eligible for dispatch and for a probe even if no probe has succeeded. |
+| `credits`, `auth` | Sticky until the owner answers the inbox item. They never expire. With `on_credits_exhausted = "next"` the provider also carries the `probe_back` mark; the row itself is still only cleared by the owner. |
+| `park:<provider>` | A one-tick request; the supervisor drains it. |
+
+A run on a provider that ends `ok` clears that provider's limit row and its `limit:`, `probe_back:`,
+`probe_back_until:`, `probe_pending:` and `park:` keys: a successful turn is proof the provider works.
+A `credits` or `auth` row is never cleared this way; only `vowp inbox answer <id> resolved` resolves
+it. In L6's `next_rung`, an expired `unavailable` row is ignored, so a residual mark cannot outrank a
+healthy sibling rung.
 
 ### Quota failover, step by step
 
@@ -94,29 +114,52 @@ provider with no limit classification mark that provider `unavailable` for 15 mi
    records the target machine, probes it over SSH when it is remote, and only then detaches the source.
 5. When the reset arrives, a probe runs a tiny prompt (`Reply with the single word: ok`) on the limited
    provider in a scratch directory, with a 60-second timeout. Its cost is recorded like any other run.
-6. A successful probe deletes the limit row. Planner and keeper sessions switch back to rung 0 with a
-   capsule only when no turn is running; ordinary jobs stay where they are until their next natural
-   start, avoiding mid-run flip-flops.
+6. A successful probe deletes the limit row and its marks. Planner and keeper sessions switch back to
+   rung 0 with a capsule only when no turn is running; ordinary jobs stay where they are until their
+   next natural start, avoiding mid-run flip-flops.
 7. A failed probe updates `last_probe_at` and is retried every 15 minutes. If it reports a new reset
-   time, that replaces the old one.
+   time, that replaces the old one. The probe-back window itself grows 10 → 20 → 40 → 60 minutes, so a
+   probe that never succeeds cannot block the provider forever: when the deadline passes the rung is
+   eligible again even before a probe answers.
 
 If the target probe fails, or every remaining rung is limited, the switch aborts and the job is parked
 with an inbox notice. The session stays readable; a human can retry after fixing the provider.
 
-### Credits and auth are not failover
+### Credits and auth: park by default, opt-in failover
 
-Credits exhausted and expired auth mean "a human must act". VOWP records the limit, parks every job
-whose **current** rung uses that provider, and opens exactly one inbox item per provider and kind. A job
-whose ladder happens to contain another provider is still parked — the owner decides after topping up or
-logging in. `vowp inbox answer <id> resolved` removes the limit row and returns the parked jobs to
-`ready`. The only credits policy is `on_credits_exhausted = "park"`.
+Credits exhausted and expired auth mean "a human must act". VOWP records the limit row, then applies
+`[providers.<name>].on_credits_exhausted`:
+
+| Value | Behaviour |
+|---|---|
+| `park` | **Default.** Park every job whose **current** rung uses that provider and open exactly one inbox item per provider and kind. Never switch. |
+| `next` | Write the same limit row, set the provider's `probe_back` mark, and move the affected session to the next healthy rung declared in the profile's ladder, with the normal capsule switch. If no healthy rung exists, park as under `park`. |
+
+`next` is an explicit owner opt-in and it **spends money on the next declared rung**: the affected
+session switches there with a capsule, and later starts that would pick the exhausted provider pick the
+next healthy declared rung instead. The fallback provider bills at its own rates. `park` stays the
+default because it cannot spend on a provider the owner did not choose for that role. A ladder is a
+budget declaration: set `on_credits_exhausted = "next"` only when rung 2 is explicitly configured for
+that profile and you accept its cost.
+
+The policy decision belongs to L6, at the moment the run ends. Harvest in L1 is only the backstop for
+the default `park`: it applies a pending `park:<provider>` request first, then parks the provider itself
+only when the effective policy is `park`. With `next`, harvest leaves the job alone, because the session
+has already moved or L6's no-healthy-rung fallback has already parked it. That is why the opt-in is not
+undone on the next tick, and why the fallback opens exactly one notice instead of a second provider-wide
+park. Harvest does not choose a new action; it only gates this backstop on the recorded policy.
+
+The limit row is written for both policies, so `vowp status`, the ledger and `vowp cost` show why the
+rung changed. `vowp inbox answer <id> resolved` removes a parked provider's limit row and returns its
+jobs to `ready`; with `next` the affected session has already moved and the sticky `credits` or `auth`
+row remains until the owner answers the notice.
 
 ## Provider concurrency and spend
 
 ```toml
 [providers.provider]
 max_concurrent = 4
-on_credits_exhausted = "park"
+on_credits_exhausted = "park"                  # default: park and ask; "next" spends on the next declared rung
 
 [providers.subscription]
 max_concurrent = 1                             # keep a subscription-backed provider at one run
@@ -160,6 +203,8 @@ invented budgets; bounds are on retries, no-progress loops and measured capacity
 - It never stores a provider key or a harness login. Keys are environment variables the user already
   has, or secrets injected by name; `env_pass` in `[harnesses.<name>]` contains **names**, never values.
 - It never switches to a paid provider that the profile does not list.
+- It never advances on credits or auth unless the owner set `on_credits_exhausted = "next"` for that
+  provider; the default is `park`.
 - It never retries credits/auth failures in a loop.
 - It never mid-run flips a job to another provider just because a probe succeeded.
 - It never lets capacity overrule a provider limit, or a provider choice overrule the measured target.

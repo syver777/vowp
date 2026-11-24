@@ -159,6 +159,63 @@ Exported by `vowp schema CapacityReport` and generated from the protocol types i
       ],
       "type": "object"
     },
+    "ClusterCapacity": {
+      "description": "Additive cluster-wide totals across Home and the online worker nodes.\n\nThis card never replaces the per-Home fields: `CapacityReport`, `CapacitySnapshot` and\n`Snapshot` keep their existing Home values and carry this document alongside them. A\nsingle-machine home reports `online_worker_nodes = 0` and totals equal to its own Home\ncapacity.",
+      "properties": {
+        "busy_workers": {
+          "description": "Home running runs plus each online worker node's `busy_slots`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpu_cores": {
+          "description": "Logical CPU cores across Home and every online worker node.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "disk_free_bytes": {
+          "description": "Free work filesystem bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mem_available_bytes": {
+          "description": "Memory available to new work in bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mem_total_bytes": {
+          "description": "Total physical memory in bytes across Home and every online worker node.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "online_worker_nodes": {
+          "description": "Number of online, active agent worker nodes (Home is not counted).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target_workers": {
+          "description": "Home `target_workers` plus each online worker node's `max_slots`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "online_worker_nodes",
+        "target_workers",
+        "busy_workers",
+        "cpu_cores",
+        "mem_total_bytes",
+        "mem_available_bytes",
+        "disk_free_bytes"
+      ],
+      "type": "object"
+    },
     "EstimateSource": {
       "description": "Where an [`UsageEstimate`] came from.",
       "oneOf": [
@@ -329,7 +386,7 @@ Exported by `vowp schema CapacityReport` and generated from the protocol types i
       "type": "object"
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {
@@ -785,6 +842,19 @@ Exported by `vowp schema CapacityReport` and generated from the protocol types i
     "brakes": {
       "$ref": "#/$defs/BrakeState",
       "description": "Brake state."
+    },
+    "cluster": {
+      "$ref": "#/$defs/ClusterCapacity",
+      "default": {
+        "busy_workers": 0,
+        "cpu_cores": 0,
+        "disk_free_bytes": 0,
+        "mem_available_bytes": 0,
+        "mem_total_bytes": 0,
+        "online_worker_nodes": 0,
+        "target_workers": 0
+      },
+      "description": "Additive totals across Home and the online worker nodes."
     },
     "estimates": {
       "description": "Usage estimates included in the report.",

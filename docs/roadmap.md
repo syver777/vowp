@@ -1,10 +1,11 @@
 # Roadmap
 
-Status: current for the 0.4.0 release; a planning note for contributors.
+Status: current for the 0.4.0 release and the implemented-but-unreleased v0.5 slices; a planning
+note for contributors.
 
-This page records what the current tree ships, the v0.4 local-orchestrator work and the open
-candidates. It promises no dates. The authoritative proof for every claim is the linked document,
-file or test, or the code itself.
+This page records what the current tree ships, the v0.4 local-orchestrator work, the six v0.5
+slices that are implemented but not released, and the open candidates. It promises no dates. The
+authoritative proof for every claim is the linked document, file or test, or the code itself.
 
 The v0.1 public release is **v0.1.0**, v0.2 is **v0.2.0**, v0.3 is **v0.3.0** and v0.4 is
 **v0.4.0**, shipped on 2026-11-18. The v0.4 local-orchestrator design is accepted and Phases 0–4
@@ -13,6 +14,10 @@ drill are recorded in [`docs/releases/v0.4-hardening.md`](releases/v0.4-hardenin
 smoke test passed on 2026-11-18. The shipped inventory is in [`CHANGELOG.md`](../CHANGELOG.md) and
 the [`0.4.0` release notes](release/0.4.0.md). The slices that merged after the 0.3.0 tag are
 included in 0.4.0 and recorded separately below.
+
+The six v0.5 slices are **implemented and gated in the tree as of 2026-11-19**, but **no v0.5
+release has been cut**: there is no tag, no version bump and no release date. The work is recorded
+in [`docs/design/v0.5/scope.md`](design/v0.5/scope.md) and in the v0.5 section below.
 
 The product rationale is [`docs/design/plan.md`](design/plan.md); the v0.1 implementation spec is
 [`docs/design/README.md`](design/README.md); the normative v0.2 specification is
@@ -185,19 +190,50 @@ recorded in [`docs/releases/v0.4-hardening.md`](releases/v0.4-hardening.md); the
 2026-11-18. The accepted [`design/v0.4/local-orchestrator.md`](design/v0.4/local-orchestrator.md)
 remains the binding design for the phases that shipped.
 
+## v0.5 — engine primitives for UI surfaces (implemented in the tree, not released)
+
+The six v0.5 slices are implemented and gated in the tree as of 2026-11-19. Every slice job is
+`done` and its final verify job returned `pass`. No public tag, version or date is promised; 0.4.0
+remains the latest release. The accepted scope and the per-slice job ids are in
+[`design/v0.5/scope.md`](design/v0.5/scope.md).
+
+| Slice | What is in the tree | Job(s) | Design note |
+|---|---|---|---|
+| 1a | Jobs list and job-detail snapshot streams, changed-only frames and keeper-action refresh, with the polling fallback and service-worker bypass. | `v5-1a-jobs-sse` | [`design/v0.5/live-streams.md`](design/v0.5/live-streams.md) |
+| 1b | Cost, inbox and nodes snapshot streams and page reconnection, so no window page relies only on five-second polling. | `v5-1b-live-pages` | [`design/v0.5/live-streams.md`](design/v0.5/live-streams.md) |
+| 2 | `vowp orchestrator move` between home and an online agent node with the same `SessionId` and home log; the agent consumes the move as a `Start`; the session row's node and cwd follow the move. | `v5-2-orchestrator-move`, `v5-2b-agent-orchestrator-move`, `v5-2c-session-location` | [`design/v0.4/local-orchestrator.md`](design/v0.4/local-orchestrator.md) §5.7 |
+| 3 | `vowp orchestrator endpoint` and `vowp agent orchestrator endpoint` return the typed discovery document; credentials stay in the explicit local command only. | `v5-3-orchestrator-endpoint`, `v5-3b-endpoint-exit-class` | [`design/v0.5/orchestrator-endpoint.md`](design/v0.5/orchestrator-endpoint.md) |
+| 4 | One-step `vowp project add` with `--git`, `--init` and `--orchestrator` and one JSON summary; clone, init and register stay ordered and credential-free. | `v5-4-project-bootstrap` | [`design/v0.5/project-bootstrap.md`](design/v0.5/project-bootstrap.md) |
+| 5 | Encrypted-at-rest vault mode with an age keyfile, `secret set --stdin` over SSH pipes, `secret ls --json` mode and `upgrade --encrypted`; `systemd-creds` is not implemented. | `v5-5a-vault-encrypted` | [`design/v0.5/vault-encrypted.md`](design/v0.5/vault-encrypted.md) |
+| 6 | Per-host admission against home or an online worker node, plus additive `cluster` totals in `capacity report`, `fleet status` and the snapshot. | `v5-6b-cluster-capacity` | [`concepts/capacity.md`](concepts/capacity.md#cluster-capacity) |
+
+### v0.5.1 — session ownership status (in the tree, not released)
+
+Session ownership is recorded and visible: `owner` on the session card and endpoint document, an
+`owners:` block in `vowp fleet status`, `vowp orchestrator attach` and `endpoint --surface`, and job
+ownership with an expiry and takeover. The **loopback engine proxy is deferred** and node-side
+enforcement does not exist, so ownership is cooperative for a UI that calls the app's HTTP API
+directly. No version, tag or date is promised. See [`design/v0.5.1/scope.md`](design/v0.5.1/scope.md)
+and [`concepts/home-and-surfaces.md`](concepts/home-and-surfaces.md#who-owns-a-session).
+
 ## Open follow-ups
 
-These follow-ups are drawn from the current code and the 0.3.0 known limitations. One has shipped;
-the rest are candidates or design work. They are not commitments, no release is promised, and a
-design note is linked only where one exists.
+These follow-ups are drawn from the current code and the 0.3.0 known limitations. The v0.5 rows
+below are closed in the tree but not released; the rest are candidates or design work. They are
+not commitments, no release is promised, and a design note is linked only where one exists.
 
 | Follow-up | Status | Design note or current limit |
 |---|---|---|
 | ACP streaming chunk events and a permission flow | design | [`design/v0.2/acp-adapter.md`](design/v0.2/acp-adapter.md), [`0.3.0` known limitations](release/0.3.0.md#acp-adapter) |
-| Live updates for the cost, inbox and nodes pages (they poll every five seconds) | candidate | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
+| Live updates for the cost, inbox and nodes pages | implemented in the v0.5 tree (unreleased) | [`design/v0.5/live-streams.md`](design/v0.5/live-streams.md) |
 | Node add, remove and probe writes through the API (the nodes route is read-only) | candidate | [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
 | Job detail page (`/jobs/{id}`) and its runs and gates | shipped | [`design/v0.3/web-window.md`](design/v0.3/web-window.md), [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
-| SSE for the jobs list and the keeper job actions (nudge, restart, replan and fail) | design | [`design/v0.3/web-window.md`](design/v0.3/web-window.md), [`design/v0.3/http-api.md`](design/v0.3/http-api.md) |
+| SSE for the jobs list and the keeper job actions (nudge, restart, replan and fail) | implemented in the v0.5 tree (unreleased) | [`design/v0.5/live-streams.md`](design/v0.5/live-streams.md) |
+| Orchestrator move between home and an agent node with the same session | implemented in the v0.5 tree (unreleased) | [`design/v0.4/local-orchestrator.md`](design/v0.4/local-orchestrator.md) §5.7 |
+| Orchestrator endpoint discovery for local UI clients | implemented in the v0.5 tree (unreleased) | [`design/v0.5/orchestrator-endpoint.md`](design/v0.5/orchestrator-endpoint.md) |
+| One-step project bootstrap (`project add --git --init --orchestrator`) | implemented in the v0.5 tree (unreleased) | [`design/v0.5/project-bootstrap.md`](design/v0.5/project-bootstrap.md) |
+| Encrypted-at-rest vault option (`age` keyfile, no `systemd-creds`) | implemented in the v0.5 tree (unreleased) | [`design/v0.5/vault-encrypted.md`](design/v0.5/vault-encrypted.md) |
+| Pooled cluster capacity across home and online worker nodes | implemented in the v0.5 tree (unreleased) | [`concepts/capacity.md`](concepts/capacity.md#cluster-capacity) |
 | A browser chat turn (needs a run queue and cancellation) | design | [`design/v0.3/web-window.md`](design/v0.3/web-window.md) |
 | A full-directory push (the `--full` form of `session push`) and a bidirectional `session sync` | design | [`design/v0.2/cross-node-sync.md`](design/v0.2/cross-node-sync.md) |
 | Multi-user accounts, quotas, roles and audit | open | — |
@@ -211,5 +247,5 @@ design note is linked only where one exists.
 
 Read [`CONTRIBUTING.md`](../CONTRIBUTING.md) first. Every command in the docs must run, tests must be
 hermetic, and a change should be one small commit. Design discussion belongs in the design note for
-the area or in an issue that links this page; the v0.4 note and the open follow-ups above are the
-current starting points.
+the area or in an issue that links this page; the v0.4 note, the v0.5 slice table and the open
+follow-ups above are the current starting points.

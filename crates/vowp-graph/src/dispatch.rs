@@ -26,6 +26,9 @@ pub struct DispatchCaps {
     pub profiles: BTreeMap<String, Profile>,
     /// Instant used to decide whether a limit has expired.
     pub now: Timestamp,
+    /// Per-job executor pins (`vowp job set-executor`); a pinned job dispatches on its pin
+    /// instead of its profile ladder, and waits while the pin's provider is limited.
+    pub overrides: HashMap<JobId, Executor>,
 }
 
 /// One job selected for dispatch and the executor it should run on.
@@ -95,8 +98,23 @@ pub fn plan_dispatch(graph: &Graph, running: &[Job], caps: &DispatchCaps) -> Vec
         let Some(profile) = caps.profiles.get(&job.profile) else {
             continue;
         };
-        let Some((rung, executor)) = profile.pick(&caps.limited, caps.now) else {
-            continue;
+        let (rung, executor) = match caps.overrides.get(&job.id) {
+            Some(pin) => {
+                let blocked = match caps.limited.get(&pin.provider()) {
+                    Some(None) => true,
+                    Some(Some(resets_at)) => *resets_at > caps.now,
+                    None => false,
+                };
+                if blocked {
+                    continue;
+                }
+                let rung = profile.ladder.iter().position(|rung| rung == pin).unwrap_or(0);
+                (rung, pin)
+            }
+            None => match profile.pick(&caps.limited, caps.now) {
+                Some(picked) => picked,
+                None => continue,
+            },
         };
         let provider = executor.provider();
         if provider_left.get(&provider).is_some_and(|left| *left == 0) {

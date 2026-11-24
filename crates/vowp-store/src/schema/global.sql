@@ -265,7 +265,8 @@ CREATE TRIGGER node_ledger_no_delete BEFORE DELETE ON node_ledger
 -- ---------------------------------------------------------------- surfaces and leases (§7.3)
 CREATE TABLE surfaces (
   id            TEXT PRIMARY KEY,        -- ULID
-  kind          TEXT NOT NULL CHECK (kind IN ('chat','opencode','claude-code','mcp','mirror','api','agent')),
+  kind          TEXT NOT NULL CHECK (kind IN
+                  ('chat','opencode','claude-code','mcp','mirror','api','agent','desktop-ui')),
   node          TEXT NOT NULL,
   holder        TEXT NOT NULL,           -- human-visible: 'laptop', 'phone', 'mac opencode'
   app           TEXT,                    -- 'opencode-desktop', 'claude-code', ...
@@ -275,22 +276,30 @@ CREATE TABLE surfaces (
                   CHECK (state IN ('pending','attached','revoked')),
   revoked_at    TEXT,
   created_at    TEXT NOT NULL,
-  last_seen_at  TEXT NOT NULL
+  last_seen_at  TEXT NOT NULL,
+  label         TEXT                     -- friendly saved name, e.g. 'OpenCode · macbook'; NULL = derive
 ) STRICT;
 
 CREATE TABLE leases (
   session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   surface_id   TEXT REFERENCES surfaces(id) ON DELETE SET NULL,
-  surface_kind TEXT NOT NULL CHECK (surface_kind IN ('chat','opencode','claude-code','mcp','mirror','api','agent')),
+  surface_kind TEXT NOT NULL CHECK (surface_kind IN
+                 ('chat','opencode','claude-code','mcp','mirror','api','agent','desktop-ui')),
   node         TEXT NOT NULL,
   holder       TEXT NOT NULL,
   token_hash   TEXT NOT NULL
                  CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
                  -- lowercase hex SHA-256; never the plaintext
+  owner_mode   TEXT NOT NULL DEFAULT 'interactive' CHECK (owner_mode IN ('interactive','job')),
+  owner_epoch  INTEGER NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0),
+                 -- bumped by the store on every acquire or takeover
+  expires_at   TEXT,                   -- required for job mode; interactive uses heartbeat_at
   acquired_at  TEXT NOT NULL,
-  heartbeat_at TEXT NOT NULL
+  heartbeat_at TEXT NOT NULL,
+  CHECK (owner_mode <> 'job' OR expires_at IS NOT NULL)
 ) STRICT;
 CREATE INDEX leases_heartbeat ON leases(heartbeat_at);
+CREATE INDEX leases_expires ON leases(expires_at);
 
 -- A surface token is stored only as SHA-256 plus a short display prefix (§4.6).
 CREATE TABLE surface_tokens (
@@ -447,4 +456,4 @@ CREATE TABLE secret_index (
   updated_at TEXT NOT NULL
 ) STRICT;
 
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;

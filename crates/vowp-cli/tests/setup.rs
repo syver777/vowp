@@ -380,23 +380,30 @@ exit 2
 
 /// Returns the `vowp` binary Cargo built for this package.
 ///
-/// Integration tests get `CARGO_BIN_EXE_vowp`; the file is also included as a library
-/// unit-test module (where Cargo does not set it), so derive the sibling binary there.
+/// Integration tests get `CARGO_BIN_EXE_vowp`. The file is also included as a library
+/// unit-test module, where Cargo does not set it and the test executable can sit in a
+/// build-script directory (`target/debug/build/vowp-cli/<hash>/out`), so the target
+/// directory comes from the manifest first and every candidate is checked before use.
 fn vowp_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp") {
-        return PathBuf::from(path);
-    }
-    let mut candidate = None;
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(debug) = current.parent().and_then(Path::parent) {
-            candidate = Some(debug.join("vowp"));
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp").map(PathBuf::from) {
+        if path.is_file() {
+            return path;
         }
     }
-    let candidate = candidate.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into()))
-            .join("debug/vowp")
-    });
+    let target = vowp_target_dir();
+    let name = vowp_exe_name();
+    let mut candidates: Vec<PathBuf> = ["debug", "release"]
+        .iter()
+        .map(|profile| target.join(profile).join(&name))
+        .collect();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().and_then(Path::parent) {
+            candidates.push(dir.join(&name));
+        }
+    }
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
     static BUILD: Once = Once::new();
     BUILD.call_once(|| {
         // `cargo test --lib` does not rebuild the binary the test runs. Build it once so
@@ -407,7 +414,30 @@ fn vowp_binary() -> PathBuf {
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status();
     });
-    candidate
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    panic!(
+        "vowp binary not found at {}; run `cargo build --bin vowp` first",
+        candidates[0].display()
+    );
+}
+
+/// The target directory Cargo used for this checkout.
+fn vowp_target_dir() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() { dir } else { manifest.join(dir) }
+        }
+        None => manifest.join("target"),
+    }
+}
+
+/// The host binary name.
+fn vowp_exe_name() -> String {
+    format!("vowp{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// Writes an executable script.

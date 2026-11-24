@@ -40,11 +40,16 @@ All time from `Clock`.
 1. **Reconcile open runs.** For every `runs` row with `ended_at IS NULL` owned by this node: if no live runner thread has it **and** its
    `pid` is not alive (`kill(pid,0)` equivalent via `/proc/<pid>` existence check; no `unsafe`) → the supervisor restarted or the child
    vanished. Kill the process group if the pid is alive but unowned (orphan), finalise the run with `outcome=crash`, `detail="orphaned at supervisor start"`,
-   and let step 2 handle it like any crash. Also free `workers` rows whose `run_id` is gone.
+   and let step 2 handle it like any crash. Also free `workers` rows whose `run_id` is gone. Then close every tagged `job-<id>` window whose job is
+   missing or no longer active (see §2, “Job windows”); this retries a close that failed after the state change. Startup runs the same close pass
+   before it recreates the fixed layout.
 2. **Harvest finished runs.** For each run finished since the last tick (runner thread reported, or step 1): write `ended_at/exit_code/outcome/cost/...`
    (cost from `RunSummary`), append a `ledger` `cost` row (`usd`, tokens, `cost_source`), classify `outcome`:
    - `ok` → role-specific follow-up (§3, §5): worker run ok but no valid report ⇒ `JobEvent::RunEndedNoReport`; report present ⇒ `ReportReady`.
    - `limit|credits|auth|rate|context` → L6 (§8) before anything else; the job event is `RunEndedNoReport` only if the run is not rerouted by L6.
+     Pending `park:<provider>` requests are applied first, so L6's no-healthy-rung fallback lands before the job event. A finished
+     credits/auth run parks the provider from harvest only under the effective `park` policy; with `next`, L6 has already switched
+     the session (or queued that fallback), and re-parking would undo the owner's opt-in and duplicate the notice (§8.3).
    - `crash|error|killed|stalled` → `RunEndedNoReport` (L2 continue) and update the provider's unknown-failure streak (§8.6).
 3. **Stall detection.** For each open run (role worker/verifier/planner/keeper) call `StallJudge::judge` with `last_event_at` = latest session event ts (via the
    session index), `last_commit_at` = `git log -1 --format=%ct job/<id>` for job runs, `output_bytes` = size of the run's raw output file. On
@@ -118,6 +123,17 @@ Events are `JobEvent` variants (crates/vowp-graph.md §3). `Exhausted(x)` means 
 | T35 | running | `RunRateLimited{until}` | — | running | `DelayRun{purpose: Continue, until}` (no counter changes; the run that hit the 429 does **not** consume `continues`; the caller stores `kv['delay:<job>']=until` and L1 starts the continue run when `now >= until`) |
 
 Terminal states: `done`, `replanned`, `cancelled`. **Any (state,event) pair not listed returns `GraphError::InvalidTransition`**; in particular no event leaves a terminal state.
+
+### Job windows
+
+Dispatch opens one tagged tmux window `job-<id>` running `vowp __window job <id>` (§3). The window is a view, not
+part of the job: whenever a transition records `done`, `cancelled`, `failed`, `parked` or `replanned`, L1 closes
+that exact tagged window after the state row is committed. Closing is best effort — a tmux failure is logged and
+never fails the tick — and idempotent: an already-missing window is success. A crash between the state write and
+the close is repaired by the next L1 reconcile pass and by startup, which close tagged `job-<id>` windows whose
+job is missing or in one of those five states. Only the exact name this tool creates is considered, and the
+window manager refuses untagged windows, so `board`, `supervisor`, `planner`, `keeper`, `inbox` and any foreign
+window are never touched. `vowp gc` reports the leftovers as the `job_window` class and `--apply` closes them.
 `NeedsSatisfied` is only emitted by L1 step 4; `Retry` on a non-`failed` job is invalid. The CLI `vowp job retry` therefore maps by state: `failed` → `Retry` (T32), `parked` → `Resolved` (T31), `stalled` → `KeeperRestart` (T11); any other state exits 4.
 Differences from the design summary §6.3: D1 (`gating`, `cancelled`), D5 (fix jobs on the original branch, no verify of their own), and `fixing → gating` (T22) instead of `fixing → reviewing`: the fix must pass the cheap
 command gates again before another verifier is spent (recorded as D17 in decisions.md).
@@ -227,6 +243,8 @@ Pushes go only to `job/*` branches and to the default branch through this queue.
 
 Both are **sessions** with a fixed role (`SessionRole::Planner|Keeper`), one per project, created on first use, resumed every turn. One turn at a time per role (`runs` open check). Their runs use `RunRole::Planner|Keeper`, `RunPurpose::Plan|Keep`, no job.
 
+**Session cwd recovery:** a planner/keeper session is bound to the cwd recorded when it was created. `check_cwd` canonicalizes the allow-list roots and, when the requested leaf is gone, the deepest existing ancestor of the requested path. A path inside a root whose leaf was deleted (a job worktree removed after its job finished) is reported as `cwd_missing` (`CoreError::CwdMissing`); a path that leaves the root through `..` or a symlink remains `Refused("… outside the allow-list")`. Before L4/L5 starts a turn, L1 checks the newest role session's cwd: when it no longer exists, L1 closes that session, writes one ledger `note` naming its id, and lets the normal creation path start a fresh role session in the project checkout. `find_role_session` skips closed sessions, so the stale cwd is retired once and never retried; a healthy older role session is reused when one exists.
+
 **Planner due (`planner_due`)** — all must hold: not paused; no open planner run; provider available (else the keeper covers, below); `now - last_planner_turn >= LoopBounds.planner_min_gap_minutes` (default 5 min); and
 (a) an unseen event for the planner exists (job `done|failed|stalled|parked`, new inbox answer, finished verify, limit/failover event, schedule firing) **or** (b) the `l4-planner` loop interval (`[loops.l4-planner].interval_secs`, default 30 min) elapsed **or** (c) there is no active job (`pending|ready|running|gating|reviewing|fixing|merging`) but non-terminal jobs exist and `LoopBounds.idle_gap_minutes` (default 15 min) elapsed.
 **Keeper due**: an unseen stall/failure event (`stalled`, `failed`, hang, run crash with continues exhausted, rate-limit re-queue) **or** the `l5-keeper` loop interval (`[loops.l5-keeper].interval_secs`, default 20 min) elapsed; min gap `LoopBounds.planner_min_gap_minutes` (default 5 min); also when the planner's provider is limited (the keeper then *covers planning*: its prompt gains the planner duties and the planner digest).
@@ -245,18 +263,22 @@ Both are **sessions** with a fixed role (`SessionRole::Planner|Keeper`), one per
 | `outcome` / kind | Action |
 |---|---|
 | `Limit`/`quota` | write `limits(provider)`: `kind=quota`, `resets_at = event.resets_at + 2 min` (the single +2 min margin; adapters report exact times, adapters.md §2.4), `detail`; ledger `limit`; **hand off** (§8.4) the affected sessions to the next ladder rung whose provider is not limited, **only if** that rung is listed in the profile; else park the affected jobs with `Blocked{ProviderBlocked}` and one inbox notice. `profile.on_quota=park` → park; `next` → switch, no probe-back. No `resets_at` known: `now + 60 min`. |
-| `Credits` | `limits(provider) kind=credits, resets_at=NULL`; **park every job whose profile's *current* rung provider is that provider** (`Blocked{Credits}`, §8.3), one inbox item; stop dispatching to it. Never switch to another paid provider (L6); `on_credits_exhausted` has only `park` in v0.1. |
-| `Auth` | `limits kind=auth, resets_at=NULL`; park jobs of that provider (§8.3, `Blocked{Auth}`); no retries. |
+| `Credits` | `limits(provider) kind=credits, resets_at=NULL`; then apply `[providers.<provider>].on_credits_exhausted`: `park` (default) **parks every job whose profile's *current* rung provider is that provider** (`Blocked{Credits}`, §8.3), one inbox item, and stops dispatching to it; `next` keeps the row, marks the provider probe-able, and hands the affected session to the next healthy declared rung (§8.4), falling back to the same provider park when none is healthy. Never switches unless the owner set the opt-in. |
+| `Auth` | `limits kind=auth, resets_at=NULL`; applies the same provider policy as credits (`Blocked{Auth}` under `park`, the next healthy declared rung under `next`); no retries in place. |
 | `Rate` | `limits kind=rate`, `resets_at = now + backoff` with `backoff = min(10 min × 2^streak, 60 min)` ±20 % jitter (deterministic LCG owned by the loop, seedable in tests). Set `concurrency_cap = max(1, running_on_provider − 1)` until `cap_until = resets_at`. The interrupted run does **not** consume `continues`: core feeds `JobEvent::RunRateLimited{until: resets_at}` (T35) instead of `RunEndedNoReport`, which delays the continue run until `resets_at` and sets `jobs.note="rate-limited; retry after <t>"`. |
 | `Context` | write a capsule (`trigger=context`) then start a **fresh native session on the same harness** seeded with it (`SessionOps::switch` with `to = same executor`, reason `Context`); continue count unchanged. |
 | `Crash`/`Error`/`Killed` | no limit row (except §8.6); L2 continue path (T4). |
 
-### 8.3 Parking all jobs of a provider (credits and auth — one policy)
-Design summary §10: credits exhausted ⇒ **park every job on that provider**; it is never a failover trigger (unlike `quota`). Algorithm:
-1. For each job in `{pending, ready, running, stalled}` — this set **includes the verify/fix/merge child jobs** (they are ordinary `jobs` rows with their own profile, so a pending verify job of a `reviewing` original, or a fix job of a `fixing` original, is parked like any other) — whose profile's **current rung** (the rung it is running on, or `Profile::pick` for jobs not yet started) has `Executor::provider() == provider`: send `JobEvent::Blocked{Credits|Auth}` (T29). A job whose ladder happens to contain another rung is **still parked**: credits/auth never advance the ladder (the owner decides after topping up/logging in).
+Every temporary mark L6 writes is bounded. `mark_provider` records `probe_back_until:<provider>` with the rate/backoff clock (10 min from the reset, doubling per failed probe, capped at 60 min). `limited_map` treats an owed probe-back as blocking only until that deadline; after it the provider is eligible for dispatch and for the next probe. `credits`/`auth` carry no deadline and stay sticky until their inbox item is resolved. A run that ends `ok` clears the provider's `limits` row and the `limit:`, `probe_back:`, `probe_back_until:`, `probe_pending:` and `park:` keys; it never clears a `credits`/`auth` row.
+
+### 8.3 Parking all jobs of a provider (the `park` arm of credits and auth)
+Design summary §10: under `on_credits_exhausted = "park"` (the default) credits exhausted ⇒ **park every job on that provider**; it is never a failover trigger (unlike `quota`). Under `next`, L6 first advances the affected session to a healthy declared rung; the algorithm below is then only the fallback for when no healthy rung exists. Algorithm:
+1. For each job in `{pending, ready, running, stalled}` — this set **includes the verify/fix/merge child jobs** (they are ordinary `jobs` rows with their own profile, so a pending verify job of a `reviewing` original, or a fix job of a `fixing` original, is parked like any other) — whose profile's **current rung** (the rung it is running on, or `Profile::pick` for jobs not yet started) has `Executor::provider() == provider`: send `JobEvent::Blocked{Credits|Auth}` (T29). Under `park` a job whose ladder happens to contain another rung is **still parked**: credits/auth do not advance the ladder (the owner decides after topping up/logging in). Under `next` the affected session has already moved to a healthy rung, and this provider-wide park is only the no-healthy-rung fallback.
 2. Jobs whose current rung is on a different provider are untouched. Parents in `gating`, `reviewing`, `fixing` or `merging` hold no harness run of their own (they wait for command gates, the merge queue, or their child job), so T29 deliberately has no such source states: once their child is parked they simply keep waiting, and `Resolved` on the child resumes the flow. Command gates and the merge queue use no provider and are unaffected.
 3. One inbox item per provider/kind (dedupe on `title`), text: "credits exhausted for <provider>; top up and run `vowp inbox answer <id> resolved`" (auth: "log in again with the harness's own login, then `… resolved`").
 4. Resolution: `vowp inbox answer <id> resolved` deletes the `limits` row and sends `Resolved` (T31) to every job parked for that provider/reason.
+
+**Harvest is a backstop, not a second policy engine.** L6 decides the credits/auth policy when the run ends and records completion in the `l6:<run>` marker. Step 2 applies pending `park:<provider>` requests before the job event and, for a running job whose last run ended `credits`/`auth`, calls L6 only as a fallback for manual or reconciled runs that have no marker. The harvest step then parks the provider itself only when `on_credits_exhausted = "park"`. With `next` it leaves the job alone: the session already moved, or L6's no-healthy-rung fallback request has already parked it. The default backstop therefore stays, while the opt-in is never undone and its fallback opens exactly one notice.
 
 ### 8.4 Capsule hand-off
 1. For a **session-backed role (planner, keeper)**: `SessionOps::switch(SwitchRequest{session, to: next rung ExecutorRef, reason: Limit|Failover, drain_secs: 5})` — freeze, capsule, stop, start target with capsule + last 2 turns as plain text, record `switch` (sessions.md §5).
@@ -266,11 +288,13 @@ Design summary §10: credits exhausted ⇒ **park every job on that provider**; 
 ### 8.5 Probe-back
 1. A probe is a run (`RunRole::Probe`, `RunPurpose::Probe`) of one tiny prompt (`"Reply with the single word: ok"`) on the limited provider's executor in a scratch directory, `timeout 60 s`, cost recorded.
 2. Scheduled at `resets_at`, then every `probe_interval_minutes` (15) after a failed probe; `limits.last_probe_at` updated; `probe_fail_streak++` on failure.
-3. Success (`outcome=ok`): delete the `limits` row; ledger `limit` "provider back"; for planner/keeper whose current rung > 0 and whose rung-0 provider is that provider: `SessionOps::switch(reason=ProbeBack)` to rung 0 (capsule hand-off), only when **no turn is running** (wait for the next quiet tick; never mid-turn). Running jobs stay where they are until their next natural start (no mid-run flip-flops).
-4. A probe failing with a *new* limit text updates `resets_at` from it.
+3. Mark lifetime: `probe_back:<p>` is owed only together with `probe_back_until:<p>`, whose deadline is 10 min from the reset (doubling per failed probe up to 60 min) or from the mark when the row has no reset. While the deadline is in the future the provider is held out of dispatch; once it passes the provider is eligible again even if no probe has succeeded, and the normal probe schedule still runs. A legacy `probe_back:<p>=1` without a deadline gets the same bounded window anchored at `limits.since`. A `credits`/`auth` row is never probe-backed under `park`; with `next` L6 sets the probe-back mark, but the row itself stays sticky.
+4. Success (`outcome=ok`): delete the `limits` row and the `limit:`, `probe_back:`, `probe_back_until:`, `probe_pending:` and `park:` keys; ledger `limit` "provider back"; for planner/keeper whose current rung > 0 and whose rung-0 provider is that provider: `SessionOps::switch(reason=ProbeBack)` to rung 0 (capsule hand-off), only when **no turn is running** (wait for the next quiet tick; never mid-turn). Running jobs stay where they are until their next natural start (no mid-run flip-flops).
+5. A probe failing with a *new* limit text updates `resets_at` from it and extends the bounded window.
+6. Any run on the provider that ends `ok` clears the same temporary marks immediately (a successful turn is proof the provider works). `credits`/`auth` are excluded: only the owner's inbox answer clears them.
 
 ### 8.6 Unknown failures (D15)
-Per provider the loop counts consecutive runs ended `error|crash` with **no** limit classification. At **3** → `limits(kind=unavailable, resets_at=now+15 min)` (and `claude_retry`-style probe-back at expiry). Any `ok` run resets the streak. The streak lives in `limits.probe_fail_streak` (row created with `resets_at=NULL` and kind `unavailable` only when tripped; before that, in `kv['fail_streak:<provider>']`).
+Per provider the loop counts consecutive runs ended `error|crash` with **no** limit classification. At **3** → `limits(kind=unavailable, resets_at=now+15 min)` (and `claude_retry`-style probe-back at expiry with a bounded `probe_back_until`). Any `ok` run resets the streak and clears the row and marks. The streak lives in `limits.probe_fail_streak` (row created with `resets_at=NULL` and kind `unavailable` only when tripped; before that, in `kv['fail_streak:<provider>']`). An `unavailable` row whose `resets_at` has passed no longer blocks the rung: `next_rung` skips the stale mark rather than returning `None` while a healthy sibling rung is configured.
 
 ## 9. L7 — inbox
 

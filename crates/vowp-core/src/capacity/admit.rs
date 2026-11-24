@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use vowp_protocol::{
     AdmitDecision, AdmitRequest, CapacityAdvice, CapacityReport, CapacityTarget, HostSample, InboxId, InboxItem,
-    InboxKind, InboxState, Job, JobId, JobKind, JobState, ParkedReason, ProjectName, Run, RunRole, TargetMode,
-    Timestamp, UsageEstimate, WaitCode, WaitReason, WaitingJob, WorkerKind,
+    InboxKind, InboxState, Job, JobId, JobKind, JobState, NodeName, ParkedReason, Placement, ProjectName, Run, RunRole,
+    TargetMode, Timestamp, UsageEstimate, VowpConfig, WaitCode, WaitReason, WaitingJob, WorkerKind,
 };
 use vowp_store::StateChange;
 use vowp_store::Store;
+use vowp_store::repo_offload::AssignmentFilter;
 
 use crate::CoreError;
 use crate::deps::Deps;
@@ -144,6 +145,7 @@ impl CapacityManager {
             brakes: brakes::evaluate_with_config(&self.deps, store, now)?,
             reserve_ram_bytes,
             min_disk_bytes: MIN_DISK_BYTES,
+            cluster: super::cluster::build(&self.deps, store, now)?,
             estimates,
             waiting: self.waiting_jobs(store, now)?,
             limits: store.active_limits(now)?,
@@ -151,25 +153,14 @@ impl CapacityManager {
     }
 
     /// Returns whether one run may start.
+    ///
+    /// Home and remote capacity are evaluated separately. A run that executes on Home
+    /// consumes Home's target, RAM/CPU headroom, disk and brake; a run that can offload to
+    /// an online mapped worker node may be admitted against that node's free slot, RAM and
+    /// disk capacity even when Home is already at its target. Provider limits are global
+    /// and are checked before either side.
     pub fn admit(&self, store: &Store, req: &AdmitRequest, now: Timestamp) -> Result<AdmitDecision, CoreError> {
         self.maintain(store, now)?;
-        let brake = brakes::evaluate_with_config(&self.deps, store, now)?;
-        if brake.active {
-            let detail = brake
-                .reasons
-                .first()
-                .map(|reason| reason.detail.clone())
-                .unwrap_or_else(|| "brake active".to_owned());
-            return self.wait(
-                store,
-                req,
-                now,
-                WaitReason {
-                    code: WaitCode::Brake,
-                    detail,
-                },
-            );
-        }
 
         let limits = store.active_limits(now)?;
         if let Some(provider) = &req.provider
@@ -186,27 +177,86 @@ impl CapacityManager {
             );
         }
 
-        let target = targets::current_for(&self.deps, store, now)?;
-        let running = self.running_capacity(store)?;
-        if running.runs >= target.target_workers {
-            return self.wait(
-                store,
-                req,
-                now,
-                WaitReason {
-                    code: WaitCode::Target,
-                    detail: format!(
-                        "{} worker(s) running; target is {}",
-                        running.runs, target.target_workers
-                    ),
-                },
-            );
-        }
-
+        let config = super::reload::effective_config(&self.deps);
+        let placement = placement_for(store, req, &config)?;
         let mut estimate = estimates::estimate_for(store, req)?;
         if consume_oom_raise(store, req, now)? {
             let raise = estimate.ram_p90_bytes / OOM_RAISE_FRACTION;
             estimate.ram_p90_bytes = estimate.ram_p90_bytes.saturating_add(raise);
+        }
+
+        let brake = brakes::evaluate_with_config(&self.deps, store, now)?;
+        let home_wait = if allows_home(&placement) {
+            self.home_wait(store, now, &estimate, &brake)?
+        } else {
+            Some(WaitReason {
+                code: WaitCode::Target,
+                detail: format!("placement {placement} requires a worker node"),
+            })
+        };
+
+        if home_wait.is_none() {
+            return self.admit_home(store, req, now);
+        }
+
+        // `pause_on_home_brake` is the one documented way a Home brake also stops remote
+        // dispatch; the default keeps the two hosts independent.
+        if !(config.offload.pause_on_home_brake && brake.active)
+            && remote_eligible(store, req, &placement, &config, &estimate, now)?
+        {
+            self.clear_wait(store, req)?;
+            store.kv_set(LAST_PROJECT_KEY, req.project.as_str())?;
+            return Ok(AdmitDecision::Admit);
+        }
+
+        match home_wait {
+            Some(reason) => self.wait(store, req, now, reason),
+            None => self.admit_home(store, req, now),
+        }
+    }
+
+    /// Records a Home admission and grows worker slots when the target needs them.
+    fn admit_home(&self, store: &Store, req: &AdmitRequest, now: Timestamp) -> Result<AdmitDecision, CoreError> {
+        let target = targets::current_for(&self.deps, store, now)?;
+        self.clear_wait(store, req)?;
+        store.kv_set(LAST_PROJECT_KEY, req.project.as_str())?;
+        if target.target_workers > super::reload::effective_config(&self.deps).node.max_workers {
+            self.ensure_worker_slots(store, target.target_workers)?;
+        }
+        Ok(AdmitDecision::Admit)
+    }
+
+    /// Returns the first reason a Home run may not start, or `None` when Home can take it.
+    fn home_wait(
+        &self,
+        store: &Store,
+        now: Timestamp,
+        estimate: &UsageEstimate,
+        brake: &vowp_protocol::BrakeState,
+    ) -> Result<Option<WaitReason>, CoreError> {
+        if brake.active {
+            let detail = brake
+                .reasons
+                .first()
+                .map(|reason| reason.detail.clone())
+                .unwrap_or_else(|| "brake active".to_owned());
+            return Ok(Some(WaitReason {
+                code: WaitCode::Brake,
+                detail,
+            }));
+        }
+
+        let target = targets::current_for(&self.deps, store, now)?;
+        // Home runs only: a run assigned to a remote node does not consume Home's target.
+        let running = self.running_capacity(store)?;
+        if running.runs >= target.target_workers {
+            return Ok(Some(WaitReason {
+                code: WaitCode::Target,
+                detail: format!(
+                    "{} worker(s) running; target is {}",
+                    running.runs, target.target_workers
+                ),
+            }));
         }
 
         if let Some(sample) = latest_sample(store, None)?
@@ -217,15 +267,10 @@ impl CapacityManager {
             let free_after = sample.mem_available_bytes.saturating_sub(estimate.ram_p90_bytes);
             if free_after < reserve {
                 let short = reserve.saturating_sub(free_after);
-                return self.wait(
-                    store,
-                    req,
-                    now,
-                    WaitReason {
-                        code: WaitCode::Ram,
-                        detail: format!("RAM {:.1} GB short", short as f64 / GIB as f64),
-                    },
-                );
+                return Ok(Some(WaitReason {
+                    code: WaitCode::Ram,
+                    detail: format!("RAM {:.1} GB short", short as f64 / GIB as f64),
+                }));
             }
             let quota = sample
                 .cpu_quota_cores
@@ -235,15 +280,10 @@ impl CapacityManager {
             if demand / quota > CPU_HEADROOM {
                 let allowed = quota * CPU_HEADROOM;
                 let short = (demand - allowed).max(0.0);
-                return self.wait(
-                    store,
-                    req,
-                    now,
-                    WaitReason {
-                        code: WaitCode::Cpu,
-                        detail: format!("CPU {short:.2} core(s) short"),
-                    },
-                );
+                return Ok(Some(WaitReason {
+                    code: WaitCode::Cpu,
+                    detail: format!("CPU {short:.2} core(s) short"),
+                }));
             }
         }
 
@@ -257,28 +297,18 @@ impl CapacityManager {
                     .disk_free_worktrees_bytes
                     .map(|free| free.min(sample.disk_free_home_bytes))
                     .unwrap_or(sample.disk_free_home_bytes);
-                return self.wait(
-                    store,
-                    req,
-                    now,
-                    WaitReason {
-                        code: WaitCode::Disk,
-                        detail: format!(
-                            "disk {:.1} GB free; minimum is {:.1} GB",
-                            free as f64 / GIB as f64,
-                            MIN_DISK_BYTES as f64 / GIB as f64
-                        ),
-                    },
-                );
+                return Ok(Some(WaitReason {
+                    code: WaitCode::Disk,
+                    detail: format!(
+                        "disk {:.1} GB free; minimum is {:.1} GB",
+                        free as f64 / GIB as f64,
+                        MIN_DISK_BYTES as f64 / GIB as f64
+                    ),
+                }));
             }
         }
 
-        self.clear_wait(store, req)?;
-        store.kv_set(LAST_PROJECT_KEY, req.project.as_str())?;
-        if target.target_workers > super::reload::effective_config(&self.deps).node.max_workers {
-            self.ensure_worker_slots(store, target.target_workers)?;
-        }
-        Ok(AdmitDecision::Admit)
+        Ok(None)
     }
 
     /// Writes one capacity target row.
@@ -422,10 +452,16 @@ impl CapacityManager {
         Ok(())
     }
 
-    /// Sums the open runs and their p90 estimates across every active project.
+    /// Sums the Home-executing open runs and their p90 estimates across every active project.
+    ///
+    /// A run assigned to a remote node is not a Home run: it consumes that node's slots,
+    /// not Home's target, RAM or CPU headroom.
     fn running_capacity(&self, store: &Store) -> Result<vowp_protocol::RunningCapacity, CoreError> {
         let mut running = vowp_protocol::RunningCapacity::default();
-        for (project, run, kind) in open_runs(store)? {
+        for (project, run, kind) in open_runs(store)?
+            .into_iter()
+            .filter(|(_, run, _)| run.node == self.deps.node)
+        {
             let request = AdmitRequest {
                 project,
                 job: run.job_id.clone(),
@@ -576,14 +612,121 @@ impl CapacityManager {
     }
 }
 
+/// Returns the effective placement for one admission request.
+fn placement_for(store: &Store, req: &AdmitRequest, config: &VowpConfig) -> Result<Placement, CoreError> {
+    let Some(job) = &req.job else {
+        return Ok(Placement::Home);
+    };
+    let policy = config.offload.project_policy(&req.project);
+    let stored = if store.bound_project().is_some() {
+        store.job_placement(job)?
+    } else {
+        None
+    };
+    Ok(stored
+        .or_else(|| policy.placement.clone())
+        .unwrap_or_else(|| config.offload.default.clone()))
+}
+
+/// Returns whether a Home run is a valid target for `placement`.
+fn allows_home(placement: &Placement) -> bool {
+    matches!(
+        placement,
+        Placement::Home
+            | Placement::Any
+            | Placement::Node {
+                fallback: Some(vowp_protocol::NodeFallback::Home),
+                ..
+            }
+    )
+}
+
+/// Returns whether an online mapped worker node can take this run.
+fn remote_eligible(
+    store: &Store,
+    req: &AdmitRequest,
+    placement: &Placement,
+    config: &VowpConfig,
+    estimate: &UsageEstimate,
+    now: Timestamp,
+) -> Result<bool, CoreError> {
+    let policy = config.offload.project_policy(&req.project);
+    if policy.home_only {
+        return Ok(false);
+    }
+    let wanted = match placement {
+        Placement::Home => return Ok(false),
+        Placement::Any if !config.offload.enabled => return Ok(false),
+        Placement::Any => None,
+        Placement::Node { node, .. } => Some(node.clone()),
+    };
+
+    for card in super::cluster::online_workers(store, now)? {
+        if let Some(wanted) = &wanted
+            && &card.name != wanted
+        {
+            continue;
+        }
+        if !card.mapped.contains(&req.project) {
+            continue;
+        }
+        let Some(capacity) = &card.capacity else {
+            continue;
+        };
+        let max_slots = config
+            .offload
+            .node_policy(&card.name)
+            .max_workers
+            .unwrap_or(capacity.max_slots);
+        if max_slots == 0 {
+            continue;
+        }
+        let busy = capacity.busy_slots.max(active_assignments_for_node(store, &card.name)?);
+        if busy >= max_slots {
+            continue;
+        }
+        let reserve = targets::reserve_ram_bytes(capacity.mem_total_bytes);
+        if capacity.mem_free_bytes.saturating_sub(estimate.ram_p90_bytes) < reserve {
+            continue;
+        }
+        if capacity.disk_free_bytes < config.offload.min_disk_bytes {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Counts the remote work that holds a run or dispatch slot on `node`.
+///
+/// The reported `busy_slots` is the node's own count; an active assignment or an open run
+/// recorded against the node on the Home side is taken as a lower bound while a heartbeat
+/// is still catching up. The two sources overlap, so the larger count wins rather than the
+/// sum.
+fn active_assignments_for_node(store: &Store, node: &NodeName) -> Result<u32, CoreError> {
+    let assignments = store
+        .list_assignments(&AssignmentFilter {
+            node: Some(node.clone()),
+            ..AssignmentFilter::default()
+        })?
+        .iter()
+        .filter(|assignment| assignment.state.is_active())
+        .count();
+    let runs = open_runs(store)?
+        .into_iter()
+        .filter(|(_, run, _)| &run.node == node)
+        .count();
+    Ok(assignments.max(runs).try_into().unwrap_or(u32::MAX))
+}
+
 /// Returns the newest host sample, optionally at or after `since`.
-fn latest_sample(store: &Store, since: Option<Timestamp>) -> Result<Option<HostSample>, CoreError> {
+pub(crate) fn latest_sample(store: &Store, since: Option<Timestamp>) -> Result<Option<HostSample>, CoreError> {
     let since = since.unwrap_or_else(|| Timestamp::from_unix_secs(0));
     Ok(store.host_samples_since(since)?.into_iter().last())
 }
 
 /// Returns every open run with its project and job kind.
-fn open_runs(store: &Store) -> Result<Vec<(ProjectName, Run, JobKind)>, CoreError> {
+pub(crate) fn open_runs(store: &Store) -> Result<Vec<(ProjectName, Run, JobKind)>, CoreError> {
     let mut runs = Vec::new();
     if let Some(paths) = store.paths() {
         for entry in store.list_project_entries()? {

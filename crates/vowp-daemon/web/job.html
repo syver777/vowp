@@ -138,6 +138,7 @@
       <p class="back"><a href="/jobs">Back to jobs</a></p>
     </div>
     <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+    <p id="live" class="muted" aria-live="polite">Live updates: connecting…</p>
   </header>
 
   <p id="error" class="error" role="alert" hidden></p>
@@ -242,6 +243,10 @@
 
   const match = document.location.pathname.match(/^\/jobs\/([^/]+)\/?$/);
   const jobId = match ? decodeURIComponent(match[1]) : "";
+  const REFRESH_MS = 5000;
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 15000;
+  const STREAM_URL = "/api/v1/jobs/" + encodeURIComponent(jobId) + "/stream";
   const TOKEN_KEY = "vowp-api-token";
   const AUTH_HEADER = "Authorization";
   const QUEUED_MESSAGE = "Action queued; the supervisor applies it on the next tick.";
@@ -255,6 +260,7 @@
   const FAIL_STATES = ["stalled"];
   const ACTION_PATHS = { nudge: "/nudge", restart: "/restart", replan: "/replan", fail: "/fail" };
   const updatedLine = document.getElementById("updated");
+  const liveLine = document.getElementById("live");
   const errorLine = document.getElementById("error");
   const noticeLine = document.getElementById("notice");
   const notFoundLine = document.getElementById("not-found");
@@ -269,6 +275,10 @@
   const gatesBody = document.getElementById("gates-body");
   const sessionsLink = document.getElementById("job-sessions");
   let lastJob = null;
+  let eventSource = null;
+  let retryTimer = null;
+  let retryDelay = RETRY_MIN_MS;
+  let fallbackTimer = null;
 
   function showError(message) {
     errorLine.textContent = message;
@@ -288,6 +298,130 @@
   function hideNotice() {
     noticeLine.textContent = "";
     noticeLine.hidden = true;
+  }
+
+  function setLive(message) {
+    liveLine.textContent = message;
+  }
+
+  function markUpdated() {
+    updatedLine.textContent = "Last updated: " + new Date().toLocaleString();
+  }
+
+  function applySnapshot(snapshot) {
+    if (!snapshot || !snapshot.job) return;
+    const runs = snapshot.runs && Array.isArray(snapshot.runs.items) ? snapshot.runs.items : [];
+    const gates = snapshot.gates && Array.isArray(snapshot.gates.items) ? snapshot.gates.items : [];
+    lastJob = snapshot.job;
+    renderJob(lastJob);
+    renderRuns(runs);
+    renderGates(gates);
+    notFoundLine.hidden = true;
+    hideError();
+    updateUnlock();
+    markUpdated();
+    setLive("Live updates: streaming");
+    stopFallbackPolling();
+  }
+
+  function closeStream() {
+    if (eventSource === null) return;
+    const source = eventSource;
+    eventSource = null;
+    source.onopen = null;
+    source.onerror = null;
+    source.close();
+  }
+
+  function clearRetry() {
+    if (retryTimer === null) return;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  function stopFallbackPolling() {
+    if (fallbackTimer === null) return;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+
+  function startFallbackPolling() {
+    if (fallbackTimer !== null) return;
+    fallbackTimer = setInterval(load, REFRESH_MS);
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null) return;
+    const delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      startStream();
+    }, delay);
+  }
+
+  function handleStreamFailure() {
+    closeStream();
+    setLive("Reconnecting... polling every 5 seconds.");
+    startFallbackPolling();
+    scheduleRetry();
+    load();
+  }
+
+  function markHeartbeat(value) {
+    const at = value === null || value === undefined || value === "" ? "now" : formatTime(value);
+    setLive("Live updates: streaming · heartbeat " + at);
+  }
+
+  function startStream() {
+    clearRetry();
+    closeStream();
+    if (!jobId) return;
+    if (typeof EventSource !== "function") {
+      setLive("Live updates unavailable in this browser; polling every 5 seconds.");
+      startFallbackPolling();
+      return;
+    }
+    let source;
+    try {
+      source = new EventSource(STREAM_URL);
+    } catch (_error) {
+      setLive("Live updates could not start; polling every 5 seconds.");
+      startFallbackPolling();
+      scheduleRetry();
+      return;
+    }
+    eventSource = source;
+    source.onopen = () => {
+      clearRetry();
+      retryDelay = RETRY_MIN_MS;
+      setLive("Live updates: streaming");
+      stopFallbackPolling();
+    };
+    source.addEventListener("job", (message) => {
+      let snapshot;
+      try {
+        snapshot = JSON.parse(message.data);
+      } catch (_error) {
+        return;
+      }
+      retryDelay = RETRY_MIN_MS;
+      applySnapshot(snapshot);
+    });
+    source.addEventListener("heartbeat", (message) => {
+      let at = null;
+      try {
+        at = JSON.parse(message.data).at;
+      } catch (_error) {
+        at = null;
+      }
+      retryDelay = RETRY_MIN_MS;
+      markHeartbeat(at);
+    });
+    source.onerror = () => {
+      if (eventSource !== source) return;
+      handleStreamFailure();
+    };
   }
 
   // The shared unlock panel: the daemon write token lives only in this tab's
@@ -548,14 +682,15 @@
   async function load() {
     if (!jobId) {
       showError("This page needs a job id in its path.");
-      return;
+      return "missing";
     }
     try {
       const jobResponse = await fetch("/api/v1/jobs/" + encodeURIComponent(jobId));
       if (jobResponse.status === 404) {
         showNotFound();
         updatedLine.textContent = "Last updated: job not found";
-        return;
+        stopFallbackPolling();
+        return "missing";
       }
       if (!jobResponse.ok) throw new Error("HTTP " + jobResponse.status);
       const job = await jobResponse.json();
@@ -573,11 +708,20 @@
       renderGates(gatesPage.items);
       hideError();
       updateUnlock();
-      updatedLine.textContent = "Last updated: " + new Date().toLocaleString();
+      markUpdated();
+      return "ok";
     } catch (error) {
       const detail = error && error.message ? error.message : "the daemon may be down";
       showError("Could not load the job (" + detail + ").");
+      return "failed";
     }
+  }
+
+  async function boot() {
+    setLive("Live updates: connecting…");
+    startFallbackPolling();
+    const status = await load();
+    if (status !== "missing") startStream();
   }
 
   unlockForm.addEventListener("submit", (event) => {
@@ -595,7 +739,7 @@
   });
 
   updateUnlock();
-  load();
+  boot();
 })();
 </script>
 <script>

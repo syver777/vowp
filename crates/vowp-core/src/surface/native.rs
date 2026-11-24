@@ -9,11 +9,25 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use vowp_protocol::{OrchestratorApp, SessionId, Timestamp};
+use vowp_protocol::{OrchestratorApp, OrchestratorAuth, SessionId, Timestamp};
 
 use crate::CoreError;
 
 use super::mirror::MirrorCursor;
+
+/// The private loopback details one live app host exposes to its local owner.
+///
+/// Only the explicit endpoint command reads these values. They never enter a card,
+/// snapshot, log or error, and `url` is always a loopback `http://127.0.0.1:<port>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointParts {
+    /// Loopback URL.
+    pub url: String,
+    /// App-side session id, when the host knows one.
+    pub native_session_id: Option<String>,
+    /// Local auth material for the app.
+    pub auth: Option<OrchestratorAuth>,
+}
 
 /// One request to start an app host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +157,14 @@ pub trait AppHost: Send + Sync {
     fn stop(&self, handle: &AppHandle) -> Result<(), CoreError>;
     /// Checks whether the app is healthy.
     fn health(&self, handle: &AppHandle) -> Result<HostHealth, CoreError>;
+    /// Returns the private loopback endpoint details for one live handle.
+    ///
+    /// The default is `None`: an app without a real loopback endpoint (Claude Remote
+    /// Control or chat) exposes no discovery document. A host that returns details reads
+    /// only its own private state; the caller keeps them out of cards, logs and errors.
+    fn endpoint(&self, _handle: &AppHandle) -> Result<Option<EndpointParts>, CoreError> {
+        Ok(None)
+    }
     /// Returns the join instructions for the three surfaces.
     fn join_instructions(&self, handle: &AppHandle) -> Result<vowp_protocol::JoinInstructions, CoreError>;
     /// Reads the transcript entries the mirror should consider after `cursor`.

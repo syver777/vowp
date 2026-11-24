@@ -373,7 +373,7 @@ impl ApiState {
     }
 
     /// Returns the jobs matching `filter`.
-    fn jobs(&self, filter: &JobFilter) -> Result<JobPage, ApiFailure> {
+    pub(crate) fn jobs(&self, filter: &JobFilter) -> Result<JobPage, ApiFailure> {
         let store = self.open()?;
         let jobs = store.list_jobs(filter).map_err(|_| store_failure())?;
         Ok(JobPage {
@@ -393,6 +393,35 @@ impl ApiState {
             .job(id)
             .map_err(|_| store_failure())?
             .ok_or_else(|| ApiFailure::not_found(format!("job {id} not found")))
+    }
+
+    /// Returns one job's complete detail snapshot for the SSE stream.
+    ///
+    /// The snapshot reads the job, its runs and its newest-attempt gate results from one
+    /// read-only store handle, so a frame is internally consistent and a poll opens only one
+    /// connection. An unknown job is a `404`; the stream handler checks that before starting
+    /// the response.
+    pub(crate) fn job_detail_page(&self, id: &JobId) -> Result<stream::JobDetailPage, ApiFailure> {
+        let store = self.open()?;
+        let job = store
+            .job(id)
+            .map_err(|_| store_failure())?
+            .ok_or_else(|| ApiFailure::not_found(format!("job {id} not found")))?;
+        let runs = store.runs_of_job(id).map_err(|_| store_failure())?;
+        let gates = store.latest_gate_results(id).map_err(|_| store_failure())?;
+        Ok(stream::JobDetailPage {
+            job,
+            runs: RunPage {
+                total: usize_to_u64(runs.len()),
+                items: runs,
+                next: None,
+            },
+            gates: GateResultPage {
+                total: usize_to_u64(gates.len()),
+                items: gates,
+                next: None,
+            },
+        })
     }
 
     /// Returns one job's runs in the store's order, oldest first (`started_at`, then `id`).
@@ -478,7 +507,7 @@ impl ApiState {
     }
 
     /// Returns the served project's registered nodes, ordered by name.
-    fn nodes(&self) -> Result<NodePage, ApiFailure> {
+    pub(crate) fn nodes(&self) -> Result<NodePage, ApiFailure> {
         let store = self.open()?;
         let nodes = store.list_nodes().map_err(|_| store_failure())?;
         Ok(NodePage {
@@ -489,7 +518,7 @@ impl ApiState {
     }
 
     /// Returns the served project's inbox items in `state`.
-    fn inbox(&self, state: InboxState) -> Result<InboxPage, ApiFailure> {
+    pub(crate) fn inbox(&self, state: InboxState) -> Result<InboxPage, ApiFailure> {
         let store = self.open()?;
         let items = store.list_inbox(Some(state)).map_err(|_| store_failure())?;
         Ok(InboxPage {
@@ -500,7 +529,7 @@ impl ApiState {
     }
 
     /// Returns the served project's cost report grouped and bounded by `spec`.
-    fn cost(&self, spec: CostQuerySpec) -> Result<CostReport, ApiFailure> {
+    pub(crate) fn cost(&self, spec: CostQuerySpec) -> Result<CostReport, ApiFailure> {
         let store = self.open()?;
         let rows = store
             .cost_totals(
@@ -709,7 +738,8 @@ fn lineage(store: &Store, session: &Session) -> Result<Vec<SessionId>, ApiFailur
 /// pages at `/cost`, `/inbox`, `/nodes`, `/jobs` and `/jobs/{id}`, the static ASIF import
 /// page at `/import`, the PWA manifest, icon and service worker, plus the API under
 /// `/api/v1`. The only non-GET API routes are the token-gated inbox answer, session switch,
-/// ASIF import and job retry/park/cancel/nudge/restart/replan/fail writes.
+/// ASIF import and job retry/park/cancel/nudge/restart/replan/fail writes. The board, jobs,
+/// cost, inbox and nodes snapshot streams are all read-only `text/event-stream` GETs.
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/", get(board_page))
@@ -730,7 +760,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/board", get(board))
         .route("/api/v1/board/stream", get(board_stream))
         .route("/api/v1/jobs", get(jobs))
+        .route("/api/v1/jobs/stream", get(jobs_stream))
         .route("/api/v1/jobs/{id}", get(job_detail))
+        .route("/api/v1/jobs/{id}/stream", get(job_stream))
         .route("/api/v1/jobs/{id}/runs", get(job_runs))
         .route("/api/v1/jobs/{id}/gates", get(job_gates))
         .route("/api/v1/jobs/{id}/retry", post(retry_job))
@@ -754,9 +786,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/v1/sessions/{id}/export/asif", get(crate::asif::export_session))
         .route("/api/v1/sessions/{id}/switch", post(switch_session))
         .route("/api/v1/inbox", get(inbox))
+        .route("/api/v1/inbox/stream", get(inbox_stream))
         .route("/api/v1/inbox/{id}/answer", post(answer_inbox))
         .route("/api/v1/nodes", get(nodes))
+        .route("/api/v1/nodes/stream", get(nodes_stream))
         .route("/api/v1/cost", get(cost))
+        .route("/api/v1/cost/stream", get(cost_stream))
         .fallback(unknown_endpoint)
         .with_state(state)
 }
@@ -817,7 +852,8 @@ async fn capsule_page() -> Html<&'static str> {
 /// The embedded static cost shell, served read-only at `/cost`.
 const COST_PAGE: &str = include_str!("../web/cost.html");
 
-/// Serves the static cost shell; it fetches `/api/v1/cost?by=` on load and every five seconds.
+/// Serves the static cost shell; it fetches `/api/v1/cost?by=` on load, follows
+/// `/api/v1/cost/stream?by=` and keeps a five-second polling fallback.
 ///
 /// The `by` selector offers job, day, role, provider and model. The page renders the grouped
 /// rows and totals, shows `?` for an unknown USD total and never treats it as zero, and has no
@@ -829,7 +865,8 @@ async fn cost_page() -> Html<&'static str> {
 /// The embedded static inbox shell, served at `/inbox`.
 const INBOX_PAGE: &str = include_str!("../web/inbox.html");
 
-/// Serves the static inbox shell; it fetches `/api/v1/inbox?state=` on load and every five seconds.
+/// Serves the static inbox shell; it fetches `/api/v1/inbox?state=` on load, follows
+/// `/api/v1/inbox/stream?state=` for a single state and keeps a five-second polling fallback.
 ///
 /// The state selector offers open, all, answered and dismissed; `all` fetches the three API
 /// states and merges their items. Open items carry the answer form: it stores the daemon write
@@ -843,7 +880,8 @@ async fn inbox_page() -> Html<&'static str> {
 /// The embedded static nodes shell, served read-only at `/nodes`.
 const NODES_PAGE: &str = include_str!("../web/nodes.html");
 
-/// Serves the static nodes shell; it fetches `/api/v1/nodes` on load and every five seconds.
+/// Serves the static nodes shell; it fetches `/api/v1/nodes` on load, follows
+/// `/api/v1/nodes/stream` and keeps a five-second polling fallback.
 ///
 /// The page renders each stored node's name, SSH target, local/remote flag, last-seen time,
 /// `capabilities.vowp` version and a compact capabilities/probe summary. It is read-only: no
@@ -855,13 +893,15 @@ async fn nodes_page() -> Html<&'static str> {
 /// The embedded static jobs shell, served at `/jobs`.
 const JOBS_PAGE: &str = include_str!("../web/jobs.html");
 
-/// Serves the static jobs shell; it fetches `/api/v1/jobs` on load and every five seconds.
+/// Serves the static jobs shell; it fetches `/api/v1/jobs` on load, follows
+/// `/api/v1/jobs/stream` and keeps a five-second polling fallback.
 ///
 /// The page renders each job's id, state, kind, role, priority, needs, attempts, updated
 /// time and note. Reads stay token-free. Retry, park and cancel appear only after the daemon
 /// write token is stored in `sessionStorage`; they post to the existing token-gated
-/// `/api/v1/jobs/{id}/retry|park|cancel` routes and refresh the list on `202`. Each job id
-/// links to the read-only `/jobs/{id}` detail page.
+/// `/api/v1/jobs/{id}/retry|park|cancel` routes, refresh the list immediately on `202` and
+/// reconcile the rest from the stream. Each job id links to the read-only `/jobs/{id}` detail
+/// page.
 async fn jobs_page() -> Html<&'static str> {
     Html(JOBS_PAGE)
 }
@@ -871,12 +911,13 @@ const JOB_PAGE: &str = include_str!("../web/job.html");
 
 /// Serves the static job-detail shell.
 ///
-/// The page reads the id from its own path and fetches `/api/v1/jobs/{id}`,
-/// `/api/v1/jobs/{id}/runs` and `/api/v1/jobs/{id}/gates` on load. It carries the shared
+/// The page reads the id from its own path, fetches `/api/v1/jobs/{id}`,
+/// `/api/v1/jobs/{id}/runs` and `/api/v1/jobs/{id}/gates` on load, then follows
+/// `/api/v1/jobs/{id}/stream` with a five-second polling fallback. It carries the shared
 /// `sessionStorage` unlock panel and posts the token-gated keeper actions (`nudge`,
-/// `restart`, `replan`, `fail`) only in the states the graph accepts, refreshing all three
-/// reads on `202`. An unknown job is the API's `404`, which the page shows as a not-found
-/// line while keeping its nav and back link.
+/// `restart`, `replan`, `fail`) only in the states the graph accepts, reloading all three
+/// reads immediately on `202`. An unknown job is the API's `404`, which the page shows as a
+/// not-found line while keeping its nav and back link.
 async fn job_page() -> Html<&'static str> {
     Html(JOB_PAGE)
 }
@@ -964,6 +1005,22 @@ async fn jobs(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Resul
     Ok(Json(page))
 }
 
+/// Streams filtered jobs-list snapshots as server-sent `jobs` frames with heartbeats.
+///
+/// The `state`, `kind` and `role` filters are the same ones `GET /api/v1/jobs` accepts; an
+/// invalid value is a normal JSON `400` before the stream starts. Every `jobs` frame is the
+/// exact current `JobPage` for those filters, sent only when it changes. The response is
+/// marked `Cache-Control: no-store`, has no cursor or resume, and a failed read ends the
+/// stream cleanly so the page reconnects and polls.
+async fn jobs_stream(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Result<Response, ApiFailure> {
+    let filter = filters::job_filter(query.as_deref()).map_err(ApiFailure::invalid)?;
+    let mut response = stream::jobs_response(state, filter).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 /// Returns one job.
 ///
 /// An invalid id is `400`, an unknown job is `404`, and a store failure is a path-free
@@ -972,6 +1029,25 @@ async fn job_detail(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     let id = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
     let job = blocking(move || state.job_detail(&id)).await?;
     Ok(Json(job))
+}
+
+/// Streams one job's detail snapshots as server-sent `job` frames with heartbeats.
+///
+/// The id is validated and the job is checked before the SSE response starts, so an invalid
+/// id is a JSON `400` and an unknown job is a JSON `404`. Every `job` frame is a
+/// `JobDetailPage` carrying the exact job, run page and newest-attempt gate page, sent only
+/// when one of them changes. The response is marked `Cache-Control: no-store`, has no
+/// cursor or resume, and a failed read ends the stream cleanly.
+async fn job_stream(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Response, ApiFailure> {
+    let id = JobId::parse(&id).map_err(|_| ApiFailure::invalid("invalid job id"))?;
+    let checked = state.clone();
+    let check_id = id.clone();
+    blocking(move || checked.job_detail(&check_id).map(|_| ())).await?;
+    let mut response = stream::job_response(state, id).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// Returns one job's runs in the store's order, oldest first (`started_at`, then `id`).
@@ -1216,11 +1292,40 @@ async fn nodes(State(state): State<ApiState>) -> Result<Json<NodePage>, ApiFailu
     Ok(Json(page))
 }
 
+/// Streams node-page snapshots as server-sent `nodes` frames with heartbeats.
+///
+/// Every `nodes` frame is the exact current `NodePage` from `GET /api/v1/nodes`, sent only
+/// when it changes. The response is marked `Cache-Control: no-store`, has no cursor or
+/// resume, and a failed read ends the stream cleanly so the page reconnects and polls.
+async fn nodes_stream(State(state): State<ApiState>) -> Result<Response, ApiFailure> {
+    let mut response = stream::nodes_response(state).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
 /// Lists the served project's inbox items in one state.
 async fn inbox(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Result<Json<InboxPage>, ApiFailure> {
     let filter = filters::inbox_state(query.as_deref()).map_err(ApiFailure::invalid)?;
     let page = blocking(move || state.inbox(filter)).await?;
     Ok(Json(page))
+}
+
+/// Streams inbox-page snapshots as server-sent `inbox` frames with heartbeats.
+///
+/// The `state` filter is the same one `GET /api/v1/inbox` accepts and defaults to `open`; an
+/// invalid value is a normal JSON `400` before the stream starts. Every `inbox` frame is the
+/// exact current `InboxPage` for that state, sent only when it changes. The response is
+/// marked `Cache-Control: no-store`, has no cursor or resume, and a failed read ends the
+/// stream cleanly so the page reconnects and polls.
+async fn inbox_stream(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Result<Response, ApiFailure> {
+    let filter = filters::inbox_state(query.as_deref()).map_err(ApiFailure::invalid)?;
+    let mut response = stream::inbox_response(state, filter).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// Answers one open inbox item and queues the supervisor request.
@@ -1293,6 +1398,22 @@ async fn cost(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Resul
     let spec = filters::cost_query(query.as_deref()).map_err(ApiFailure::invalid)?;
     let report = blocking(move || state.cost(spec)).await?;
     Ok(Json(report))
+}
+
+/// Streams cost-report snapshots as server-sent `cost` frames with heartbeats.
+///
+/// The `by`, `since` and `until` filters are the same ones `GET /api/v1/cost` accepts; an
+/// invalid value is a normal JSON `400` before the stream starts. Every `cost` frame is the
+/// exact current `CostReport`, sent only when it changes. The response is marked
+/// `Cache-Control: no-store`, has no cursor or resume, and a failed read ends the stream
+/// cleanly so the page reconnects and polls.
+async fn cost_stream(State(state): State<ApiState>, RawQuery(query): RawQuery) -> Result<Response, ApiFailure> {
+    let spec = filters::cost_query(query.as_deref()).map_err(ApiFailure::invalid)?;
+    let mut response = stream::cost_response(state, spec).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 /// Returns one page of a session's exact stored events.

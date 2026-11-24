@@ -141,13 +141,69 @@ fn print_status(io: &mut dyn IoStreams, status: &FleetStatus) -> Result<(), CliE
         snapshot.capacity.target.target_workers,
         target_mode_name(snapshot.capacity.target.mode)
     )?;
+    if snapshot.capacity.cluster.online_worker_nodes > 0 {
+        writeln!(
+            io.out(),
+            "{}",
+            crate::cmd::capacity::cluster_line(&snapshot.capacity.cluster)
+        )?;
+    }
     if snapshot.limits.is_empty() {
         writeln!(io.out(), "limits: none")?;
     } else {
         writeln!(io.out(), "limits: {}", snapshot.limits.len())?;
     }
     writeln!(io.out(), "inbox: {} open", snapshot.inbox.len())?;
+    print_owners(io, snapshot)?;
     Ok(())
+}
+
+/// Prints the `owners:` section: one line per session that has an owner row.
+///
+/// The lines come from the same recent-session set the snapshot carries and name no token or
+/// password. Ages are relative to the snapshot time.
+fn print_owners(io: &mut dyn IoStreams, snapshot: &vowp_protocol::Snapshot) -> Result<(), CliError> {
+    let owned: Vec<_> = snapshot
+        .sessions
+        .iter()
+        .filter_map(|card| card.owner.as_ref().map(|owner| (card, owner)))
+        .collect();
+    if owned.is_empty() {
+        return Ok(());
+    }
+    writeln!(io.out(), "owners:")?;
+    let at = snapshot.generated_at;
+    for (card, owner) in owned {
+        let timing = match owner.expires_at {
+            Some(expires) if expires > at => format!("expires in {}", short_span(expires.since(at).as_secs())),
+            Some(_) => "expired".to_owned(),
+            None => format!("heartbeat {}", short_span(at.since(owner.heartbeat_at).as_secs())),
+        };
+        writeln!(
+            io.out(),
+            "  {}  {}  {}  {} ({})  {}@{}  {}  {}  {}",
+            card.id,
+            card.title,
+            owner.label.as_deref().unwrap_or("-"),
+            owner.kind.store_name(),
+            owner.mode,
+            owner.holder,
+            owner.node,
+            owner.state,
+            owner.activity,
+            timing
+        )?;
+    }
+    Ok(())
+}
+
+/// Formats a span of seconds as `4s`, `8m` or `3h`.
+fn short_span(secs: u64) -> String {
+    match secs {
+        0..=119 => format!("{secs}s"),
+        120..=7199 => format!("{}m", secs / 60),
+        _ => format!("{}h", secs / 3600),
+    }
 }
 
 /// Runs `fleet queue`.

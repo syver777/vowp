@@ -243,16 +243,20 @@ impl Fixture {
         )
         .expect("accept assignment");
         store
-            .take_lease(&Lease {
-                session_id: session.id.clone(),
-                surface_id: None,
-                surface_kind: SurfaceKind::Agent,
-                node: node.clone(),
-                holder: "agent".to_owned(),
-                token: LEASE.to_owned(),
-                acquired_at: ts(),
-                heartbeat_at: ts(),
-            })
+            .take_ownership(
+                &Lease {
+                    session_id: session.id.clone(),
+                    surface_id: None,
+                    surface_kind: SurfaceKind::Agent,
+                    node: node.clone(),
+                    holder: "agent".to_owned(),
+                    token: LEASE.to_owned(),
+                    acquired_at: ts(),
+                    heartbeat_at: ts(),
+                },
+                vowp_protocol::OwnershipMode::Job,
+                Some(ts().plus(dispatch::RUN_LEASE_TTL)),
+            )
             .expect("run lease");
 
         Self {
@@ -772,6 +776,26 @@ fn terminal_result_releases_the_lease_and_clears_the_waiting_note() {
     );
     assert_eq!(fixture.assignment().state, AgentAssignmentState::Finished);
     assert_eq!(job.state, JobState::Gating);
+}
+
+#[test]
+fn accepted_result_releases_the_job_owner() {
+    let fixture = Fixture::new(&["src/**"]);
+    let before = fixture
+        .store
+        .ownership(&fixture.session)
+        .expect("ownership")
+        .expect("the run holds a job owner");
+    assert_eq!(before.mode, vowp_protocol::OwnershipMode::Job);
+    let head = fixture.push(&[("src/lib.rs", "pub fn owned() {}\n")]);
+
+    let settled = fixture.ingest(Some(&head), Fixture::summary_ok());
+
+    assert_eq!(settled.outcome, RunOutcome::Ok);
+    assert!(
+        fixture.store.ownership(&fixture.session).expect("ownership").is_none(),
+        "an accepted result releases the job owner"
+    );
 }
 
 #[test]

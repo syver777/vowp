@@ -206,8 +206,16 @@ impl SessionService {
             return Err(CoreError::Invalid("session is closed; no further turns".to_owned()));
         }
         self.check_cwd(&session.cwd)?;
-        // A live lease must match VOWP_LEASE_TOKEN.
-        crate::surface::check_lease(&self.deps, &store, &req.session_id)?;
+        // A live owner must match VOWP_LEASE_TOKEN. A supervisor-internal probe or capsule
+        // run is not a person's write: it may run on a session nobody owns, but never over
+        // another surface's live ownership.
+        let internal = matches!(
+            req.role,
+            vowp_protocol::RunRole::Probe | vowp_protocol::RunRole::Capsule
+        );
+        if !(internal && store.ownership(&req.session_id)?.is_none()) {
+            crate::surface::check_lease(&self.deps, &store, &req.session_id)?;
+        }
         if cancel.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
@@ -853,6 +861,15 @@ impl SessionService {
 /// `<VOWP_HOME>/orchestrators/<name>/`, so a takeover or repair must accept that directory
 /// even though it is outside the project checkout.
 ///
+/// An existing `cwd` is canonicalized whole, so a symlink can never smuggle a path out of a
+/// root. When the leaf does not exist, the deepest existing ancestor is canonicalized and the
+/// missing components are appended literally; that is how a deleted child of a symlinked
+/// worktree root is still recognised as inside the root. A missing component of `..` is
+/// refused instead of interpreted, because without an existing ancestor it cannot be resolved
+/// safely. A path that resolves inside a root but whose leaf is gone is reported as
+/// [`CoreError::CwdMissing`]: the caller may retire a stale role session and start a fresh
+/// turn elsewhere, but no adapter is ever started in a directory that does not exist.
+///
 /// A configuration with no project path, worktree root or `[node].cwd_allow` keeps the
 /// historical fallback: no allow-list is configured, so every directory is admitted.
 pub(crate) fn check_cwd(deps: &Deps, cwd: &str) -> Result<(), CoreError> {
@@ -873,16 +890,74 @@ pub(crate) fn check_cwd(deps: &Deps, cwd: &str) -> Result<(), CoreError> {
     // VOWP creates and owns this root; it is not a user-supplied `cwd_allow` entry.
     roots.push(deps.paths.root().join("orchestrators"));
 
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (path, exists) = resolve_allow_list_path(path)?;
     for root in &roots {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         if path.starts_with(&root) {
-            return Ok(());
+            if exists {
+                return Ok(());
+            }
+            return Err(CoreError::CwdMissing(cwd.to_owned()));
         }
     }
     Err(CoreError::Refused(format!(
         "working directory {cwd} is outside the allow-list"
     )))
+}
+
+/// Resolves `path` for the allow-list comparison.
+///
+/// Returns the canonical path and whether the original leaf is an existing directory. A path
+/// that exists is canonicalized whole. A path whose leaf is missing is rebuilt from its
+/// deepest existing, canonicalized ancestor plus the literal missing components; a `..` in
+/// that missing tail is refused because resolving it against a non-existent directory could
+/// escape the allow-list.
+fn resolve_allow_list_path(path: &Path) -> Result<(PathBuf, bool), CoreError> {
+    let exists = path.is_dir();
+    if exists {
+        let canonical = std::fs::canonicalize(path).map_err(|_| {
+            CoreError::Refused(format!(
+                "working directory {} is outside the allow-list",
+                path.display()
+            ))
+        })?;
+        return Ok((canonical, true));
+    }
+
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path;
+    loop {
+        if current.components().next_back() == Some(std::path::Component::ParentDir) {
+            return Err(CoreError::Refused(format!(
+                "working directory {} is outside the allow-list",
+                path.display()
+            )));
+        }
+        match std::fs::canonicalize(current) {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok((resolved, false));
+            }
+            Err(_) => {
+                let Some(name) = current.file_name() else {
+                    return Err(CoreError::Refused(format!(
+                        "working directory {} cannot be resolved",
+                        path.display()
+                    )));
+                };
+                missing.push(name.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(CoreError::Refused(format!(
+                        "working directory {} cannot be resolved",
+                        path.display()
+                    )));
+                };
+                current = parent;
+            }
+        }
+    }
 }
 
 impl SessionOps for SessionService {

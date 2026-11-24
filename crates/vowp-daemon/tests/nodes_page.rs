@@ -138,6 +138,15 @@ fn nodes_page_serves_the_shell_and_the_fixture_nodes() {
         "fetch(\"/api/v1/nodes\")",
         "const REFRESH_MS = 5000;",
         "setInterval(refresh, REFRESH_MS)",
+        "const RETRY_MIN_MS = 1000;",
+        "const RETRY_MAX_MS = 15000;",
+        "id=\"live\"",
+        "Live updates: connecting",
+        "Reconnecting... polling every 5 seconds.",
+        "new EventSource(\"/api/v1/nodes/stream\")",
+        "source.addEventListener(\"nodes\"",
+        "source.addEventListener(\"heartbeat\"",
+        "startStream();",
         "Name",
         "SSH target",
         "Local / remote",
@@ -168,6 +177,20 @@ fn nodes_page_serves_the_shell_and_the_fixture_nodes() {
         assert!(
             !lowered.contains(forbidden),
             "nodes page must not mention {forbidden:?} at all"
+        );
+    }
+    // The nodes page stays read-only: no add, remove or probe control and no write path.
+    for forbidden in [
+        "<button",
+        "<form",
+        "method: \"POST\"",
+        "/api/v1/nodes/add",
+        "/api/v1/nodes/remove",
+        "/api/v1/nodes/probe",
+    ] {
+        assert!(
+            !page.body.contains(forbidden),
+            "nodes page must not offer a write control {forbidden:?}"
         );
     }
 
@@ -229,4 +252,27 @@ fn nodes_page_serves_the_empty_state_and_an_empty_page() {
     assert_eq!(page.total, 0);
     assert_eq!(page.next, None);
     assert!(page.items.is_empty());
+}
+
+#[test]
+fn service_worker_bypasses_api_and_stream_urls() {
+    let fixture = Fixture::empty();
+    let server = support::Server::start_for(&fixture.paths);
+
+    let response = support::get(server.address, "/sw.js");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    for needle in [
+        "url.pathname.startsWith(\"/api/\")",
+        "url.pathname.endsWith(\"/stream\")",
+        "accept.includes(\"text/event-stream\")",
+    ] {
+        assert!(
+            response.body.contains(needle),
+            "the service worker must bypass {needle:?}"
+        );
+    }
+    assert!(
+        !response.body.contains("/api/v1/"),
+        "the service worker must not cache an API route"
+    );
 }

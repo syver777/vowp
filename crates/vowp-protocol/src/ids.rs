@@ -66,10 +66,10 @@ fn validate_ulid(s: &str, kind: &'static str, original: &str) -> Result<String, 
     Ok(ulid.to_string())
 }
 
-/// Returns true for a valid slug: `^[a-z0-9][a-z0-9-]{0,63}$` with no trailing `-`.
-fn is_slug(s: &str) -> bool {
+/// Returns true for a slug of at most `max` bytes: `^[a-z0-9][a-z0-9-]{0,max-1}$`, no trailing `-`.
+fn is_slug_max(s: &str, max: usize) -> bool {
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() > 64 {
+    if bytes.is_empty() || bytes.len() > max {
         return false;
     }
     let Some(first) = bytes.first() else {
@@ -167,12 +167,15 @@ macro_rules! ulid_id {
 /// Declares a slug-backed id type.
 macro_rules! slug_id {
     ($(#[$meta:meta])* $name:ident) => {
-        slug_id!(@define $(#[$meta])* $name, false);
+        slug_id!(@define $(#[$meta])* $name, false, 64);
+    };
+    ($(#[$meta:meta])* $name:ident, max $max:expr) => {
+        slug_id!(@define $(#[$meta])* $name, false, $max);
     };
     ($(#[$meta:meta])* $name:ident, reserved_node) => {
-        slug_id!(@define $(#[$meta])* $name, true);
+        slug_id!(@define $(#[$meta])* $name, true, 64);
     };
-    (@define $(#[$meta:meta])* $name:ident, $allow_node:expr) => {
+    (@define $(#[$meta:meta])* $name:ident, $allow_node:expr, $max:expr) => {
         $(#[$meta])*
         #[derive(
             Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -182,11 +185,11 @@ macro_rules! slug_id {
         pub struct $name(String);
 
         impl $name {
-            /// Parses a slug: lowercase letters and digits, `-` inside, at most 64 characters.
+            /// Parses a slug: lowercase letters and digits, `-` inside, at most 64 characters (120 for job ids).
             ///
             /// Project names additionally accept the reserved literal `_node`.
             pub fn parse(s: &str) -> Result<Self, ProtocolError> {
-                if is_slug(s) || ($allow_node && s == "_node") {
+                if is_slug_max(s, $max) || ($allow_node && s == "_node") {
                     Ok(Self(s.to_owned()))
                 } else {
                     Err(ProtocolError::InvalidId {
@@ -263,8 +266,9 @@ impl CapsuleId {
 }
 
 slug_id!(
-    /// Job id slug, for example `example-job`.
-    JobId
+    /// Job id slug, for example `example-job`, at most 120 characters.
+    JobId,
+    max 120
 );
 slug_id!(
     /// Node name slug, for example `vps`.
@@ -277,3 +281,21 @@ slug_id!(
     ProjectName,
     reserved_node
 );
+
+#[cfg(test)]
+mod job_id_length_tests {
+    use super::{JobId, NodeName};
+
+    #[test]
+    fn job_ids_allow_up_to_120_characters() {
+        assert!(JobId::parse(&"a".repeat(120)).is_ok());
+        assert!(JobId::parse(&"a".repeat(121)).is_err());
+        assert!(JobId::parse(&format!("{}-", "a".repeat(119))).is_err());
+    }
+
+    #[test]
+    fn other_slugs_keep_the_64_character_cap() {
+        assert!(NodeName::parse(&"a".repeat(64)).is_ok());
+        assert!(NodeName::parse(&"a".repeat(65)).is_err());
+    }
+}

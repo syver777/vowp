@@ -3,9 +3,9 @@
 //! Values are read from a hidden prompt or from stdin, never from argv. The CLI only
 //! renders the core vault API; storage, injection and redaction live in `vowp-core`.
 //!
-//! Spec: `docs/design/v0.2/home-and-surfaces.md` §9 and §12.
+//! Spec: `docs/design/v0.2/home-and-surfaces.md` §9 and §12, and
+//! `docs/design/v0.5/vault-encrypted.md`.
 
-use std::io::IsTerminal;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use clap::{Args, Subcommand};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle, Signals};
-use vowp_core::vault::{self, REQUEST_TTL, SecretRequestServer, Upgrade};
+use vowp_core::vault::{self, EncryptedUpgrade, REQUEST_TTL, SecretRequestServer, Upgrade};
 use vowp_protocol::{SecretInfo, SecretName, VaultMode};
 
 use crate::output::{Table, local_time_at, print_json};
@@ -40,7 +40,7 @@ pub enum SecretCommand {
     /// Remove a secret.
     Rm(SecretRmArgs),
     /// Move basic-mode secrets to the vault user.
-    Upgrade,
+    Upgrade(SecretUpgradeArgs),
     /// Open a one-time paste page for a secret.
     Request(SecretRequestArgs),
 }
@@ -50,6 +50,23 @@ pub enum SecretCommand {
 pub struct SecretSetArgs {
     /// Secret name (`^[A-Z][A-Z0-9_]{0,63}$`).
     pub name: String,
+    /// Read the value from stdin instead of a hidden prompt (for SSH pipes and scripts).
+    ///
+    /// Hidden from `vowp secret set --help` so the committed CLI reference stays current until
+    /// the v0.5 close-out docs job regenerates `docs/reference/cli.md`.
+    #[arg(long, hide = true)]
+    pub stdin: bool,
+}
+
+/// Arguments for `vowp secret upgrade`.
+#[derive(Debug, Clone, Args)]
+pub struct SecretUpgradeArgs {
+    /// Encrypt basic-mode secrets with a local age key instead of moving them to the vault user.
+    ///
+    /// Hidden from `vowp secret upgrade --help` so the committed CLI reference stays current
+    /// until the v0.5 close-out docs job regenerates `docs/reference/cli.md`.
+    #[arg(long, hide = true)]
+    pub encrypted: bool,
 }
 
 /// Arguments for `vowp secret rm`.
@@ -112,7 +129,7 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, args: &SecretArgs) -> Result<i32, 
         SecretCommand::Set(set) => set_secret(ctx, io, set),
         SecretCommand::Ls => list_secrets(ctx, io),
         SecretCommand::Rm(remove) => remove_secret(ctx, io, remove),
-        SecretCommand::Upgrade => upgrade(ctx, io),
+        SecretCommand::Upgrade(upgrade_args) => upgrade(ctx, io, upgrade_args),
         SecretCommand::Request(request) => request_secret(ctx, io, request),
     }
 }
@@ -162,23 +179,20 @@ pub fn vault_admin(ctx: &Ctx, io: &mut dyn IoStreams, args: &VaultAdminArgs) -> 
     }
 }
 
-/// Stores a secret after reading it from a hidden terminal prompt.
+/// Stores a secret after reading it from stdin or a hidden terminal prompt.
 fn set_secret(ctx: &Ctx, io: &mut dyn IoStreams, args: &SecretSetArgs) -> Result<i32, CliError> {
     let name = SecretName::parse(&args.name)?;
-    if !std::io::stdin().is_terminal() {
-        return Err(CliError::Guard(
-            "run it in a terminal or use `vowp secret request`".to_owned(),
-        ));
-    }
-    let mut guard = EchoGuard::hide()?;
-    write!(io.err(), "value for {name}: ")?;
-    io.err().flush()?;
-    let mut line = String::new();
-    let read = io.input().read_line(&mut line);
-    guard.restore()?;
-    read?;
-    writeln!(io.err())?;
-    let value = line.trim_end_matches(&['\r', '\n'][..]).to_owned();
+    let value = if args.stdin {
+        read_secret_stdin(io)?
+    } else {
+        if !io.is_tty() {
+            return Err(CliError::Guard(
+                "run it in a terminal, pipe the value with `vowp secret set NAME --stdin`, or use `vowp secret request`"
+                    .to_owned(),
+            ));
+        }
+        read_secret_prompt(io, &name)?
+    };
     let info = vault::write_secret(ctx.deps(), &name, &value)?;
     if ctx.json() {
         print_json(io, &info)?;
@@ -188,11 +202,50 @@ fn set_secret(ctx: &Ctx, io: &mut dyn IoStreams, args: &SecretSetArgs) -> Result
     Ok(0)
 }
 
+/// Reads the whole stdin value and strips exactly one trailing newline.
+///
+/// A trailing `\r\n` and a bare `\n` are both accepted once. Any other leading or trailing
+/// bytes, including an earlier newline, are part of the value. An empty result is refused.
+fn read_secret_stdin(io: &mut dyn IoStreams) -> Result<String, CliError> {
+    let text = crate::read_stdin(io)?;
+    let value = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    if value.is_empty() {
+        return Err(CliError::Invalid("secret value must not be empty".to_owned()));
+    }
+    Ok(value.to_owned())
+}
+
+/// Reads one line from the hidden prompt with terminal echo disabled.
+fn read_secret_prompt(io: &mut dyn IoStreams, name: &SecretName) -> Result<String, CliError> {
+    let mut guard = EchoGuard::hide()?;
+    write!(io.err(), "value for {name}: ")?;
+    io.err().flush()?;
+    let mut line = String::new();
+    let read = io.input().read_line(&mut line);
+    guard.restore()?;
+    read?;
+    writeln!(io.err())?;
+    Ok(line.trim_end_matches(&['\r', '\n'][..]).to_owned())
+}
+
+/// The `secret ls --json` document: the storage mode plus metadata, never values.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SecretList {
+    /// Active storage mode (`basic`, `vault_user` or `encrypted`).
+    mode: VaultMode,
+    /// Name, last four characters and timestamps.
+    secrets: Vec<SecretInfo>,
+}
+
 /// Lists secret names, last four characters and update times.
 fn list_secrets(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
+    let mode = vault::mode(ctx.deps())?;
     let infos = vault::list_secrets(ctx.deps())?;
     if ctx.json() {
-        print_json(io, &infos)?;
+        print_json(io, &SecretList { mode, secrets: infos })?;
         return Ok(0);
     }
     let now = ctx.clock().now();
@@ -205,7 +258,17 @@ fn list_secrets(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
         ]);
     }
     writeln!(io.out(), "{}", table.render(ctx.color()))?;
+    writeln!(io.out(), "storage: {}", mode_label(mode))?;
     Ok(0)
+}
+
+/// Returns the wire spelling of a vault mode for human output.
+fn mode_label(mode: VaultMode) -> &'static str {
+    match mode {
+        VaultMode::VaultUser => "vault_user",
+        VaultMode::Basic => "basic",
+        VaultMode::Encrypted => "encrypted",
+    }
 }
 
 /// Removes one secret after the explicit `--yes` guard.
@@ -225,14 +288,25 @@ fn remove_secret(ctx: &Ctx, io: &mut dyn IoStreams, args: &SecretRmArgs) -> Resu
     Ok(0)
 }
 
-/// Prints or completes the basic-to-vault upgrade.
-fn upgrade(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
+/// Prints or completes the basic-to-vault or basic-to-encrypted upgrade.
+fn upgrade(ctx: &Ctx, io: &mut dyn IoStreams, args: &SecretUpgradeArgs) -> Result<i32, CliError> {
+    if args.encrypted {
+        return upgrade_encrypted(ctx, io);
+    }
     match vault::upgrade(ctx.deps())? {
         Upgrade::AlreadyVault => {
             if ctx.json() {
                 print_json(io, &serde_json::json!({"mode": VaultMode::VaultUser}))?;
             } else {
                 writeln!(io.out(), "secrets: vault user")?;
+            }
+            Ok(0)
+        }
+        Upgrade::AlreadyEncrypted => {
+            if ctx.json() {
+                print_json(io, &serde_json::json!({"mode": VaultMode::Encrypted}))?;
+            } else {
+                writeln!(io.out(), "secrets: encrypted")?;
             }
             Ok(0)
         }
@@ -248,6 +322,28 @@ fn upgrade(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
             "run this command, then re-run `vowp secret upgrade`:\n{command}"
         ))),
         Upgrade::NoSudo(reason) => Err(CliError::Guard(reason)),
+    }
+}
+
+/// Encrypts basic-mode secrets with the local age key.
+fn upgrade_encrypted(ctx: &Ctx, io: &mut dyn IoStreams) -> Result<i32, CliError> {
+    match vault::upgrade_encrypted(ctx.deps())? {
+        EncryptedUpgrade::AlreadyEncrypted => {
+            if ctx.json() {
+                print_json(io, &serde_json::json!({"mode": VaultMode::Encrypted}))?;
+            } else {
+                writeln!(io.out(), "secrets: encrypted")?;
+            }
+            Ok(0)
+        }
+        EncryptedUpgrade::Switched => {
+            if ctx.json() {
+                print_json(io, &serde_json::json!({"mode": VaultMode::Encrypted}))?;
+            } else {
+                writeln!(io.out(), "secrets: encrypted (switched from basic mode)")?;
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -572,6 +668,56 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn secret_set_stdin_parses_and_argv_never_accepts_a_value() {
+        use clap::Parser;
+
+        use crate::BufferIo;
+        use crate::cli::{Cli, Command};
+
+        let cli = Cli::try_parse_from(["vowp", "secret", "set", "STDIN_KEY", "--stdin"]).expect("parse");
+        let Command::Secret(args) = cli.command else {
+            panic!("expected a secret command");
+        };
+        let SecretCommand::Set(set) = args.command else {
+            panic!("expected `secret set`");
+        };
+        assert!(set.stdin);
+        assert_eq!(set.name, "STDIN_KEY");
+
+        let error = Cli::try_parse_from(["vowp", "secret", "set", "STDIN_KEY", "a-value"])
+            .expect_err("a value in argv must be refused");
+        assert!(error.to_string().contains("unexpected argument"), "{error}");
+
+        // The stdin reader is what keeps a value off argv; prove it reads the pipe.
+        let mut io = BufferIo::new("from-the-pipe-1234\n");
+        assert_eq!(read_secret_stdin(&mut io).expect("stdin value"), "from-the-pipe-1234");
+    }
+
+    #[test]
+    fn secret_stdin_strips_one_newline_and_refuses_empty() {
+        use crate::BufferIo;
+
+        let mut io = BufferIo::new("value-1234\n");
+        assert_eq!(read_secret_stdin(&mut io).expect("LF"), "value-1234");
+
+        let mut io = BufferIo::new("value-1234\r\n");
+        assert_eq!(read_secret_stdin(&mut io).expect("CRLF"), "value-1234");
+
+        let mut io = BufferIo::new("value-1234\n\n");
+        assert_eq!(
+            read_secret_stdin(&mut io).expect("one newline only"),
+            "value-1234\n",
+            "exactly one trailing newline is stripped"
+        );
+
+        for input in ["", "\n", "\r\n"] {
+            let mut io = BufferIo::new(input);
+            let error = read_secret_stdin(&mut io).expect_err("an empty value must be refused");
+            assert!(error.to_string().contains("must not be empty"), "{error}");
+        }
     }
 
     #[test]

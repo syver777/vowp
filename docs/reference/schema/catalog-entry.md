@@ -49,6 +49,11 @@ Exported by `vowp schema CatalogEntry` and generated from the protocol types in
           "type": "string"
         },
         {
+          "const": "job_window",
+          "description": "Tagged `job-<id>` tmux windows whose job is no longer active.",
+          "type": "string"
+        },
+        {
           "const": "sample",
           "description": "Host samples.",
           "type": "string"
@@ -61,7 +66,7 @@ Exported by `vowp schema CatalogEntry` and generated from the protocol types in
       ]
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "ProjectName": {

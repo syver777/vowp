@@ -36,6 +36,58 @@ Observed facts below come from real harness runs (Claude Code 2.1.319 `stream-js
 
 ---
 
+## 1.1 Harness binary resolution and the one retry
+
+`AdapterRegistry::from_config` never resolves or caches a binary path when `Deps` is built.
+The three built-in adapters are wrapped in a per-spawn resolver. Each `Adapter::start`
+resolves the configured value immediately before building the real adapter, and
+`Adapter::probe` resolves for its check, in this order
+(`vowp_core::deps::resolve_harness_binary`):
+
+1. **Configured multi-component path** (`[harnesses.<name>].binary = "/opt/harness/bin/opencode"`):
+   use it while it is an executable regular file. It wins over `PATH`.
+2. **Configured bare name** (`binary = "opencode"`): look it up on `PATH`.
+3. **Configured path that moved** (only after this adapter resolved it successfully
+   before): look up its file name on `PATH`. This is the 2026-11-20 incident: the
+   supervisor had a working absolute path, the binary moved, and `opencode` was still
+   installed elsewhere on `PATH`. A path that never resolved is a configuration error, not
+   a reason to guess an unrelated binary from `PATH`.
+4. **No configured value**: look up the adapter's default name (`claude`, `opencode`,
+   `claude-code-acp`). opencode additionally tries its documented
+   `$HOME/.opencode/bin/opencode` install.
+
+The resolved path is a **hint, not the only truth**. If the first start returns a locator
+failure (an `AdapterError::Unavailable` or a spawn `NotFound`), the resolver retries
+**exactly once** with a forced `PATH` lookup by file name. It ignores a configured
+multi-component path that is still an executable file but cannot be spawned (for example a
+missing interpreter) or that moved between resolution and spawn. A second locator failure
+returns `AdapterError::Unavailable` with the requested value and the actionable hint:
+
+```
+harness not found: <requested>; install the harness or fix [harnesses.*].binary
+```
+
+A locator miss is **not** a provider fault. The failed start is finalised as an ended
+`Error` run with no `limit_kind`; the runner does not feed it to L6, and L1's harvest only
+calls L6 for a run with a limit kind or for an orphaned run. It therefore writes no
+`fail_streak:<provider>`, `limit:<provider>`, `probe_back:<provider>` or `limits` row, and
+an existing provider mark is never cleared by the failed spawn. L6's unknown-failure
+streak still counts runs that actually started and then ended `Error`/`Crash`; those are
+genuine provider failures. Genuine auth, credits, quota and rate signals keep their normal
+classification.
+
+`Adapter::probe` reports the resolved path in `ProbeResult.path` and appends
+`resolved from config|PATH|$HOME fallback: <path>` to `ProbeResult.detail`. `vowp doctor`
+shows that detail (and the version, when one was printed), so `harness:<name>` names the
+exact path and its origin without a CLI change.
+
+`AdapterRegistry::from_config_with_search_path` is a `#[doc(hidden)]` test seam: tests
+inject a private directory as the whole resolution `PATH` (and opencode then skips the real
+`$HOME` fallback) so no real harness is reached. Production code uses
+`AdapterRegistry::from_config` and the child environment's `PATH`, then the process `PATH`.
+
+---
+
 ## 2. claude-code adapter (`ClaudeCodeAdapter`)
 
 ### 2.1 argv
@@ -64,7 +116,7 @@ Rules:
 - Resume with `can_resume_native`: `--resume <id>`. If a resumed run fails immediately with text matching `No conversation found` the adapter
   returns `outcome = Error` with `detail` containing it; core then retries once as a fresh session seeded with a capsule (sessions.md §5).
 - `ClaudeConfig.permission_mode` default is `"auto"`; VOWP never sends keystrokes, so a mode that prompts would hang — `probe()` does not check this; docs say so.
-- Binary: `ClaudeConfig.binary` (default: first `claude` on `PATH`).
+- Binary: `ClaudeConfig.binary` (default: first `claude` on `PATH`; resolution order and the one retry: §1.1).
 
 ### 2.2 Stream-json message → canonical events
 
@@ -168,7 +220,7 @@ Prompt size: Linux's per-argument cap is 128 KiB. If `prompt.len() > 100_000` by
 - New session: no `--session`. The id is learned from the first event's top-level `sessionID` (e.g. `ses_e439617b6ffepWG4UNK521b6ly`) and reported as `RunSummary.native_session_id`
   and in `RunSummary.native_session_id` (core writes it into the detach event and `adapters.json`); the adapter emits **no** framing event.
 - `--model` variant sigil: the Executor stores `variant = Some("max")`; `model_arg()` renders `provider/model#max`.
-- Binary: `OpencodeConfig.binary` (default first `opencode` on `PATH`, falling back to `$HOME/.opencode/bin/opencode` — checked with `Path::exists`, only for the user's own HOME read from `StartInput.env`'s `HOME`… the adapter reads `HOME` from the process env for this single lookup).
+- Binary: `OpencodeConfig.binary` (default first `opencode` on `PATH`, falling back to `$HOME/.opencode/bin/opencode` — checked for an executable file, only for the user's own HOME read from the process env for this single lookup; resolution order and the one retry: §1.1). The injected test `PATH` deliberately skips the real `$HOME` fallback.
 
 ### 3.2 Event mapping (real data, opencode 2.0.28)
 
@@ -546,9 +598,9 @@ run = one prompt = one turn.
 <binary> [<extra_args>...]
 ```
 
-- Binary: `[harnesses.acp].binary`, default `claude-code-acp` on `PATH`. `probe()` only resolves
-  the executable; it does not run a `--version` command because an ACP server waits on JSON-RPC
-  stdin.
+- Binary: `[harnesses.acp].binary`, default `claude-code-acp` on `PATH` (resolution order and
+  the one retry: §1.1). `probe()` only resolves the executable; it does not run a `--version`
+  command because an ACP server waits on JSON-RPC stdin.
 - The adapter sends `initialize` (id 1) with `protocolVersion: 1`, empty
   `clientCapabilities` (no `fs`, no terminal — VOWP never reads or writes the server's files) and
   `clientInfo {name: "vowp", version: <crate version>}`.

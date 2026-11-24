@@ -78,7 +78,7 @@ fn capacity_rollups_table_has_the_v7_columns_and_index() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 #[test]

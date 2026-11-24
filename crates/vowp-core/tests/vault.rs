@@ -19,7 +19,8 @@ use support::fake_git::FakeGit;
 use tempfile::tempdir;
 use vowp_core::session::service::SessionService;
 use vowp_core::vault::{
-    self, REQUEST_TTL, Redactor, SecretRequestServer, redact_capsule, redact_event, redact_job_artifacts, redact_text,
+    self, EncryptedUpgrade, REQUEST_TTL, Redactor, SecretRequestServer, redact_capsule, redact_event,
+    redact_job_artifacts, redact_text,
 };
 use vowp_core::{AdapterRegistry, Deps, FixedRng, SystemRunner};
 use vowp_protocol::{
@@ -554,9 +555,265 @@ fn mode_file_is_read_and_unknown_values_are_refused() {
         vault::mode(&deps).expect("vault mode"),
         vowp_protocol::VaultMode::VaultUser
     );
+    fs::write(dir.join("mode"), "encrypted\n").expect("mode");
+    assert_eq!(
+        vault::mode(&deps).expect("encrypted mode"),
+        vowp_protocol::VaultMode::Encrypted
+    );
     fs::write(dir.join("mode"), "bogus\n").expect("mode");
     let error = vault::mode(&deps).expect_err("bogus mode");
     assert!(error.to_string().contains("must contain"));
+}
+
+/// Fails when any regular file below `root` contains `value` as an exact byte string.
+fn assert_no_plaintext_on_disk(root: &Path, value: &str) {
+    let needle = value.as_bytes();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("walk home") {
+            let entry = entry.expect("home entry");
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).expect("home metadata");
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                let bytes = fs::read(&path).expect("home file");
+                assert!(
+                    !bytes.windows(needle.len()).any(|window| window == needle),
+                    "plaintext secret value found in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Switches a fresh test home to encrypted mode.
+fn set_encrypted_mode(deps: &Deps) {
+    let secrets = deps.paths.root().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    fs::write(secrets.join("mode"), "encrypted\n").expect("mode file");
+}
+
+#[test]
+fn encrypted_mode_round_trips_without_plaintext_on_disk() {
+    let tmp = tempdir().expect("tempdir");
+    let (deps, _) = deps(tmp.path());
+    set_encrypted_mode(&deps);
+    let name = vowp_protocol::SecretName::parse("ENCRYPTED_KEY").expect("name");
+    let value = "encrypted-round-trip-8f3c";
+
+    let info = vault::write_secret(&deps, &name, value).expect("write");
+    assert_eq!(info.name, name);
+    assert_eq!(info.last4, "8f3c");
+
+    let secrets = deps.paths.root().join("secrets");
+    let ciphertext = secrets.join("encrypted/ENCRYPTED_KEY");
+    assert!(ciphertext.is_file(), "ciphertext is stored under secrets/encrypted");
+    assert_eq!(
+        fs::metadata(&ciphertext)
+            .expect("ciphertext metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "ciphertext files are mode 0600"
+    );
+    assert!(!secrets.join("ENCRYPTED_KEY").exists(), "no plaintext copy is written");
+
+    let key = secrets.join("age.key");
+    assert!(key.is_file(), "the age identity is created on first use");
+    assert_eq!(
+        fs::metadata(&key).expect("key metadata").permissions().mode() & 0o777,
+        0o600,
+        "the age identity is mode 0600"
+    );
+
+    assert_eq!(
+        vault::read_value_for_exec(&deps, &name).expect("read"),
+        Some(value.to_owned())
+    );
+    assert_eq!(vault::list_secrets(&deps).expect("list"), vec![info.clone()]);
+    assert_no_plaintext_on_disk(tmp.path(), value);
+
+    assert!(vault::remove_secret(&deps, &name).expect("remove"));
+    assert!(!ciphertext.exists(), "removal deletes the ciphertext");
+    assert_eq!(
+        vault::read_value_for_exec(&deps, &name).expect("read after remove"),
+        None
+    );
+    assert!(vault::list_secrets(&deps).expect("list after remove").is_empty());
+    assert!(!vault::remove_secret(&deps, &name).expect("second remove"));
+}
+
+#[test]
+fn encrypted_mode_refuses_a_wrong_or_missing_key() {
+    use age::secrecy::ExposeSecret;
+
+    let tmp = tempdir().expect("tempdir");
+    let (deps, _) = deps(tmp.path());
+    set_encrypted_mode(&deps);
+    let name = vowp_protocol::SecretName::parse("KEYLESS_KEY").expect("name");
+    let value = "key-custody-secret-6d2a";
+    vault::write_secret(&deps, &name, value).expect("write");
+    let key = deps.paths.root().join("secrets/age.key");
+
+    fs::remove_file(&key).expect("remove the age key");
+    let read_error = vault::read_value_for_exec(&deps, &name).expect_err("a missing key must fail");
+    assert!(
+        read_error.to_string().contains("age key") || read_error.to_string().contains("vault key"),
+        "the error must name the missing key: {read_error}"
+    );
+    let write_error = vault::write_secret(&deps, &name, "replacement-value-1357")
+        .expect_err("a missing key must not be replaced while ciphertext exists");
+    assert!(
+        write_error.to_string().contains("missing"),
+        "the write must refuse to mint a key that cannot decrypt existing secrets: {write_error}"
+    );
+    assert!(
+        !read_error.to_string().contains(value) && !write_error.to_string().contains(value),
+        "no error may carry the value"
+    );
+    assert!(!deps.paths.root().join("secrets/KEYLESS_KEY").exists());
+    assert_no_plaintext_on_disk(tmp.path(), value);
+
+    let wrong = age::x25519::Identity::generate();
+    fs::write(&key, wrong.to_string().expose_secret().as_bytes()).expect("wrong key file");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("wrong key mode");
+    let decrypt_error = vault::read_value_for_exec(&deps, &name).expect_err("a wrong key must fail");
+    assert!(
+        decrypt_error.to_string().contains("decrypt"),
+        "a wrong key must report a decryption failure: {decrypt_error}"
+    );
+    assert!(
+        !decrypt_error.to_string().contains(value),
+        "the decryption error must not carry the value"
+    );
+}
+
+#[test]
+fn upgrade_basic_to_encrypted_keeps_metadata_and_removes_plaintext() {
+    let tmp = tempdir().expect("tempdir");
+    let (deps, _) = deps(tmp.path());
+    let alpha = vowp_protocol::SecretName::parse("ALPHA_KEY").expect("name");
+    let beta = vowp_protocol::SecretName::parse("BETA_KEY").expect("name");
+    let alpha_value = "basic-alpha-value-1a2b";
+    let beta_value = "basic-beta-value-3c4d";
+    vault::write_secret(&deps, &alpha, alpha_value).expect("alpha");
+    vault::write_secret(&deps, &beta, beta_value).expect("beta");
+    let before = vault::list_secrets(&deps).expect("list before");
+    assert_eq!(names(&before), vec!["ALPHA_KEY", "BETA_KEY"]);
+
+    assert_eq!(
+        vault::upgrade_encrypted(&deps).expect("upgrade"),
+        EncryptedUpgrade::Switched
+    );
+
+    assert_eq!(vault::mode(&deps).expect("mode"), vowp_protocol::VaultMode::Encrypted);
+    assert_eq!(
+        vault::list_secrets(&deps).expect("list after"),
+        before,
+        "last4, created_at and updated_at are preserved"
+    );
+    let secrets = deps.paths.root().join("secrets");
+    for name in [&alpha, &beta] {
+        assert!(
+            !secrets.join(name.as_str()).exists(),
+            "the plaintext copy of {name} is removed"
+        );
+        assert!(
+            secrets.join("encrypted").join(name.as_str()).is_file(),
+            "the ciphertext of {name} exists"
+        );
+    }
+    assert_eq!(
+        vault::read_value_for_exec(&deps, &alpha).expect("alpha read"),
+        Some(alpha_value.to_owned())
+    );
+    assert_eq!(
+        vault::read_value_for_exec(&deps, &beta).expect("beta read"),
+        Some(beta_value.to_owned())
+    );
+    assert_no_plaintext_on_disk(tmp.path(), alpha_value);
+    assert_no_plaintext_on_disk(tmp.path(), beta_value);
+
+    assert_eq!(
+        vault::upgrade_encrypted(&deps).expect("second upgrade"),
+        EncryptedUpgrade::AlreadyEncrypted
+    );
+    assert_eq!(vault::list_secrets(&deps).expect("list after repeat"), before);
+    assert_eq!(
+        vault::upgrade(&deps).expect("plain upgrade is not applicable"),
+        vault::Upgrade::AlreadyEncrypted,
+        "the vault-user upgrade must never switch away from encrypted mode"
+    );
+    assert_eq!(
+        vault::mode(&deps).expect("mode after plain upgrade"),
+        vowp_protocol::VaultMode::Encrypted
+    );
+}
+
+#[test]
+fn upgrade_encrypted_refuses_vault_user_mode() {
+    let tmp = tempdir().expect("tempdir");
+    let (deps, _) = deps(tmp.path());
+    let secrets = deps.paths.root().join("secrets");
+    fs::create_dir_all(&secrets).expect("secrets dir");
+    fs::write(secrets.join("mode"), "vault\n").expect("mode file");
+
+    let error = vault::upgrade_encrypted(&deps).expect_err("vault-user mode must be refused");
+
+    assert!(error.to_string().contains("vault-user mode"), "{error}");
+    assert_eq!(
+        vault::mode(&deps).expect("mode"),
+        vowp_protocol::VaultMode::VaultUser,
+        "the mode file is unchanged"
+    );
+    assert!(!secrets.join("age.key").exists(), "no key is generated");
+}
+
+#[test]
+fn encrypted_mode_lists_and_redacts_without_exposing_values() {
+    let tmp = tempdir().expect("tempdir");
+    let (deps, _) = deps(tmp.path());
+    set_encrypted_mode(&deps);
+    let name = vowp_protocol::SecretName::parse("REDACT_ENCRYPTED").expect("name");
+    let value = "encrypted-redact-2e4d";
+    vault::write_secret(&deps, &name, value).expect("write");
+
+    let listed = vault::list_secrets(&deps).expect("list");
+    assert_eq!(names(&listed), vec!["REDACT_ENCRYPTED"]);
+    assert_eq!(listed[0].last4, "2e4d");
+    let listed_json = serde_json::to_string(&listed).expect("list json");
+    assert!(!listed_json.contains(value), "metadata never contains the value");
+
+    let redactor = Redactor::load(&deps).expect("load redactor");
+    assert!(!redactor.is_empty());
+    assert_eq!(
+        redactor.redact("before encrypted-redact-2e4d after"),
+        "before [REDACTED:REDACT_ENCRYPTED] after"
+    );
+    let event = NewEvent {
+        actor: Actor::Assistant,
+        source: EventSource {
+            harness: HarnessKind::Opencode,
+            model: None,
+            node: None,
+            native_session_id: None,
+        },
+        body: EventBody::AssistantMessage(AssistantMessage {
+            text: "the token is encrypted-redact-2e4d".to_owned(),
+        }),
+        raw: Some(json!({"stdout": "encrypted-redact-2e4d"})),
+        ts: Some(now()),
+    };
+    let redacted = redact_event(&deps, event).expect("redact");
+    let body = serde_json::to_string(&redacted.body.to_value()).expect("body json");
+    assert!(!body.contains(value));
+    assert!(body.contains("[REDACTED:REDACT_ENCRYPTED]"));
+    let raw = redacted.raw.expect("raw");
+    assert!(!raw.to_string().contains(value));
+    assert!(raw.to_string().contains("[REDACTED:REDACT_ENCRYPTED]"));
 }
 
 #[test]

@@ -75,6 +75,14 @@ pub enum CoreError {
     /// An action was refused and must not be worked around (cwd allow-list, guard).
     #[error("refused: {0}")]
     Refused(String),
+    /// The requested working directory is inside an allowed root but no longer exists.
+    ///
+    /// The leaf was deleted (for example a job worktree removed after merge) while the
+    /// deepest existing ancestor still resolves inside the allow-list. Callers that own a
+    /// role session retire that session and create a fresh one instead of retrying the
+    /// same missing directory every tick.
+    #[error("cwd_missing: working directory {0} does not exist")]
+    CwdMissing(String),
     /// A gate rejected the work.
     #[error("guard failed: {name}: {detail}")]
     Guard {
@@ -108,7 +116,7 @@ impl CoreError {
             Self::Command(_) | Self::CapsuleInvalid(_) => ErrorKind::Internal,
             Self::SwitchAborted(_) | Self::Cancelled => ErrorKind::Conflict,
             Self::Limited(_) => ErrorKind::Limit,
-            Self::Refused(_) => ErrorKind::Refused,
+            Self::Refused(_) | Self::CwdMissing(_) => ErrorKind::Refused,
             Self::Guard { .. } => ErrorKind::Guard,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Invalid(_) => ErrorKind::InvalidInput,

@@ -47,6 +47,7 @@ pub(crate) fn project_read(
     })?;
     let open_runs = store.open_runs()?;
 
+    let config = deps.config_now();
     let mut running = Vec::new();
     for job in jobs.iter().filter(|job| job.state.holds_lock()) {
         let run = open_runs.iter().rev().find(|run| run.job_id.as_ref() == Some(&job.id));
@@ -68,6 +69,8 @@ pub(crate) fn project_read(
             }
             None => (None, deps.node.clone(), job.state_changed_at, None, None),
         };
+        let usage = run.map(|run| run_usage_fields(deps, store, run)).transpose()?;
+        let usage = usage.unwrap_or_default();
         running.push(RunningJobCard {
             job: job.id.clone(),
             kind: job.kind,
@@ -77,6 +80,12 @@ pub(crate) fn project_read(
             age_secs: now.since(started_at).as_secs(),
             last_event_age_secs,
             session_id,
+            tokens_input: usage.tokens_input,
+            tokens_output: usage.tokens_output,
+            tokens_cache_read: usage.tokens_cache_read,
+            context_window: usage.context_window,
+            cost_usd: usage.cost_usd,
+            billing_mode: usage.billing_mode,
         });
     }
     running.sort_by(|left, right| left.job.cmp(&right.job));
@@ -115,23 +124,32 @@ pub(crate) fn project_read(
     queued.truncate(200);
     let queue = queued
         .into_iter()
-        .map(|job| QueueJobCard {
-            job: job.id.clone(),
-            title: full_title(redactor, &job.title),
-            kind: job.kind,
-            role: job.role,
-            priority: job.priority,
-            state: job.state,
-            age_secs: now.since(job.created_at).as_secs(),
-            waiting_reason: waiting_reason(redactor, job),
+        .map(|job| {
+            Ok(QueueJobCard {
+                job: job.id.clone(),
+                title: full_title(redactor, &job.title),
+                kind: job.kind,
+                role: job.role,
+                priority: job.priority,
+                state: job.state,
+                age_secs: now.since(job.created_at).as_secs(),
+                waiting_reason: waiting_reason(redactor, job),
+                needs: store.needs_of(&job.id)?,
+                planned_executor: planned_executor(store, config.as_ref(), job, now)?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CoreError>>()?;
 
     // `latest_gate_results` only sees the newest attempt. The card is specified as the last
     // 10 failures across the project, so walk every attempt the job has recorded. The newest
     // attempt is added as well, which keeps the card honest even if `job.attempts` is stale.
     let mut gate_failures = Vec::new();
-    for job in &jobs {
+    // Failures of jobs that are already done, cancelled or replanned are history, not
+    // attention items, so they stay out of the live list.
+    for job in jobs
+        .iter()
+        .filter(|job| !matches!(job.state, JobState::Done | JobState::Cancelled | JobState::Replanned))
+    {
         let mut results = Vec::new();
         for attempt in 0..=job.attempts {
             results.extend(store.gate_results_for(&job.id, attempt)?);
@@ -182,6 +200,107 @@ pub(crate) fn project_read(
         inbox,
         fail_streak,
     })
+}
+
+/// Live usage fields of one running card.
+#[derive(Default)]
+struct UsageFields {
+    tokens_input: Option<u64>,
+    tokens_output: Option<u64>,
+    tokens_cache_read: Option<u64>,
+    context_window: Option<u64>,
+    cost_usd: Option<f64>,
+    billing_mode: Option<String>,
+}
+
+/// Derives token, context, cost and billing fields from the active run.
+///
+/// Nothing is invented: tokens and cost are summed from the `cost` events of the run's
+/// session (the run row only carries a cost once it finishes) and stay `None` while none
+/// were recorded; cost only shows for `api` billing, and the context window comes from the
+/// `model_context_window:<model>` kv entry when an operator set one.
+fn run_usage_fields(deps: &Deps, store: &Store, run: &vowp_protocol::Run) -> Result<UsageFields, CoreError> {
+    let mut fields = UsageFields::default();
+    let Some(executor) = &run.executor else {
+        return Ok(fields);
+    };
+    let mode = billing_mode(executor);
+    let cost = live_cost(deps, store, run)?;
+    let tokens = &cost.tokens;
+    if tokens.input + tokens.output + tokens.cache_read > 0 {
+        fields.tokens_input = Some(tokens.input);
+        fields.tokens_output = Some(tokens.output);
+        fields.tokens_cache_read = Some(tokens.cache_read);
+    }
+    if mode == Some("api") {
+        fields.cost_usd = cost.usd;
+    }
+    fields.billing_mode = mode.map(str::to_owned);
+    fields.context_window = store
+        .kv_get(&format!("model_context_window:{}", executor.model))?
+        .and_then(|value| value.trim().parse().ok());
+    Ok(fields)
+}
+
+/// Sums the run's cost: the recorded run cost plus every `cost` event its session logged
+/// for this run (or for no run) since it started.
+fn live_cost(deps: &Deps, store: &Store, run: &vowp_protocol::Run) -> Result<vowp_protocol::Cost, CoreError> {
+    let mut total = run.cost.clone();
+    let Some(session_id) = &run.session_id else {
+        return Ok(total);
+    };
+    let has_cost = store
+        .event_rows(session_id, 0, u32::MAX)?
+        .iter()
+        .any(|row| row.event_type == vowp_protocol::EventType::Cost);
+    if !has_cost {
+        return Ok(total);
+    }
+    let reader = vowp_store::session_log::SessionLog::open_read(&deps.paths, session_id)?;
+    for envelope in reader.read_all()? {
+        if envelope.event_type != vowp_protocol::EventType::Cost || envelope.ts < run.started_at {
+            continue;
+        }
+        if let Ok(vowp_protocol::EventBody::Cost(event)) = envelope.body()
+            && event.run_id.as_ref().is_none_or(|id| *id == run.id)
+        {
+            total.add(&event.cost);
+        }
+    }
+    Ok(total)
+}
+
+/// Classifies how an executor is billed: `subscription`, `api` or `free`.
+///
+/// `claude-code` runs on the user's claude.ai plan; free-tier models (`:free` / `-free`
+/// suffix) are `free`; every other provider-backed harness is `api`. The built-in `vowp`
+/// harness has no provider, so it has no billing mode.
+pub(crate) fn billing_mode(executor: &vowp_protocol::Executor) -> Option<&'static str> {
+    use vowp_protocol::HarnessKind;
+    match executor.harness {
+        HarnessKind::Vowp => None,
+        HarnessKind::ClaudeCode => Some("subscription"),
+        _ if executor.model.ends_with(":free") || executor.model.ends_with("-free") => Some("free"),
+        _ => Some("api"),
+    }
+}
+
+/// The executor a queued job will dispatch on: its override, else the first non-limited rung.
+fn planned_executor(
+    store: &Store,
+    config: &vowp_protocol::VowpConfig,
+    job: &Job,
+    now: Timestamp,
+) -> Result<Option<String>, CoreError> {
+    if let Some(executor) = crate::loops::dispatch::job_executor_override(store, &job.id)? {
+        return Ok(Some(executor.to_string()));
+    }
+    let Some(profile) = config.profiles.get(&job.profile) else {
+        return Ok(None);
+    };
+    let limited: std::collections::HashMap<String, Option<Timestamp>> =
+        crate::loops::limited_map(store, now)?.into_iter().collect();
+    Ok(profile.pick(&limited, now).map(|(_, executor)| executor.to_string()))
 }
 
 /// Builds the card for a project whose database could not be read.

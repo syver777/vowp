@@ -637,6 +637,59 @@ fn control_routes_secret_writes_with_tty_and_requests_through_a_tunnel() {
     assert_eq!(tunnels, json!([]), "the request wrapper closes the tunnel it opened");
 }
 
+#[test]
+fn secret_set_stdin_routes_without_a_tty_and_keeps_the_tty_form() {
+    let machine = Machine::new();
+    machine.seed_control();
+    machine.write_fake_ssh(
+        "printf '%s\\n' '---' >> \"$FAKE_SSH_ARGS\"\n\
+         printf '%s\\n' \"$@\" >> \"$FAKE_SSH_ARGS\"\n\
+         exit 0\n",
+    );
+
+    let output = machine.run(&["secret", "set", "DEEPSEEK_API_KEY", "--stdin"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = recorded_calls(&machine);
+    let stdin_call = calls
+        .iter()
+        .find(|call| call.iter().any(|arg| arg.contains("'secret' 'set'")))
+        .expect("the stdin write was routed to the home");
+    assert!(
+        !stdin_call.iter().any(|arg| arg == "-t"),
+        "`secret set --stdin` must not force a remote TTY: {stdin_call:?}"
+    );
+    assert_eq!(
+        stdin_call.last().map(String::as_str),
+        Some("vowp '--home' '/home/fake/.vowp' 'secret' 'set' 'DEEPSEEK_API_KEY' '--stdin'"),
+        "the remote command must name --stdin so the caller's pipe is read"
+    );
+
+    std::fs::remove_file(&machine.args).expect("clear recorded ssh calls");
+    let output = machine.run(&["secret", "set", "DEEPSEEK_API_KEY"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = recorded_calls(&machine);
+    let prompt_call = calls
+        .iter()
+        .find(|call| call.iter().any(|arg| arg.contains("'secret' 'set'")))
+        .expect("the prompt write was routed to the home");
+    assert!(
+        prompt_call.iter().any(|arg| arg == "-t"),
+        "the hidden-prompt form must still use ssh -t: {prompt_call:?}"
+    );
+    assert_eq!(
+        prompt_call.last().map(String::as_str),
+        Some("vowp '--home' '/home/fake/.vowp' 'secret' 'set' 'DEEPSEEK_API_KEY'")
+    );
+}
+
 /// Splits the fake ssh log into one argument vector per invocation.
 fn recorded_calls(machine: &Machine) -> Vec<Vec<String>> {
     std::fs::read_to_string(&machine.args)

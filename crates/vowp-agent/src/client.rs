@@ -1432,11 +1432,108 @@ impl AgentClient {
                 self.send_frame(&AgentFrame::OrchestratorResult(result))
             }
             OrchestratorCommand::Start { project, .. } => {
+                // A move lands as `Start`: the target node's active paired surface is
+                // the home-issued session binding. A start on a different binding than
+                // a live host is a move within this node, so the old host and its
+                // surface are stopped before the new process is spawned.
+                let name = command.name().to_owned();
+                let binding = match self.orchestrator.resolve_current_binding(&name) {
+                    Ok(Some(binding)) => binding,
+                    Ok(None) => {
+                        let error = OrchestratorError::new(
+                            "surface_missing",
+                            "pair a surface for this orchestrator before starting it",
+                            false,
+                        );
+                        return self.fail_orchestrator_command(&command, OrchestratorNodeState::Failed, error);
+                    }
+                    Err(error) => {
+                        return self.fail_orchestrator_command(&command, OrchestratorNodeState::Failed, error);
+                    }
+                };
+                let live = self
+                    .orchestrator
+                    .live_state(&name)
+                    .map_err(|error| AgentError::Config(error.message))?;
+                let live_binding = live
+                    .as_ref()
+                    .and_then(|state| state.surface.clone().zip(state.session.clone()));
+                if let Some((surface, session)) = live_binding
+                    && (surface != binding.surface || session != binding.session)
+                {
+                    self.close_orchestrator_bridge(&name);
+                    let stop = OrchestratorCommand::Stop {
+                        request_id: command.request_id().to_owned(),
+                        name,
+                    };
+                    let stopped = self.orchestrator.stop(
+                        &stop,
+                        &mut ConnectionSurface {
+                            connection: &mut self.connection,
+                        },
+                    );
+                    if !stopped.accepted {
+                        let error = stopped.error.unwrap_or_else(|| {
+                            OrchestratorError::new("stop_failed", "the old host could not be stopped", true)
+                        });
+                        let mut result = OrchestratorResult::failed(command.request_id(), stopped.state, error);
+                        result.detail = stopped.detail;
+                        return self.send_frame(&AgentFrame::OrchestratorResult(result));
+                    }
+                }
                 let project_root = self.orchestrator_project_root(project.as_ref());
                 self.begin_orchestrator_start(command, project_root)
             }
-            OrchestratorCommand::Resume { .. } => self.begin_orchestrator_start(command, None),
+            OrchestratorCommand::Resume { .. } => {
+                // Resume is not a move: a live host bound to another session stays
+                // untouched and the command is refused. A stopped record may bind the
+                // node's current pairing when it starts again.
+                let name = command.name().to_owned();
+                let live = self
+                    .orchestrator
+                    .live_state(&name)
+                    .map_err(|error| AgentError::Config(error.message))?;
+                if let Some((surface, session)) = live
+                    .as_ref()
+                    .and_then(|state| state.surface.clone().zip(state.session.clone()))
+                {
+                    match self.orchestrator.resolve_current_binding(&name) {
+                        Ok(Some(binding)) if surface != binding.surface || session != binding.session => {
+                            let error = OrchestratorError::new(
+                                "session_conflict",
+                                "a different session or surface is bound to this orchestrator; refusing to replace the running host",
+                                false,
+                            );
+                            return self.fail_orchestrator_command(&command, OrchestratorNodeState::Running, error);
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            let error = OrchestratorError::new(
+                                "surface_missing",
+                                "pair a surface for this orchestrator before resuming it",
+                                false,
+                            );
+                            return self.fail_orchestrator_command(&command, OrchestratorNodeState::Running, error);
+                        }
+                        Err(error) => {
+                            return self.fail_orchestrator_command(&command, OrchestratorNodeState::Running, error);
+                        }
+                    }
+                }
+                self.begin_orchestrator_start(command, None)
+            }
         }
+    }
+
+    /// Sends one typed refusal for an orchestrator command without starting a host.
+    fn fail_orchestrator_command(
+        &mut self,
+        command: &OrchestratorCommand,
+        state: OrchestratorNodeState,
+        error: OrchestratorError,
+    ) -> Result<(), AgentError> {
+        let result = OrchestratorResult::failed(command.request_id(), state, error);
+        self.send_frame(&AgentFrame::OrchestratorResult(result))
     }
 
     /// Flushes and closes the bridge bound to an orchestrator that is about to stop.

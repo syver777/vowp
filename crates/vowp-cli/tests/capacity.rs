@@ -10,8 +10,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use vowp_protocol::{HostSample, Node, NodeName, Project, SampleSource, Timestamp, VowpConfig};
-use vowp_store::{LedgerFilter, NodePaths, Store};
+use vowp_protocol::{
+    AGENT_PROTOCOL, HostSample, Node, NodeName, NodeStatus, Project, SampleSource, Timestamp, VowpConfig,
+};
+use vowp_store::{LedgerFilter, NodePath, NodePaths, Store};
 
 /// The resolved CLI binary, built at most once per test process.
 static CLI_BINARY: OnceLock<PathBuf> = OnceLock::new();
@@ -129,29 +131,44 @@ fn cli_binary() -> PathBuf {
 
 /// Resolves or builds the CLI binary exactly once.
 fn resolve_cli_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp") {
-        return PathBuf::from(path);
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp").map(PathBuf::from)
+        && path.is_file()
+    {
+        return path;
     }
-    let current = std::env::current_exe().expect("current test executable");
-    let profile = current
-        .parent()
-        .and_then(Path::parent)
-        .expect("target profile directory");
-    let binary = profile.join(if cfg!(windows) { "vowp.exe" } else { "vowp" });
-    if binary.is_file() {
-        return binary;
+    let root = workspace_root();
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() { dir } else { root.join(dir) }
+        }
+        None => root.join("target"),
+    };
+    let name = format!("vowp{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates: Vec<PathBuf> = ["debug", "release"]
+        .iter()
+        .map(|profile| target.join(profile).join(&name))
+        .collect();
+    if let Ok(current) = std::env::current_exe()
+        && let Some(profile) = current.parent().and_then(Path::parent)
+    {
+        candidates.push(profile.join(&name));
     }
-    let target = profile.parent().expect("target directory");
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
-        .current_dir(workspace_root())
+        .current_dir(&root)
         .args(["build", "--quiet", "-p", "vowp-cli", "--bin", "vowp", "--target-dir"])
-        .arg(target)
+        .arg(&target)
         .status()
         .unwrap_or_else(|error| panic!("build vowp CLI: {error}"));
     assert!(status.success(), "cargo build -p vowp-cli --bin vowp failed");
-    assert!(binary.is_file(), "CLI binary missing at {}", binary.display());
-    binary
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    panic!("CLI binary missing at {}", candidates[0].display());
 }
 
 /// Finds the workspace root from the package manifest directory.
@@ -229,6 +246,90 @@ fn capacity_report_shows_provider_caps_and_reload_state() {
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("providers: deepseek=2"), "{stdout}");
     assert!(stdout.contains("reload: current"), "{stdout}");
+}
+
+#[test]
+fn capacity_report_and_fleet_status_show_cluster_totals() {
+    let env = CliEnv::new();
+    let store = env.store();
+    let now = store.clock().now();
+    let project = env.config().project.name;
+    let worker = NodeName::parse("worker-a").expect("worker slug");
+    store
+        .insert_pending_node(&worker, &["linux".to_owned()], now)
+        .expect("pending node");
+    store
+        .set_node_status(&worker, NodeStatus::Active, "", now)
+        .expect("active node");
+    store
+        .upsert_node_path(&NodePath {
+            node: worker.clone(),
+            project: project.clone(),
+            local_root: "/srv/vowp".to_owned(),
+            worktree_root: "/srv/vowp-worktrees".to_owned(),
+            allow: Vec::new(),
+            updated_at: now,
+        })
+        .expect("path map");
+    store
+        .touch_node(
+            &worker,
+            // Keep the node online even if the test harness schedules this test late
+            // behind the other CLI subprocesses; a future heartbeat reads as age zero.
+            now.plus(Duration::from_secs(3600)),
+            Some("0.3.0"),
+            Some(AGENT_PROTOCOL),
+            &serde_json::json!({
+                "os": "linux",
+                "arch": "x86_64",
+                "agent_version": "0.3.0",
+                "harnesses": {"opencode": "1.0.0"},
+                "git_version": "git version 2.47.0",
+                "labels": ["linux"],
+                "secret_names": [],
+                "projects": [project.as_str()],
+                "capacity": {
+                    "cpu_cores": 8,
+                    "load1": 0.1,
+                    "mem_total_bytes": 16_u64 * 1024 * 1024 * 1024,
+                    "mem_free_bytes": 8_u64 * 1024 * 1024 * 1024,
+                    "disk_free_bytes": 100_u64 * 1024 * 1024 * 1024,
+                    "busy_slots": 1,
+                    "max_slots": 4,
+                    "on_battery": false,
+                    "thermal_state": "nominal"
+                }
+            }),
+        )
+        .expect("heartbeat");
+
+    let (code, value, stderr) = env.run_json(&["capacity", "report"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["cluster"]["online_worker_nodes"], 1);
+    assert_eq!(value["cluster"]["target_workers"], 8, "4 Home + 4 node slots");
+    assert_eq!(value["cluster"]["busy_workers"], 1);
+    assert_eq!(value["cluster"]["cpu_cores"], 8);
+    assert_eq!(value["cluster"]["mem_total_bytes"], 16_u64 * 1024 * 1024 * 1024);
+    assert_eq!(value["cluster"]["disk_free_bytes"], 100_u64 * 1024 * 1024 * 1024);
+
+    let (code, human, stderr) = env.run(&["capacity", "report"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        human.contains("cluster: 1 online worker node(s), workers 1/8"),
+        "{human}"
+    );
+
+    let (code, value, stderr) = env.run_json(&["fleet", "status", "--refresh"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(value["snapshot"]["capacity"]["cluster"]["online_worker_nodes"], 1);
+    assert_eq!(value["snapshot"]["capacity"]["cluster"]["target_workers"], 8);
+
+    let (code, human, stderr) = env.run(&["fleet", "status", "--refresh"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        human.contains("cluster: 1 online worker node(s), workers 1/8"),
+        "{human}"
+    );
 }
 
 #[test]

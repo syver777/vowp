@@ -945,3 +945,57 @@ fn capacity_target_serializes_as_the_snapshot_expects() {
     assert_eq!(json["advised_workers"], 5);
     assert_eq!(json["is_override"], true);
 }
+
+/// Writes three samples one minute apart whose swap use grows by `growth` per sample.
+fn seed_swap_growth(store: &Store, available: u64, pressure: f64, growth: u64) {
+    for step in 0..3_u64 {
+        let at = now().minus(Duration::from_secs((2 - step) * 60));
+        store
+            .insert_host_sample(&sample(
+                at,
+                23 * GIB + GIB / 2,
+                available,
+                step * growth,
+                Some(pressure),
+                140 * GIB,
+                Some(8.0),
+            ))
+            .unwrap();
+    }
+}
+
+#[test]
+fn swap_growth_does_not_brake_with_abundant_available_ram() {
+    // The live false alarm: 23.5 GiB total, 20 GiB available, no pressure, swap +2000 MiB/min.
+    let (_tmp, _deps, store, _project, _job) = fixture();
+    seed_swap_growth(&store, 20 * GIB, 0.0, 2000 * 1024 * 1024);
+    let brake = capacity::brakes::evaluate(&store, now()).unwrap();
+    assert!(!brake.active, "reasons: {:?}", brake.reasons);
+}
+
+#[test]
+fn swap_growth_brakes_when_available_ram_is_tight() {
+    let (_tmp, _deps, store, _project, _job) = fixture();
+    seed_swap_growth(&store, 5 * GIB / 2, 0.0, 2000 * 1024 * 1024);
+    let brake = capacity::brakes::evaluate(&store, now()).unwrap();
+    assert!(brake.active);
+    assert_eq!(brake.reasons[0].code, vowp_protocol::BrakeCode::SwapGrowth);
+}
+
+#[test]
+fn swap_growth_brakes_under_elevated_memory_pressure_even_with_ram_available() {
+    let (_tmp, _deps, store, _project, _job) = fixture();
+    seed_swap_growth(&store, 20 * GIB, 10.0, 2000 * 1024 * 1024);
+    let brake = capacity::brakes::evaluate(&store, now()).unwrap();
+    assert!(brake.active);
+    assert_eq!(brake.reasons[0].code, vowp_protocol::BrakeCode::SwapGrowth);
+}
+
+#[test]
+fn swap_growth_ignores_a_pressure_blip_while_ram_is_abundant() {
+    // Live feedback: 20.5 / 23.5 GiB available and avg10 1-2 must not raise `swap growing`.
+    let (_tmp, _deps, store, _project, _job) = fixture();
+    seed_swap_growth(&store, 20 * GIB + GIB / 2, 2.0, 2000 * 1024 * 1024);
+    let brake = capacity::brakes::evaluate(&store, now()).unwrap();
+    assert!(!brake.active, "reasons: {:?}", brake.reasons);
+}

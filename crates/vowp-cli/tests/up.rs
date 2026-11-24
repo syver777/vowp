@@ -803,6 +803,18 @@ fn read_pid_file(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.lines().next()?.trim().parse().ok()
 }
 
+/// Reads an argv file written by a fake child process.
+///
+/// The fake scripts record argv with `printf '%s\n' "$@" > "$FAKE_..._ARGS"`, which creates
+/// and truncates the file before the first line is written. An empty file therefore means
+/// "the child has not recorded its arguments yet", not "the child started with no
+/// arguments", so it reads as `None`.
+fn read_recorded_args(path: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().next()?;
+    Some(text.lines().map(str::to_owned).collect())
+}
+
 /// Returns whether `pid` still names a live process, using `kill -0` on every platform.
 fn process_alive(pid: u32) -> bool {
     if !vowp_adapters::proc::valid_pid(pid) {
@@ -1005,10 +1017,9 @@ done
         ]
     }
 
-    /// Returns the recorded argv, when the daemon started.
+    /// Returns the recorded argv, when the daemon has recorded at least one argument.
     fn args(&self) -> Option<Vec<String>> {
-        let text = std::fs::read_to_string(&self.args).ok()?;
-        Some(text.lines().map(str::to_owned).collect())
+        read_recorded_args(&self.args)
     }
 
     /// Returns the recorded `VOWP_API_TOKEN` value, when the daemon started.
@@ -1033,6 +1044,23 @@ impl Drop for FakeDaemon {
             kill_group(pid);
         }
     }
+}
+
+#[test]
+fn fake_daemon_args_stay_none_until_a_line_is_recorded() {
+    let fake = FakeDaemon::new();
+    std::fs::write(&fake.args, "").expect("empty daemon args file");
+    assert_eq!(
+        fake.args(),
+        None,
+        "an empty args file means the daemon has not started, not that it started with no arguments"
+    );
+    std::fs::write(&fake.args, "--home\n/tmp/node\n").expect("recorded daemon args");
+    assert_eq!(
+        fake.args(),
+        Some(vec!["--home".to_owned(), "/tmp/node".to_owned()]),
+        "the recorded lines are the parsed argv once the daemon writes them"
+    );
 }
 
 /// A detached supervisor stopped by `vowp down` even when the test panics.
@@ -2618,6 +2646,47 @@ fn up_refuses_on_a_control_machine() {
 }
 
 #[test]
+fn project_add_without_new_flags_keeps_the_legacy_json() {
+    let env = common::TestEnv::new();
+    let second = git_repo();
+    write_project_config(second.path(), "second");
+    let path = second.path().to_str().expect("path");
+
+    let (code, value, stderr) = env.run_json(&["project", "add", path]);
+    assert_eq!(code, 0, "{stderr}");
+    let object = value.as_object().expect("one ProjectEntry object");
+    let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+    let expected = [
+        "name",
+        "path",
+        "remote_url",
+        "default_branch",
+        "state",
+        "weight",
+        "paused_reason",
+        "archived_at",
+        "created_at",
+        "updated_at",
+    ]
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys, expected, "legacy project add JSON fields changed: {value}");
+    assert_eq!(value["name"], "second", "{value}");
+    assert_eq!(value["state"], "active", "{value}");
+    assert_eq!(
+        Path::new(value["path"].as_str().expect("path"))
+            .canonicalize()
+            .expect("registered path canonicalises"),
+        second.path().canonicalize().expect("checkout canonicalises"),
+        "{value}"
+    );
+    assert!(
+        registry_entry(&env, "second").is_some(),
+        "legacy add still writes the real registry row"
+    );
+}
+
+#[test]
 fn project_registry_add_ls_weight_pause_resume_archive_and_rm() {
     let env = common::TestEnv::new();
     let second = git_repo();
@@ -3066,7 +3135,7 @@ fn migrate_requires_yes_and_reports_the_v01_backup() {
     );
 
     let store = Store::open(&env.paths()).expect("migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     let node = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT).expect("reserved project");
     assert!(
         store.project(&node).expect("lookup").is_some(),
@@ -3110,7 +3179,7 @@ fn up_migrates_with_backup_first() {
     );
 
     let store = Store::open(&env.paths()).expect("migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     let node = ProjectName::parse(vowp_store::RESERVED_NODE_PROJECT).expect("reserved project");
     assert!(
         env.paths().project_db_path(&node).is_file(),
@@ -3713,8 +3782,7 @@ done
     }
 
     fn args(&self) -> Option<Vec<String>> {
-        let text = std::fs::read_to_string(&self.args).ok()?;
-        Some(text.lines().map(str::to_owned).collect())
+        read_recorded_args(&self.args)
     }
 
     fn pid(&self) -> Option<u32> {
@@ -3732,6 +3800,23 @@ impl Drop for FakeGateway {
             kill_group(pid);
         }
     }
+}
+
+#[test]
+fn fake_gateway_args_stay_none_until_a_line_is_recorded() {
+    let fake = FakeGateway::new();
+    std::fs::write(&fake.args, "").expect("empty gateway args file");
+    assert_eq!(
+        fake.args(),
+        None,
+        "an empty args file means the gateway has not started, not that it started with no arguments"
+    );
+    std::fs::write(&fake.args, "--listen\n127.0.0.1:18743\n").expect("recorded gateway args");
+    assert_eq!(
+        fake.args(),
+        Some(vec!["--listen".to_owned(), "127.0.0.1:18743".to_owned()]),
+        "the recorded lines are the parsed argv once the gateway writes them"
+    );
 }
 
 /// Writes a node `config.toml` that enables or disables the WSS ingress.

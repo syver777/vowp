@@ -213,7 +213,7 @@ fn global_schema_loads_and_matches_enums() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("version");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     for table in schema_table_names(include_str!("../src/schema/global.sql")) {
         let found: i64 = conn
             .query_row(
@@ -288,7 +288,7 @@ fn global_and_project_schemas_share_no_application_table_names() {
 fn store_binds_global_plus_exactly_one_project() {
     let fixture = Fixture::new();
     assert_eq!(fixture.store.bound_project(), Some(&fixture.project));
-    assert_eq!(fixture.store.global_schema_version().expect("global"), 7);
+    assert_eq!(fixture.store.global_schema_version().expect("global"), 8);
     assert_eq!(fixture.store.project_schema_version().expect("project"), 2);
 
     let other = fixture.add_project("other");
@@ -580,15 +580,15 @@ fn schema_version_compat_shim_reports_one() {
 }
 
 #[test]
-fn global_schema_version_reports_seven() {
+fn global_schema_version_reports_eight() {
     let fixture = Fixture::new();
-    assert_eq!(fixture.store.global_schema_version().expect("global"), 7);
+    assert_eq!(fixture.store.global_schema_version().expect("global"), 8);
     assert_eq!(
         Store::open_global(&fixture.paths)
             .expect("global")
             .global_schema_version()
             .expect("v"),
-        7
+        8
     );
 }
 
@@ -826,7 +826,7 @@ fn read_only_handles_see_both_files_and_never_write() {
         .expect("job");
     let read_only = Store::open_read_only(&fixture.paths, Some(&fixture.project)).expect("read-only handle");
     assert_eq!(read_only.bound_project(), Some(&fixture.project));
-    assert_eq!(read_only.global_schema_version().expect("global"), 7);
+    assert_eq!(read_only.global_schema_version().expect("global"), 8);
     assert_eq!(read_only.require_job(&job.id).expect("job"), job);
     let error = read_only
         .insert_job(&fixture.project, &new_job("write-attempt"), "human")

@@ -111,6 +111,26 @@ Admission is **machine-wide**. The manager opens each active project database in
 and their estimated CPU, and compares the total with the machine target. A project handle never decides
 the machine's capacity from its own runs alone.
 
+### Cluster capacity
+
+Home and worker nodes are admitted separately. A run that executes on Home counts against Home's
+`target_workers`, Home RAM/CPU headroom, Home disk and Home brake. A run assigned to a remote agent
+node does not consume those Home limits; an active `repo_offload` assignment is remote capacity, not a
+Home run.
+
+A ready job is eligible to offload when its placement is `node:<name>` (or `any` with
+`[offload] enabled = true`), an online active agent node has the project mapped, and that node has a
+free slot, enough free RAM for the run's p90 plus the node's reserve, and disk above
+`[offload] min_disk_bytes`. Admission then checks that worker's slot count instead of blocking on
+Home's target. Provider limits stay global: a limited provider still waits everywhere. A node that is
+offline, revoked, degraded or not mapped is not a candidate, so admission falls back to Home's limits.
+
+`capacity report` and `fleet status` also carry an additive `cluster` card. It reports
+`online_worker_nodes`, `target_workers` (Home target plus online nodes' `max_slots`), `busy_workers`
+(Home running plus nodes' `busy_slots`), and summed CPU cores, total/available memory and free disk.
+The existing per-Home fields are unchanged, and both commands print the cluster line only when at
+least one worker node is online.
+
 ### Fairness
 
 Every active project gets one L1 tick per machine tick. The supervisor orders projects by **fairness
@@ -133,7 +153,7 @@ trips on measured conditions and clears after two clean samples:
 | Brake | Trips when |
 |---|---|
 | `memory_pressure` | `/proc/pressure/memory` `avg10` is above 10.0 for two consecutive samples. |
-| `swap_growth` | Swap used grew by more than 64 MiB per minute over the last three samples. |
+| `swap_growth` | Swap used grew by more than 64 MiB per minute over the last three samples **and** memory is tight: available RAM is at or below 30% of total or within twice the RAM reserve, or `/proc/pressure/memory` `avg10` is at or above 5.0 (half the 10.0 memory-pressure brake level). A 1–2 blip never trips it while RAM is abundant. Swap growth with abundant available RAM is normal Linux cache-versus-cold-page balancing and does not brake. |
 | `disk_low` | Free disk on the home or worktree filesystem is below 5 GiB in the latest sample. One low sample trips it; the brake clears after two clean samples. |
 | `provider` | Every configured provider has an active limit. |
 
@@ -141,6 +161,16 @@ vowp `capacity show` prints the active reason and its start time, for example
 `brake: memory pressure (avg10 14.2)`. A kernel OOM kill is recorded on the run, the job is parked with
 a machine-inbox notice, and its estimate's p90 is raised for the next admission. The run itself is not
 retried by the brake; the normal job retry path decides.
+
+### Working-set RAM
+
+Run RAM is measured as the working set, not the cgroup `memory.peak`, because `memory.peak` counts
+reclaimable file/page cache that `cargo` builds fill with build artifacts. The cgroup sampler reads
+`memory.stat` (`anon`, `kernel`, `file`) every tick and keeps the breakdown at the highest
+`anon + kernel`. Estimates (`ram_p50_bytes`, `ram_p90_bytes`) use, in order: `anon + kernel`;
+`peak - file` when only the file share is known; the raw peak (adapter-only rows, gate runs, legacy
+rows). Legacy cache-inflated rows with no breakdown keep their raw peak until fresh samples push
+them out of the newest 50 runs of their group.
 
 ## Targets and advice
 
@@ -176,6 +206,11 @@ advisor reads the same report as vowp `capacity report --json` and writes:
 - one `capacity_advice` row with the current and proposed target, mode, reasons and expected effect;
 - one machine-inbox `decision` item titled `Capacity: <n> workers (advised <a>)` with the options
   `apply` and `keep`.
+
+**`keep` is remembered.** When the owner answers `keep` (or dismisses the item), the advisor records the
+`(target, proposed)` pair. While the target and the proposal are both unchanged, timer, idle, new-project
+and ordinary brake turns do not open another `Capacity:` item. A fresh item is still raised at once for an
+OOM kill, a `disk_low` brake, a changed target, or any other proposal than the kept one (a lower one in particular).
 
 The advisor **never changes the target itself**. Applying a proposal is the owner's
 vowp `capacity set --target N`, through the CLI or the `capacity_set` MCP tool. The tool records the actor.

@@ -131,6 +131,12 @@ const V06_SCHEMA_VERSION: i64 = 6;
 /// Schema version written by the v6 → v7 migration.
 const V07_SCHEMA_VERSION: i64 = 7;
 
+/// Schema version written by the v7 → v8 migration.
+const V08_SCHEMA_VERSION: i64 = 8;
+
+/// The tables added by the v8 global schema; a migrated v7 home starts with none.
+const V08_NEW_TABLES: [&str; 0] = [];
+
 /// Every table in the project v1 schema; all must exist before the v2 upgrade.
 const PROJECT_V1_TABLES: [&str; 10] = [
     "jobs",
@@ -1004,6 +1010,218 @@ pub(crate) fn migrate_v06_if_needed(paths: &NodePaths) -> Result<(), StoreError>
     Ok(())
 }
 
+/// Builds the report of a v7 → v8 run that changed nothing.
+fn v08_noop_report(warning: String) -> MigrationReport {
+    MigrationReport {
+        from_version: V08_SCHEMA_VERSION,
+        to_version: V08_SCHEMA_VERSION,
+        backup: String::new(),
+        projects: Vec::new(),
+        tables: BTreeMap::new(),
+        verified: true,
+        dry_run: false,
+        dropped_workers: 0,
+        dropped_worker_rows: Vec::new(),
+        primary_runs: Vec::new(),
+        node_wide_loops: Vec::new(),
+        node_wide_schedules: Vec::new(),
+        warnings: vec![warning],
+    }
+}
+
+/// Migrates an existing v7 global database to the v8 session-ownership schema.
+///
+/// SQLite cannot widen a CHECK with `ALTER TABLE`, so `surfaces` and `leases` are rebuilt:
+/// the new tables are created, every row is copied with its id, the old tables are dropped
+/// and the new ones renamed. Foreign-key enforcement is switched off around the rebuild (the
+/// pragma is a no-op inside a transaction) so dropping `surfaces` cannot cascade into
+/// `surface_tokens`; every row count is compared, then `PRAGMA integrity_check` and
+/// `PRAGMA foreign_key_check` must pass before `user_version = 8` commits.
+///
+/// The original file is copied to `backups/pre-0.8-<ms>.db` first. Existing leases keep their
+/// token hash and times with `owner_mode = 'interactive'`, `owner_epoch = 0` and no expiry,
+/// except an old offload run lease (`agent` kind, no surface), which becomes `job` mode with
+/// `expires_at = heartbeat_at + 600 s`. No lease is cleared. Calling it on a v8 home is a no-op.
+pub fn migrate_v07(paths: &NodePaths) -> Result<MigrationReport, StoreError> {
+    resume_migration(paths)?;
+    match db_version(&paths.db_path())? {
+        Some(V08_SCHEMA_VERSION) => {
+            return Ok(v08_noop_report(format!(
+                "the global database is already at schema version {V08_SCHEMA_VERSION}, not v7"
+            )));
+        }
+        Some(V07_SCHEMA_VERSION) => {}
+        Some(1..=6) => return Err(StoreError::MigrationRequired),
+        Some(found) => {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                supported: V08_SCHEMA_VERSION,
+            });
+        }
+        None => {
+            return Err(StoreError::not_found(
+                "v0.7 database",
+                paths.db_path().display().to_string(),
+            ));
+        }
+    }
+    refuse_live_supervisor(paths)?;
+    let mut tables: Vec<&str> = V05_GLOBAL_TABLES.to_vec();
+    tables.extend(V06_NEW_TABLES);
+    tables.extend(V07_NEW_TABLES);
+    validate_global_source(paths, V07_SCHEMA_VERSION, &tables, "v7")?;
+    let backup = paths
+        .backups_dir()
+        .join(format!("pre-0.8-{}.db", Timestamp::now().unix_millis()));
+    backup_global(paths, &backup)?;
+
+    let conn = Connection::open(paths.db_path())?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Outside the transaction: the pragma does nothing inside one.
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    let before = table_counts(&tx, "main")?;
+    tx.execute_batch(
+        "CREATE TABLE surfaces_v8 (
+           id            TEXT PRIMARY KEY,
+           kind          TEXT NOT NULL CHECK (kind IN
+                           ('chat','opencode','claude-code','mcp','mirror','api','agent','desktop-ui')),
+           node          TEXT NOT NULL,
+           holder        TEXT NOT NULL,
+           app           TEXT,
+           cwd           TEXT,
+           metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+           state         TEXT NOT NULL DEFAULT 'attached'
+                           CHECK (state IN ('pending','attached','revoked')),
+           revoked_at    TEXT,
+           created_at    TEXT NOT NULL,
+           last_seen_at  TEXT NOT NULL,
+           label         TEXT
+         ) STRICT;
+         INSERT INTO surfaces_v8
+           (id, kind, node, holder, app, cwd, metadata_json, state, revoked_at, created_at, last_seen_at, label)
+           SELECT id, kind, node, holder, app, cwd, metadata_json, state, revoked_at, created_at, last_seen_at, NULL
+           FROM surfaces;
+         CREATE TABLE leases_v8 (
+           session_id   TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+           surface_id   TEXT REFERENCES surfaces(id) ON DELETE SET NULL,
+           surface_kind TEXT NOT NULL CHECK (surface_kind IN
+                          ('chat','opencode','claude-code','mcp','mirror','api','agent','desktop-ui')),
+           node         TEXT NOT NULL,
+           holder       TEXT NOT NULL,
+           token_hash   TEXT NOT NULL
+                          CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+           owner_mode   TEXT NOT NULL DEFAULT 'interactive' CHECK (owner_mode IN ('interactive','job')),
+           owner_epoch  INTEGER NOT NULL DEFAULT 0 CHECK (owner_epoch >= 0),
+           expires_at   TEXT,
+           acquired_at  TEXT NOT NULL,
+           heartbeat_at TEXT NOT NULL,
+           CHECK (owner_mode <> 'job' OR expires_at IS NOT NULL)
+         ) STRICT;
+         INSERT INTO leases_v8
+           (session_id, surface_id, surface_kind, node, holder, token_hash, owner_mode, owner_epoch,
+            expires_at, acquired_at, heartbeat_at)
+           SELECT session_id, surface_id, surface_kind, node, holder, token_hash, 'interactive', 0,
+                  NULL, acquired_at, heartbeat_at
+           FROM leases;
+         DROP TABLE leases;
+         DROP TABLE surfaces;
+         ALTER TABLE surfaces_v8 RENAME TO surfaces;
+         ALTER TABLE leases_v8 RENAME TO leases;
+         CREATE INDEX leases_heartbeat ON leases(heartbeat_at);
+         CREATE INDEX leases_expires ON leases(expires_at);",
+    )?;
+    // An old offload run lease becomes a job owner that lives for the run TTL.
+    let legacy: Vec<(String, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT session_id, heartbeat_at FROM leases WHERE surface_kind = 'agent' AND surface_id IS NULL",
+        )?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (session, heartbeat) in legacy {
+        let heartbeat = crate::convert::ts_from_text(&heartbeat, "leases.heartbeat_at")?;
+        let expires = heartbeat.plus(std::time::Duration::from_secs(
+            crate::repo_surfaces::LEGACY_RUN_LEASE_TTL_SECS,
+        ));
+        tx.execute(
+            "UPDATE leases SET owner_mode = 'job', expires_at = ?1 WHERE session_id = ?2",
+            rusqlite::params![crate::convert::ts_to_text(expires), session],
+        )?;
+    }
+    tx.pragma_update(None, "user_version", V08_SCHEMA_VERSION)?;
+
+    let after = table_counts(&tx, "main")?;
+    let mut counts = BTreeMap::new();
+    for (table, before_rows) in &before {
+        let after_rows = after.get(table).copied().ok_or_else(|| StoreError::Corrupt {
+            path: format!("global.db:{table}"),
+            line: None,
+            reason: "existing table disappeared during the v8 migration".to_owned(),
+        })?;
+        if after_rows != *before_rows {
+            return Err(StoreError::Corrupt {
+                path: format!("global.db:{table}"),
+                line: None,
+                reason: format!("row count changed: before {before_rows}, after {after_rows}"),
+            });
+        }
+        counts.insert(
+            format!("global:{table}"),
+            MigrationCount {
+                before: *before_rows,
+                after: after_rows,
+            },
+        );
+    }
+    for table in V08_NEW_TABLES {
+        counts.insert(format!("global:{table}"), MigrationCount { before: 0, after: 0 });
+    }
+    let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if !integrity.eq_ignore_ascii_case("ok") {
+        return Err(StoreError::Corrupt {
+            path: "global.db:integrity_check".to_owned(),
+            line: None,
+            reason: integrity,
+        });
+    }
+    {
+        let mut statement = tx.prepare("PRAGMA foreign_key_check")?;
+        if statement.query([])?.next()?.is_some() {
+            return Err(StoreError::Corrupt {
+                path: "global.db:foreign_key_check".to_owned(),
+                line: None,
+                reason: "foreign key violations".to_owned(),
+            });
+        }
+    }
+    tx.commit()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(MigrationReport {
+        from_version: 7,
+        to_version: 8,
+        backup: backup.display().to_string(),
+        projects: Vec::new(),
+        tables: counts,
+        verified: true,
+        dry_run: false,
+        dropped_workers: 0,
+        dropped_worker_rows: Vec::new(),
+        primary_runs: Vec::new(),
+        node_wide_loops: Vec::new(),
+        node_wide_schedules: Vec::new(),
+        warnings: Vec::new(),
+    })
+}
+
+/// Runs [`migrate_v07`] when an existing home still has the v7 global schema.
+pub(crate) fn migrate_v07_if_needed(paths: &NodePaths) -> Result<(), StoreError> {
+    if db_version(&paths.db_path())? == Some(V07_SCHEMA_VERSION) {
+        migrate_v07(paths)?;
+    }
+    Ok(())
+}
+
 /// Checks that the source really is a healthy v2 global database.
 fn validate_v02_source(paths: &NodePaths) -> Result<(), StoreError> {
     validate_global_source(paths, 2, &V02_GLOBAL_TABLES, "v2")
@@ -1449,7 +1667,18 @@ fn create_v04_stage(stage: &Path, paths: &NodePaths) -> Result<BTreeMap<String, 
 fn copy_v04_global(conn: &Connection) -> Result<BTreeMap<String, MigrationCount>, StoreError> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     for table in V04_GLOBAL_TABLES.iter().filter(|table| **table != "leases") {
-        conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM old.{table}"), [])?;
+        if *table == "surfaces" {
+            // The embedded schema's `surfaces` has a v8 `label` column the v4 table lacks.
+            conn.execute(
+                "INSERT INTO main.surfaces
+                   (id, kind, node, holder, app, cwd, metadata_json, state, revoked_at, created_at, last_seen_at)
+                 SELECT id, kind, node, holder, app, cwd, metadata_json, state, revoked_at, created_at, last_seen_at
+                 FROM old.surfaces",
+                [],
+            )?;
+        } else {
+            conn.execute(&format!("INSERT INTO main.{table} SELECT * FROM old.{table}"), [])?;
+        }
     }
     conn.execute_batch("COMMIT")?;
 

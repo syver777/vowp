@@ -53,6 +53,8 @@ In the current git repo: writes `vowp.toml` (a `[node]` table with `tz_offset_mi
 (`AGENTS.md`, `CLAUDE.md` containing `@AGENTS.md`, `.claude/skills/vowp-{worker,planner,verifier,keeper}/SKILL.md`, `opencode.jsonc`, brief/report templates) from the templates **embedded in the binary**,
 appends `.vowp/tmp/` to `.gitignore`, creates the home (global DB, directories), registers the local node and the project, creates `~/.vowp/projects/<name>/project.db`, and creates the project's loop rows (`loops` table, default intervals). Existing files are never overwritten without `--force` (skipped files are listed).
 Human: `initialised project vowp at /path (8 files written, 2 skipped)`. JSON: `{"project":"vowp","path":"…","written":[…],"skipped":[…]}`. Exit 4 if already initialised and not `--force`.
+`vowp project add --init` calls the same initializer at a known checkout root without changing
+the process cwd; see §6.1 and [`v0.5/project-bootstrap.md`](v0.5/project-bootstrap.md).
 
 ### `vowp doctor`
 Checks (each `ok|warn|fail` with detail): `home` writable; `db` opens + `integrity_check` + schema version; `schema` matches the binary; `projects` each have an openable project DB; `snapshot` is writable; `git` version; `tmux` version (warn if absent); harness probes via adapters
@@ -250,8 +252,8 @@ printed; the streaming ones print one JSON object per line.
 vowp session turn-begin <session> --executor <exec> --purpose <p> --node <n> --request <file|->
 vowp __exec --grant <file> [--spool-dir <dir>]
 vowp session ingest <session> --run <run-id> [--replay] [--json]
-vowp session lease <session> [--acquire <kind> --holder <h> --node <n>] [--json]
-vowp session takeover <session> --kind <kind> --holder <h> --node <n> [--json]
+vowp session lease <session> [--acquire <kind> --holder <h> --node <n> --label <l>] [--json]
+vowp session takeover <session> --kind <kind> --holder <h> --node <n> [--label <l>] [--json]
 vowp session dir-export <session> [--max-bytes <n>]
 ```
 
@@ -266,6 +268,24 @@ export: it prints one `vowp-asif-export-stream-v1` envelope line (`format`, `ses
 it, and pipes `RemoteLine` JSON lines into `session ingest`; `ingest` assigns `seq`, is idempotent by
 event id and acknowledges each event. The lease token is never on argv or in `ps`; the grant file is
 mode 0600. `session lease` prints the token only on acquire. Full protocol: `sessions.md` §9.
+
+`<kind>` is `chat`, `opencode`, `claude-code`, `mcp`, `mirror`, `api`, `agent` or `desktop-ui`. Without
+`--acquire`, `session lease` prints the owner: `held by <holder> (<kind>) on <node> since <t>
+(heartbeat <t>); mode <interactive|job> state <active|stale|expired> activity <idle|running|waiting>
+epoch <n>` (plus `expires <t>` for a job); `--json` is a `LeaseStatus` with `mode`, `state`, `activity`,
+`epoch`, `expires_at` and `label`. Every acquire or takeover bumps the epoch. A takeover of a live owner
+that is mid-turn needs a second confirmation from whoever asks the person: the plumbing command itself
+never asks (chat and the tests call it mid-turn), so the gate lives in the callers — MCP
+`session_resume {takeover:true}` refuses a running owner until `confirm_running:true` is added, and
+`vowp_core::surface::takeover::takeover_confirmed` is the API for UIs; an idle owner needs one
+confirmation. A takeover appends one `note` ending in the `ownership_conflict` stop
+notice (new owner, epoch), which the old surface's ingest writer receives as `LeaseRevoked`.
+
+An interactive session (`user` or `orchestrator` role, or no role and no job) with no owner row
+refuses a write (`session has no owner; acquire one`); local planner/keeper/worker/verifier sessions
+keep running without an owner. `session show` prints an `owner:` block (name, holder, kind, node,
+mode, state, activity, epoch, heartbeat, expiry) or `owner: none`, and its JSON gains `owner`;
+`session ls` adds an `OWNER` column (`<name> [<state>/<activity>]`).
 
 ## 5. Inbox, cost, nodes, loops, schedules, release
 
@@ -306,7 +326,7 @@ These commands are new in v0.2. Full `--json` shapes are in
 ### 6.1 `vowp project`
 
 ```
-vowp project add <path> [--name <n>] [--weight <1-100>]
+vowp project add [<path>] [--git <url>] [--init] [--orchestrator <app>] [--name <n>] [--weight <1-100>]
 vowp project ls [--all]
 vowp project pause|resume|archive <name>
 vowp project rm <name> --yes
@@ -314,12 +334,30 @@ vowp project weight <name> <1-100>
 ```
 
 `add` registers an existing checkout on the home (idempotent for the same path and name; it does not
-start a supervisor). `ls` prints state, weight, path and update time; `_node` is hidden unless
-`--all`. `pause` stops new dispatch but keeps maintenance; `resume` returns a paused project to
-`active`; `archive` stops every tick and keeps the database; `rm --yes` archives the project
-directory under `~/.vowp/archive/projects/` and removes the registry row (refused while running and
-for `_node`). `weight` sets the fairness weight. JSON: `ProjectEntry` or `[ProjectEntry]`;
-`rm` prints `{name, archive_path, removed}`.
+start a supervisor). At least one of `<path>` or `--git <url>` is required. `--git` clones the
+repository into the explicit `<path>` or `<home-parent>/<name>` first; the name comes from `--name`
+or the URL basename minus a trailing `.git`, and `_node` is refused. The command refuses a missing
+home parent, an existing target, a `..` component, a target outside the canonical home parent, and a
+URL with userinfo in its `scheme://` authority (SCP-style `git@host:path` is allowed). The clone is
+argv-only `git clone -- <url> <target>` with `GIT_TERMINAL_PROMPT=0`,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` and `GIT_SSH_COMMAND=ssh -oBatchMode=yes`;
+a failure removes only the target it created and redacts the URL from its error.
+`--init` initialises the checkout only when `vowp.toml` is absent, using the same writer as
+`vowp init`; an existing file is left byte-identical and the summary says `initialized: false`.
+`--orchestrator <app>` then creates or reuses the project's same-named orchestrator for `opencode`,
+`claude-code` or `chat`; a same-name card with a different project or app is a conflict. A failure
+after registration keeps the project registered, removes a newly created orchestrator directory and
+names the retry `vowp orchestrator new --name <project> --app <app> --project <project>`.
+With none of `--git`/`--init`/`--orchestrator`, the human output and `ProjectEntry` JSON are
+unchanged. In bootstrap mode `--json` prints one summary
+`{"project","path","initialized","orchestrator"}` where `orchestrator` is an `OrchestratorCard` or
+`null`. Full rules: [`v0.5/project-bootstrap.md`](v0.5/project-bootstrap.md).
+`ls` prints state, weight, path and update time; `_node` is hidden unless `--all`. `pause` stops new
+dispatch but keeps maintenance; `resume` returns a paused project to `active`; `archive` stops every
+tick and keeps the database; `rm --yes` archives the project directory under
+`~/.vowp/archive/projects/` and removes the registry row (refused while running and for `_node`).
+`weight` sets the fairness weight. JSON: `ProjectEntry` or `[ProjectEntry]`; `rm` prints
+`{name, archive_path, removed}`.
 
 ### 6.2 `vowp fleet`
 
@@ -338,6 +376,16 @@ requires SSH and `--cached` never opens a connection. The JSON wrapper is
 include `waiting_reason`; `inbox --json` prints `[InboxItem]` with the full body (the snapshot's own
 inbox cards omit it); `capacity` is an alias of `capacity show`.
 
+`fleet status` lists an `owners:` section after the inbox line, one row per recent session that has
+an owner row: session id, title, label, kind (mode), `holder@node`, state, activity and `heartbeat <age>` or
+`expires in <span>`. `sessions[].owner` carries the same data in `--json`; no token or password is ever
+printed.
+
+`fleet status` adds one `cluster:` line when at least one online agent worker node is present:
+the online worker count, pooled busy and target workers, available and total RAM, CPU cores and
+free disk. The same additive card is `capacity.cluster` in the snapshot and
+`CapacityReport.cluster`; the per-home fields are unchanged.
+
 ### 6.3 `vowp capacity`
 
 ```
@@ -351,8 +399,13 @@ vowp capacity history [--since <dur|date>] [--bucket 5m|1h|1d]
 `show`/`report` return `CapacityReport`: the latest host sample (or none), the owner target and
 advice, running run count and p90 estimates, brakes, reserves, estimates and waiting jobs. `show`
 and `report` also print the effective provider caps and whether a config reload is pending; their
-`--json` document carries the extra `provider_caps` object and `reload_pending` boolean. `set`
-writes one `capacity_targets` history row. A target above the advised value needs `--override`
+`--json` document carries the extra `provider_caps` object and `reload_pending` boolean. When at
+least one online agent worker node exists, both print the additive `cluster:` line and the JSON
+document carries `cluster` (`online_worker_nodes`, `target_workers`, `busy_workers`, `cpu_cores`,
+`mem_total_bytes`, `mem_available_bytes`, `disk_free_bytes`). Admission uses the home target and
+headroom for home runs and the chosen worker node's slots and headroom for an eligible offloaded
+run; a single-machine home reports zero worker nodes. `set` writes one `capacity_targets` history
+row. A target above the advised value needs `--override`
 (exit 5 otherwise); the brakes still apply and `capacity show` prints
 `owner override: 8 (advised 5)`. The board does not carry capacity data. The AI advisor only
 proposes: it opens a `capacity` inbox item and never changes the target itself.
@@ -409,32 +462,61 @@ JSON: `MigrationReport {from_version,to_version,backup,projects,tables,verified,
 ### 6.6 `vowp secret`
 
 ```
-vowp secret set <NAME>
+vowp secret set <NAME> [--stdin]
 vowp secret ls
 vowp secret rm <NAME> [--yes]
-vowp secret upgrade
+vowp secret upgrade [--encrypted]
 vowp secret request <NAME>
 ```
 
 Values are never accepted as arguments. `set` reads from a hidden prompt (requires a TTY; exit 5
-without one); `ls` prints names and the last four characters; `rm` deletes; `upgrade` prints the one
-sudo command that moves basic-mode files to the vault user; `request` starts a one-time paste page
-bound to `127.0.0.1` with a 10-minute expiry and returns `{name,url,expires_at,single_use}`. Basic
-mode stores `~/.vowp/secrets/<NAME>` (0600, same user); vault mode stores under
-`/home/vowp-vault/secrets/<NAME>` through the `vowp __vault-exec`/`__vault-admin` helpers. Injected
-values are redacted from events, capsules, report artifacts, raw run mirrors and the snapshot; no
-secret is included in a backup. Honest limit: code that is given a value can print it.
+without one). With `--stdin` it reads the value from the process stdin instead: exactly one
+trailing `\n` or `\r\n` is stripped, an empty value is refused (exit 2), and no TTY is required.
+`ls` prints names, the last four characters and a `storage: <mode>` line; `ls --json` is one
+object `{"mode":"…","secrets":[…]}` (`basic`, `vault_user` or `encrypted`). `rm` deletes; `upgrade`
+prints the one sudo command that moves basic-mode files to the vault user; `upgrade --encrypted`
+encrypts every basic value before removing any plaintext copy, writes the mode file last, refuses
+vault-user mode and is idempotent when already encrypted. `request` starts a one-time paste page
+bound to `127.0.0.1` with a 10-minute expiry and returns `{name,url,expires_at,single_use}`.
+
+Basic mode stores `~/.vowp/secrets/<NAME>` (0600, same user); vault mode stores under
+`/home/vowp-vault/secrets/<NAME>` through the `vowp __vault-exec`/`__vault-admin` helpers;
+encrypted mode stores age ciphertext under `~/.vowp/secrets/encrypted/<NAME>` (0600) with an age
+identity at `~/.vowp/secrets/age.key` (0600). The encrypted key is not a passphrase, is not
+rotated or backed up, and code running as the same user can read it; the mode protects an offline
+copy without the key, not the runtime user. `systemd-creds` is not implemented. On a control
+machine, `set/ls/rm/upgrade` route to the home over SSH; the hidden-prompt `set` uses `ssh -t` and
+`set --stdin` uses plain `ssh` with the caller's stdin. Injected values are redacted from events,
+capsules, report artifacts, raw run mirrors, the snapshot, the supervisor log, command-gate
+evidence and ledger summary/detail strings; no secret is included in a backup. Honest limit: code
+that is given a value can print it. The full contract is
+[`v0.5/vault-encrypted.md`](v0.5/vault-encrypted.md).
 
 ### 6.7 `vowp gc`
 
 ```
-vowp gc [--apply] [--class <class>] [--now <RFC3339>]
+vowp gc [--apply] [--class <class>] [--older-than <duration>] [--now <RFC3339>]
 ```
 
-Dry run by default: lists eligible files per lifecycle class (`production`, `truth`, `open_work`,
-`secrets`, `closed_sessions`, `run_output`, `worktrees`, `samples`, `cache`). `--apply` deletes
-only the eligible classes; production, truth, open work and secrets are never touched. A nightly
+Dry run by default: lists files per lifecycle class (`production`, `truth`, `open_work`,
+`secrets`, `closed_sessions`, `run_output`, `worktrees`, `job_window`, `samples`, `cache`), the bytes they
+occupy and how many of those bytes an `--apply` would free now. `--apply` deletes only the
+eligible classes; production, truth, open work and secrets are never touched. A nightly
 `gc-nightly` schedule runs `--apply` by default. `--now` is a test clock override.
+
+`--older-than` overrides the retention window for `closed_session` (default 30 days) and
+`run_output` (default 14 days) without changing any other class or the nightly pass. It accepts
+a positive whole number followed by `s`, `m`, `h`, `d` or `w`, so `36h`, `7d` and `2w` are valid.
+Zero, negative, unterminated and larger-than-ten-year values exit 2. With `--class`, the override
+is accepted only for `closed_session` and `run_output`; naming any other class with it also exits
+2. A dry run prints the same class totals plus `ELIGIBLE` and `ELIGIBLE BYTES`, so the operator
+can see what a later `--apply` would remove.
+
+A session that holds a live lease, belongs to a job that still holds its lock (`running`,
+`stalled`, `gating`, `reviewing`, `fixing` or `merging`), or is a running orchestrator is listed
+under `refused` and is not compacted, in both the dry run and `--apply`. The JSON report carries
+one `refused` entry per candidate, with its class, session, path and reason, and the per-class
+`eligible_files`/`eligible_bytes` fields.
 
 ### 6.8 `vowp backup` (v0.2 forms)
 
@@ -472,8 +554,10 @@ exit 5 instead of working around it. Answers are names only: `--harness`, `--pro
 ```
 vowp orchestrator new [--name <n>] [--project <p>] --app opencode|claude-code|chat [--node <n>] [--executor <e>] [--force]
 vowp orchestrator ls
+vowp orchestrator move <name> (--node <n> | --home)
 vowp orchestrator stop <name>
 vowp orchestrator resume <name>
+vowp orchestrator endpoint <name> [--json]
 ```
 
 Creates an ordinary session with role `orchestrator` (fleet-wide or project-bound), a project-local
@@ -485,7 +569,22 @@ is not an SSH redirect for this command); the node materializes its own private 
 `running` only after the app is healthy. `--app claude-code` records a degraded orchestrator and
 exits non-zero when no claude.ai login exists rather than pretending the host runs. `stop` stops the
 host and releases the lease (the session stays); `resume` starts it again; the supervisor resumes
-running orchestrators after a restart. JSON: `OrchestratorCard`.
+running orchestrators after a restart. JSON: `OrchestratorCard`. `vowp project add --orchestrator
+<app>` creates the same card named after the project and bound to it, reuses an existing card only
+when its project and app match, and starts the keeper for a home app host; `chat` needs none.
+
+`orchestrator move` requires exactly one of `--node <n>` (move to that enrolled local node) or
+`--home` (move back to this home); both or neither is a usage error (exit 2). It validates the
+target before stopping anything: an unknown, pending or revoked node is refused (exit 3 or 5), and
+a project-bound orchestrator needs a path map for its project on the target node. The current host
+is then stopped and its surface lease released, a handoff capsule is written on the existing session
+when it has content beyond its creation and placement notes, and the orchestrator is materialized on
+the target **with the same `SessionId`** and the same session log on the home. A capsule failure is
+logged and does not abort the move. Moving to the placement the orchestrator already occupies is
+idempotent: a live host is returned unchanged and a stopped or degraded one is resumed there.
+`--json` prints the `OrchestratorCard`, whose `session_id` is the preserved id. On `move`, `--node`
+names the target node for the orchestrator, not an SSH redirect. The global `--home <DIR>` flag is
+accepted before the command; after `orchestrator move`, `--home` is the target switch.
 
 An opencode app may write its own 0600 `service.json` or, on macOS, print its readiness on stdout
 (`server listening on http://127.0.0.1:<port>` and `server password <secret>`); the agent parses
@@ -497,6 +596,19 @@ starts no process. The default `chat` app is started as `vowp chat --agent <sess
 `degraded` or `node_offline` record, is `null` for `starting`, `running` and `stopped`, and is
 cleared by a clean `resume` or `stop`. It never contains a port, password, secret value or absolute
 local path.
+
+`orchestrator endpoint <name>` returns the `OrchestratorEndpoint` discovery document for a UI
+client. It is a home-side inspection: the global `--node` is consumed and is not an SSH redirect,
+and the command never opens SSH, a socket or a node's files. For a home-hosted orchestrator with a
+live host it reads the private 0600 service state and fills `url`, `native_session_id` and `auth`;
+a stopped host, or an app without a loopback endpoint (Claude Remote Control or chat), leaves all
+three `null`. For a node-hosted orchestrator it returns the metadata-only document (`location:
+node`, the same `session_id`, `url`/`native_session_id`/`auth` null) and the human output tells the
+owner to run `vowp agent orchestrator endpoint <name> --json` on that machine. The `--json`
+document carries `auth.password` only for a live home-hosted endpoint; the human key/value block
+prints the auth scheme and username and says the password is in `--json`. No other command returns
+that password; it never appears in a card, `snapshot.json`, `fleet status`, `orchestrator ls`, a
+log or an error.
 
 ### 6.11 `vowp mcp`
 
@@ -518,8 +630,8 @@ reads still work in follow mode. `tunnel_open`/`tunnel_close` refuse on the home
 | `vowp reindex [--session <id>]` | rebuilds `sessions`, `session_events`, `session_natives`, `capsules` rows from `sessions/*/log.jsonl`; prints counts. Safe while the supervisor runs. |
 | `vowp backup …` | see §6.8. |
 | `vowp schema [<type>]` | with no arg lists the JSON-Schema type names; with a name prints that schema (types.md §14). `snapshot` is the v0.2 snapshot schema. Still needs an initialised home in this build. |
-| `vowp --version` | prints `vowp 0.3.0` (the binary version only). |
-| `vowp version` | prints `vowp 0.3.0 (<git sha>) schema 1`. |
+| `vowp --version` | prints `vowp 0.4.0` (the binary version only). |
+| `vowp version` | prints `vowp 0.4.0 (<git sha>) schema 1`. |
 | `vowp __window <board\|capacity\|supervisor\|planner\|keeper\|inbox\|job> [<id>]` | hidden; what tmux windows run (renders the board or capacity screen, tails `supervisor.log`, tails the planner/keeper session, lists the inbox, tails a job session). Read-only. |
 | `vowp __exec --grant <file> [--spool-dir <dir>]` | hidden remote-executor client (sessions.md §9). |
 | `vowp __vault-exec --env <NAME> -- <cmd…>` · `vowp __vault-admin probe` · `vowp __vault-admin set\|rm <NAME>` | hidden vault-user helper; `probe` takes no name and checks the helper context and vault directory, `set` reads the value from stdin, never argv. In basic mode `__vault-exec` is a plain exec. |
@@ -763,6 +875,25 @@ seven days prints one warning to stderr. `--json` prints:
 `superseded` or `stopped`. `AgentStatus` is a CLI-local document, not an exported protocol
 schema.
 
+### `vowp agent orchestrator endpoint <name> [--json]`
+
+Reads only this machine's agent state directory (`$VOWP_AGENT_HOME`, else `~/.vowp-agent`):
+`orchestrators/<name>/config.json`, the recorded `host.json` and, while the host's pid is alive,
+the 0600 app `service.json` named by `service_json`. It prints the same `OrchestratorEndpoint`
+document as the home command with `location: "node"` and the home session id from the paired
+binding. A live opencode host fills the loopback `url` and Basic `auth` (header `Authorization`,
+scheme `Basic`, username `opencode`, the service password); `native_session_id` is `null` unless
+the app's service file names one, because the desktop client creates that app session. Claude
+Remote Control, chat and a stopped host leave `url`, `native_session_id` and `auth` null. The
+command never contacts the home and never opens a socket.
+
+An unknown name is a typed `not_found` (exit 3). A corrupt, too-wide or unreadable private file
+still carries the agent library's typed `config_invalid` code, but the CLI class is invalid input
+(exit 2), matching the home command's invalid error for the same corruption, and the message never
+echoes a path, port, password, token or pair link. The password appears only in `--json` for a live
+local host; the human key/value block prints the auth scheme and username and says the password is
+in `--json`.
+
 ### `vowp agent service install [--print] [--force] [--now]` · `uninstall [--yes]` · `status`
 
 `install` writes exactly one launchd `LaunchAgent` (`~/Library/LaunchAgents/dev.vowp.agent.plist`)
@@ -897,6 +1028,14 @@ active token's 12-character display prefix; `OVERLAP` is `-`, an old token's ove
 `PENDING <deadline>` for an undelivered rotation. No token or hash is ever printed. The id index
 is `<home>/surfaces.json` (0600) because the v4 store read model returns one surface by id; the
 ids are not secrets and the state/scopes/expiry always come from the store.
+
+### `vowp surface rename <id> <label> | --clear`
+
+Saves a friendly name for a surface (1-80 printable characters), shown as the owner `label` on
+`session show`, `fleet status` and MCP `session_resume`. `--clear` restores the default
+`<kind name> · <node>` (for example `OpenCode · macbook`). `surface pair --label <l>` names a surface at
+creation, and `surface ls` shows a `LABEL` column and a `label` JSON member. The name lives in
+`vowp.db`; there is no second store.
 
 ### `vowp surface revoke <id> [--yes]`
 

@@ -13,7 +13,11 @@ use support::fake_git::FakeGit;
 use tempfile::{TempDir, tempdir};
 use vowp_core::session::remote::{IngestGrant, IngestSession};
 use vowp_core::session::service::SessionService;
-use vowp_core::surface::lease::{AcquireLease, HEARTBEAT_INTERVAL, LeaseGuard, STALE_AFTER, check_lease_with};
+use vowp_core::surface::lease::{
+    AcquireLease, HEARTBEAT_INTERVAL, LeaseGuard, STALE_AFTER, TakeoverConfirmation, check_lease_with,
+    revocation_ack_for, takeover_confirmation,
+};
+use vowp_core::surface::takeover::takeover_confirmed;
 use vowp_core::{AdapterRegistry, CoreError, Deps};
 use vowp_protocol::{
     Actor, AssistantMessage, AttachAction, Clock, Cost, EventBody, EventSource, EventType, Executor, FakeClock,
@@ -405,7 +409,10 @@ fn lease_revoked_is_pushed_within_2s() {
             last_seq,
         } => {
             assert_eq!(by, "phone");
-            assert_eq!(reason, "session taken over");
+            assert!(
+                reason.starts_with("ownership_conflict: session taken over by"),
+                "the revocation is the ownership_conflict stop notice: {reason}"
+            );
             assert_eq!(*at, ts());
             assert!(*last_seq >= 1, "last_seq names the last appended event");
         }
@@ -534,8 +541,10 @@ fn takeover_before_first_executor_writes_note_only() {
         })
         .collect();
     assert!(
-        notes.iter().any(|note| note.starts_with("taken over by phone at ")),
-        "the note records the takeover: {notes:?}"
+        notes
+            .iter()
+            .any(|note| note.starts_with("taken over by phone at ") && note.contains("from laptop")),
+        "the note records the old and new holder: {notes:?}"
     );
 }
 
@@ -594,8 +603,8 @@ fn lease_check_rejects_wrong_token() {
     let guard = acquire(&deps, &store, &session, &target).expect("lease");
     assert!(check_lease_with(&store, &session, Some(guard.token())).is_ok());
     assert!(
-        check_lease_with(&store, &session, None).is_ok(),
-        "None means no lease required"
+        check_lease_with(&store, &session, None).is_err(),
+        "no token against an owned session is the read-only refusal"
     );
 
     let error = check_lease_with(&store, &session, Some("wrong-token")).expect_err("wrong token");
@@ -630,6 +639,218 @@ fn lease_sweep_drops_dead_surface() {
     assert!(store.lease(&session).expect("lease").is_none());
     assert_eq!(
         vowp_core::surface::sweep_leases(&deps, &store, clock.now()).expect("second sweep"),
+        0
+    );
+}
+
+/// Reader that yields queued bytes, then waits for more until the sender hangs up.
+struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: std::collections::VecDeque<u8>,
+}
+
+impl std::io::Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.buf.is_empty() {
+            match self.rx.recv() {
+                Ok(bytes) => self.buf.extend(bytes),
+                Err(_) => return Ok(0),
+            }
+        }
+        let count = out.len().min(self.buf.len());
+        for slot in out.iter_mut().take(count) {
+            *slot = self.buf.pop_front().expect("queued byte");
+        }
+        Ok(count)
+    }
+}
+
+/// Writer whose bytes the test can read while the gateway still runs.
+#[derive(Clone, Default)]
+struct SharedWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("writer lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serves one real gateway connection for the enrolled `local` node: handshake, one
+/// `Heartbeat` frame, then hang-up. Returns once the gateway has handled the heartbeat.
+fn drive_heartbeat(deps: &Deps, store: &Store, clock: &FakeClock) {
+    use ed25519_dalek::{Signer, SigningKey};
+    use vowp_core::agent::gateway::{self, GatewayOptions, GatewayOutcome};
+    use vowp_core::agent::{EnrollRequest, auth, create_pending, redeem};
+    use vowp_protocol::{AgentCapabilities, AgentCapacity, AgentFrame};
+
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let key = SigningKey::from_bytes(&[9_u8; 32]);
+    let capabilities = AgentCapabilities {
+        os: "linux".to_owned(),
+        arch: "x86_64".to_owned(),
+        agent_version: "0.3.0".to_owned(),
+        harnesses: std::collections::BTreeMap::new(),
+        git_version: None,
+        labels: Vec::new(),
+        secret_names: Vec::new(),
+        projects: Vec::new(),
+    };
+    let pending = create_pending(store, &local(), &[], clock.now()).expect("pending node");
+    redeem(
+        store,
+        &EnrollRequest {
+            code: pending.code,
+            public_key: hex(key.verifying_key().as_bytes()),
+            agent_version: "0.3.0".to_owned(),
+            capabilities: capabilities.clone(),
+            paths: Vec::new(),
+        },
+        clock.now(),
+    )
+    .expect("redeem");
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let send = |tx: &std::sync::mpsc::Sender<Vec<u8>>, frame: &AgentFrame| {
+        let mut line = serde_json::to_vec(frame).expect("frame json");
+        line.push(b'\n');
+        tx.send(line).expect("send frame");
+    };
+    let output = SharedWriter::default();
+    let reader = std::io::BufReader::new(ChannelReader {
+        rx,
+        buf: std::collections::VecDeque::new(),
+    });
+    let options = GatewayOptions {
+        home_id: "home-1".to_owned(),
+        heartbeat_secs: 10,
+        max_frame_bytes: 1024 * 1024,
+        handshake_timeout: Duration::from_secs(30),
+    };
+    let frames = |output: &SharedWriter| -> Vec<AgentFrame> {
+        let bytes = output.0.lock().expect("writer lock").clone();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    };
+    let wait_for = |output: &SharedWriter, predicate: &dyn Fn(&AgentFrame) -> bool| -> AgentFrame {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(frame) = frames(output).into_iter().find(|frame| predicate(frame)) {
+                return frame;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for a gateway frame");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+
+    std::thread::scope(|scope| {
+        let writer = output.clone();
+        let gateway_deps = deps.clone();
+        let handle = scope.spawn(move || {
+            // `Store` is not `Sync`: the gateway thread opens its own handle on the same home.
+            let gateway_store = gateway_deps.open_store().expect("gateway store");
+            gateway::serve_with_options(&gateway_store, &gateway_deps, reader, writer, options)
+        });
+        send(
+            &tx,
+            &AgentFrame::AgentHello {
+                node: local(),
+                key_id: hex(key.verifying_key().as_bytes()),
+                agent_version: "0.3.0".to_owned(),
+                os: "linux".to_owned(),
+                arch: "x86_64".to_owned(),
+                labels: Vec::new(),
+                capabilities,
+            },
+        );
+        let AgentFrame::HomeChallenge {
+            nonce,
+            home_id,
+            connection_id,
+            ..
+        } = wait_for(&output, &|frame| matches!(frame, AgentFrame::HomeChallenge { .. }))
+        else {
+            panic!("expected HomeChallenge");
+        };
+        let signature = hex(&key
+            .sign(&auth::handshake_payload(&nonce, &home_id, &connection_id))
+            .to_bytes());
+        send(&tx, &AgentFrame::AgentAuth { signature });
+        wait_for(&output, &|frame| matches!(frame, AgentFrame::HomeWelcome { .. }));
+        send(
+            &tx,
+            &AgentFrame::Heartbeat {
+                at: clock.now(),
+                capacity: AgentCapacity {
+                    cpu_cores: 4,
+                    load1: 0.1,
+                    mem_total_bytes: 1024,
+                    mem_free_bytes: 512,
+                    disk_free_bytes: 1024,
+                    busy_slots: 0,
+                    max_slots: 2,
+                    on_battery: Some(false),
+                    thermal_state: Some("nominal".to_owned()),
+                },
+                pending_spool_bytes: 0,
+            },
+        );
+        // Hanging up after the heartbeat makes the gateway finish its frame before it closes.
+        drop(tx);
+        let outcome = handle.join().expect("gateway thread").expect("gateway result");
+        assert!(matches!(outcome, GatewayOutcome::Closed { node: Some(_) }));
+    });
+}
+
+#[test]
+fn agent_heartbeat_renews_a_running_orchestrator_lease() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_session(&service, &tmp, None);
+    let store = deps.open_store().expect("store");
+    let mut row = store.session(&session).expect("read").expect("session");
+    row.role = Some(SessionRole::Orchestrator);
+    row.state = SessionState::Running;
+    store.upsert_session(&row).expect("orchestrator row");
+    let target = surface(SurfaceKind::Opencode, "macbook", ts());
+    let _guard = acquire(&deps, &store, &session, &target).expect("lease");
+
+    clock.advance(STALE_AFTER * 3);
+    let now = clock.now();
+    assert_eq!(
+        vowp_core::surface::sweep_leases(&deps, &store, now).expect("sweep"),
+        0,
+        "the running orchestrator's lease is never swept"
+    );
+    assert!(store.lease(&session).expect("lease").expect("kept").heartbeat_at < now);
+
+    let owner = store.lease(&session).expect("lease").expect("kept");
+    let before = owner.surface_id.clone();
+    drive_heartbeat(&deps, &store, &clock);
+    let renewed = store.lease(&session).expect("lease").expect("renewed");
+    assert_eq!(renewed.heartbeat_at, now, "the Heartbeat frame refreshed the owner row");
+    assert_eq!(renewed.surface_id, before, "the owner is unchanged");
+    assert_eq!(renewed.surface_id.as_ref(), Some(&target.id));
+
+    // Another node's agent, or a session that stopped running, renews nothing.
+    let other = NodeName::parse("other").expect("node");
+    assert_eq!(
+        vowp_core::surface::lease::renew_running_orchestrator_leases(&store, &other, now).expect("renew"),
+        0
+    );
+    row.state = SessionState::Idle;
+    store.upsert_session(&row).expect("idle row");
+    clock.advance(Duration::from_secs(5));
+    assert_eq!(
+        vowp_core::surface::lease::renew_running_orchestrator_leases(&store, &local(), clock.now()).expect("renew"),
         0
     );
 }
@@ -952,4 +1173,312 @@ fn takeover_notice_is_the_exact_spec_text() {
         vowp_core::surface::takeover::notice("phone", at, 0),
         "Taken over by phone at 14:05. This surface is now read-only (follow mode)."
     );
+}
+
+/// Creates a session with an explicit role and no job.
+fn create_with_role(service: &SessionService, tmp: &TempDir, role: SessionRole) -> SessionId {
+    service
+        .create_session(NewSession {
+            project: None,
+            job_id: None,
+            role,
+            title: "ownership".to_owned(),
+            cwd: tmp.path().join("project"),
+            parent: None,
+            executor: None,
+        })
+        .expect("create session")
+}
+
+fn note_texts(deps: &Deps, session: &SessionId) -> Vec<String> {
+    read_events(deps, session)
+        .iter()
+        .filter_map(|event| match event.body() {
+            Ok(EventBody::Note(note)) => Some(note.text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn desktop_ui_takeover_invalidates_the_previous_token_immediately() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::Orchestrator);
+    let store = deps.open_store().expect("store");
+    let host = surface(SurfaceKind::Opencode, "main", ts());
+    let guard = acquire(&deps, &store, &session, &host).expect("host lease");
+    let host_token = guard.token().to_owned();
+    assert!(check_lease_with(&store, &session, Some(&host_token)).is_ok());
+
+    let ui = surface(SurfaceKind::DesktopUi, "StackSpirit", clock.now());
+    vowp_core::takeover(&deps, &store, &session, &ui, clock.now()).expect("takeover");
+    let error = check_lease_with(&store, &session, Some(&host_token)).expect_err("old token is dead");
+    assert!(matches!(error, CoreError::Refused(text) if text.contains("StackSpirit")));
+    let owner = store.session_owner(&session, clock.now()).expect("owner").expect("row");
+    assert_eq!(owner.kind, SurfaceKind::DesktopUi);
+    assert_eq!(owner.epoch, 2, "acquire was epoch 1, the takeover epoch 2");
+    std::mem::forget(guard);
+}
+
+#[test]
+fn read_only_surface_refuses_a_turn_and_an_ingest_line() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::User);
+    let store = deps.open_store().expect("store");
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Chat, "laptop", ts())).expect("lease");
+    let old_token = guard.token().to_owned();
+    vowp_core::takeover(
+        &deps,
+        &store,
+        &session,
+        &surface(SurfaceKind::DesktopUi, "ui", ts()),
+        ts(),
+    )
+    .expect("takeover");
+
+    let turn = vowp_core::session::remote::begin_turn(
+        &deps,
+        &store,
+        &vowp_core::session::remote::BeginTurn {
+            session: session.clone(),
+            lease: old_token.clone(),
+            executor: vowp_protocol::ExecutorRef {
+                executor: opencode(),
+                node: None,
+            },
+            purpose: RunPurpose::Continue,
+            node: local(),
+            cwd: None,
+            prompt: "hello".to_owned(),
+        },
+    );
+    assert!(
+        matches!(turn, Err(CoreError::Refused(_))),
+        "a read-only surface cannot start a turn"
+    );
+
+    let before = read_events(&deps, &session).len();
+    let ack = revocation_ack_for(&store, &session, &old_token, 0)
+        .expect("ack")
+        .expect("revoked");
+    assert!(
+        matches!(ack, IngestAck::LeaseRevoked { .. }),
+        "an ingest line gets the stop notice"
+    );
+    assert_eq!(read_events(&deps, &session).len(), before, "nothing was appended");
+    std::mem::forget(guard);
+}
+
+#[test]
+fn user_or_orchestrator_session_without_an_owner_refuses_a_write() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let store = deps.open_store().expect("store");
+    for role in [SessionRole::User, SessionRole::Orchestrator] {
+        let session = create_with_role(&service, &tmp, role);
+        let error = check_lease_with(&store, &session, Some("any-token")).expect_err("no owner");
+        assert!(
+            matches!(&error, CoreError::Refused(text) if text.contains("no owner")),
+            "{role:?}: {error:?}"
+        );
+        assert!(check_lease_with(&store, &session, None).is_err());
+    }
+}
+
+#[test]
+fn planner_and_keeper_sessions_without_an_owner_still_run_on_the_home() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let store = deps.open_store().expect("store");
+    for role in [
+        SessionRole::Planner,
+        SessionRole::Keeper,
+        SessionRole::Worker,
+        SessionRole::Verifier,
+    ] {
+        let session = create_with_role(&service, &tmp, role);
+        assert!(
+            check_lease_with(&store, &session, None).is_ok(),
+            "{role:?} passes with no owner"
+        );
+    }
+}
+
+#[test]
+fn stale_interactive_owner_is_refused_before_the_sweep() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::User);
+    let store = deps.open_store().expect("store");
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Chat, "laptop", ts())).expect("lease");
+    let token = guard.token().to_owned();
+    // The heartbeat thread is real-time; the fake clock moves past the stale window without a sweep.
+    clock.advance(STALE_AFTER + Duration::from_secs(1));
+    let error = check_lease_with(&store, &session, Some(&token)).expect_err("stale owner");
+    assert!(
+        matches!(&error, CoreError::Refused(text) if text.contains("stale")),
+        "{error:?}"
+    );
+    assert!(
+        store.lease(&session).expect("lease").is_some(),
+        "the row is still there: no sweep ran"
+    );
+    let owner = store.session_owner(&session, clock.now()).expect("owner").expect("row");
+    assert_eq!(owner.state, vowp_protocol::OwnershipState::Stale);
+    std::mem::forget(guard);
+}
+
+#[test]
+fn takeover_writes_one_note_with_the_new_epoch() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::User);
+    let store = deps.open_store().expect("store");
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Chat, "laptop", ts())).expect("lease");
+    let before = note_texts(&deps, &session)
+        .iter()
+        .filter(|text| text.contains("taken over"))
+        .count();
+    vowp_core::takeover(
+        &deps,
+        &store,
+        &session,
+        &surface(SurfaceKind::DesktopUi, "StackSpirit", ts()),
+        ts(),
+    )
+    .expect("takeover");
+    let notes: Vec<String> = note_texts(&deps, &session)
+        .into_iter()
+        .filter(|text| text.contains("taken over"))
+        .collect();
+    assert_eq!(notes.len(), before + 1, "exactly one takeover note: {notes:?}");
+    let note = notes.last().expect("note");
+    assert!(note.contains("owner epoch 2"), "the note names the new epoch: {note}");
+    assert!(note.contains("StackSpirit"), "the note names the new owner: {note}");
+    assert!(note.contains("from laptop"), "the note names the old holder: {note}");
+    assert!(
+        note.contains("mode interactive"),
+        "the note names the ownership mode: {note}"
+    );
+    std::mem::forget(guard);
+}
+
+#[test]
+fn released_interactive_session_has_no_owner_and_refuses_a_write() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::Orchestrator);
+    let store = deps.open_store().expect("store");
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Opencode, "main", ts())).expect("lease");
+    let token = guard.token().to_owned();
+    assert!(check_lease_with(&store, &session, Some(&token)).is_ok());
+    guard.release().expect("release");
+    assert!(store.session_owner(&session, ts()).expect("owner").is_none());
+    let error = check_lease_with(&store, &session, Some(&token)).expect_err("released");
+    assert!(matches!(error, CoreError::Refused(text) if text.contains("no owner")));
+}
+
+#[test]
+fn takeover_idle_is_one_confirmation_and_running_requires_extra_confirmation() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::User);
+    let store = deps.open_store().expect("store");
+    assert_eq!(
+        takeover_confirmation(&store, &session, ts()).expect("none"),
+        TakeoverConfirmation::NotNeeded
+    );
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Chat, "laptop", ts())).expect("lease");
+    assert_eq!(
+        takeover_confirmation(&store, &session, ts()).expect("idle"),
+        TakeoverConfirmation::Single
+    );
+
+    store
+        .set_session_state(&session, SessionState::Running, None)
+        .expect("running");
+    assert_eq!(
+        takeover_confirmation(&store, &session, ts()).expect("running"),
+        TakeoverConfirmation::Extra
+    );
+    let target = surface(SurfaceKind::DesktopUi, "ui", ts());
+    let error = takeover_confirmed(&deps, &store, &session, &target, ts(), false).expect_err("needs extra");
+    assert!(
+        matches!(&error, CoreError::Refused(text) if text.contains("running a turn")),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.session_owner(&session, ts()).expect("owner").expect("row").holder,
+        "laptop",
+        "a refused takeover changes nothing"
+    );
+    takeover_confirmed(&deps, &store, &session, &target, ts(), true).expect("confirmed twice");
+    assert_eq!(
+        store.session_owner(&session, ts()).expect("owner").expect("row").holder,
+        "ui"
+    );
+
+    // Idle: one confirmation (the call itself) is enough.
+    store
+        .set_session_state(&session, SessionState::Idle, None)
+        .expect("idle");
+    let other = surface(SurfaceKind::Chat, "phone", ts());
+    takeover_confirmed(&deps, &store, &session, &other, ts(), false).expect("idle takeover");
+    std::mem::forget(guard);
+}
+
+#[test]
+fn takeover_sends_a_stop_notice_to_the_old_surface() {
+    let tmp = tempdir().expect("tempdir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let service = SessionService::new(deps.clone());
+    let session = create_with_role(&service, &tmp, SessionRole::User);
+    let store = deps.open_store().expect("store");
+    let guard = acquire(&deps, &store, &session, &surface(SurfaceKind::Chat, "laptop", ts())).expect("lease");
+    let old_token = guard.token().to_owned();
+    assert!(
+        revocation_ack_for(&store, &session, &old_token, 3)
+            .expect("ack")
+            .is_none()
+    );
+    let ui = surface(SurfaceKind::DesktopUi, "StackSpirit", ts());
+    store.upsert_surface(&ui).expect("surface");
+    store.set_surface_label(&ui.id, Some("Desk UI")).expect("label");
+    vowp_core::takeover(&deps, &store, &session, &ui, ts()).expect("takeover");
+    match revocation_ack_for(&store, &session, &old_token, 3).expect("ack") {
+        Some(IngestAck::LeaseRevoked {
+            reason, by, last_seq, ..
+        }) => {
+            assert!(reason.starts_with("ownership_conflict:"), "{reason}");
+            assert!(reason.contains("Desk UI"), "the notice names the new owner: {reason}");
+            assert!(
+                reason.contains("mode interactive"),
+                "the notice names the mode: {reason}"
+            );
+            assert!(reason.contains("stop writing"), "{reason}");
+            assert_eq!(by, "StackSpirit");
+            assert_eq!(last_seq, 3);
+        }
+        other => panic!("expected a stop notice, got {other:?}"),
+    }
+    std::mem::forget(guard);
 }

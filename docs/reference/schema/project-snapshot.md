@@ -72,7 +72,7 @@ Exported by `vowp schema ProjectSnapshot` and generated from the protocol types 
       "type": "object"
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {
@@ -283,6 +283,20 @@ Exported by `vowp schema ProjectSnapshot` and generated from the protocol types 
           "$ref": "#/$defs/JobKind",
           "description": "Job kind."
         },
+        "needs": {
+          "description": "Upstream jobs this job needs, from the job graph.",
+          "items": {
+            "$ref": "#/$defs/JobId"
+          },
+          "type": "array"
+        },
+        "planned_executor": {
+          "description": "Executor the job will dispatch on: its explicit override, else the first\nnon-limited rung of its profile ladder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "priority": {
           "description": "Dispatch priority.",
           "format": "int32",
@@ -353,6 +367,30 @@ Exported by `vowp schema ProjectSnapshot` and generated from the protocol types 
           "minimum": 0,
           "type": "integer"
         },
+        "billing_mode": {
+          "description": "`subscription`, `api` or `free`, when the executor is known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "Known context window of the model in tokens, when configured.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "description": "Cost so far in USD; only for API-priced providers, absent for subscriptions.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "executor": {
           "description": "Executor string, when known.",
           "type": [
@@ -395,6 +433,33 @@ Exported by `vowp schema ProjectSnapshot` and generated from the protocol types 
             }
           ],
           "description": "Session the job runs in, when any."
+        },
+        "tokens_cache_read": {
+          "description": "Prompt-cache read tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_input": {
+          "description": "Non-cached input tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_output": {
+          "description": "Output tokens of the active run, when recorded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [

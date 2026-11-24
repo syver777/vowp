@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use vowp_protocol::{
-    AdviceState, CapacityAdvice, CapacityReport, InboxId, InboxItem, InboxKind, InboxState, JobState, ProjectState,
-    SampleSource, TargetMode, Timestamp,
+    AdviceState, BrakeCode, CapacityAdvice, CapacityReport, InboxId, InboxItem, InboxKind, InboxState, JobState,
+    ProjectState, SampleSource, TargetMode, Timestamp,
 };
 use vowp_store::Store;
 
@@ -38,6 +38,9 @@ const PROJECTS_KEY: &str = "capacity:advice_projects";
 
 /// Key holding whether the brake was active at the last advice turn.
 const BRAKE_KEY: &str = "capacity:advice_brake";
+
+/// Key holding the `target:proposed` pair the owner last answered `keep` (or dismissed).
+const KEPT_KEY: &str = "capacity:advice_kept";
 
 /// Key holding the instant the node became idle.
 const IDLE_KEY: &str = "capacity:advice_idle_since";
@@ -131,6 +134,10 @@ fn maybe_advise_with_report(
         // fallback advice is to keep what the owner already chose.
         report.target.target_workers.clamp(MIN_TARGET, MAX_TARGET)
     };
+
+    if suppressed_by_keep(store, trigger, &report, report.target.target_workers, proposed)? {
+        return Ok(None);
+    }
 
     close_superseded_advice(store, now)?;
     let reasons = build_reasons(&report, trigger, measured, advised);
@@ -391,8 +398,45 @@ fn reconcile_dismissed_advice(store: &Store, now: Timestamp) -> Result<(), CoreE
     };
     if kept {
         close_advice(store, &advice.id, now)?;
+        store.kv_set(
+            KEPT_KEY,
+            &format!("{}:{}", advice.current_target, advice.proposed_target),
+        )?;
     }
     Ok(())
+}
+
+/// Returns whether the owner already kept exactly this `(target, proposed)` pair.
+///
+/// An OOM kill, a low-disk brake, a changed target or a lower proposal than the kept one
+/// is new information and always raises a fresh item; routine ticks do not repeat a
+/// question the owner has answered.
+fn suppressed_by_keep(
+    store: &Store,
+    trigger: AdviceTrigger,
+    report: &CapacityReport,
+    target: u32,
+    proposed: u32,
+) -> Result<bool, CoreError> {
+    if trigger == AdviceTrigger::Oom {
+        return Ok(false);
+    }
+    if trigger == AdviceTrigger::Brake
+        && report
+            .brakes
+            .reasons
+            .iter()
+            .any(|reason| reason.code == BrakeCode::DiskLow)
+    {
+        return Ok(false);
+    }
+    let Some(text) = store.kv_get(KEPT_KEY)? else {
+        return Ok(false);
+    };
+    let Some((kept_target, kept_proposed)) = text.split_once(':') else {
+        return Ok(false);
+    };
+    Ok(kept_target.parse::<u32>().ok() == Some(target) && kept_proposed.parse::<u32>().ok() == Some(proposed))
 }
 
 /// Dismisses one proposal and starts a fresh thirty-minute gap.

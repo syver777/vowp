@@ -67,6 +67,52 @@ pub enum SurfaceKind {
     Api,
     /// A v0.4 local surface attached through a `vowp agent`.
     Agent,
+    /// A desktop UI that talks to an orchestrator's app engine itself.
+    ///
+    /// Wire spelling `desktop_ui`; the store and the CLI spell it `desktop-ui`.
+    DesktopUi,
+}
+
+impl SurfaceKind {
+    /// Returns the human-facing name used in saved surface labels and owner views.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Chat => "VOWP Chat",
+            Self::Opencode => "OpenCode",
+            Self::ClaudeCode => "Claude Code",
+            Self::Mcp => "MCP",
+            Self::Mirror => "Mirror",
+            Self::Api => "API",
+            Self::Agent => "Agent",
+            Self::DesktopUi => "Desktop UI",
+        }
+    }
+
+    /// Returns the hyphenated store and CLI spelling (`claude-code`, `desktop-ui`).
+    pub fn store_name(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Opencode => "opencode",
+            Self::ClaudeCode => "claude-code",
+            Self::Mcp => "mcp",
+            Self::Mirror => "mirror",
+            Self::Api => "api",
+            Self::Agent => "agent",
+            Self::DesktopUi => "desktop-ui",
+        }
+    }
+}
+
+/// Returns the clean human label a surface gets when nobody named it.
+///
+/// The label is `"<name> · <node>"`: a desktop UI uses its holder name (for example
+/// `StackSpirit`) when one is set, every other kind uses [`SurfaceKind::display_name`].
+pub fn default_surface_label(kind: SurfaceKind, holder: &str, node: &NodeName) -> String {
+    let name = match kind {
+        SurfaceKind::DesktopUi if !holder.trim().is_empty() => holder.trim(),
+        other => other.display_name(),
+    };
+    format!("{name} · {node}")
 }
 
 /// A registered surface.
@@ -113,6 +159,132 @@ pub struct Lease {
     pub heartbeat_at: Timestamp,
 }
 
+/// How an owner holds a session: as a person's surface or as a worker job run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipMode {
+    /// A person's surface; liveness is its heartbeat.
+    #[default]
+    Interactive,
+    /// A worker-node job run; liveness is the run's `expires_at`.
+    Job,
+}
+
+impl OwnershipMode {
+    /// Returns the stable wire and store string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Job => "job",
+        }
+    }
+}
+
+impl fmt::Display for OwnershipMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Liveness of an owner, derived at read time from its mode and timestamps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipState {
+    /// An interactive heartbeat younger than 60 seconds, or an unexpired job.
+    #[default]
+    Active,
+    /// An interactive owner whose heartbeat is 60 seconds old or older.
+    Stale,
+    /// A job owner whose `expires_at` has passed.
+    Expired,
+}
+
+impl OwnershipState {
+    /// Returns the stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stale => "stale",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl fmt::Display for OwnershipState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the owner of a session is doing right now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceActivity {
+    /// No turn is running.
+    #[default]
+    Idle,
+    /// A turn or run is in progress.
+    Running,
+    /// The session is blocked, waiting for an answer or a limit to clear.
+    Waiting,
+}
+
+impl SurfaceActivity {
+    /// Returns the stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+        }
+    }
+}
+
+impl fmt::Display for SurfaceActivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The read projection of a session's ownership record (its one `leases` row).
+///
+/// It never carries a lease token, a token hash, or an engine password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SessionOwner {
+    /// Session the owner holds.
+    pub session_id: SessionId,
+    /// Surface instance id; `None` for a job run with no paired surface.
+    pub surface_id: Option<SurfaceId>,
+    /// Kind of client that owns the session.
+    pub kind: SurfaceKind,
+    /// Friendly saved surface name, for example `"StackSpirit · macbook"`.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Human-visible holder name.
+    pub holder: String,
+    /// Node the owner runs on.
+    pub node: NodeName,
+    /// Interactive surface or job run.
+    #[serde(default)]
+    pub mode: OwnershipMode,
+    /// Liveness at the time the projection was built.
+    #[serde(default)]
+    pub state: OwnershipState,
+    /// Whether the session is idle, running or waiting.
+    #[serde(default)]
+    pub activity: SurfaceActivity,
+    /// Monotonic counter the store bumps on every acquire or takeover.
+    #[serde(default)]
+    pub epoch: u64,
+    /// When the owner acquired the session.
+    pub acquired_at: Timestamp,
+    /// Last heartbeat.
+    pub heartbeat_at: Timestamp,
+    /// Expiry of a job owner; `None` for an interactive owner.
+    #[serde(default)]
+    pub expires_at: Option<Timestamp>,
+}
+
 /// A compact reference to the surface that holds a lease.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SurfaceRef {
@@ -147,6 +319,24 @@ pub struct LeaseStatus {
     pub heartbeat_at: Option<Timestamp>,
     /// The token, set only in the response to `--acquire`.
     pub token: Option<String>,
+    /// Interactive surface or job run, when held.
+    #[serde(default)]
+    pub mode: Option<OwnershipMode>,
+    /// Liveness of the owner, when held.
+    #[serde(default)]
+    pub state: Option<OwnershipState>,
+    /// Owner epoch, when held.
+    #[serde(default)]
+    pub epoch: Option<u64>,
+    /// Expiry of a job owner, when held in job mode.
+    #[serde(default)]
+    pub expires_at: Option<Timestamp>,
+    /// Friendly saved surface name, when held and known.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Whether the session is idle, running or waiting, when held.
+    #[serde(default)]
+    pub activity: Option<SurfaceActivity>,
 }
 
 /// Output of `vowp session takeover`.
@@ -429,6 +619,144 @@ pub struct OrchestratorCard {
     pub last_error: Option<String>,
     /// How to join from the three surfaces.
     pub join: JoinInstructions,
+}
+
+/// Where an orchestrator's app host runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorLocation {
+    /// The app host runs on this home.
+    Home,
+    /// The app host runs on an enrolled agent node.
+    Node,
+}
+
+/// The local auth material a UI client needs to call an app's loopback endpoint.
+///
+/// The password is a secret. Only the explicit local endpoint command returns it; the
+/// custom [`fmt::Debug`] redacts it, and no card, snapshot, log or error carries it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestratorAuth {
+    /// HTTP header carrying the credential, for example `Authorization`.
+    pub header: String,
+    /// Authentication scheme, for example `Basic`.
+    pub scheme: String,
+    /// Authentication username, for example `opencode`.
+    pub username: String,
+    /// Secret password; only the explicit local endpoint document carries it.
+    pub password: String,
+}
+
+impl fmt::Debug for OrchestratorAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrchestratorAuth")
+            .field("header", &self.header)
+            .field("scheme", &self.scheme)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Discovery document for a UI client connecting to one orchestrator.
+///
+/// The base fields always come from the orchestrator record. `url`, `native_session_id` and
+/// `auth` are filled only when the app host runs locally and its private loopback state is
+/// readable; a node-hosted or stopped orchestrator carries `null` for all three.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestratorEndpoint {
+    /// Orchestrator name.
+    pub name: String,
+    /// App the orchestrator runs.
+    pub app: OrchestratorApp,
+    /// Home session id the orchestrator mirrors.
+    pub session_id: SessionId,
+    /// Where the app host runs.
+    pub location: OrchestratorLocation,
+    /// Node that runs the app, when known.
+    #[serde(default)]
+    pub node: Option<NodeName>,
+    /// Lifecycle state at the time of the request.
+    pub state: OrchestratorNodeState,
+    /// Loopback URL (`http://127.0.0.1:<port>`), only for a live local endpoint.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// App-side session id, when the local app host knows one.
+    #[serde(default)]
+    pub native_session_id: Option<String>,
+    /// Local auth material, only for a live local endpoint.
+    #[serde(default)]
+    pub auth: Option<OrchestratorAuth>,
+    /// Who owns the orchestrator's session at the time of the request, when anyone does.
+    ///
+    /// Read from the home, so it is reported even for a node-hosted record. Old readers
+    /// ignore it; a document without it reads as `None`.
+    #[serde(default)]
+    pub owner: Option<SessionOwner>,
+    /// Whether the caller may write: [`EndpointAccess::Owner`] only for the live owner surface.
+    #[serde(default)]
+    pub access: EndpointAccess,
+}
+
+/// What the caller of an orchestrator endpoint may do with the session.
+///
+/// Recorded ownership is cooperative: a UI that talks to the app's HTTP API directly is not
+/// stopped by it. This value tells a well-behaved client whether to write or stay read-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointAccess {
+    /// The caller is the live owner surface and may write.
+    Owner,
+    /// Any other caller, including one that named no surface.
+    #[default]
+    ReadOnly,
+}
+
+impl EndpointAccess {
+    /// Returns the stable wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::ReadOnly => "read_only",
+        }
+    }
+}
+
+impl fmt::Display for EndpointAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The grant `vowp orchestrator attach` returns after it creates a desktop-UI surface.
+///
+/// `token` is the surface's lease token, shown once. The custom [`fmt::Debug`] redacts it.
+/// An attach grant never goes into a card, snapshot, log or error. `expires_at` is when the
+/// lease goes stale if the attach process stops heartbeating (`heartbeat_at` plus 60 s).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct OrchestratorAttach {
+    /// The desktop-UI surface the attach created.
+    pub surface_id: SurfaceId,
+    /// One-time lease token; a secret.
+    pub token: String,
+    /// The owner the attach produced.
+    pub owner: SessionOwner,
+    /// The endpoint document, with `access` set to the owner.
+    pub endpoint: OrchestratorEndpoint,
+    /// When the lease is stale if the attach process stops.
+    pub expires_at: Timestamp,
+}
+
+impl fmt::Debug for OrchestratorAttach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrchestratorAttach")
+            .field("surface_id", &self.surface_id)
+            .field("token", &"[REDACTED]")
+            .field("owner", &self.owner)
+            .field("endpoint", &self.endpoint)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// One home -> agent orchestrator command.

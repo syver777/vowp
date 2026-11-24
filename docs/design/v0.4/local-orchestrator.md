@@ -337,6 +337,15 @@ What v0.4 adds:
 The lease is per session, not per run. A **run fence** is separate: it keeps late frames from a
 disconnected run harmless even if the session lease has not yet moved.
 
+> **Superseded in part by v0.5.1.** The v0.5.1 ownership model extends this lease row with a mode
+> (`interactive` or `job`), an owner epoch and an expiry, so the 60-second stale window above now
+> applies to interactive owners only. A job run holds a `job`-mode owner with an expiry renewed by run
+> activity; an expired owner fences the run, and an explicit interactive takeover of a running job
+> fences it and leaves the job `ready`. A session with no owner refuses an interactive write.
+> The text above stays as the v0.4 record; the current rules are in
+> [`../v0.5.1/session-ownership.md`](../v0.5.1/session-ownership.md) and
+> [home and surfaces](../../concepts/home-and-surfaces.md#who-owns-a-session).
+
 The local app does not need the lease token in its configuration. The agent holds it; MCP tool
 calls are authorized by the agent's connection, the surface token and the home's lease check.
 
@@ -518,6 +527,8 @@ prints them, and never logs the port or password. The pair link is a secret.
 
 ```sh
 vowp orchestrator new --name mac --app opencode --node mac-studio --project vowp
+vowp orchestrator move mac --node mac-studio
+vowp orchestrator move mac --home
 ```
 
 - The home creates the orchestrator session and card, with `node=mac-studio` in the card. The home
@@ -531,6 +542,27 @@ vowp orchestrator new --name mac --app opencode --node mac-studio --project vowp
   `SurfaceAttach`/`Start`. If the node is offline, `resume` fails with `node_offline` in the MVP
   (queueing is Phase 3). `resume_all` marks a local orchestrator `degraded` when its node is
   offline; it never starts it on the home.
+- `orchestrator move <name> --node <node>` stops the current host, releases its lease, writes a
+  handoff capsule on the existing session and starts the orchestrator on that node; `--home`
+  reverses the direction. The exact same `SessionId` and the single session log on the home are
+  preserved. The target is validated first (active node, mapped project), so an unknown, pending,
+  revoked or unmapped target leaves the current host running. Moving to the current placement is
+  idempotent, or resumes a stopped record there. The target node must already have a paired surface
+  for the session; the home never mints a new session id during a move.
+- The node consumes a move as the landed `Start` command: the command names the orchestrator, app
+  and project, and the home session is carried by the target node's existing paired surface, not
+  by a wire field. The agent's order is: stop a live host for the name and close its bridge first
+  (the stop sends `SurfaceDetach` and releases the lease); read the active `surfaces/<id>/session`
+  pairing, ignoring a revoked or `needs_pair` surface; overwrite a stale local
+  `config.session`/`config.surface` from that pairing; write `config.json`, `AGENTS.md`,
+  `opencode.json` and `orchestrator.json` atomically at 0600; start the app bound to that session;
+  attach the surface and report `running`. A duplicate `Start`/`Resume` for the same binding
+  reports the live host without spawning a second process. A `Resume` whose active pairing names
+  a different binding than the live host is refused with `session_conflict` and leaves the live
+  host and its surface attached. No active pairing is `surface_missing`; more than one active
+  pairing without a configured surface is `surface_ambiguous`. Both refusals start nothing and
+  never mint a session id. The agent never rewrites `surfaces/<id>/session`: the home wrote it
+  when it paired the surface, and it is the home-issued authority for the move.
 - The local `AGENTS.md` template says: you are on a local surface; paths are project-relative; the
   home cannot see the Mac's local files; call `session_resume` if the tool is available; ask before
   public actions; never read a secret. It does not tell the app to open a tunnel; the agent is the

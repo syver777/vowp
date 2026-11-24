@@ -4,7 +4,7 @@
 //! `--force`; a second init without `--force` is a conflict (exit 4).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use vowp_protocol::{
@@ -25,20 +25,78 @@ struct InitOutput {
     skipped: Vec<String>,
 }
 
+/// What one successful initialisation wrote.
+///
+/// `vowp init` prints this; `project add --init` uses it only as a signal that this
+/// command ran the initializer, then registers through the same `register_checkout`.
+pub(crate) struct InitOutcome {
+    /// Project name written into `vowp.toml`.
+    pub project: ProjectName,
+    /// Checkout root that was initialised.
+    pub root: PathBuf,
+    /// Files written relative to the root.
+    pub written: Vec<String>,
+    /// Existing files that were left untouched.
+    pub skipped: Vec<String>,
+}
+
 /// Runs `vowp init`.
 pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i32, CliError> {
     let cwd = std::env::current_dir()?;
     let root = crate::ctx::find_git_root(&cwd)
         .ok_or_else(|| CliError::Invalid("init must run inside a git repository".to_owned()))?;
+    let paths = crate::ctx::node_paths(global)?;
+    let outcome = run_at(&paths, &root, args.name.as_deref(), args.force, args.no_framework)?;
+
+    if global.json {
+        crate::output::print_json(
+            io,
+            &InitOutput {
+                project: outcome.project.to_string(),
+                path: outcome.root.display().to_string(),
+                written: outcome.written,
+                skipped: outcome.skipped,
+            },
+        )?;
+    } else {
+        writeln!(
+            io.out(),
+            "initialised project {} at {} ({} files written, {} skipped)",
+            outcome.project,
+            outcome.root.display(),
+            outcome.written.len(),
+            outcome.skipped.len()
+        )?;
+        if !outcome.skipped.is_empty() {
+            writeln!(io.out(), "skipped: {}", outcome.skipped.join(", "))?;
+        }
+    }
+    Ok(0)
+}
+
+/// Initialises `root` without requiring the process to stand in it.
+///
+/// This is the whole `vowp init` body below its git-root lookup and above its
+/// rendering. `vowp init` and `project add --init` therefore write the same files,
+/// create the same registry rows, loops and worker slots, and share one conflict
+/// preflight. The caller owns printing; a second init of the same root without
+/// `force` is still a conflict.
+pub(crate) fn run_at(
+    paths: &vowp_store::NodePaths,
+    root: &Path,
+    name: Option<&str>,
+    force: bool,
+    no_framework: bool,
+) -> Result<InitOutcome, CliError> {
     let config_path = root.join("vowp.toml");
-    if config_path.exists() && !args.force {
+    if config_path.exists() && !force {
         return Err(CliError::Conflict(format!(
             "project already initialised at {}; use --force",
             root.display()
         )));
     }
 
-    let name = match &args.name {
+    let name = match name {
         Some(name) => ProjectName::parse(name)?,
         None => {
             let directory = root
@@ -56,10 +114,9 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
     // Check the registry before touching the checkout. `init` registers through the same
     // path as `project add` (§12.2), and a conflict must not leave a half-initialised
     // checkout that names a project the registry points elsewhere.
-    let paths = crate::ctx::node_paths(global)?;
-    let store = Store::open(&paths)?;
+    let store = Store::open(paths)?;
     if let Some(existing) = store.project(&name)? {
-        if !same_checkout(&existing.path, &root) {
+        if !same_checkout(&existing.path, root) {
             return Err(CliError::Conflict(format!(
                 "project {name} is already registered at {}",
                 existing.path
@@ -68,7 +125,7 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
     } else if let Some(existing) = store
         .list_project_entries()?
         .into_iter()
-        .find(|entry| same_checkout(&entry.path, &root))
+        .find(|entry| same_checkout(&entry.path, root))
     {
         return Err(CliError::Conflict(format!(
             "{} is already registered as project {}",
@@ -85,27 +142,27 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
 
     let mut written = Vec::new();
     let mut skipped = Vec::new();
-    write_relative(&root, "vowp.toml", &config_text, args.force, &mut written, &mut skipped)?;
+    write_relative(root, "vowp.toml", &config_text, force, &mut written, &mut skipped)?;
 
     std::fs::create_dir_all(root.join(".vowp/jobs"))?;
     std::fs::create_dir_all(root.join(".vowp/checkpoints"))?;
 
-    if !args.no_framework {
+    if !no_framework {
         for file in crate::framework::FILES {
             if file.target == "CLAUDE.md" {
-                write_claude_md(&root, file.content, args.force, &mut written, &mut skipped)?;
+                write_claude_md(root, file.content, force, &mut written, &mut skipped)?;
             } else {
-                write_relative(&root, file.target, file.content, args.force, &mut written, &mut skipped)?;
+                write_relative(root, file.target, file.content, force, &mut written, &mut skipped)?;
             }
         }
     }
 
-    if ensure_gitignore(&root)? {
+    if ensure_gitignore(root)? {
         written.push(".gitignore".to_owned());
     }
 
-    crate::node_ctx::ensure_home_project_file(&paths)?;
-    let store = Store::open(&paths)?;
+    crate::node_ctx::ensure_home_project_file(paths)?;
+    let store = Store::open(paths)?;
     let now = store.clock().now();
     // The reserved `_node` project owns project-less session runs and node-wide history.
     // It is created here so a fresh home always has the row and its database.
@@ -121,7 +178,7 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
             updated_at: now,
         })?;
     } else {
-        Store::create_project_db(&paths, &node_project)?;
+        Store::create_project_db(paths, &node_project)?;
     }
     store.upsert_node(&Node {
         name: config.node.name.clone(),
@@ -147,8 +204,8 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
     // A home with several projects is fleet-only until the caller says which project it
     // means. Open the registered project explicitly for its loop rows and worker slots.
     drop(store);
-    Store::create_project_db(&paths, &config.project.name)?;
-    let store = Store::open_with_project(&paths, &config.project.name)?;
+    Store::create_project_db(paths, &config.project.name)?;
+    let store = Store::open_with_project(paths, &config.project.name)?;
     for loop_ in default_loops(&config.project.name, now) {
         store.upsert_loop(&loop_)?;
     }
@@ -165,30 +222,12 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, args: &InitArgs) -> Result<i
         config.node.max_verifiers,
     )?;
 
-    if global.json {
-        crate::output::print_json(
-            io,
-            &InitOutput {
-                project: config.project.name.to_string(),
-                path: root.display().to_string(),
-                written,
-                skipped,
-            },
-        )?;
-    } else {
-        writeln!(
-            io.out(),
-            "initialised project {} at {} ({} files written, {} skipped)",
-            config.project.name,
-            root.display(),
-            written.len(),
-            skipped.len()
-        )?;
-        if !skipped.is_empty() {
-            writeln!(io.out(), "skipped: {}", skipped.join(", "))?;
-        }
-    }
-    Ok(0)
+    Ok(InitOutcome {
+        project: config.project.name.clone(),
+        root: root.to_path_buf(),
+        written,
+        skipped,
+    })
 }
 
 /// Builds the config `init` writes: four default profiles and no schedules.

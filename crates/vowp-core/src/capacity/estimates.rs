@@ -148,7 +148,7 @@ fn last_window(mut rows: Vec<&RunUsage>) -> Vec<&RunUsage> {
 
 /// Builds one estimate from a non-empty sample set.
 fn from_stats(key: &EstimateKey, build: BuildMode, rows: &[&RunUsage], source: EstimateSource) -> UsageEstimate {
-    let mut ram: Vec<u64> = rows.iter().map(|row| row.peak_rss_bytes).collect();
+    let mut ram: Vec<u64> = rows.iter().map(|row| working_set_bytes(row)).collect();
     let mut cpu: Vec<f64> = rows.iter().map(|row| row.mean_cpu_cores).collect();
     let mut duration: Vec<u64> = rows.iter().map(|row| row.duration_ms).collect();
     ram.sort_unstable();
@@ -169,6 +169,25 @@ fn from_stats(key: &EstimateKey, build: BuildMode, rows: &[&RunUsage], source: E
         duration_p90_ms: percentile_u64(&duration, 90.0),
         source,
     }
+}
+
+/// Returns the RAM a run really needed: its working set, without reclaimable page cache.
+///
+/// `memory.peak` counts file/page cache, which a `cargo` build fills with gigabytes of build
+/// artifacts and the kernel drops again under pressure. So the estimate prefers, in order:
+/// sampled `anon + kernel`; then `peak - file` when only the file share is known; then the
+/// raw peak (adapter-only or legacy rows). The result never exceeds the raw peak. Legacy
+/// cache-inflated rows with no breakdown stay at their raw peak until fresh anon samples
+/// push them out of the newest-[`WINDOW`] runs of their group.
+pub fn working_set_bytes(row: &RunUsage) -> u64 {
+    let peak = row.peak_rss_bytes.max(1);
+    if let Some(anon) = row.anon_peak_bytes {
+        return anon.saturating_add(row.kernel_peak_bytes.unwrap_or(0)).clamp(1, peak);
+    }
+    if let Some(file) = row.file_peak_bytes {
+        return peak.saturating_sub(file).max(1);
+    }
+    peak
 }
 
 /// Returns the compiled conservative default for `key`.

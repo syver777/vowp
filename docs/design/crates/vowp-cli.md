@@ -27,8 +27,11 @@ crates/vowp-cli/
   src/cmd/session_asif.rs  (ASIF export/import facade: flags, temp files, remote stream)
   src/cmd/promote.rs  (`promote`, `rollback`, `releases`)
   src/cmd/capacity.rs  (`capacity show|report|set|reload|history`; the report adds effective
-                       provider caps and reload pending, `reload` asks the supervisor or checks
-                       locally, and `history` reads the bounded rollups read-only)
+                       provider caps, reload pending and the additive cluster card, `reload` asks
+                       the supervisor or checks locally, and `history` reads the bounded rollups
+                       read-only)
+  src/cmd/secret.rs    (`secret set|ls|rm|upgrade|request` and the hidden vault helpers; `set
+                       --stdin` reads stdin, `upgrade --encrypted` selects the age mode)
   src/cmd/agent.rs    (`agent enroll|paths|pair|run|status|service|doctor` plus hidden `agent gateway`; no store or project context for the Mac commands)
   src/agent_exec.rs   (`CoreRunHandler`: the Mac assignment executor used by `agent run`, including bundle chunking)
   src/cmd/surface.rs  (`surface pair|ls|rotate|revoke`; home-only global-store surface pairing)
@@ -38,6 +41,27 @@ crates/vowp-cli/
 ```
 Every command module in `src/cmd/` is real code. A command that cannot run returns an explicit error (exit code 1, message `not implemented in this build`);
 no command may ship as a stub in a final build: the acceptance test `no_command_returns_not_implemented` iterates every command in `cli.rs` with `--help`-free dry arguments and fails on `NotImplemented`.
+
+`cmd/project.rs` owns the one-step bootstrap behind `project add --git/--init/--orchestrator`.
+It keeps the clone argv builder (`clone_argv`), target validation (`clone_target`), URL
+credential detector (`url_has_credentials`) and stderr redaction (`redacted_clone_stderr`) next
+to the command, so the unit tests run without a home. `cmd/init.rs` exposes
+`run_at(paths, root, name, force, no_framework)`: the whole initializer body without the cwd
+lookup or printing, shared by `vowp init` and `project add --init`. `cmd/orchestrator.rs`
+exports `parse_app`, `app_name` and `ensure_keeper_at(paths, project_root, orchestrator, info)`
+so the bootstrap creates the same card and detached keeper as `orchestrator new`. The bootstrap
+runs node-scoped (`project::run_node`), registers before it touches the orchestrator, and prints
+one `{"project","path","initialized","orchestrator"}` summary; see
+[`../v0.5/project-bootstrap.md`](../v0.5/project-bootstrap.md).
+
+`cmd/orchestrator.rs` serves `orchestrator move` through `Orchestrator::move_to_node`. The parsed
+global `--node` is the target node, not an SSH redirect, and `cli.rs` rewrites a bare `--home`
+after the subcommand to the hidden `--move-home` switch so the global `--home <DIR>` flag keeps
+its meaning before the command. `cmd/secret.rs` keeps `set --stdin` stdin-only (one trailing
+newline stripped, empty refused) and routes `upgrade --encrypted` to the core age-keyfile
+upgrade; the two flags are hidden from `--help`, so the generated CLI reference does not list
+them, while [`../cli.md`](../cli.md) §6.6 and [`../v0.5/vault-encrypted.md`](../v0.5/vault-encrypted.md)
+document the contract.
 
 ## 2. Shared API (frozen)
 
@@ -301,8 +325,25 @@ node that runs the app:
 - `orchestrator ls` adds a `NODE` column (`home` for a v0.2 orchestrator) and the JSON card
   carries `node` and the typed `state`. `stop`/`resume <name>` read the node from
   `orchestrator.json`; `resume` on an offline node prints `node_offline` and exits 7.
+- `orchestrator endpoint <name> [--json]` calls `Orchestrator::endpoint` and prints the
+  `OrchestratorEndpoint` document. It is home-side inspection, so the global `--node` is
+  consumed and never becomes an SSH redirect (`take_orchestrator_node` returns `None` for
+  it). A node-hosted record returns `location: "node"` with null endpoint values and the
+  human output names `vowp agent orchestrator endpoint <name> --json`. A live home-hosted
+  opencode host returns the loopback URL, native id and Basic auth; a stopped host, Claude or
+  chat leaves them null. The human key/value block prints the auth scheme and username and
+  points at `--json` for the password, which is never printed on the terminal.
 - The output is the `OrchestratorCard`; a node card carries no directory, port, token, pair
   link or secret. Human output prints the orchestrator directory and the card's join text only.
+
+`vowp agent orchestrator endpoint <name> [--json]` lives in `cmd/agent.rs`. It runs before
+`Ctx::build` with the other agent commands, builds an `OrchestratorHost` over
+`AgentConfig::default_state_dir()`, and prints the same document with `location: "node"`.
+It reads only local files: the private `config.json`, the recorded `host.json` and, for a live
+opencode host, the 0600 `service.json`. An unknown name is `not_found` (exit 3); a corrupt or
+too-wide file keeps the agent's typed `config_invalid` code but is invalid input at the CLI
+(exit 2), the same class as the home command's invalid error, with no path or secret in the
+message. The password is only in `--json`.
 
 ### Local chat (`chat --agent`)
 
@@ -460,7 +501,34 @@ home with no database and a fake mode-0600 Unix socket. The local-orchestrator s
 `orchestrator_apply_result_correlates_the_late_node_result` and
 `orchestrator_card_contains_no_path_or_secret` in `tests/orchestrator.rs`. They use a
 temporary home, a fake app host and a fake agent command stream; no real app, tmux, network
-or home directory is touched.
+or home directory is touched. The endpoint slice adds
+`orchestrator_endpoint_json_reports_home_and_node_locations`,
+`orchestrator_endpoint_remote_never_returns_auth` and
+`orchestrator_endpoint_redacts_a_corrupt_private_file_error` in `tests/orchestrator.rs`, plus
+`agent_orchestrator_endpoint_json_returns_local_auth_and_ls_stays_clean` in `tests/agent.rs`;
+they use a temporary home or `VOWP_AGENT_HOME`, a private live `host.json`/`service.json` and
+the test process id, and never open a socket, SSH or a real app.
+
+The move slice adds `orchestrator_move_requires_exactly_one_target_and_never_ssh_redirects`,
+`orchestrator_move_preserves_the_session_between_home_and_an_agent` and
+`orchestrator_move_to_a_revoked_node_keeps_the_home_host_running` in `tests/orchestrator.rs`.
+The bootstrap slice adds `project_add_without_new_flags_keeps_the_legacy_json` in `tests/up.rs`
+and `project_add_git_clones_initializes_registers_and_returns_one_summary`,
+`project_add_git_refuses_an_existing_target_and_a_url_with_credentials`,
+`project_add_init_is_skipped_when_vowp_toml_exists`,
+`project_add_git_failure_leaves_no_partial_checkout_or_registry_row`,
+`project_add_orchestrator_reuses_a_matching_existing_card_and_refuses_a_conflict`,
+`project_add_orchestrator_failure_keeps_the_project_and_names_the_retry` and
+`project_add_bootstrap_summary_never_contains_the_url_or_a_secret` in `tests/init.rs`; the
+clone-argv, credential and basename unit tests live in `src/cmd/project.rs`. The vault slice
+adds `secret_set_stdin_and_ls_json_report_the_mode_without_values`,
+`secret_ls_json_is_an_object_and_rm_keeps_its_shape` and
+`secret_set_stdin_refuses_an_empty_value` in `tests/maint.rs`, plus
+`secret_set_stdin_routes_without_a_tty_and_keeps_the_tty_form` in `tests/control.rs`. The
+cluster slice adds `capacity_report_and_fleet_status_show_cluster_totals` in
+`tests/capacity.rs`, run through the registered `vowp-core` `capacity_admit` target. All use
+temporary homes, fake harnesses or host commands and a private tmux environment; no real home,
+network, SSH or app is touched.
 
 The phase-4 CLI slice adds `agent_service_install_print_writes_nothing_and_names_the_manager`,
 `agent_service_install_without_home_exits_two`, `agent_service_unsupported_platform_is_exit_five`,

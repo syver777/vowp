@@ -7,7 +7,9 @@
 //! maps an [`Executor`] to the adapter that can run it.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,17 +17,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use vowp_adapters::acp::{AcpAdapter, AcpConfig};
 use vowp_adapters::claude_code::{ClaudeCodeAdapter, ClaudeConfig};
 use vowp_adapters::cli::CliAdapter;
 use vowp_adapters::opencode::{OpencodeAdapter, OpencodeConfig};
 use vowp_adapters::proc::{Signal, signal_group};
 use vowp_protocol::{
-    Adapter, Clock, Executor, HarnessKind, Log, NodeName, Project, ProjectName, Timestamp, VowpConfig,
+    Adapter, AdapterCapabilities, AdapterError, AdapterRun, Clock, Executor, HarnessKind, Log, NodeName, ProbeResult,
+    Project, ProjectName, StartInput, Timestamp, VowpConfig,
 };
 use vowp_store::{NodePaths, Store};
 
 use crate::CoreError;
-use crate::adapters::acp_adapter;
+use crate::adapters::acp_config;
 
 /// Bytes of merged command output kept by [`SystemRunner`]; older bytes are dropped first.
 const OUTPUT_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -658,6 +662,350 @@ impl GitOps for SystemGit {
     }
 }
 
+/// Where a resolved harness binary came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinarySource {
+    /// The configured value itself, used as a multi-component path.
+    Config,
+    /// A `PATH` lookup: a bare configured name, the file name of a moved configured path,
+    /// or the harness default name.
+    Path,
+    /// opencode's documented `$HOME/.opencode/bin/opencode` fallback.
+    HomeFallback,
+}
+
+impl BinarySource {
+    /// Returns the short label shown after "resolved from" in a probe detail.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Path => "PATH",
+            Self::HomeFallback => "$HOME fallback",
+        }
+    }
+}
+
+/// A harness binary resolved immediately before one spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBinary {
+    /// The executable path.
+    pub path: PathBuf,
+    /// Where [`ResolvedBinary::path`] came from.
+    pub source: BinarySource,
+}
+
+/// Hint shown when no harness binary can be found.
+///
+/// A missing binary is an install or configuration problem, never a provider outage.
+pub const HARNESS_BINARY_HINT: &str = "install the harness or fix [harnesses.*].binary";
+
+/// Resolves the harness binary for one spawn.
+///
+/// Order: a configured multi-component path while it is executable (it wins over `PATH`);
+/// otherwise the configured file name after `previous` resolved successfully, a configured
+/// bare name, or `default_name` on `search_path` (the process `PATH` when `None`); and
+/// finally, only when no binary was configured and no test search path is injected,
+/// `home_relative` under `$HOME`.
+///
+/// `previous` is the path this same configured value resolved to before. It gates the
+/// moved-path fallback: a path that was never resolved is a configuration error, not a
+/// reason to guess an unrelated binary from `PATH`.
+pub fn resolve_harness_binary(
+    configured: Option<&str>,
+    default_name: &str,
+    search_path: Option<&OsStr>,
+    home_relative: Option<&str>,
+    previous: Option<&Path>,
+) -> Option<ResolvedBinary> {
+    if let Some(value) = configured {
+        let path = Path::new(value);
+        if path.components().count() > 1 {
+            if is_executable(path) {
+                return Some(ResolvedBinary {
+                    path: path.to_path_buf(),
+                    source: BinarySource::Config,
+                });
+            }
+            previous?;
+            let name = path.file_name().and_then(OsStr::to_str);
+            if let Some(name) = name
+                && let Some(found) = search_path_for(name, search_path)
+            {
+                return Some(ResolvedBinary {
+                    path: found,
+                    source: BinarySource::Path,
+                });
+            }
+            return None;
+        }
+        return search_path_for(value, search_path).map(|path| ResolvedBinary {
+            path,
+            source: BinarySource::Path,
+        });
+    }
+
+    if let Some(path) = search_path_for(default_name, search_path) {
+        return Some(ResolvedBinary {
+            path,
+            source: BinarySource::Path,
+        });
+    }
+
+    // An injected search path is the whole resolution view for a test; do not leak the
+    // real `$HOME` install into it.
+    if search_path.is_some() {
+        return None;
+    }
+    let relative = home_relative?;
+    let home = std::env::var_os("HOME")?;
+    let candidate = Path::new(&home).join(relative);
+    is_executable(&candidate).then_some(ResolvedBinary {
+        path: candidate,
+        source: BinarySource::HomeFallback,
+    })
+}
+
+/// Returns true for a regular file with at least one execute bit.
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+/// Looks `name` up in `search_path`, or the process `PATH` when it is `None`.
+fn search_path_for(name: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    let path_var = match search_path {
+        Some(path) => path.to_os_string(),
+        None => std::env::var_os("PATH")?,
+    };
+    for directory in std::env::split_paths(&path_var) {
+        let candidate = directory.join(name);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The built-in adapter configurations, rebuilt for every spawn.
+#[derive(Clone)]
+enum BuiltinSpec {
+    ClaudeCode(ClaudeConfig),
+    Opencode(OpencodeConfig),
+    Acp(AcpConfig),
+}
+
+impl BuiltinSpec {
+    /// Returns the configured value, the harness default name and the HOME fallback.
+    fn config_parts(&self) -> (Option<&str>, &'static str, Option<&'static str>) {
+        match self {
+            Self::ClaudeCode(config) => (config.binary.as_deref(), "claude", None),
+            Self::Opencode(config) => (config.binary.as_deref(), "opencode", Some(".opencode/bin/opencode")),
+            Self::Acp(config) => (config.binary.as_deref(), "claude-code-acp", None),
+        }
+    }
+
+    /// The configured value, or the harness default name, for error messages.
+    fn requested(&self) -> String {
+        let (binary, default, _) = self.config_parts();
+        binary.unwrap_or(default).to_owned()
+    }
+
+    /// Builds an adapter around one resolved path.
+    fn build_resolved(&self, resolved: &ResolvedBinary) -> Arc<dyn Adapter> {
+        let binary = Some(resolved.path.to_string_lossy().into_owned());
+        match self {
+            Self::ClaudeCode(config) => Arc::new(ClaudeCodeAdapter::new(ClaudeConfig {
+                binary,
+                ..config.clone()
+            })),
+            Self::Opencode(config) => Arc::new(OpencodeAdapter::new(OpencodeConfig {
+                binary,
+                ..config.clone()
+            })),
+            Self::Acp(config) => Arc::new(AcpAdapter::new(AcpConfig {
+                binary,
+                ..config.clone()
+            })),
+        }
+    }
+
+    /// Resolves the binary now and builds an adapter that will run it.
+    fn build(
+        &self,
+        search_path: Option<&OsStr>,
+        previous: Option<&Path>,
+    ) -> Result<(Arc<dyn Adapter>, ResolvedBinary), AdapterError> {
+        let (configured, default_name, home_relative) = self.config_parts();
+        let resolved = resolve_or_error(configured, default_name, search_path, home_relative, previous)?;
+        Ok((self.build_resolved(&resolved), resolved))
+    }
+
+    /// Rebuilds the adapter after a locator failure, searching `PATH` by file name.
+    ///
+    /// The configured multi-component path is deliberately ignored here: it may still be an
+    /// executable file that cannot be spawned (a missing interpreter) or it may have moved
+    /// between resolution and spawn. A bare configured value or the default name is used as
+    /// the lookup name, so the retry can find the harness where it actually is.
+    fn build_from_path(&self, search_path: Option<&OsStr>) -> Result<(Arc<dyn Adapter>, ResolvedBinary), AdapterError> {
+        let (configured, default_name, home_relative) = self.config_parts();
+        let name = configured
+            .and_then(|value| Path::new(value).file_name())
+            .and_then(OsStr::to_str)
+            .unwrap_or(default_name);
+        let resolved = resolve_harness_binary(Some(name), default_name, search_path, home_relative, None)
+            .ok_or_else(|| missing_binary_error(&self.requested()))?;
+        Ok((self.build_resolved(&resolved), resolved))
+    }
+}
+
+/// Builds the actionable locator error for `requested`.
+fn missing_binary_error(requested: &str) -> AdapterError {
+    AdapterError::Unavailable(format!("harness not found: {requested}; {HARNESS_BINARY_HINT}"))
+}
+
+/// Resolves a binary or returns the actionable locator error.
+fn resolve_or_error(
+    configured: Option<&str>,
+    default_name: &str,
+    search_path: Option<&OsStr>,
+    home_relative: Option<&str>,
+    previous: Option<&Path>,
+) -> Result<ResolvedBinary, AdapterError> {
+    resolve_harness_binary(configured, default_name, search_path, home_relative, previous)
+        .ok_or_else(|| missing_binary_error(configured.unwrap_or(default_name)))
+}
+
+/// An adapter that resolves its binary immediately before every spawn.
+///
+/// `prototype` answers `kind` and `capabilities`; it never starts a process. The real
+/// adapter is built from `spec` on each start. A locator failure is retried exactly once,
+/// and a second failure carries the install/fix hint instead of a provider fault.
+struct ResolvingAdapter {
+    prototype: Arc<dyn Adapter>,
+    spec: BuiltinSpec,
+    /// Test seam: overrides the child/process `PATH` used for resolution.
+    search_path: Option<OsString>,
+    /// Last path this spec resolved. Only a path that resolved before can have "moved",
+    /// so the file-name fallback is never used for a configured path that never existed.
+    last_resolved: Mutex<Option<PathBuf>>,
+}
+
+impl ResolvingAdapter {
+    /// Returns the last path this spec resolved, if any.
+    fn previous(&self) -> Option<PathBuf> {
+        self.last_resolved.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Remembers a successful resolution as the next spawn's hint.
+    fn remember(&self, path: &Path) {
+        if let Ok(mut guard) = self.last_resolved.lock() {
+            *guard = Some(path.to_path_buf());
+        }
+    }
+}
+
+impl Adapter for ResolvingAdapter {
+    fn kind(&self) -> HarnessKind {
+        self.prototype.kind()
+    }
+
+    fn probe(&self) -> ProbeResult {
+        let previous = self.previous();
+        match self.spec.build(self.search_path.as_deref(), previous.as_deref()) {
+            Ok((adapter, resolved)) => {
+                self.remember(&resolved.path);
+                let mut probe = adapter.probe();
+                // `vowp doctor` shows ProbeResult.detail and version, so naming the path and
+                // its origin here makes the locator visible without a CLI change.
+                probe.detail = probe_detail(&probe.detail, &resolved);
+                probe.path = Some(resolved.path.to_string_lossy().into_owned());
+                probe
+            }
+            Err(error) => ProbeResult {
+                ok: false,
+                version: None,
+                path: None,
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        self.prototype.capabilities()
+    }
+
+    fn start(&self, input: StartInput) -> Result<Box<dyn AdapterRun>, AdapterError> {
+        let child_path = child_search_path(&input.env);
+        let search = self.search_path.as_deref().or(child_path.as_deref());
+        let previous = self.previous();
+        let (first, resolved) = self.spec.build(search, previous.as_deref())?;
+        self.remember(&resolved.path);
+        match first.start(input.clone()) {
+            Ok(run) => Ok(run),
+            Err(error) if is_locator_failure(&error) => {
+                // The cached path can be an executable file that fails to spawn (missing
+                // interpreter) or it can move between resolution and spawn. Retry once with
+                // a PATH lookup by file name, then report the actionable hint.
+                let (retry, resolved) = self.spec.build_from_path(search)?;
+                self.remember(&resolved.path);
+                retry
+                    .start(input)
+                    .map_err(|error| locator_error(&self.spec.requested(), error))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Appends the resolved path and its origin to an adapter probe detail.
+fn probe_detail(detail: &str, resolved: &ResolvedBinary) -> String {
+    let origin = format!("resolved from {}: {}", resolved.source.label(), resolved.path.display());
+    if detail.trim().is_empty() {
+        origin
+    } else {
+        format!("{detail}; {origin}")
+    }
+}
+
+/// Returns the `PATH` carried by a start input, when the caller passed one.
+fn child_search_path(env: &[(String, String)]) -> Option<OsString> {
+    env.iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| OsString::from(value))
+}
+
+/// Returns true when the error says the harness binary could not be found.
+fn is_locator_failure(error: &AdapterError) -> bool {
+    match error {
+        AdapterError::Unavailable(_) => true,
+        AdapterError::Spawn { source, .. } => source.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+/// Converts a locator failure into the actionable install/fix error.
+fn locator_error(requested: &str, error: AdapterError) -> AdapterError {
+    if is_locator_failure(&error) {
+        missing_binary_error(requested)
+    } else {
+        error
+    }
+}
+
+/// Wraps a built-in spec in a per-spawn resolving adapter.
+fn resolving_adapter(spec: BuiltinSpec, search_path: Option<OsString>) -> Arc<dyn Adapter> {
+    let prototype: Arc<dyn Adapter> = match &spec {
+        BuiltinSpec::ClaudeCode(config) => Arc::new(ClaudeCodeAdapter::new(config.clone())),
+        BuiltinSpec::Opencode(config) => Arc::new(OpencodeAdapter::new(config.clone())),
+        BuiltinSpec::Acp(config) => Arc::new(AcpAdapter::new(config.clone())),
+    };
+    Arc::new(ResolvingAdapter {
+        prototype,
+        spec,
+        search_path,
+        last_resolved: Mutex::new(None),
+    })
+}
+
 /// Maps an [`Executor`] to the adapter that can run it.
 ///
 /// Keys are `claude-code`, `opencode`, `acp` and `cli:<name>`; tests inject fakes with
@@ -677,32 +1025,44 @@ impl AdapterRegistry {
     ///
     /// `claude-code`, `opencode` and `acp` always exist, with defaults when their table is
     /// absent. Every other harness entry must name a `mapping` file and becomes `cli:<name>`.
+    ///
+    /// Building the registry deliberately resolves no binary path: each built-in adapter
+    /// resolves its configured value immediately before a spawn, so a harness that moves or
+    /// a `PATH` that changes is recovered without rebuilding `Deps`.
     pub fn from_config(config: &VowpConfig) -> Result<Self, CoreError> {
+        Self::from_config_with_search_path(config, None)
+    }
+
+    /// Builds the registry with a fixed resolution `PATH`.
+    ///
+    /// `None` uses the child environment's `PATH` when present and the process `PATH`
+    /// otherwise. Tests use the parameter to resolve hermetic fake binaries; production
+    /// callers use [`AdapterRegistry::from_config`].
+    #[doc(hidden)]
+    pub fn from_config_with_search_path(config: &VowpConfig, search_path: Option<OsString>) -> Result<Self, CoreError> {
         let tz = config.node.tz_offset_minutes;
         let claude = config.harnesses.get("claude-code").cloned().unwrap_or_default();
         let opencode = config.harnesses.get("opencode").cloned().unwrap_or_default();
 
+        let claude_spec = BuiltinSpec::ClaudeCode(ClaudeConfig {
+            binary: claude.binary,
+            extra_args: claude.extra_args,
+            permission_mode: claude.permission_mode,
+            tz_offset_minutes: tz,
+            ..ClaudeConfig::default()
+        });
+        let opencode_spec = BuiltinSpec::Opencode(OpencodeConfig {
+            binary: opencode.binary,
+            extra_args: opencode.extra_args,
+            tz_offset_minutes: tz,
+            ..OpencodeConfig::default()
+        });
+        let acp_spec = BuiltinSpec::Acp(acp_config(config));
+
         let mut registry = Self::new()
-            .with(
-                "claude-code",
-                Arc::new(ClaudeCodeAdapter::new(ClaudeConfig {
-                    binary: claude.binary,
-                    extra_args: claude.extra_args,
-                    permission_mode: claude.permission_mode,
-                    tz_offset_minutes: tz,
-                    ..ClaudeConfig::default()
-                })),
-            )
-            .with(
-                "opencode",
-                Arc::new(OpencodeAdapter::new(OpencodeConfig {
-                    binary: opencode.binary,
-                    extra_args: opencode.extra_args,
-                    tz_offset_minutes: tz,
-                    ..OpencodeConfig::default()
-                })),
-            )
-            .with("acp", Arc::new(acp_adapter(config)));
+            .with("claude-code", resolving_adapter(claude_spec, search_path.clone()))
+            .with("opencode", resolving_adapter(opencode_spec, search_path.clone()))
+            .with("acp", resolving_adapter(acp_spec, search_path));
 
         for (name, harness) in &config.harnesses {
             if matches!(name.as_str(), "claude-code" | "opencode" | "acp" | "vowp") {

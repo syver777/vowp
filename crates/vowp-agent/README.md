@@ -17,7 +17,7 @@ The crate depends on `vowp-protocol` only. It never opens a store or a database 
 
 ## Status
 
-VOWP 0.4.0 is an early release. The agent client and the local orchestrator are new in 0.4.0 and their
+VOWP 0.5.1-dev is an early release. The agent client and the local orchestrator are new in 0.4.0 and their
 interfaces are not yet stable while VOWP is in 0.x.
 
 ## Links

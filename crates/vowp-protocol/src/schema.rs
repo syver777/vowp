@@ -23,8 +23,8 @@ use crate::api::{
 };
 use crate::asif::{AsifCounts, AsifImportResponse, AsifLoss, AsifReport};
 use crate::capacity::{
-    BrakeState, CapacityAdvice, CapacityHistory, CapacityReport, CapacitySnapshot, CapacityTarget, HostSample,
-    RunUsage, RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
+    BrakeState, CapacityAdvice, CapacityHistory, CapacityReport, CapacitySnapshot, CapacityTarget, ClusterCapacity,
+    HostSample, RunUsage, RunningCapacity, UsageEstimate, WaitReason, WaitingJob,
 };
 use crate::capsule::{Capsule, CapsuleDraft};
 use crate::catalog::{BackupFile, BackupReport, CatalogEntry, GcClassReport, GcReport};
@@ -51,8 +51,10 @@ use crate::snapshot::{
     RunningJobCard, SessionSurfaceCard, Snapshot, SupervisorSnapshot,
 };
 use crate::surface::{
-    IngestAck, JoinInstructions, Lease, LeaseStatus, OrchestratorCard, OrchestratorCommand, OrchestratorError,
-    OrchestratorNodeState, OrchestratorResult, RemoteEvent, RemoteLine, Surface, SurfaceRef, TakeoverReport, TurnGrant,
+    EndpointAccess, IngestAck, JoinInstructions, Lease, LeaseStatus, OrchestratorAttach, OrchestratorAuth,
+    OrchestratorCard, OrchestratorCommand, OrchestratorEndpoint, OrchestratorError, OrchestratorLocation,
+    OrchestratorNodeState, OrchestratorResult, OwnershipMode, OwnershipState, RemoteEvent, RemoteLine, SessionOwner,
+    Surface, SurfaceActivity, SurfaceRef, TakeoverReport, TurnGrant,
 };
 use crate::vault::{SecretInfo, SecretRequest};
 
@@ -101,6 +103,7 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("CapacityTarget", schema_value::<CapacityTarget>());
     schemas.insert("CapacityAdvice", schema_value::<CapacityAdvice>());
     schemas.insert("CapacityReport", schema_value::<CapacityReport>());
+    schemas.insert("ClusterCapacity", schema_value::<ClusterCapacity>());
     schemas.insert("RunningCapacity", schema_value::<RunningCapacity>());
     schemas.insert("WaitingJob", schema_value::<WaitingJob>());
     schemas.insert("CapacitySnapshot", schema_value::<CapacitySnapshot>());
@@ -108,6 +111,10 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("Surface", schema_value::<Surface>());
     schemas.insert("Lease", schema_value::<Lease>());
     schemas.insert("SurfaceRef", schema_value::<SurfaceRef>());
+    schemas.insert("SessionOwner", schema_value::<SessionOwner>());
+    schemas.insert("OwnershipMode", schema_value::<OwnershipMode>());
+    schemas.insert("OwnershipState", schema_value::<OwnershipState>());
+    schemas.insert("SurfaceActivity", schema_value::<SurfaceActivity>());
     schemas.insert("LeaseStatus", schema_value::<LeaseStatus>());
     schemas.insert("TakeoverReport", schema_value::<TakeoverReport>());
     schemas.insert("RemoteEvent", schema_value::<RemoteEvent>());
@@ -119,6 +126,11 @@ pub fn all_schemas() -> BTreeMap<&'static str, serde_json::Value> {
     schemas.insert("OrchestratorCommand", schema_value::<OrchestratorCommand>());
     schemas.insert("OrchestratorResult", schema_value::<OrchestratorResult>());
     schemas.insert("OrchestratorError", schema_value::<OrchestratorError>());
+    schemas.insert("OrchestratorLocation", schema_value::<OrchestratorLocation>());
+    schemas.insert("OrchestratorAuth", schema_value::<OrchestratorAuth>());
+    schemas.insert("OrchestratorEndpoint", schema_value::<OrchestratorEndpoint>());
+    schemas.insert("EndpointAccess", schema_value::<EndpointAccess>());
+    schemas.insert("OrchestratorAttach", schema_value::<OrchestratorAttach>());
     schemas.insert("JoinInstructions", schema_value::<JoinInstructions>());
     schemas.insert("Snapshot", schema_value::<Snapshot>());
     schemas.insert("SupervisorSnapshot", schema_value::<SupervisorSnapshot>());

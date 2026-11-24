@@ -76,6 +76,7 @@ that variable or a temporary `HOME`, so the real directory is never touched.
 | `orchestrators/<name>/opencode.json` | 0600 | opencode's global MCP config: the local `mcp.vowp` proxy command and the `instructions` entry for `AGENTS.md`; no token |
 | `orchestrators/<name>/orchestrator.json` | 0600 | redacted app record: name, app, project, session, surface and node; no token, port, password or local path |
 | `orchestrators/<name>/host.json` | 0600 | pid, lifecycle state (`starting`/`running`/`degraded`/`failed`/`stopped`) and a redacted detail |
+| `orchestrators/<name>/native-session.json` | 0600 | the last app-side session id the local bridge saw, `{"native_session_id": "…"}`; cleared on stop, never a URL or password |
 | `orchestrators/<name>/.opencode/{config,data,state,cache}/` | 0700 | private XDG roots for a managed opencode app |
 | `orchestrators/<name>/.opencode/state/opencode/service.json` | 0600 | the app's own service state; read for a port/password, never copied or logged |
 | `spool/<session>/<run>/events.jsonl` | 0600 | every sent event and the terminal summary, fsynced before send |
@@ -272,6 +273,8 @@ impl OpencodeBridge {
     pub fn load(service_json: &Path, state_dir: &Path, surface: SurfaceId, session: SessionId)
         -> Result<Self, AgentError>;
     pub fn with_native_session(self, native_session: impl Into<String>) -> Self;
+    pub fn with_native_session_state(self, path: impl Into<PathBuf>) -> Self;
+    pub fn observed_native_session(&self) -> Option<&str>;
     pub fn with_path_roots(self, roots: Vec<PathRoot>) -> Self;
     pub fn with_path_maps(self, maps: &[AgentPathMap]) -> Result<Self, AgentError>;
     pub fn with_path_root(self, root: PathRoot) -> Self;
@@ -368,6 +371,8 @@ impl OrchestratorHost {
     pub fn host_path(state_dir: &Path, name: &str) -> Result<PathBuf, OrchestratorError>;
     pub fn config(&self, name: &str) -> Result<Option<OrchestratorConfig>, OrchestratorError>;
     pub fn state(&self, name: &str) -> Result<Option<OrchestratorHostState>, OrchestratorError>;
+    pub fn live_state(&self, name: &str) -> Result<Option<OrchestratorHostState>, OrchestratorError>;
+    pub fn endpoint(&self, name: &str) -> Result<OrchestratorEndpoint, OrchestratorError>;
     pub fn prepare_start(&self, command: &OrchestratorCommand, project_root: Option<&Path>)
         -> PrepareOutcome;
     pub fn finish_start(&self, outcome: PrepareOutcome, link: &mut dyn SurfaceAttachment)
@@ -765,6 +770,18 @@ contiguous. A pending assistant message holds the cursor until it is flushed, so
 before the flush replays its text parts rather than losing them. The home's native-id
 deduplication covers the case where a write reached the home but the local cursor did not.
 
+**Native session id.** Every app event carrying a `sessionID` tells the bridge which app-side
+session it is mirroring. The bridge keeps the latest id in memory (`observed_native_session`) and,
+when its `service.json` belongs to a local orchestrator, finds that orchestrator's private
+`native-session.json` from the same `config.json` that names the service file and writes it on first
+sight and whenever the id changes. A caller that already knows the path can override the discovered
+location with `with_native_session_state(path)`. The write goes through the orchestrator host's
+atomic 0600 helper and the file holds only the id; it never carries the service URL, port, password
+or a local path. A re-created app session therefore replaces the previous hint. The id is
+remembered before the optional `with_native_session` filter, so a new session is visible even when
+the bridge is pinned to the old one. A hint write failure is diagnostic only: the frames are
+already spooled and the home remains the authority, and the bridge retries on the next event.
+
 **Paths.** `PathRoot`s are matched longest first. The exact project root becomes
 `project:<name>`; a path below it becomes `subdir:<name>/<relative>` when `PathRef::parse`
 accepts the result; the exact worktree root becomes `worktree:<name>/<job>`. Any other
@@ -890,17 +907,54 @@ a custom command that cannot start is `spawn_failed`; a malformed or too-wide fi
 
 The app runs in its own process group with private `XDG_CONFIG_HOME`, `XDG_DATA_HOME`,
 `XDG_STATE_HOME` and `XDG_CACHE_HOME` below `<orchestrator>/.opencode/`. The surface binding
-comes from the local config, or from the one paired surface under `surfaces/<id>/session`; no
-pairing is `surface_missing`, and more than one without an explicit choice is
-`surface_ambiguous`. The frame loop sends `SurfaceAttach` and only then writes `running`; a
-failed attach stops a fresh process and removes `host.json`, so no partial host remains. A
-duplicate `Start` or `Resume` finds the live pid and reports the existing state instead of
-spawning a second process; an already-running host is not attached twice.
+comes from the active paired surface named by the local config, or from the one other active
+pairing under `surfaces/<id>/session`. The pairing file written when the home paired the surface
+is authoritative: its session overwrites a stale `config.session`, and a revoked or `needs_pair`
+surface is ignored rather than started. No active pairing is `surface_missing`, and more than one
+without a configured surface is `surface_ambiguous`; neither mints a `SessionId`. The frame loop
+sends `SurfaceAttach` and only then writes `running`; a failed attach stops a fresh process and
+removes `host.json`, so no partial host remains. A duplicate `Start` or `Resume` finds the live
+pid and reports the existing state instead of spawning a second process; an already-running host
+is not attached twice.
+
+A `Start` is also the landed move command. The home's move keeps the session id and expects the
+target node's active pairing to be bound to it; the wire shape carries the name, app and project,
+not a session or surface field. The client stops a live host whose recorded binding differs from
+the active pairing before it starts another: it flushes and closes that host's bridge, sends
+`SurfaceDetach`, signals the old process group and waits for it to exit. The worker then resolves
+the active pairing, overwrites a stale local `config.session`/`config.surface`, rewrites the app
+files and starts the app bound to that session. The agent never rewrites the pairing file itself.
+A duplicate `Start`/`Resume` for the same binding reports the live host; a `Resume` whose active
+pairing names a different binding than the live host is refused with `session_conflict` and leaves
+the live host and its surface attached. Named tests in
+`crates/vowp-agent/tests/orchestrator.rs`:
+`agent_orchestrator_move_preserves_the_home_session_id`,
+`agent_orchestrator_move_overwrites_a_stale_local_binding`,
+`agent_orchestrator_move_stops_the_old_host_before_starting`,
+`agent_orchestrator_move_is_idempotent_and_refuses_a_different_session`,
+`agent_orchestrator_move_never_returns_a_secret_path_or_port`, and
+`agent_orchestrator_move_requires_a_paired_surface`.
 
 `Stop` sends `SurfaceDetach`, signals only that host's process group with SIGTERM, waits
 `ORCHESTRATOR_STOP_GRACE` (2 seconds), then sends SIGKILL and waits briefly. The pid/state file
 is removed and the config stays for a later `Resume`. The agent and every other orchestrator
 are untouched.
+
+`OrchestratorHost::endpoint(name)` is the local discovery read used by
+`vowp agent orchestrator endpoint`. It reads `config.json`, the recorded `host.json`, and, only
+while the host's pid is alive, the app's 0600 `service.json` named by `service_json` and the
+bridge's `native-session.json` hint. The base document carries the name, app, paired home session
+id and `location: "node"`; the live opencode values add the canonical
+`http://127.0.0.1:<port>` URL and Basic auth (header `Authorization`, scheme `Basic`, username
+`opencode`, the service password). A stopped host, Claude or chat, or a missing service file
+leaves `url` and `auth` `None`. `native_session_id` prefers a non-empty id in the app's own
+service file, then the latest id the bridge persisted beside `host.json`, and otherwise stays
+`None`; it is never guessed from a session's `time.updated`. A stop or a failed host clears the
+hint, and a fresh app process starts without one. An unknown name is `not_found`; a corrupt,
+too-wide or unreadable required private file is `config_invalid` (the hint is tightened to 0600
+when it is read). Every error names the orchestrator and the failure class, and no message
+carries a path, port, password, token or pair link. The password appears only in the explicit
+`--json` document, never in the human block, a log or an error.
 
 A lost home connection keeps the app process and marks `host.json` `degraded`; a reconnect
 re-attaches every live host and marks it `running` without spawning a duplicate. A lost or
@@ -1188,7 +1242,15 @@ macOS host slice adds `orchestrator_macos_stdout_readiness_materializes_0600_ser
 `orchestrator_app_exits_before_ready_is_typed`, `orchestrator_service_timeout_is_typed`,
 `orchestrator_missing_default_binary_is_capability_missing`,
 `orchestrator_chat_default_command_carries_the_session_and_holds_stdin` and
-`orchestrator_claude_holds_stdin_and_reports_an_early_exit`; the transport adds
+`orchestrator_claude_holds_stdin_and_reports_an_early_exit`; the endpoint slice adds
+`agent_orchestrator_endpoint_reads_a_live_0600_service_file`,
+`agent_orchestrator_endpoint_stopped_and_unknown_are_metadata_only`,
+`agent_orchestrator_endpoint_errors_never_echo_a_path_or_password` and, for the v0.5.1 native-id
+hint, `agent_orchestrator_endpoint_reports_the_persisted_native_session_id`; the bridge adds
+`opencode_bridge_persists_a_native_session_id_0600_without_secrets`,
+`opencode_bridge_replaces_the_persisted_native_session_id_on_change` and
+`opencode_bridge_persists_the_native_session_id_beside_the_orchestrator_host` in
+`tests/bridge.rs`; the transport adds
 `agent_reconnects_after_a_ping_precedes_an_old_home_path_map_refusal` and
 `agent_reconnects_after_any_non_retryable_home_error`.
 

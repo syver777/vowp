@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use vowp_protocol::{
-    CapsuleTrigger, FleetStatus, InboxId, InboxItem, JobId, JobState, LeaseStatus, LedgerEntry, LedgerKind, NewJob,
-    Project, ProjectName, Session, SessionId, SessionRole, SurfaceId, SurfaceScope, TargetMode, Timestamp, VowpConfig,
+    CapsuleTrigger, FleetStatus, InboxId, InboxItem, JobId, JobState, LedgerEntry, LedgerKind, NewJob, Project,
+    ProjectName, Session, SessionId, SessionRole, SurfaceId, SurfaceScope, TargetMode, Timestamp, VowpConfig,
 };
 use vowp_store::session_log::SessionLog;
 use vowp_store::{Store, StoreError};
@@ -803,15 +803,17 @@ impl Executor<'_, '_> {
             Err(StoreError::NotFound { .. }) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let lease = self.ctx.store.lease(session)?.map(|lease| LeaseStatus {
-            held: true,
-            holder: Some(lease.holder),
-            kind: Some(lease.surface_kind),
-            node: Some(lease.node),
-            acquired_at: Some(lease.acquired_at),
-            heartbeat_at: Some(lease.heartbeat_at),
-            token: None,
-        });
+        let now = self.ctx.deps.clock.now();
+        let record = self.ctx.store.ownership(session)?;
+        let lease = record
+            .as_ref()
+            .map(|record| crate::surface::lease::lease_status(record, now));
+        // The gateway verified this surface's lease for a takeover; for a read, ownership is
+        // reported, never required, so a taken-over surface can still resume read-only.
+        let owner = record.as_ref().map(|record| record.to_owner(now));
+        let is_owner = record
+            .as_ref()
+            .is_some_and(|record| record.is_live_at(now) && record.lease.surface_id.as_ref() == Some(self.ctx.surface));
 
         if takeover {
             let store = self.project_store(&project)?;
@@ -834,6 +836,8 @@ impl Executor<'_, '_> {
             "capsule": capsule,
             "tail": tail,
             "lease": lease,
+            "owner": owner,
+            "is_owner": is_owner,
         }))
     }
 

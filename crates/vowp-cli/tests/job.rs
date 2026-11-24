@@ -449,3 +449,65 @@ fn job_show_gates_maps_duplicate_configured_gates_by_index() {
     assert_eq!(lines[0], "  report  not run");
     assert!(lines[1].starts_with("  report  pass  3ms  "), "{}", lines[1]);
 }
+
+#[test]
+fn job_set_executor_pins_pending_job_and_validates_input() {
+    let env = common::TestEnv::new();
+    env.insert_job("pin-me", "Pin", vowp_protocol::JobKind::Build, &[]);
+    let (code, value, stderr) = env.run_json(&["job", "set-executor", "pin-me", "opencode:deepseek/deepseek-pro#max"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(value["job"], "pin-me");
+    assert_eq!(value["switched"], false);
+    assert!(value["session_id"].is_null());
+    assert_eq!(value["executor"], "opencode:deepseek/deepseek-pro#max");
+    assert_eq!(
+        env.store().kv_get("job_executor:pin-me").expect("kv").as_deref(),
+        Some("opencode:deepseek/deepseek-pro#max")
+    );
+
+    let (code, _, _) = env.run_json(&["job", "set-executor", "pin-me", "not an executor"]);
+    assert_ne!(code, 0, "invalid executor is rejected");
+    assert_eq!(
+        env.store().kv_get("job_executor:pin-me").expect("kv").as_deref(),
+        Some("opencode:deepseek/deepseek-pro#max"),
+        "a rejected value leaves the override alone"
+    );
+}
+
+#[test]
+fn job_set_executor_refuses_running_job_without_session_and_terminal_jobs() {
+    let env = common::TestEnv::new();
+    let job = env.insert_job("run-me", "Run", vowp_protocol::JobKind::Build, &[]);
+    env.store()
+        .set_job_state(
+            &job.id,
+            JobState::Running,
+            &StateChange {
+                note: None,
+                parked_reason: None,
+            },
+        )
+        .expect("running");
+    let (code, _, _) = env.run_json(&["job", "set-executor", "run-me", "opencode:deepseek/deepseek-pro"]);
+    assert_ne!(code, 0, "running job without a session cannot switch");
+    assert_eq!(env.store().kv_get("job_executor:run-me").expect("kv"), None);
+}
+
+#[test]
+fn job_set_executor_refuses_terminal_jobs() {
+    let env = common::TestEnv::new();
+    let job = env.insert_job("done-job", "Done", vowp_protocol::JobKind::Build, &[]);
+    env.store()
+        .set_job_state(
+            &job.id,
+            JobState::Cancelled,
+            &StateChange {
+                note: None,
+                parked_reason: None,
+            },
+        )
+        .expect("cancelled");
+    let (code, _, _) = env.run_json(&["job", "set-executor", "done-job", "opencode:deepseek/deepseek-pro"]);
+    assert_ne!(code, 0, "terminal job cannot change executor");
+    assert_eq!(env.store().kv_get("job_executor:done-job").expect("kv"), None);
+}

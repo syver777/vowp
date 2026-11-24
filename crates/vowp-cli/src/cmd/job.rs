@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use vowp_core::requests::{self, Request};
 use vowp_graph::{Graph, JobEvent, transition};
 use vowp_protocol::{
-    EdgeKind, Gate, GateResult, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Placement, Role,
-    default_gates,
+    EdgeKind, Executor, Gate, GateResult, Job, JobId, JobKind, JobLoop, JobPatch, JobState, NewJob, Placement, Role,
+    SwitchReason, default_gates,
 };
 use vowp_store::{JobFilter, Store};
 
@@ -35,6 +35,7 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &JobCommand) -> Result<i3
         JobCommand::Replan(args) => keeper(ctx, io, &args.id, KeeperAction::Replan),
         JobCommand::Fail(args) => keeper(ctx, io, &args.id, KeeperAction::Fail(args.reason.clone())),
         JobCommand::Cancel(args) => cancel(ctx, io, &args.id),
+        JobCommand::SetExecutor(args) => set_executor(ctx, io, &args.id, &args.executor),
     }
 }
 
@@ -436,6 +437,57 @@ fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &JobShowArgs) -> Result<i32, Cl
                 None => writeln!(io.out(), "  {}  not run", gate.short())?,
             }
         }
+    }
+    Ok(0)
+}
+
+/// Pins a job to one executor.
+///
+/// Pending, ready and parked jobs get a `job_executor:<id>` override that dispatch reads when
+/// it picks the rung. A running job with a session is switched through the session service
+/// (drain, handoff capsule, resume on the new executor) and keeps the override for later
+/// resumes. The switch reason is [`SwitchReason::User`], the protocol's human-requested reason.
+fn set_executor(ctx: &Ctx, io: &mut dyn IoStreams, id: &str, executor: &str) -> Result<i32, CliError> {
+    let store = ctx.store()?;
+    let id = JobId::parse(id)?;
+    let job = store.require_job(&id)?;
+    let target = Executor::parse(executor)?;
+    let mut session_id = None;
+    let mut switched = false;
+    match job.state {
+        JobState::Pending | JobState::Ready | JobState::Parked => {}
+        JobState::Running => {
+            let session = store
+                .open_runs()?
+                .into_iter()
+                .rev()
+                .find(|run| run.job_id.as_ref() == Some(&id))
+                .and_then(|run| run.session_id)
+                .ok_or_else(|| CliError::Conflict(format!("job {id} is running without a universal session")))?;
+            super::session::switch_to(ctx, &session, target.clone(), None, SwitchReason::User, true)?;
+            session_id = Some(session);
+            switched = true;
+        }
+        other => {
+            return Err(CliError::Conflict(format!(
+                "job {id} is {} and its executor cannot change",
+                other.as_str()
+            )));
+        }
+    }
+    store.kv_set(&vowp_core::loops::dispatch::job_executor_key(&id), &target.to_string())?;
+    let value = serde_json::json!({
+        "job": id,
+        "session_id": session_id,
+        "switched": switched,
+        "executor": target.to_string(),
+    });
+    if ctx.json() {
+        print_json(io, &value)?;
+    } else if switched {
+        writeln!(io.out(), "switched job {id} to {target}")?;
+    } else {
+        writeln!(io.out(), "job {id} will dispatch on {target}")?;
     }
     Ok(0)
 }

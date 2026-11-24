@@ -1,7 +1,7 @@
 # VOWP design specification — index
 
-Status: current for the implemented v0.3 surface and the v0.4 ASIF slice (the v0.2 home and
-surface specification remains the binding base).
+Status: current for the implemented v0.5 surface in the tree (not released); the v0.4 ASIF slice
+shipped in 0.4.0, and the v0.2 home and surface specification remains the binding base.
 
 This directory describes how VOWP works: architecture, types, database schema, behavioural contracts
 and the command line. The **v0.1 implementation spec** is still the base; the **v0.2 spec** in
@@ -70,10 +70,26 @@ ambiguous or wrong, open an issue rather than inventing a different design.
 | File | Status | What it covers |
 |---|---|---|
 | [`v0.4/asif-integration.md`](v0.4/asif-integration.md) | **implemented for the ASIF slice** | ASIF 0.4 (review draft) interchange: the pinned adapter, core facade, `session export/import --format asif`, declared losses and strict mode, remote streams, the daemon download/report/import routes and the `/import` page. |
-| [`v0.4/hardening.md`](v0.4/hardening.md) | implemented in the tree; [security checklist and rollback drill recorded](../releases/v0.4-hardening.md), owner live Mac smoke test pending | Phase-4 hardening: optional WSS ingress behind a loopback listener, launchd/systemd-user service install, rotation UX, bundle result, separate user, bounded metrics history, and the phase-exit review, owner live Mac smoke test and rollback gates. |
+| [`v0.4/hardening.md`](v0.4/hardening.md) | implemented and shipped in 0.4.0; [security checklist, rollback drill and owner live Mac smoke test recorded](../releases/v0.4-hardening.md) | Phase-4 hardening: optional WSS ingress behind a loopback listener, launchd/systemd-user service install, rotation UX, bundle result, separate user, bounded metrics history, and the phase-exit review, owner live Mac smoke test and rollback gates. |
 | [`v0.4/live-upgrade-and-drain.md`](v0.4/live-upgrade-and-drain.md) | accepted design, queued | Live binary/schema upgrade, cooperative drain and selective subsystem restart. |
-| [`v0.4/local-orchestrator.md`](v0.4/local-orchestrator.md) | draft; Phase 0/1 implemented | The Mac-side local surface and outbound local agent (offload, path map, result return). |
+| [`v0.4/local-orchestrator.md`](v0.4/local-orchestrator.md) | implemented; Phases 0–4 shipped in 0.4.0 | The Mac-side local surface and outbound local agent (offload, path map, result return). |
 | [`v0.4/public-positioning-review.md`](v0.4/public-positioning-review.md) | private review note | Public-claim qualifications and the wording not applied to the public tree. |
+
+## v0.5 design notes
+
+All six v0.5 slices are implemented and gated in the tree as of 2026-11-19. No tag, version or
+release date has been cut; the latest release remains 0.4.0.
+
+| File | Status | What it covers |
+|---|---|---|
+| [`v0.5/scope.md`](v0.5/scope.md) | implemented in the tree; not released | The accepted six-slice scope, each slice's landed job id and design note, and the candidate survey kept as reference. |
+| [`v0.5/live-streams.md`](v0.5/live-streams.md) | implemented | Jobs list/detail and cost/inbox/nodes snapshot streams, first/changed-only frames, heartbeats, reconnect and polling fallback, service-worker bypass. |
+| [`v0.5/orchestrator-endpoint.md`](v0.5/orchestrator-endpoint.md) | implemented | The typed `OrchestratorEndpoint` discovery document, the home/agent split, the loopback URL rule and the explicit-command-only credential rule. |
+| [`v0.5/project-bootstrap.md`](v0.5/project-bootstrap.md) | implemented | One-step `project add` with `--git`, `--init` and `--orchestrator`: clone target rules, argv-only clone, init/register order and the single JSON summary. |
+| [`v0.5/vault-encrypted.md`](v0.5/vault-encrypted.md) | implemented | The age-keyfile encrypted vault mode, key custody and limits, `secret set --stdin`, `secret ls --json` mode and `upgrade --encrypted`; `systemd-creds` is not implemented. |
+
+The orchestrator-move slice has no separate v0.5 note; its contract is in
+[`v0.4/local-orchestrator.md`](v0.4/local-orchestrator.md) §5.7.
 
 ## Vocabulary (one meaning everywhere)
 
@@ -107,8 +123,13 @@ The v0.4 local agent and Phase 3 (including `v4-local-3h-offline-cache`) are shi
 and the phase-4 hardening build (WSS, service, rotation UX, bundle result, separate user and
 capacity history) and its documentation are implemented in the tree. The security review checklist
 and the rollback drill are recorded in
-[`releases/v0.4-hardening.md`](../releases/v0.4-hardening.md); the owner live Mac smoke test is
-pending the owner's run and record. Phase 4 is complete in the tree. It is not a completed release.
-The live-upgrade/drain slice is queued. Multi-user accounts, multi-home sync and the remaining
-roadmap items are still planned, as marked in
-[`../roadmap.md`](../roadmap.md).
+[`releases/v0.4-hardening.md`](../releases/v0.4-hardening.md); the owner live Mac smoke test
+passed on 2026-11-18. Phase 4 is complete in the tree and shipped in 0.4.0. The live-upgrade/drain
+slice is queued.
+
+The six v0.5 slices are implemented and gated in the tree as of 2026-11-19: live snapshot streams,
+the orchestrator move and session-location follow, orchestrator endpoint discovery, one-step
+project bootstrap, the encrypted vault option and pooled cluster capacity. They are **not
+released**: no tag, version bump or date is promised, and 0.4.0 remains the latest release.
+Multi-user accounts, multi-home sync and the remaining roadmap items are still planned, as marked
+in [`../roadmap.md`](../roadmap.md).

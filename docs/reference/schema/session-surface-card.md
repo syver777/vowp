@@ -11,12 +11,47 @@ Exported by `vowp schema SessionSurfaceCard` and generated from the protocol typ
 {
   "$defs": {
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "NodeName": {
       "description": "Node name slug, for example `vps`.",
       "type": "string"
+    },
+    "OwnershipMode": {
+      "description": "How an owner holds a session: as a person's surface or as a worker job run.",
+      "oneOf": [
+        {
+          "const": "interactive",
+          "description": "A person's surface; liveness is its heartbeat.",
+          "type": "string"
+        },
+        {
+          "const": "job",
+          "description": "A worker-node job run; liveness is the run's `expires_at`.",
+          "type": "string"
+        }
+      ]
+    },
+    "OwnershipState": {
+      "description": "Liveness of an owner, derived at read time from its mode and timestamps.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "An interactive heartbeat younger than 60 seconds, or an unexpired job.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "An interactive owner whose heartbeat is 60 seconds old or older.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "A job owner whose `expires_at` has passed.",
+          "type": "string"
+        }
+      ]
     },
     "ProjectName": {
       "description": "Project name slug, for example `vowp`.\n\n`_node` is the reserved project that owns project-less session runs.",
@@ -25,6 +60,97 @@ Exported by `vowp schema SessionSurfaceCard` and generated from the protocol typ
     "SessionId": {
       "description": "Session id: 26-character ULID.",
       "type": "string"
+    },
+    "SessionOwner": {
+      "description": "The read projection of a session's ownership record (its one `leases` row).\n\nIt never carries a lease token, a token hash, or an engine password.",
+      "properties": {
+        "acquired_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the owner acquired the session."
+        },
+        "activity": {
+          "$ref": "#/$defs/SurfaceActivity",
+          "default": "idle",
+          "description": "Whether the session is idle, running or waiting."
+        },
+        "epoch": {
+          "default": 0,
+          "description": "Monotonic counter the store bumps on every acquire or takeover.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Expiry of a job owner; `None` for an interactive owner."
+        },
+        "heartbeat_at": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "Last heartbeat."
+        },
+        "holder": {
+          "description": "Human-visible holder name.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/SurfaceKind",
+          "description": "Kind of client that owns the session."
+        },
+        "label": {
+          "default": null,
+          "description": "Friendly saved surface name, for example `\"StackSpirit · macbook\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/OwnershipMode",
+          "default": "interactive",
+          "description": "Interactive surface or job run."
+        },
+        "node": {
+          "$ref": "#/$defs/NodeName",
+          "description": "Node the owner runs on."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "Session the owner holds."
+        },
+        "state": {
+          "$ref": "#/$defs/OwnershipState",
+          "default": "active",
+          "description": "Liveness at the time the projection was built."
+        },
+        "surface_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SurfaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Surface instance id; `None` for a job run with no paired surface."
+        }
+      },
+      "required": [
+        "session_id",
+        "kind",
+        "holder",
+        "node",
+        "acquired_at",
+        "heartbeat_at"
+      ],
+      "type": "object"
     },
     "SessionRole": {
       "description": "The role a session serves. User sessions exist for `vowp session new`.\n\nDefined in the event module because [`SessionCreated`] needs it; the session domain\nrows use the same role vocabulary.",
@@ -91,6 +217,26 @@ Exported by `vowp schema SessionSurfaceCard` and generated from the protocol typ
         }
       ]
     },
+    "SurfaceActivity": {
+      "description": "What the owner of a session is doing right now.",
+      "oneOf": [
+        {
+          "const": "idle",
+          "description": "No turn is running.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A turn or run is in progress.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "The session is blocked, waiting for an answer or a limit to clear.",
+          "type": "string"
+        }
+      ]
+    },
     "SurfaceId": {
       "description": "A surface instance id (ULID, 26 characters).",
       "type": "string"
@@ -131,6 +277,11 @@ Exported by `vowp schema SessionSurfaceCard` and generated from the protocol typ
         {
           "const": "agent",
           "description": "A v0.4 local surface attached through a `vowp agent`.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_ui",
+          "description": "A desktop UI that talks to an orchestrator's app engine itself.\n\nWire spelling `desktop_ui`; the store and the CLI spell it `desktop-ui`.",
           "type": "string"
         }
       ]
@@ -221,6 +372,18 @@ Exported by `vowp schema SessionSurfaceCard` and generated from the protocol typ
     "node": {
       "$ref": "#/$defs/NodeName",
       "description": "Node the session runs on."
+    },
+    "owner": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionOwner"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The session's owner (its one lease row), including stale and job owners.\n\nAuthoritative; `active_surface` stays `null` for compatibility with older readers.\nNever carries a token or a password."
     },
     "project": {
       "anyOf": [

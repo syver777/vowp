@@ -19,11 +19,11 @@ use std::path::Path;
 use std::time::Duration;
 
 use vowp_protocol::{
-    Actor, AgentFrame, AssignmentPayload, EventBody, EventSource, Executor, ExecutorRef, HarnessKind, Job, JobId,
-    JobState, Lease, NodeCard, NodeName, PathRef, Placement, ProjectName, RemoteRunState, ResultTransport, RunId,
-    RunOutcome, RunPurpose, RunRejectReason, RunResume, RunResumeResult, Session, SessionCreated, SessionId,
-    SessionRole, SessionState, SurfaceKind, SurfaceResume, SurfaceResumeResult, SurfaceState, Timestamp, VowpConfig,
-    WaitingReason,
+    Actor, AgentFrame, AssignmentPayload, CapsuleTrigger, EventBody, EventSource, Executor, ExecutorRef, HarnessKind,
+    Job, JobId, JobState, Lease, NodeCard, NodeName, OwnershipMode, PathRef, Placement, ProjectName, RemoteRunState,
+    ResultTransport, RunId, RunOutcome, RunPurpose, RunRejectReason, RunResume, RunResumeResult, Session,
+    SessionCreated, SessionId, SessionRole, SessionState, SurfaceKind, SurfaceResume, SurfaceResumeResult,
+    SurfaceState, Timestamp, VowpConfig, WaitingReason,
 };
 use vowp_store::repo_offload::{AgentAssignment, AgentAssignmentState, AssignmentFilter};
 use vowp_store::session_log::{NewEvent, SessionLog, index_row};
@@ -679,6 +679,32 @@ pub fn sweep_expired(
             )?);
         }
     }
+    // A job owner can expire before its assignment row does (the owner is renewed from the
+    // connection that holds the token). Fence that run too; an owner with no active
+    // assignment on any node is just released, because nothing else would.
+    let still_active = store.list_assignments(&AssignmentFilter {
+        states: dispatch_states().to_vec(),
+        ..AssignmentFilter::default()
+    })?;
+    for owner in store.expired_job_leases(now)? {
+        match still_active.iter().find(|row| row.session_id == owner.session_id) {
+            Some(assignment) if assignment.node == *node => {
+                lost.push(lose(
+                    deps,
+                    store,
+                    node,
+                    &assignment.run_id,
+                    assignment.epoch,
+                    "the run lease expired",
+                    now,
+                )?);
+            }
+            Some(_) => {}
+            None => {
+                store.release_lease_hash(&owner.session_id, &owner.token)?;
+            }
+        }
+    }
     Ok(lost)
 }
 
@@ -1020,25 +1046,161 @@ fn issue_run_lease(
 ) -> Result<(String, Timestamp), CoreError> {
     let token = crate::surface::new_lease_token();
     let expires_at = now.plus(RUN_LEASE_TTL);
-    store.take_lease(&Lease {
-        session_id: assignment.session_id.clone(),
-        surface_id: None,
-        surface_kind: SurfaceKind::Agent,
-        node: assignment.node.clone(),
-        holder: "agent".to_owned(),
-        token: token.clone(),
-        acquired_at: now,
-        heartbeat_at: now,
-    })?;
+    // A run lease is a job owner: its lifetime is `expires_at`, renewed by run activity,
+    // not the 60 s interactive heartbeat window.
+    store.take_ownership(
+        &Lease {
+            session_id: assignment.session_id.clone(),
+            surface_id: None,
+            surface_kind: SurfaceKind::Agent,
+            node: assignment.node.clone(),
+            holder: "agent".to_owned(),
+            token: token.clone(),
+            acquired_at: now,
+            heartbeat_at: now,
+        },
+        OwnershipMode::Job,
+        Some(expires_at),
+    )?;
     Ok((token, expires_at))
 }
 
-/// Releases the run lease of `session`, when one exists.
+/// Renews the job ownership of `session` after run activity.
+///
+/// `token` is the plaintext run-lease token the home minted for this assignment. Returns
+/// false when another owner (an interactive surface after a takeover) or no owner holds the
+/// session, or when the job owner has already expired, so a late renewal never revives an
+/// owner that expiry has retired. The run fence is the assignment row, not this call.
+pub fn renew_run_owner(store: &Store, session: &SessionId, token: &str, now: Timestamp) -> Result<bool, CoreError> {
+    match store.ownership(session)? {
+        Some(record) if record.mode == OwnershipMode::Job && record.is_live_at(now) => {
+            Ok(store.renew_job_lease(session, token, now, now.plus(RUN_LEASE_TTL))?)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Releases the job owner of `session`, when one exists.
+///
+/// An interactive owner is never released here: after a takeover the session belongs to the
+/// surface, and a late `lose`, `reject` or sweep for the old run must not delete its lease.
 pub(crate) fn release_run_lease(store: &Store, session: &SessionId) -> Result<(), CoreError> {
-    if let Some(lease) = store.lease(session)? {
-        store.release_lease_hash(session, &lease.token)?;
+    if let Some(record) = store.ownership(session)?
+        && record.mode == OwnershipMode::Job
+    {
+        store.release_lease_hash(session, &record.lease.token)?;
     }
     Ok(())
+}
+
+/// What an interactive takeover found and fenced.
+#[derive(Debug, Clone)]
+pub struct JobFence {
+    /// Holder of the job owner that was replaced.
+    pub previous_holder: String,
+    /// The assignment `lose` fenced; `None` when the owner had no active assignment.
+    pub assignment: Option<AgentAssignment>,
+}
+
+/// Fences the job that owns `session`, when a job owns it.
+///
+/// An interactive surface that takes a running job over calls this first. The active
+/// assignment goes through [`lose`] (the run is closed with `outcome=error`, the job stays
+/// `ready`, the owner row is released); it is never switched to a human surface. `by`
+/// names the taker in the fence reason. Returns `None` when no job owns the session, so the
+/// caller continues with the ordinary interactive path. An expired job owner is fenced the
+/// same way; the explicit flag is only required while it is live.
+pub fn fence_job_owner(
+    deps: &Deps,
+    store: &Store,
+    session: &SessionId,
+    by: &str,
+    now: Timestamp,
+) -> Result<Option<JobFence>, CoreError> {
+    let Some(record) = store.ownership(session)? else {
+        return Ok(None);
+    };
+    if record.mode != OwnershipMode::Job {
+        return Ok(None);
+    }
+    let reason = format!("session {session} was taken over by {by}");
+    let active = store.list_assignments(&AssignmentFilter {
+        states: dispatch_states().to_vec(),
+        ..AssignmentFilter::default()
+    })?;
+    let mut fenced = None;
+    for assignment in active.into_iter().filter(|row| row.session_id == *session) {
+        fenced = Some(lose(
+            deps,
+            store,
+            &assignment.node,
+            &assignment.run_id,
+            assignment.epoch,
+            &reason,
+            now,
+        )?);
+    }
+    // No active assignment left to release the row: drop the job owner directly.
+    release_run_lease(store, session)?;
+    Ok(Some(JobFence {
+        previous_holder: record.lease.holder,
+        assignment: fenced,
+    }))
+}
+
+/// Writes the capsule and the one takeover note of an interactive takeover.
+///
+/// The capsule is written when the session already has events; a failed capsule is logged
+/// and does not undo the takeover, because the owner row has already moved. The note names
+/// the previous and new holder and carries the `ownership_conflict` stop notice.
+pub fn record_takeover(
+    deps: &Deps,
+    store: &Store,
+    session: &SessionId,
+    previous_holder: &str,
+    by: &str,
+    now: Timestamp,
+) -> Result<(), CoreError> {
+    let mut row = store.require_session(session)?;
+    let mut capsule = "no capsule (the session has no events)".to_owned();
+    if row.last_seq > 0 {
+        // An offloaded session records the relative cwd `.`; the keeper that writes the
+        // capsule runs at home, so it works from the project root instead.
+        if Path::new(&row.cwd).is_relative()
+            && let Some(project) = row
+                .project
+                .as_ref()
+                .map(|name| store.project(name))
+                .transpose()?
+                .flatten()
+        {
+            row.cwd = project.path;
+            store.upsert_session(&row)?;
+        }
+        capsule = match crate::session::service::SessionService::new(deps.clone())
+            .write_capsule(session, CapsuleTrigger::Switch)
+        {
+            Ok(written) => format!("capsule {}", written.capsule_id),
+            Err(error) => {
+                deps.log.log(
+                    vowp_protocol::Level::Warn,
+                    "agent",
+                    &format!("takeover of {session} could not write a capsule: {error}"),
+                );
+                "capsule failed".to_owned()
+            }
+        };
+    }
+    let notice = match store.session_owner(session, now)? {
+        Some(owner) => crate::surface::lease::stop_notice(&owner),
+        None => "ownership_conflict: session taken over".to_owned(),
+    };
+    crate::surface::lease::append_note(
+        deps,
+        store,
+        session,
+        format!("taken over by {by} from {previous_holder} ({notice}); {capsule}"),
+    )
 }
 
 /// Builds the `AssignRun` frame from a durable row and a fresh token.

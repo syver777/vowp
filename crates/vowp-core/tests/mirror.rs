@@ -1522,3 +1522,79 @@ fn write_state(workdir: &Path, url: &str) {
     )
     .expect("host.json");
 }
+
+#[test]
+fn mirror_pass_refuses_a_session_owned_by_another_surface() {
+    let tmp = tempdir().expect("temp dir");
+    let clock = FakeClock::at(ts());
+    let deps = deps(&tmp, &clock);
+    let store = deps.open_store().expect("store");
+    let session = create_session(&deps, &tmp);
+    let host = FakeHost::new(
+        OrchestratorApp::Opencode,
+        vec![entry(
+            "u1",
+            TranscriptKind::UserMessage,
+            Some("typed in the OpenCode window"),
+        )],
+    );
+    let handle = handle(OrchestratorApp::Opencode, tmp.path());
+    let before = event_count(&deps, &session);
+
+    // A desktop UI owns the session: the OpenCode mirror must not write its turns.
+    let ui = vowp_protocol::Surface {
+        id: vowp_protocol::SurfaceId::new(),
+        kind: SurfaceKind::DesktopUi,
+        node: local(),
+        holder: "StackSpirit".to_owned(),
+        app: Some("opencode".to_owned()),
+        cwd: None,
+        metadata: json!({}),
+        created_at: ts(),
+        last_seen_at: ts(),
+    };
+    store.upsert_surface(&ui).expect("surface");
+    store
+        .take_lease(&Lease {
+            session_id: session.clone(),
+            surface_id: Some(ui.id.clone()),
+            surface_kind: SurfaceKind::DesktopUi,
+            node: local(),
+            holder: "StackSpirit".to_owned(),
+            token: new_lease_token(),
+            acquired_at: ts(),
+            heartbeat_at: ts(),
+        })
+        .expect("ui lease");
+    let mut cursor = empty_cursor();
+    let error = mirror_from_host(&deps, &store, &session, &host, &handle, &mut cursor).expect_err("fenced");
+    assert!(
+        matches!(&error, CoreError::Refused(text) if text.contains("StackSpirit") && text.contains("epoch 1")),
+        "{error:?}"
+    );
+    assert_eq!(event_count(&deps, &session), before, "nothing was appended");
+    assert_eq!(cursor.last_native_id, None, "the cursor did not advance");
+
+    // The app's own surface owning the session is the normal case.
+    let own = vowp_protocol::Surface {
+        id: vowp_protocol::SurfaceId::new(),
+        kind: SurfaceKind::Opencode,
+        holder: "main".to_owned(),
+        ..ui
+    };
+    store.upsert_surface(&own).expect("own surface");
+    store
+        .take_lease(&Lease {
+            session_id: session.clone(),
+            surface_id: Some(own.id.clone()),
+            surface_kind: SurfaceKind::Opencode,
+            node: local(),
+            holder: "main".to_owned(),
+            token: new_lease_token(),
+            acquired_at: ts(),
+            heartbeat_at: ts(),
+        })
+        .expect("host lease");
+    let report = mirror_from_host(&deps, &store, &session, &host, &handle, &mut cursor).expect("owner's mirror");
+    assert_eq!(report.events, 1);
+}

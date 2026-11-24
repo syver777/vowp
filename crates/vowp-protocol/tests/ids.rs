@@ -80,26 +80,25 @@ fn id_parse_roundtrip_all_types() {
 
 #[test]
 fn slug_ids_reject_bad_input() {
-    let too_long = "a".repeat(65);
+    let too_long = "a".repeat(200);
     let bad = ["", "-a", "A", too_long.as_str(), "a b", "a-", "a_b", "æ-b"];
 
     macro_rules! check_slug {
-        ($ty:ty) => {{
+        ($ty:ty, $max:expr) => {{
             for input in bad {
                 assert_invalid_id(<$ty>::parse(input));
             }
             for input in ["a", "sample-job", "0", "a-b-c", "a--b"] {
                 assert!(<$ty>::parse(input).is_ok(), "rejected valid slug {input:?}");
             }
-            let sixty_four = "a".repeat(64);
-            assert!(<$ty>::parse(&sixty_four).is_ok());
-            assert_invalid_id(<$ty>::parse(&"a".repeat(65)));
+            assert!(<$ty>::parse(&"a".repeat($max)).is_ok());
+            assert_invalid_id(<$ty>::parse(&"a".repeat($max + 1)));
         }};
     }
 
-    check_slug!(JobId);
-    check_slug!(NodeName);
-    check_slug!(ProjectName);
+    check_slug!(JobId, 120);
+    check_slug!(NodeName, 64);
+    check_slug!(ProjectName, 64);
 }
 
 #[test]

@@ -343,17 +343,23 @@ ladder = ["opencode:provider/model-b#max"]
 
 [providers.provider]
 max_concurrent = 6
-on_credits_exhausted = "park"     # report the blocker, never switch to another paid provider silently
+on_credits_exhausted = "park"     # default: report the blocker; "next" spends on the next declared rung
 ```
+
+`on_credits_exhausted` applies to credits and auth. `park` is the default: park the affected jobs and
+open an inbox item. `next` is an explicit owner opt-in that writes the same limit row and moves the
+affected session to the next healthy rung declared in the profile ladder; if none is healthy it parks
+as under `park`. A ladder is a budget declaration, so `next` is only valid when rung 2 is explicitly
+configured for that profile and the owner accepts spending on it.
 
 `vowp doctor` checks that each profile's harnesses are installed and that provider credentials are present **by environment-variable name only**; it never prints a value and never calls the network.
 
 | Signal | Example | Action |
 |---|---|---|
 | `quota` | "You've hit your limit · resets …" | Capsule → next rung; probe back after the reset |
-| `credits` | 402 / insufficient balance | Park every job on that provider; inbox; stop |
+| `credits` | 402 / insufficient balance | `park` (default): park every job on that provider; inbox; stop. `next`: write the row and use the next declared healthy rung |
 | `rate` | 429 | Backoff with jitter; lower that provider's concurrency |
-| `auth` | 401 / login expired | Park; inbox ("log in again") |
+| `auth` | 401 / login expired | `park` (default): park; inbox ("log in again"). `next`: use the next declared healthy rung |
 | `context` | Context overflow | Capsule → fresh session on the same harness |
 | `crash` | Process exited without a report | L2 continue (×2) → keeper |
 

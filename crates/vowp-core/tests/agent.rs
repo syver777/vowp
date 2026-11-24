@@ -437,6 +437,11 @@ impl Gateway {
         self.output.wait_frame(predicate, Duration::from_secs(2))
     }
 
+    /// Waits up to `timeout` for a frame matching `predicate`.
+    fn expect_within(&self, predicate: impl Fn(&AgentFrame) -> bool, timeout: Duration) -> AgentFrame {
+        self.output.wait_frame(predicate, timeout)
+    }
+
     fn frame_count(&self) -> usize {
         self.output.frames().len()
     }
@@ -456,20 +461,39 @@ impl Gateway {
 }
 
 fn authenticate(gateway: &Gateway, name: &NodeName, key: &SigningKey) {
+    authenticate_within(gateway, name, key, Duration::from_secs(2));
+}
+
+/// Authenticates one connection, waiting up to `timeout` for each handshake frame.
+///
+/// Most tests keep the short default; the heartbeat dispatch test passes the same
+/// generous bound as its dispatch wait because a workspace gate runs this suite
+/// beside every other test binary and the gateway thread can be starved between
+/// the challenge and the welcome.
+fn authenticate_within(gateway: &Gateway, name: &NodeName, key: &SigningKey, timeout: Duration) {
     gateway.send(&hello(name, key));
     let AgentFrame::HomeChallenge {
         nonce,
         home_id,
         connection_id,
         ..
-    } = gateway.expect(|frame| matches!(frame, AgentFrame::HomeChallenge { .. }))
+    } = gateway.expect_within(|frame| matches!(frame, AgentFrame::HomeChallenge { .. }), timeout)
     else {
         panic!("expected HomeChallenge");
     };
     let signature = signature_hex(key, &nonce, &home_id, &connection_id);
     gateway.send(&AgentFrame::AgentAuth { signature });
-    gateway.expect(|frame| matches!(frame, AgentFrame::HomeWelcome { .. }));
+    gateway.expect_within(|frame| matches!(frame, AgentFrame::HomeWelcome { .. }), timeout);
 }
+
+/// Longest a test waits for one gateway dispatch pass on a loaded host.
+///
+/// The pass itself takes milliseconds when the host is idle. A workspace gate
+/// runs this suite beside every other test binary and other agents, and a
+/// deliberately single-core loaded run took 2.30 s, so a two-second budget was
+/// too tight. This is a hang guard, not a paced delay: the waits below finish as
+/// soon as their observable condition holds.
+const GATEWAY_WAIT: Duration = Duration::from_secs(30);
 
 fn wait_until(condition: impl FnMut() -> bool) {
     wait_until_for(condition, Duration::from_secs(2));
@@ -2920,6 +2944,89 @@ fn offload_heartbeat(busy_slots: u32, max_slots: u32) -> AgentFrame {
     }
 }
 
+/// Waits for one heartbeat's dispatch pass to settle.
+///
+/// The caller sends the heartbeat and then a `Ping`. Frames are processed in
+/// order on one connection thread, so the `Pong` is written only after the
+/// heartbeat's enqueue, claim and send pass has finished. `start` is the frame
+/// count before the heartbeat, which separates this pass's `AssignRun` frames
+/// from earlier ones.
+///
+/// The wait is condition-based and bounded for a loaded host, but it never waits
+/// past an over-dispatch: one more `AssignRun` frame or `sent` row than the
+/// slots allow panics immediately with the dispatch state.
+fn wait_for_dispatch(
+    gateway: &Gateway,
+    store: &Store,
+    name: &NodeName,
+    start: usize,
+    expected_assigns: usize,
+    expected_sent: usize,
+) {
+    let deadline = Instant::now() + GATEWAY_WAIT;
+    loop {
+        let frames = gateway.output.frames();
+        let window = &frames[start.min(frames.len())..];
+        let assigns = window
+            .iter()
+            .filter(|frame| matches!(frame, AgentFrame::AssignRun { .. }))
+            .count();
+        let sent = store
+            .assignments_for_node(name)
+            .expect("assignments")
+            .iter()
+            .filter(|assignment| assignment.state == vowp_store::repo_offload::AgentAssignmentState::Sent)
+            .count();
+        assert!(
+            assigns <= expected_assigns && sent <= expected_sent,
+            "the node admitted more runs than its slots: expected at most {expected_assigns} new AssignRun \
+             frames and {expected_sent} sent rows, saw {assigns} and {sent}; {}",
+            dispatch_state(gateway, store, name)
+        );
+        if window.iter().any(|frame| matches!(frame, AgentFrame::Pong)) {
+            assert_eq!(
+                assigns,
+                expected_assigns,
+                "the dispatch settled with the wrong number of new runs: {}",
+                dispatch_state(gateway, store, name)
+            );
+            assert_eq!(
+                sent,
+                expected_sent,
+                "the dispatch settled with the wrong number of sent rows: {}",
+                dispatch_state(gateway, store, name)
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the dispatch did not settle within {GATEWAY_WAIT:?}: {}",
+            dispatch_state(gateway, store, name)
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Formats the frames and durable assignments for a failed dispatch wait.
+fn dispatch_state(gateway: &Gateway, store: &Store, name: &NodeName) -> String {
+    let frames = gateway.output.frames();
+    let assigns = frames
+        .iter()
+        .filter(|frame| matches!(frame, AgentFrame::AssignRun { .. }))
+        .count();
+    let rows = store
+        .assignments_for_node(name)
+        .map(|assignments| {
+            assignments
+                .iter()
+                .map(|assignment| format!("{}={}", assignment.payload.job, assignment.state.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|error| format!("<store error: {error}>"));
+    format!("{assigns} AssignRun frames sent; assignments: [{rows}]")
+}
+
 #[test]
 fn heartbeat_dispatches_at_most_the_node_slots() {
     let key = signing_key();
@@ -2962,8 +3069,8 @@ fn heartbeat_dispatches_at_most_the_node_slots() {
     // Keep the fleet cap above the node's two slots so this test measures the node limit.
     config.offload.max_remote_runs = 3;
     let gateway = Gateway::start_with_config(home.path(), clock.clone(), config);
-    authenticate(&gateway, &name, &key);
-    gateway.send(&offload_heartbeat(0, 2));
+    let store = gateway.store();
+    authenticate_within(&gateway, &name, &key, GATEWAY_WAIT);
 
     let count_assign = |gateway: &Gateway| {
         gateway
@@ -2973,16 +3080,23 @@ fn heartbeat_dispatches_at_most_the_node_slots() {
             .filter(|frame| matches!(frame, AgentFrame::AssignRun { .. }))
             .count()
     };
-    wait_until(|| count_assign(&gateway) == 2);
-    thread::sleep(Duration::from_millis(150));
+
+    // The heartbeat and the Ping are queued together. The connection handles
+    // frames in order, so the Pong proves this heartbeat's enqueue/claim/send
+    // pass has finished; the wait then checks the runs and sent rows it made.
+    let start = gateway.frame_count();
+    gateway.send(&offload_heartbeat(0, 2));
+    gateway.send(&AgentFrame::Ping);
+    wait_for_dispatch(&gateway, &store, &name, start, 2, 2);
     assert_eq!(count_assign(&gateway), 2, "one heartbeat sends only the free slots");
 
     // The two sent rows occupy the slots even though the agent reports idle capacity.
+    let start = gateway.frame_count();
     gateway.send(&offload_heartbeat(0, 2));
-    thread::sleep(Duration::from_millis(150));
+    gateway.send(&AgentFrame::Ping);
+    wait_for_dispatch(&gateway, &store, &name, start, 0, 2);
     assert_eq!(count_assign(&gateway), 2, "a second heartbeat must not over-dispatch");
 
-    let store = gateway.store();
     let assignments = store.assignments_for_node(&name).expect("assignments");
     assert_eq!(assignments.len(), 3, "all three jobs are durably queued");
     assert_eq!(
@@ -2990,7 +3104,8 @@ fn heartbeat_dispatches_at_most_the_node_slots() {
             .iter()
             .filter(|assignment| assignment.state == vowp_store::repo_offload::AgentAssignmentState::Sent)
             .count(),
-        2
+        2,
+        "only the claimed rows are sent"
     );
     gateway.finish().expect("gateway");
 }
@@ -4280,4 +4395,274 @@ fn unknown_surface_attach_keeps_the_connection_open() {
         "an unpaired surface attach must not send a connection-level Error: the agent treats one as terminal"
     );
     gateway.finish().expect("gateway");
+}
+
+/// One offloaded job dispatched through the gateway and accepted by the fake agent.
+struct OwnedRun {
+    home: TempDir,
+    clock: Arc<FakeClock>,
+    store: Store,
+    gateway: Gateway,
+    name: NodeName,
+    assignment: vowp_protocol::AssignmentPayload,
+    token: String,
+    job: JobId,
+}
+
+/// Dispatches one ready job to `mac-studio` and sends `RunAccepted` for it.
+fn owned_run() -> OwnedRun {
+    let key = signing_key();
+    let name = node_name("mac-studio");
+    let home = TempDir::new().expect("temp home");
+    let clock = Arc::new(FakeClock::at(ts()));
+    let project = ProjectName::parse("vowp").expect("project");
+    let store = test_store(home.path(), &clock);
+    store
+        .upsert_project(&Project {
+            name: project.clone(),
+            path: home.path().join("project").display().to_string(),
+            remote_url: Some("https://example.invalid/acme/vowp.git".to_owned()),
+            default_branch: "main".to_owned(),
+            config: serde_json::json!({}),
+            created_at: ts(),
+            updated_at: ts(),
+        })
+        .expect("project row");
+    activate(home.path(), &clock, &name, &key);
+    store
+        .upsert_node_path(&NodePath {
+            node: name.clone(),
+            project: project.clone(),
+            local_root: "/srv/vowp".to_owned(),
+            worktree_root: "/srv/vowp-wt".to_owned(),
+            allow: Vec::new(),
+            updated_at: ts(),
+        })
+        .expect("path map");
+    std::fs::create_dir_all(home.path().join("project")).expect("project dir");
+    let job = insert_ready_offload_job(&store, &project, "owned-job");
+    let mut config = VowpConfig::with_defaults_for_tests();
+    config.project.name = project.clone();
+    config.project.path = Some(home.path().join("project").display().to_string());
+    config.offload.enabled = true;
+    config.offload.default = Placement::Any;
+    // A fake keeper answers the capsule turn a takeover asks for; no real harness runs.
+    let draft = serde_json::json!({
+        "intent": "owned job",
+        "constraints": [],
+        "decisions": [],
+        "state": {"done": [], "in_progress": ["work"], "blocked": [], "next_steps": []},
+        "files": [],
+        "gotchas": [],
+        "open_questions": []
+    })
+    .to_string();
+    let keeper = support::fake_adapter::FakeAdapter::from_bodies(
+        HarnessKind::Opencode,
+        ts(),
+        vec![EventBody::AssistantMessage(vowp_protocol::AssistantMessage {
+            text: draft,
+        })],
+    );
+    let log = Arc::new(MemoryLog::new());
+    let mut deps = test_deps_with_config(home.path(), clock.clone(), log.clone(), config);
+    deps.adapters = Arc::new(AdapterRegistry::new().with("opencode", Arc::new(keeper)));
+    let gateway = Gateway::start_with_deps(home.path(), clock.clone(), log, deps);
+    authenticate_within(&gateway, &name, &key, GATEWAY_WAIT);
+    gateway.send(&offload_heartbeat(0, 2));
+    let AgentFrame::AssignRun {
+        assignment,
+        lease_token,
+        ..
+    } = gateway.expect(|frame| matches!(frame, AgentFrame::AssignRun { .. }))
+    else {
+        panic!("expected AssignRun");
+    };
+    gateway.send(&AgentFrame::RunAccepted {
+        assignment_id: assignment.assignment_id.clone(),
+        run_id: assignment.run_id.clone(),
+        epoch: assignment.epoch,
+    });
+    // The Pong proves the RunAccepted above has been applied.
+    let start = gateway.frame_count();
+    gateway.send(&AgentFrame::Ping);
+    gateway.expect_after(start, |frame| matches!(frame, AgentFrame::Pong));
+    OwnedRun {
+        home,
+        clock,
+        store,
+        gateway,
+        name,
+        assignment,
+        token: lease_token,
+        job,
+    }
+}
+
+impl OwnedRun {
+    /// Sends one frame and waits until the gateway has processed it.
+    fn send_and_sync(&self, frame: &AgentFrame) {
+        let start = self.gateway.frame_count();
+        self.gateway.send(frame);
+        self.gateway.send(&AgentFrame::Ping);
+        self.gateway
+            .expect_after(start, |frame| matches!(frame, AgentFrame::Pong));
+    }
+
+    fn run_state(&self) -> AgentFrame {
+        AgentFrame::RunState {
+            run_id: self.assignment.run_id.clone(),
+            epoch: self.assignment.epoch,
+            state: RemoteRunState::Running,
+            spool_bytes: 0,
+            head_commit: None,
+            detail: "working".to_owned(),
+        }
+    }
+
+    fn owner(&self) -> Option<vowp_store::repo_surfaces::OwnerRecord> {
+        self.store.ownership(&self.assignment.session_id).expect("ownership")
+    }
+}
+
+#[test]
+fn run_state_renews_the_job_ownership_expiry() {
+    let run = owned_run();
+    let first = run.owner().expect("job owner").expires_at.expect("job expiry");
+
+    // 500 s in, the run reports state: the owner and the assignment both move out.
+    run.clock.advance(Duration::from_secs(500));
+    run.send_and_sync(&run.run_state());
+    let renewed = run.owner().expect("job owner").expires_at.expect("job expiry");
+    assert_eq!(renewed, run.clock.now().plus(vowp_core::agent::dispatch::RUN_LEASE_TTL));
+    assert!(renewed > first, "RunState extends the owner past the issue-time expiry");
+
+    // Past the original expiry the renewed owner still writes.
+    run.clock.advance(Duration::from_secs(200));
+    vowp_core::surface::check_lease_with(&run.store, &run.assignment.session_id, Some(&run.token))
+        .expect("a renewed job owner still writes after the first expiry");
+    run.gateway.finish().expect("gateway");
+}
+
+#[test]
+fn a_late_run_frame_after_expiry_is_fenced() {
+    let run = owned_run();
+    let session = run.assignment.session_id.clone();
+    let hello = AgentFrame::RemoteLine {
+        run_id: run.assignment.run_id.clone(),
+        epoch: run.assignment.epoch,
+        line: hello_line(&session, &run.assignment.run_id, &run.token),
+    };
+    run.send_and_sync(&hello);
+
+    // The lease runs out with no activity; the next heartbeat sweeps and fences the run.
+    run.clock
+        .advance(vowp_core::agent::dispatch::RUN_LEASE_TTL + Duration::from_secs(1));
+    let start = run.gateway.frame_count();
+    run.gateway.send(&offload_heartbeat(1, 2));
+    run.gateway
+        .expect_after(start, |frame| matches!(frame, AgentFrame::RunLost { .. }));
+    let old = run
+        .store
+        .assignments_for_run(&run.assignment.run_id)
+        .expect("assignments")
+        .into_iter()
+        .find(|row| row.epoch == run.assignment.epoch)
+        .expect("old assignment");
+    assert_eq!(old.state, vowp_store::repo_offload::AgentAssignmentState::Lost);
+
+    // A frame from the fenced run is refused and never appended.
+    let late = EventId::new();
+    let start = run.gateway.frame_count();
+    run.gateway
+        .send(&event_line(&run.assignment.run_id, assistant_event(&late, "too late")));
+    run.gateway
+        .expect_after(start, |frame| matches!(frame, AgentFrame::RunLost { .. }));
+    // The old token no longer writes: the expired owner is gone and the re-dispatched
+    // assignment has a new one.
+    vowp_core::surface::check_lease_with(&run.store, &session, Some(&run.token))
+        .expect_err("the fenced run's token is refused");
+    run.gateway.finish().expect("gateway");
+    let events = read_log(run.home.path(), &session);
+    assert!(
+        !events.iter().any(|event| event.id == late),
+        "a fenced run appends nothing"
+    );
+}
+
+#[test]
+fn interactive_takeover_of_a_job_fences_the_run_and_writes_a_capsule() {
+    let run = owned_run();
+    let session = run.assignment.session_id.clone();
+    run.send_and_sync(&AgentFrame::RemoteLine {
+        run_id: run.assignment.run_id.clone(),
+        epoch: run.assignment.epoch,
+        line: hello_line(&session, &run.assignment.run_id, &run.token),
+    });
+    run.send_and_sync(&event_line(
+        &run.assignment.run_id,
+        assistant_event(&EventId::new(), "work before the takeover"),
+    ));
+    let (phone, phone_token) = pair_surface(&run.store, &run.name, &session, "opencode", run.clock.now());
+
+    // Without --takeover the live job owner is never displaced.
+    let start = run.gateway.frame_count();
+    run.gateway
+        .send(&acquire_frame(&phone, &session, &phone_token, LeaseMode::Acquire));
+    run.gateway
+        .expect_after(start, |frame| matches!(frame, AgentFrame::Error { .. }));
+    assert_eq!(
+        run.owner().expect("owner").mode,
+        vowp_protocol::OwnershipMode::Job,
+        "a plain acquire keeps the running job's owner"
+    );
+
+    // An explicit takeover fences the run and takes interactive ownership.
+    let start = run.gateway.frame_count();
+    run.gateway
+        .send(&acquire_frame(&phone, &session, &phone_token, LeaseMode::Takeover));
+    run.gateway
+        .expect_after(start, |frame| matches!(frame, AgentFrame::RunLost { .. }));
+    expect_grant(&run.gateway, start);
+    let owner = run.owner().expect("owner");
+    assert_eq!(owner.mode, vowp_protocol::OwnershipMode::Interactive);
+    assert_eq!(owner.lease.surface_id.as_ref(), Some(&phone));
+
+    let assignment = run
+        .store
+        .assignments_for_run(&run.assignment.run_id)
+        .expect("assignments")
+        .pop()
+        .expect("assignment");
+    assert_eq!(assignment.state, vowp_store::repo_offload::AgentAssignmentState::Lost);
+    assert!(assignment.detail.contains("taken over"), "{:?}", assignment.detail);
+    let job = run.store.require_job(&run.job).expect("job");
+    assert_eq!(job.state, JobState::Ready, "the job is left ready, not switched");
+    let session_row = run.store.require_session(&session).expect("session");
+    let notes_now: Vec<String> = read_log(run.home.path(), &session)
+        .iter()
+        .filter_map(|event| match event.body() {
+            Ok(EventBody::Note(note)) => Some(note.text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        session_row.last_capsule_id.is_some(),
+        "the takeover wrote a capsule: {notes_now:?} {:?}",
+        run.gateway.log.lines()
+    );
+
+    run.gateway.finish().expect("gateway");
+    let notes: Vec<String> = read_log(run.home.path(), &session)
+        .iter()
+        .filter_map(|event| match event.body() {
+            Ok(EventBody::Note(note)) => Some(note.text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notes.iter().filter(|text| text.contains("taken over by")).count(),
+        1,
+        "one takeover note: {notes:?}"
+    );
 }

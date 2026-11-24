@@ -443,6 +443,30 @@ pub struct CapacityAdvice {
     pub applied_by: Option<String>,
 }
 
+/// Additive cluster-wide totals across Home and the online worker nodes.
+///
+/// This card never replaces the per-Home fields: `CapacityReport`, `CapacitySnapshot` and
+/// `Snapshot` keep their existing Home values and carry this document alongside them. A
+/// single-machine home reports `online_worker_nodes = 0` and totals equal to its own Home
+/// capacity.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ClusterCapacity {
+    /// Number of online, active agent worker nodes (Home is not counted).
+    pub online_worker_nodes: u32,
+    /// Home `target_workers` plus each online worker node's `max_slots`.
+    pub target_workers: u32,
+    /// Home running runs plus each online worker node's `busy_slots`.
+    pub busy_workers: u32,
+    /// Logical CPU cores across Home and every online worker node.
+    pub cpu_cores: u32,
+    /// Total physical memory in bytes across Home and every online worker node.
+    pub mem_total_bytes: u64,
+    /// Memory available to new work in bytes across Home and every online worker node.
+    pub mem_available_bytes: u64,
+    /// Free work filesystem bytes across Home and every online worker node.
+    pub disk_free_bytes: u64,
+}
+
 /// Current running-capacity totals.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RunningCapacity {
@@ -484,6 +508,9 @@ pub struct CapacitySnapshot {
     pub reserve_ram_bytes: u64,
     /// Disk kept free for the node in bytes.
     pub min_disk_bytes: u64,
+    /// Additive totals across Home and the online worker nodes.
+    #[serde(default)]
+    pub cluster: ClusterCapacity,
 }
 
 /// Output of `vowp capacity show` and `vowp capacity report`.
@@ -503,6 +530,9 @@ pub struct CapacityReport {
     pub reserve_ram_bytes: u64,
     /// Disk reserve in bytes.
     pub min_disk_bytes: u64,
+    /// Additive totals across Home and the online worker nodes.
+    #[serde(default)]
+    pub cluster: ClusterCapacity,
     /// Usage estimates included in the report.
     pub estimates: Vec<UsageEstimate>,
     /// Jobs waiting for capacity.

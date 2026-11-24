@@ -809,5 +809,6 @@ fn surface_kind_name(kind: SurfaceKind) -> &'static str {
         SurfaceKind::Mirror => "mirror",
         SurfaceKind::Api => "api",
         SurfaceKind::Agent => "agent",
+        SurfaceKind::DesktopUi => "desktop-ui",
     }
 }

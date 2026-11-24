@@ -17,7 +17,9 @@ use crate::CoreError;
 use crate::deps::Deps;
 use crate::session::service::SessionService;
 
-use super::lease::{append_note, clock_time, surface_kind_name};
+use super::lease::{
+    TakeoverConfirmation, append_note, clock_time, stop_notice, surface_kind_name, takeover_confirmation,
+};
 
 /// How long a takeover lets the old surface's turn drain before interrupting it.
 pub const TAKEOVER_DRAIN_SECS: u64 = 5;
@@ -31,6 +33,33 @@ pub fn takeover(
     now: Timestamp,
 ) -> Result<TakeoverReport, CoreError> {
     Ok(takeover_inner(deps, store, session, target, now)?.0)
+}
+
+/// Takes the session over, enforcing the activity-aware confirmation rule.
+///
+/// A live idle owner needs one confirmation (the caller asked); a live owner that is mid-turn
+/// needs `acknowledge_running` as well, otherwise the takeover is refused and changes nothing.
+/// Callers that have already asked the person twice pass `true`; [`takeover`] itself never
+/// refuses.
+pub fn takeover_confirmed(
+    deps: &Deps,
+    store: &Store,
+    session: &SessionId,
+    target: &Surface,
+    now: Timestamp,
+    acknowledge_running: bool,
+) -> Result<TakeoverReport, CoreError> {
+    if takeover_confirmation(store, session, now)? == TakeoverConfirmation::Extra && !acknowledge_running {
+        let owner = store.session_owner(session, now)?;
+        let who = owner
+            .as_ref()
+            .map(|owner| owner.label.clone().unwrap_or_else(|| owner.holder.clone()))
+            .unwrap_or_default();
+        return Err(CoreError::Refused(format!(
+            "{who} is running a turn; confirm again to take the session over and stop it"
+        )));
+    }
+    takeover(deps, store, session, target, now)
 }
 
 /// Takes the session over and also returns the inserted lease.
@@ -117,14 +146,22 @@ pub(crate) fn takeover_inner(
     // The note is written after the switch: during an active turn the runner or ingest
     // writer owns the single-writer log lock; the switch and the revocation release it
     // before this point.
+    // One note per takeover: the old and new holder, when, and the new owner's mode and
+    // epoch; the same text starts with the `ownership_conflict` stop notice every fenced
+    // surface receives.
+    let notice = match store.session_owner(session, now)? {
+        Some(owner) => stop_notice(&owner),
+        None => "ownership_conflict: session taken over".to_owned(),
+    };
     append_note(
         deps,
         store,
         session,
         format!(
-            "taken over by {} at {}",
+            "taken over by {} at {} from {} ({notice})",
             target.holder,
-            clock_time(now, deps.config.node.tz_offset_minutes)
+            clock_time(now, deps.config.node.tz_offset_minutes),
+            previous.holder
         ),
     )?;
 

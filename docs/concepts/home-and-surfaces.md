@@ -156,14 +156,15 @@ The snapshot carries:
 - total capacity: target and advice, brake state, reserves and the running run count. The
   snapshot's `measured` host sample is `null` and `running` carries zero RAM/CPU in this build;
   vowp `capacity show` is the measured report;
-- provider limits, open inbox items, recent sessions (the session card's `active_surface` field is
-  reserved and always `null` in this build), and orchestrator cards.
+- provider limits, open inbox items, recent sessions (each session card carries the authoritative
+  `owner` read model, see [Who owns a session](#who-owns-a-session); the older `active_surface` field
+  stays `null` in this release and is not the owner), and orchestrator cards.
 
 Read commands:
 
 | Command | What it shows |
 |---|---|
-| vowp `fleet status [--refresh] [--cached]` | The machine summary and snapshot wrapper. On a control machine it can fall back to the cache. |
+| vowp `fleet status [--refresh] [--cached]` | The machine summary and snapshot wrapper, with an `owners:` section for sessions that have an owner. On a control machine it can fall back to the cache. |
 | vowp `fleet queue [--project] [--state]` | Every queued job with its waiting reason. |
 | vowp `fleet inbox [--project] [--all]` | Machine and project inbox items, oldest first. |
 | vowp `fleet capacity` | The snapshot capacity card: target, advised target, run count, brake and `measured` (currently none). Use vowp `capacity show` for the full measured report. |
@@ -183,8 +184,9 @@ export/import. v0.2 adds a transport, a lease and app-host integration. The rule
 
 Surfaces include `vowp chat`, the opencode app, a Claude app and the `mcp` server those apps call. A
 surface registers once and heartbeats its lease every 5 seconds. If the
-heartbeat is older than 60 seconds the lease is stale and another surface may take it. A clean exit
-releases the lease.
+heartbeat is older than 60 seconds the lease is stale and another surface may take it without
+`--takeover`. A clean exit releases the lease. The 60-second window applies to an interactive owner
+only; a worker job run has its own lifetime (see [Who owns a session](#who-owns-a-session)).
 
 When another surface holds a live lease, opening the session asks before taking over. A takeover:
 
@@ -204,6 +206,56 @@ Taken over by phone at 14:05. This surface is now read-only (follow mode).
 ```
 
 A pre-attach session with no executor gets the note only; there is no executor to switch to.
+
+### Who owns a session
+
+The one `leases` row per session is the **ownership record**: it names the writer and also carries
+the mode (`interactive` or `job`), an owner epoch and, for a job, an expiry. The **owner** is the
+only writer; every other surface is read-only. The epoch increases on every acquire or takeover, so a
+stale surface can tell it is behind. The design is
+[`session-ownership.md`](../design/v0.5.1/session-ownership.md); the field tables are in
+[types §16.2](../design/types.md#162-surfaces-leases-remote-execution-and-orchestrators-surface) and
+the [CLI reference](../reference/cli.md).
+
+**Seeing the owner.** `SessionSurfaceCard.owner` is the authoritative read model. It names the surface
+label, kind, holder, node, mode, state (`active`, `stale` or `expired`), activity (`idle`, `running`
+or `waiting`), epoch and timestamps, and never a token or password. `active_surface` is still `null`
+in this release; do not read it as the owner. Operators see the same data in:
+
+- vowp `fleet status`, which prints an `owners:` section with one line per owned recent session;
+- vowp `session lease <id>`, which adds mode, state, activity, epoch and expiry;
+- vowp `session show <id>`, which prints an `owner:` block (or `owner: none`);
+- vowp `session ls`, which shows the owner's name with its state and activity.
+
+**Read-only and takeover.** A session with a live owner refuses a write from any other surface with a
+read-only notice, and a matching token on a stale or expired owner is refused too. An explicit
+takeover replaces the lease, increments the epoch and tells the old surface with an
+`ownership_conflict` stop notice, a capsule and a `note`; a stale interactive lease can be replaced
+without `--takeover`. A released interactive session (role `user` or `orchestrator`) has no owner and
+refuses a write with `session has no owner; acquire one`; a home `planner`, `keeper`, `worker` or
+`verifier` session keeps the old pass, so the supervisor's own runs are unchanged.
+
+**Desktop UI.** A UI that talks to an orchestrator's app engine registers as a `desktop-ui` surface
+with vowp `orchestrator attach <name> --holder <name> [--label <label>] [--takeover]`. The command
+creates the surface, prints a one-time `OrchestratorAttach` grant and holds the lease in the
+foreground, heartbeating until stdin closes, then releases it. A UI that needs the lease must keep
+that process alive as its child; there is **no detached keeper for an attached UI in this release**.
+vowp `orchestrator endpoint <name> [--surface <id>]` reports `owner` and `access`; `access` is
+`read_only` unless the caller names the live owner's surface id. The engine credential is still the
+app's own loopback password, shown only by the explicit local endpoint command or the attach grant,
+each with `--json`; the owner read model and snapshots never carry it.
+
+**Job ownership.** A worker run holds ownership in `job` mode with an expiry that run activity renews;
+the 60-second interactive window does not apply. An expired assignment fences the run and releases the
+owner. An explicit interactive takeover of a running job fences it through the dispatch loss path,
+writes a capsule and leaves the job `ready`; it does not switch a human executor.
+
+**Honest limits.** Ownership is **recorded and cooperative**. A UI that calls the app's HTTP API
+directly with the engine password is not stopped by it. The loopback VOWP engine proxy that would
+hard-enforce ownership is **planned and deferred** (owner decision, 2026-11-20); it does not exist in
+this release. There is no node-side proxy either, so a UI talking to a node's loopback engine is
+outside this release's enforcement, and `vowp agent orchestrator endpoint` reports `access: read_only`
+with no home owner view.
 
 ### `vowp chat`
 

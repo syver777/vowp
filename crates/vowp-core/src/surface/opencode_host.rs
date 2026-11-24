@@ -30,14 +30,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use vowp_protocol::{JoinInstructions, OrchestratorApp, Timestamp};
+use vowp_protocol::{JoinInstructions, OrchestratorApp, OrchestratorAuth, Timestamp};
 
 use crate::CoreError;
 
 use super::mirror::MirrorCursor;
 use super::native::{
-    AppHandle, AppHost, HostHealth, HostRequest, TranscriptBatch, TranscriptEntry, TranscriptKind, process_alive,
-    remove_private, shell_quote_text, stop_pid, write_private_json,
+    AppHandle, AppHost, EndpointParts, HostHealth, HostRequest, TranscriptBatch, TranscriptEntry, TranscriptKind,
+    process_alive, remove_private, shell_quote_text, stop_pid, write_private_json,
 };
 
 /// How long `start` waits for the service and its first authenticated answer.
@@ -404,6 +404,85 @@ impl AppHost for OpencodeHost {
                 detail: error.to_string(),
             }),
         }
+    }
+
+    /// Returns the live loopback endpoint from the private host and service files.
+    ///
+    /// Every error is path-free: the service path, port and password never leave this
+    /// function in an error string. A service file from another process, or one that is
+    /// missing or not a regular 0600 file, yields no endpoint rather than a guess.
+    fn endpoint(&self, handle: &AppHandle) -> Result<Option<EndpointParts>, CoreError> {
+        let layout = Layout::for_workdir(&handle.workdir);
+        match fs::metadata(&layout.service_json) {
+            Ok(metadata) => {
+                if !metadata.is_file() {
+                    return Err(CoreError::Invalid(
+                        "the opencode service state is not a regular file".to_owned(),
+                    ));
+                }
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(CoreError::Invalid(
+                        "the opencode service state is wider than 0600".to_owned(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => {
+                return Err(CoreError::Invalid(
+                    "the opencode service state is not readable".to_owned(),
+                ));
+            }
+        }
+        let service = match read_service_state_or_none(&layout) {
+            Ok(Some(service)) => service,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                return Err(CoreError::Invalid(
+                    "the opencode service state is not readable".to_owned(),
+                ));
+            }
+        };
+        if service.password.is_empty() {
+            return Err(CoreError::Invalid(
+                "the opencode service state has no service password".to_owned(),
+            ));
+        }
+        let host = match read_host_state(&layout) {
+            Ok(Some(host)) => host,
+            Ok(None) => return Ok(None),
+            Err(_) => {
+                return Err(CoreError::Invalid("the opencode host state is not readable".to_owned()));
+            }
+        };
+        if let Some(service_pid) = service.pid
+            && service_pid != host.pid
+            && !process_alive(service_pid)
+        {
+            // A leftover service file from a previous run is not this host's endpoint.
+            return Ok(None);
+        }
+        let port = match service.url.as_deref() {
+            Some(url) => {
+                let (_, port) = loopback_address(url)?;
+                port
+            }
+            None => service.port.unwrap_or(0),
+        };
+        if port == 0 {
+            return Err(CoreError::Invalid(
+                "the opencode service state has no loopback port".to_owned(),
+            ));
+        }
+        Ok(Some(EndpointParts {
+            url: format!("http://127.0.0.1:{port}"),
+            native_session_id: host.native_session_id,
+            auth: Some(OrchestratorAuth {
+                header: "Authorization".to_owned(),
+                scheme: "Basic".to_owned(),
+                username: "opencode".to_owned(),
+                password: service.password,
+            }),
+        }))
     }
 
     fn join_instructions(&self, handle: &AppHandle) -> Result<JoinInstructions, CoreError> {

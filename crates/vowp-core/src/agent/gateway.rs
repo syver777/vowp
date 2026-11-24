@@ -427,6 +427,9 @@ fn run_connection_inner(
     // so the connection does not need the plaintext lease token.
     let mut attached_surfaces: HashMap<SurfaceId, SessionId> = HashMap::new();
     let mut surface_turns: HashMap<(SurfaceId, SessionId), AttachedSurfaceTurn> = HashMap::new();
+    // Plaintext run-lease tokens of the assignments sent on this connection, keyed by run.
+    // The store keeps only hashes, so this is what lets run activity renew the job owner.
+    let mut run_tokens: HashMap<RunId, String> = HashMap::new();
     // Orchestrator commands cross the same authenticated connection. The home command
     // writes the durable spool; this connection drains it and publishes the result back.
     let orchestrator = Orchestrator::new_queued(deps.clone());
@@ -516,8 +519,14 @@ fn run_connection_inner(
                 }
                 // Dispatch on the heartbeat so the slot count is the node's latest
                 // report. Expired run leases are fenced before they can be resumed.
+                // A running orchestrator's paired surface is renewed from the same heartbeat so
+                // its owner row stays `active` while the node is alive.
+                lease::renew_running_orchestrator_leases(store, &session.node, now)?;
                 let lost = dispatch::sweep_expired(deps, store, &session.node, now)?;
                 for assignment in lost {
+                    // The fenced run's ingest stream goes with it, so a later line from the
+                    // run is answered with `RunLost` and never reaches the session log.
+                    chats.remove(&assignment.run_id);
                     send_frame(
                         writer,
                         &AgentFrame::RunLost {
@@ -529,6 +538,7 @@ fn run_connection_inner(
                 dispatch::enqueue_ready_jobs(deps, store, now)?;
                 let claimed = dispatch::claim_for_node(deps, store, &session.node, now)?;
                 for (index, item) in claimed.iter().enumerate() {
+                    remember_run_token(&mut run_tokens, &item.frame);
                     if let Err(error) = send_frame(writer, &item.frame) {
                         let _ = dispatch::return_claimed_to_queue(
                             store,
@@ -554,7 +564,7 @@ fn run_connection_inner(
                 run_id,
                 epoch,
             } => match dispatch::accept(deps, store, &session.node, &assignment_id, &run_id, epoch, now) {
-                Ok(_) => {}
+                Ok(accepted) => renew_owner_for(store, &run_tokens, &accepted, now)?,
                 Err(error @ (CoreError::Refused(_) | CoreError::Invalid(_) | CoreError::NotFound(_))) => {
                     send_error(writer, error.kind(), error.to_string(), false)?;
                 }
@@ -602,7 +612,8 @@ fn run_connection_inner(
                 &detail,
                 now,
             ) {
-                Ok(_) => {
+                Ok(updated) => {
+                    renew_owner_for(store, &run_tokens, &updated, now)?;
                     if let Some(stream) = chats.get_mut(&run_id) {
                         stream.ingest.set_reported_head(head_commit.as_deref());
                     }
@@ -620,6 +631,7 @@ fn run_connection_inner(
                             send_frame(writer, &AgentFrame::RunLost { run_id, reason })?;
                         }
                         for claimed in outcome.assignments {
+                            remember_run_token(&mut run_tokens, &claimed.frame);
                             send_frame(writer, &claimed.frame)?;
                         }
                     }
@@ -717,7 +729,7 @@ fn run_connection_inner(
                 Err(error) => return Err(error),
             },
             AgentFrame::SurfaceAttach(attach) => {
-                match handle_surface_attach(store, &session.node, &attach, &mut attached_surfaces, writer, now) {
+                match handle_surface_attach(deps, store, &session.node, &attach, &mut attached_surfaces, writer, now) {
                     Ok(()) => {}
                     Err(SurfaceFrameError::NotFound(message)) => {
                         // The agent may attach a local orchestrator binding before the home
@@ -797,12 +809,22 @@ fn run_connection_inner(
                 surface_token,
                 mode,
             } => {
-                let result = acquire_lease(store, &session.node, &surface, &session_id, &surface_token, mode, now);
+                let result = acquire_lease(
+                    deps,
+                    store,
+                    &session.node,
+                    &surface,
+                    &session_id,
+                    &surface_token,
+                    mode,
+                    now,
+                );
                 match result {
                     Ok(LeaseResponse::Granted {
                         grant,
                         previous,
                         holder,
+                        takeover,
                     }) => {
                         if let Some(previous) = &previous
                             && lease::is_live(now, previous)
@@ -823,6 +845,7 @@ fn run_connection_inner(
                             &format!("session {session_id} was taken over by {holder}"),
                             writer,
                         )?;
+                        finish_takeover(deps, store, &session_id, takeover, now)?;
                         deps.log.log(
                             Level::Info,
                             &format!("agent {}", session.node),
@@ -1067,6 +1090,10 @@ fn run_connection_inner(
                 if is_event {
                     stream.in_flight = stream.in_flight.saturating_add(1);
                 }
+                // An accepted line is run activity: it extends the job owner.
+                if let Some(token) = &stream.job_lease {
+                    dispatch::renew_run_owner(store, &stream.session, token, now)?;
+                }
             }
             AgentFrame::TurnEnd { run_id, summary } => {
                 let Some(mut stream) = chats.remove(&run_id) else {
@@ -1269,6 +1296,8 @@ struct ChatStream<'a> {
     in_flight: u64,
     /// Whether the next window was granted and awaits the agent's round-trip.
     credit_pending: bool,
+    /// Plaintext run-lease token of an offloaded run; accepted lines renew its job owner.
+    job_lease: Option<String>,
 }
 
 /// A turn begun by a paired surface, ready to ingest.
@@ -1306,7 +1335,7 @@ fn resume_run_stream<'a>(
     let Some(current) = store.lease(session)? else {
         return Err(CoreError::Refused(format!("session {session} has no live lease")));
     };
-    if !lease::is_live(now, &current) {
+    if !lease_is_live(store, now, &current) {
         return Err(CoreError::Refused(format!(
             "session {session} lease has expired; the surface is read-only"
         )));
@@ -1384,6 +1413,7 @@ fn resume_offload_stream<'a>(
         ingest,
         in_flight: 0,
         credit_pending: false,
+        job_lease: Some(lease.to_owned()),
     })
 }
 
@@ -1433,7 +1463,7 @@ fn resume_chat_stream<'a>(
     let Some(current) = store.lease(session)? else {
         return Err(CoreError::Refused(format!("session {session} has no live lease")));
     };
-    if !lease::is_live(now, &current) {
+    if !lease_is_live(store, now, &current) {
         return Err(CoreError::Refused(format!(
             "session {session} lease has expired; the surface is read-only"
         )));
@@ -1459,6 +1489,7 @@ fn resume_chat_stream<'a>(
         ingest,
         in_flight: 0,
         credit_pending: false,
+        job_lease: None,
     })
 }
 
@@ -1486,7 +1517,7 @@ fn begin_agent_turn<'a>(
     let Some(current) = store.lease(session)? else {
         return Err(CoreError::Refused(format!("session {session} has no live lease")));
     };
-    if !lease::is_live(now, &current) {
+    if !lease_is_live(store, now, &current) {
         return Err(CoreError::Refused(format!(
             "session {session} lease has expired; the surface is read-only"
         )));
@@ -1543,6 +1574,7 @@ fn begin_agent_turn<'a>(
         )?,
         in_flight: 0,
         credit_pending: false,
+        job_lease: None,
     };
     Ok(StartedTurn {
         run_id: grant.run_id,
@@ -1712,6 +1744,114 @@ fn fence_all(
     Ok(())
 }
 
+/// Remembers the plaintext run-lease token carried by an `AssignRun` frame.
+fn remember_run_token(tokens: &mut HashMap<RunId, String>, frame: &AgentFrame) {
+    if let AgentFrame::AssignRun {
+        assignment,
+        lease_token,
+        ..
+    } = frame
+    {
+        tokens.insert(assignment.run_id.clone(), lease_token.clone());
+    }
+}
+
+/// Renews the job owner of an assignment's session from the token this connection holds.
+///
+/// A run whose token this connection never saw (it was assigned on another connection)
+/// renews nothing; its owner then expires on schedule and the sweep fences it.
+fn renew_owner_for(
+    store: &Store,
+    tokens: &HashMap<RunId, String>,
+    assignment: &vowp_store::repo_offload::AgentAssignment,
+    now: Timestamp,
+) -> Result<(), CoreError> {
+    if let Some(token) = tokens.get(&assignment.run_id) {
+        dispatch::renew_run_owner(store, &assignment.session_id, token, now)?;
+    }
+    Ok(())
+}
+
+/// A takeover whose capsule and note the caller writes once the old run's log is released.
+struct PendingTakeover {
+    /// Holder of the owner that was replaced.
+    previous_holder: String,
+    /// Holder of the new interactive owner.
+    by: String,
+}
+
+/// Returns whether `lease` still lets its holder write at `now`.
+///
+/// A job owner lives until its expiry, not for the 60 s interactive heartbeat window, so the
+/// owner row decides when it is the row the caller holds; any other lease (a row already
+/// replaced) falls back to its heartbeat.
+fn lease_is_live(store: &Store, now: Timestamp, lease: &Lease) -> bool {
+    match store.ownership(&lease.session_id) {
+        Ok(Some(record)) if record.lease.token == lease.token => record.is_live_at(now),
+        _ => lease::is_live(now, lease),
+    }
+}
+
+/// Acquires the session lease for a paired surface, fencing a job owner first.
+///
+/// A live job owner is replaced only by an explicit [`LeaseMode::Takeover`]; the run is fenced
+/// through [`dispatch::fence_job_owner`] (never switched) and the job stays `ready`. An expired
+/// job owner is fenced the same way for any mode. When a live owner was replaced by a takeover
+/// the returned [`PendingTakeover`] asks the caller to write the capsule and the one note
+/// after it has dropped the fenced run's ingest stream.
+fn acquire_fenced(
+    deps: &Deps,
+    store: &Store,
+    session: &SessionId,
+    surface: &SurfaceInfo,
+    mode: LeaseMode,
+    now: Timestamp,
+) -> Result<(AgentLeaseAcquire, Option<PendingTakeover>), CoreError> {
+    let takeover = mode == LeaseMode::Takeover;
+    let mut previous_holder = None;
+    if let Some(record) = store.ownership(session)? {
+        let live = record.is_live_at(now);
+        if record.mode == vowp_protocol::OwnershipMode::Job && (!live || takeover) {
+            let by = surface.holder.as_str();
+            dispatch::fence_job_owner(deps, store, session, by, now)?;
+        }
+        if live && takeover {
+            previous_holder = Some(record.lease.holder);
+        }
+    }
+    let outcome = lease::acquire_agent_lease(store, session, surface, mode, now)?;
+    let pending = match (&outcome, previous_holder) {
+        (AgentLeaseAcquire::Granted { .. }, Some(previous_holder)) => Some(PendingTakeover {
+            previous_holder,
+            by: surface.holder.clone(),
+        }),
+        _ => None,
+    };
+    Ok((outcome, pending))
+}
+
+/// Writes the capsule and note of a completed takeover.
+fn finish_takeover(
+    deps: &Deps,
+    store: &Store,
+    session: &SessionId,
+    pending: Option<PendingTakeover>,
+    now: Timestamp,
+) -> Result<(), CoreError> {
+    if let Some(pending) = pending {
+        // The lease already moved; a failed capsule or note must not drop the grant.
+        if let Err(error) = dispatch::record_takeover(deps, store, session, &pending.previous_holder, &pending.by, now)
+        {
+            deps.log.log(
+                Level::Warn,
+                "agent",
+                &format!("takeover of {session}: could not record the note: {error}"),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The answer to one lease acquire frame.
 enum LeaseResponse {
     /// The surface now holds the lease.
@@ -1722,6 +1862,8 @@ enum LeaseResponse {
         previous: Option<Box<Lease>>,
         /// Human-visible holder name of the new surface.
         holder: String,
+        /// Capsule and note still to write for a takeover of a live owner.
+        takeover: Option<PendingTakeover>,
     },
     /// A live lease is held by another surface and no takeover was requested.
     Conflict(String),
@@ -1732,7 +1874,9 @@ enum LeaseResponse {
 /// The token is checked against the v4 `surface_tokens` row and must belong to a surface
 /// on the connection's node whose metadata names this session and whose scope grants
 /// `session.write:<id>`. No token or code value is logged or echoed.
+#[allow(clippy::too_many_arguments)]
 fn acquire_lease(
+    deps: &Deps,
     store: &Store,
     node: &NodeName,
     surface_id: &SurfaceId,
@@ -1752,11 +1896,13 @@ fn acquire_lease(
             "surface token does not grant {write_scope}"
         )));
     }
-    match lease::acquire_agent_lease(store, session, &surface, mode, now)? {
+    let (outcome, takeover) = acquire_fenced(deps, store, session, &surface, mode, now)?;
+    match outcome {
         AgentLeaseAcquire::Granted { grant, previous } => Ok(LeaseResponse::Granted {
             grant,
             previous: previous.map(Box::new),
             holder: surface.holder,
+            takeover,
         }),
         AgentLeaseAcquire::Conflict(conflict) => Ok(LeaseResponse::Conflict(format!(
             "session {session} is held by {} ({}) since {}",
@@ -2166,7 +2312,7 @@ fn verify_surface_writer(
 ) -> Result<(), SurfaceFrameError> {
     let key = (surface.clone(), session.clone());
     match store.lease(session)? {
-        Some(current) if current.surface_id.as_ref() == Some(surface) && lease::is_live(now, &current) => {
+        Some(current) if current.surface_id.as_ref() == Some(surface) && lease_is_live(store, now, &current) => {
             store.heartbeat_surface_lease(session, surface, node, now)?;
             Ok(())
         }
@@ -2336,6 +2482,7 @@ fn refresh_attached_surfaces(
 
 /// Handles one `SurfaceAttach`: verifies the surface token, then acquires or follows.
 fn handle_surface_attach(
+    deps: &Deps,
     store: &Store,
     node: &NodeName,
     attach: &SurfaceAttach,
@@ -2354,7 +2501,7 @@ fn handle_surface_attach(
             store.heartbeat_surface_lease(&attach.session, &attach.surface, node, now)?;
             attached_surfaces.insert(attach.surface.clone(), attach.session.clone());
         }
-        Some(current) if lease::is_live(now, &current) => {
+        Some(current) if lease_is_live(store, now, &current) => {
             send_frame(
                 writer,
                 &AgentFrame::LeaseRevoked {
@@ -2363,7 +2510,7 @@ fn handle_surface_attach(
                 },
             )?;
         }
-        _ => match lease::acquire_agent_lease(store, &attach.session, &active.info, LeaseMode::Acquire, now)? {
+        _ => match acquire_fenced(deps, store, &attach.session, &active.info, LeaseMode::Acquire, now)?.0 {
             lease::AgentLeaseAcquire::Granted { .. } => {
                 attached_surfaces.insert(attach.surface.clone(), attach.session.clone());
             }
@@ -2856,13 +3003,15 @@ fn handle_surface_tool_call(
         }
         let held_here = matches!(
             store.lease(&call.session)?,
-            Some(current) if current.surface_id.as_ref() == Some(&call.surface) && lease::is_live(now, &current)
+            Some(current) if current.surface_id.as_ref() == Some(&call.surface) && lease_is_live(store, now, &current)
         );
         if held_here {
             store.heartbeat_surface_lease(&call.session, &call.surface, node, now)?;
             attached_surfaces.insert(call.surface.clone(), call.session.clone());
         } else if takeover {
-            match lease::acquire_agent_lease(store, &call.session, &active.info, LeaseMode::Takeover, now)? {
+            let (outcome, pending) =
+                acquire_fenced(deps, store, &call.session, &active.info, LeaseMode::Takeover, now)?;
+            match outcome {
                 lease::AgentLeaseAcquire::Granted { previous, .. } => {
                     if let Some(previous) = previous
                         && lease::is_live(now, &previous)
@@ -2885,6 +3034,15 @@ fn handle_surface_tool_call(
                             writer,
                         )?;
                     }
+                    // A fenced job run has no previous surface to notify; its ingest stream is
+                    // dropped here so the capsule and note can take the session log.
+                    fence_session(
+                        chats,
+                        &call.session,
+                        &format!("session {} was taken over by {}", call.session, active.info.holder),
+                        writer,
+                    )?;
+                    finish_takeover(deps, store, &call.session, pending, now)?;
                     attached_surfaces.insert(call.surface.clone(), call.session.clone());
                 }
                 lease::AgentLeaseAcquire::Conflict(conflict) => {
@@ -2899,7 +3057,7 @@ fn handle_surface_tool_call(
             }
         } else {
             match store.lease(&call.session)? {
-                Some(current) if lease::is_live(now, &current) => {
+                Some(current) if lease_is_live(store, now, &current) => {
                     let notice = crate::surface::takeover::notice(
                         &current.holder,
                         current.acquired_at,
@@ -2908,7 +3066,7 @@ fn handle_surface_tool_call(
                     send_tool_failure(writer, &call.request_id, "refused", &notice)?;
                     return Ok(());
                 }
-                _ => match lease::acquire_agent_lease(store, &call.session, &active.info, LeaseMode::Acquire, now)? {
+                _ => match acquire_fenced(deps, store, &call.session, &active.info, LeaseMode::Acquire, now)?.0 {
                     lease::AgentLeaseAcquire::Granted { .. } => {
                         attached_surfaces.insert(call.surface.clone(), call.session.clone());
                     }

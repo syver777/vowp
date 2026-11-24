@@ -82,9 +82,42 @@ pub fn fix_prompt(job: &Job, findings: &[String]) -> String {
     }
     format!(
         "Job {parent} failed its checks (round {attempt} of {max}). Findings:\n{list}\n\
-         Fix exactly these problems in the same worktree, re-run the failing commands, commit, and update {report_path}. Do not widen scope.",
+         Fix exactly these problems in the same worktree, re-run the failing commands, commit, and update {report_path}. Do not widen scope.{extra}",
         report_path = report_text(job),
+        extra = failing_report_note(findings, &job.report)
+            .map(|note| format!("\n{note}"))
+            .unwrap_or_default(),
     )
+}
+
+/// Returns an instruction naming the report file to edit when a finding is a report-gate
+/// failure of another job (`gate N (report) for <job> at <path>: ...`).
+///
+/// The fix worker's own report (`own_report`) is a separate file it must also write.
+pub(crate) fn failing_report_note(findings: &[String], own_report: &str) -> Option<String> {
+    let mut paths: Vec<&str> = Vec::new();
+    for finding in findings {
+        let Some((head, rest)) = finding.split_once(" (report) for ") else {
+            continue;
+        };
+        if !head.starts_with("gate ") {
+            continue;
+        }
+        let Some((_, after)) = rest.split_once(" at ") else {
+            continue;
+        };
+        let path = after.split(": ").next().unwrap_or(after).trim();
+        if !path.is_empty() && path != own_report && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The failing report is {list} — edit that file in the shared worktree to supply the missing fields. Your own fix report ({own_report}) is a separate file; you must also write it.",
+        list = paths.join(", "),
+    ))
 }
 
 /// Checks the report after a worker run.

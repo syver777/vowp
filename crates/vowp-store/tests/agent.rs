@@ -7,8 +7,9 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use vowp_protocol::{
-    EventId, HarnessKind, NodeName, NodePresence, NodeStatus, ProjectName, SessionId, Surface, SurfaceId, SurfaceKind,
-    SurfaceScope, SurfaceState, Timestamp,
+    EventId, HarnessKind, Lease, NodeName, NodePresence, NodeStatus, OwnershipMode, OwnershipState, ProjectName,
+    Session, SessionId, SessionRole, SessionState, Surface, SurfaceActivity, SurfaceId, SurfaceKind, SurfaceScope,
+    SurfaceState, Timestamp,
 };
 use vowp_store::{
     EnrollmentCode, EnrollmentKind, NodeCredential, NodePath, NodePaths, Store, StoreError, SurfaceToken, migrate_v02,
@@ -178,7 +179,7 @@ fn migration_v2_to_v3_preserves_nodes_projects_and_sessions() {
     drop(backup);
 
     let store = Store::open(&paths).expect("open migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     assert_eq!(store.list_nodes().expect("nodes").len(), 2);
     assert_eq!(store.kv_get("node_id").expect("kv"), Some("preserved-id".to_owned()));
     let projects = store.list_projects().expect("projects");
@@ -981,7 +982,7 @@ fn migration_v3_to_v4_preserves_surfaces_and_rows() {
     drop(backup);
 
     let store = Store::open(&paths).expect("open migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     assert_eq!(store.kv_get("node_id").expect("kv"), Some("preserved-id".to_owned()));
     assert_eq!(store.require_session(&session_id).expect("session").title, "kept");
     let stored_surface = store
@@ -1154,7 +1155,7 @@ fn migration_v4_to_v5_clears_leases_and_preserves_surfaces() {
     drop(backup);
 
     let store = Store::open(&paths).expect("open migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     assert_eq!(store.kv_get("node_id").expect("kv"), Some("preserved-id".to_owned()));
     assert_eq!(store.require_session(&session_id).expect("session").title, "kept");
     let stored_surface = store
@@ -1252,4 +1253,315 @@ fn surface_token_schema_has_no_plaintext_token() {
         );
     }
     assert_eq!(found, 1);
+}
+
+// ---------------------------------------------------------------- session ownership (v8)
+
+/// Opens a fresh home and inserts one idle session.
+fn owner_home() -> (TempDir, Store, SessionId) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(&NodePaths::new(tmp.path())).expect("store");
+    let id = SessionId::new();
+    store
+        .upsert_session(&Session {
+            id: id.clone(),
+            project: None,
+            job_id: None,
+            role: Some(SessionRole::User),
+            title: "owned".to_owned(),
+            parent_session_id: None,
+            node: node("local"),
+            cwd: "/tmp".to_owned(),
+            state: SessionState::Idle,
+            executor: None,
+            last_seq: 0,
+            last_capsule_id: None,
+            log_bytes: 0,
+            created_at: ts(T0),
+            updated_at: ts(T0),
+        })
+        .expect("session");
+    (tmp, store, id)
+}
+
+fn lease_for(session: &SessionId, surface: Option<&SurfaceId>, kind: SurfaceKind, token: &str, at: &str) -> Lease {
+    Lease {
+        session_id: session.clone(),
+        surface_id: surface.cloned(),
+        surface_kind: kind,
+        node: node("mac-studio"),
+        holder: "holder".to_owned(),
+        token: token.to_owned(),
+        acquired_at: ts(at),
+        heartbeat_at: ts(at),
+    }
+}
+
+fn ui_surface(id: &SurfaceId, holder: &str) -> Surface {
+    Surface {
+        kind: SurfaceKind::DesktopUi,
+        holder: holder.to_owned(),
+        ..surface(id)
+    }
+}
+
+#[test]
+fn surfaces_and_leases_accept_desktop_ui_and_job_mode() {
+    let (_tmp, store, session) = owner_home();
+    let ui = SurfaceId::new();
+    store
+        .upsert_surface(&ui_surface(&ui, "StackSpirit"))
+        .expect("desktop-ui surface");
+    assert_eq!(
+        store.surface(&ui).expect("read").expect("row").kind,
+        SurfaceKind::DesktopUi
+    );
+    store
+        .take_lease(&lease_for(
+            &session,
+            Some(&ui),
+            SurfaceKind::DesktopUi,
+            &"u".repeat(52),
+            T0,
+        ))
+        .expect("desktop-ui lease");
+    let owner = store.session_owner(&session, ts(T0)).expect("owner").expect("present");
+    assert_eq!(owner.kind, SurfaceKind::DesktopUi);
+    assert_eq!(owner.mode, OwnershipMode::Interactive);
+
+    // A job owner needs an expiry.
+    let job = lease_for(&session, None, SurfaceKind::Agent, &"j".repeat(52), T0);
+    let error = store
+        .take_ownership(&job, OwnershipMode::Job, None)
+        .expect_err("job without expiry");
+    assert!(matches!(error, StoreError::InvalidInput(_)), "got {error:?}");
+    store
+        .take_ownership(&job, OwnershipMode::Job, Some(ts(T1)))
+        .expect("job owner");
+    let owner = store.session_owner(&session, ts(T0)).expect("owner").expect("present");
+    assert_eq!(owner.mode, OwnershipMode::Job);
+    assert_eq!(owner.surface_id, None);
+    assert_eq!(owner.expires_at, Some(ts(T1)));
+}
+
+#[test]
+fn take_lease_increments_owner_epoch_once_per_replace() {
+    let (_tmp, store, session) = owner_home();
+    let surface_id = SurfaceId::new();
+    store.upsert_surface(&surface(&surface_id)).expect("surface");
+    let mut epochs = Vec::new();
+    for round in 0..3 {
+        let lease = lease_for(
+            &session,
+            Some(&surface_id),
+            SurfaceKind::Agent,
+            &format!("{round}").repeat(52),
+            T0,
+        );
+        store.take_lease(&lease).expect("take");
+        epochs.push(
+            store
+                .session_owner(&session, ts(T0))
+                .expect("owner")
+                .expect("row")
+                .epoch,
+        );
+    }
+    assert_eq!(
+        epochs,
+        vec![1, 2, 3],
+        "one increment per replace, assigned by the store"
+    );
+    // A heartbeat is not a replace.
+    assert!(
+        store
+            .heartbeat_lease(&session, &"2".repeat(52), ts(T1))
+            .expect("heartbeat")
+    );
+    assert_eq!(
+        store
+            .session_owner(&session, ts(T1))
+            .expect("owner")
+            .expect("row")
+            .epoch,
+        3
+    );
+}
+
+#[test]
+fn interactive_stale_sweep_ignores_an_unexpired_job_lease() {
+    let (_tmp, store, session) = owner_home();
+    let job = lease_for(&session, None, SurfaceKind::Agent, &"j".repeat(52), T0);
+    store
+        .take_ownership(&job, OwnershipMode::Job, Some(ts("2026-01-01T01:00:00.000Z")))
+        .expect("job owner");
+    let before = ts(T1).plus(Duration::from_secs(3600));
+    assert!(store.stale_leases(before).expect("stale").is_empty());
+    assert!(
+        !store
+            .release_stale_lease(&session, &vowp_store::hash_lease_token(&"j".repeat(52)), before)
+            .expect("conditional delete"),
+        "the conditional delete leaves a job row alone"
+    );
+    assert!(store.lease(&session).expect("lease").is_some());
+}
+
+#[test]
+fn legacy_agent_run_lease_is_not_selected_as_interactive_stale() {
+    let (_tmp, store, session) = owner_home();
+    // The old take_lease wrapper still writes this shape.
+    store
+        .take_lease(&lease_for(&session, None, SurfaceKind::Agent, &"r".repeat(52), T0))
+        .expect("legacy run lease");
+    let record = store.ownership(&session).expect("record").expect("row");
+    assert_eq!(record.mode, OwnershipMode::Job, "read as job mode");
+    assert_eq!(record.expires_at, Some(ts(T0).plus(Duration::from_secs(600))));
+    let long_after = ts(T0).plus(Duration::from_secs(300));
+    assert!(store.stale_leases(long_after).expect("stale").is_empty());
+    assert!(store.expired_job_leases(long_after).expect("expired").is_empty());
+    assert_eq!(record.state_at(long_after), OwnershipState::Active);
+    let later = ts(T0).plus(Duration::from_secs(601));
+    assert_eq!(store.expired_job_leases(later).expect("expired").len(), 1);
+}
+
+#[test]
+fn expired_job_lease_is_selected_only_after_expires_at() {
+    let (_tmp, store, session) = owner_home();
+    let job = lease_for(&session, None, SurfaceKind::Agent, &"j".repeat(52), T0);
+    let expiry = ts(T1);
+    store
+        .take_ownership(&job, OwnershipMode::Job, Some(expiry))
+        .expect("job owner");
+    let just_before = expiry.minus(Duration::from_millis(1));
+    assert!(store.expired_job_leases(just_before).expect("before").is_empty());
+    assert_eq!(
+        store
+            .session_owner(&session, just_before)
+            .expect("o")
+            .expect("row")
+            .state,
+        OwnershipState::Active
+    );
+    assert_eq!(store.expired_job_leases(expiry).expect("at").len(), 1);
+    assert_eq!(
+        store.session_owner(&session, expiry).expect("o").expect("row").state,
+        OwnershipState::Expired
+    );
+    // Renewing extends the expiry; a wrong token does not.
+    assert!(
+        !store
+            .renew_job_lease(&session, "wrong", expiry, expiry.plus(Duration::from_secs(60)))
+            .expect("renew")
+    );
+    let renewed = expiry.plus(Duration::from_secs(600));
+    assert!(
+        store
+            .renew_job_lease(&session, &"j".repeat(52), expiry, renewed)
+            .expect("renew")
+    );
+    assert!(store.expired_job_leases(expiry).expect("after renew").is_empty());
+}
+
+#[test]
+fn surface_label_defaults_and_round_trips() {
+    let (_tmp, store, _session) = owner_home();
+    let ui = SurfaceId::new();
+    store.upsert_surface(&ui_surface(&ui, "StackSpirit")).expect("surface");
+    assert_eq!(
+        store.surface_label(&ui).expect("label").as_deref(),
+        Some("StackSpirit · mac-studio")
+    );
+    let opencode = SurfaceId::new();
+    store
+        .upsert_surface(&Surface {
+            kind: SurfaceKind::Opencode,
+            ..surface(&opencode)
+        })
+        .expect("opencode surface");
+    assert_eq!(
+        store.surface_label(&opencode).expect("label").as_deref(),
+        Some("OpenCode · mac-studio")
+    );
+    // An upsert never overwrites a saved label.
+    store
+        .set_surface_label(&opencode, Some("Kitchen laptop"))
+        .expect("rename");
+    store.upsert_surface(&surface(&opencode)).expect("upsert again");
+    assert_eq!(
+        store.surface_label(&opencode).expect("label").as_deref(),
+        Some("Kitchen laptop")
+    );
+    assert_eq!(store.surface_label(&SurfaceId::new()).expect("unknown"), None);
+}
+
+#[test]
+fn surface_rename_updates_the_label() {
+    let (_tmp, store, session) = owner_home();
+    let ui = SurfaceId::new();
+    store.upsert_surface(&ui_surface(&ui, "StackSpirit")).expect("surface");
+    store
+        .take_lease(&lease_for(
+            &session,
+            Some(&ui),
+            SurfaceKind::DesktopUi,
+            &"u".repeat(52),
+            T0,
+        ))
+        .expect("lease");
+    store.set_surface_label(&ui, Some("  Desk monitor  ")).expect("rename");
+    let owner = store.session_owner(&session, ts(T0)).expect("owner").expect("row");
+    assert_eq!(
+        owner.label.as_deref(),
+        Some("Desk monitor"),
+        "trimmed and shown on the owner"
+    );
+    for bad in ["", "   ", "tab\there", &"x".repeat(81)] {
+        let error = store.set_surface_label(&ui, Some(bad)).expect_err("invalid label");
+        assert!(
+            matches!(error, StoreError::InvalidInput(_)),
+            "got {error:?} for {bad:?}"
+        );
+    }
+    store.set_surface_label(&ui, None).expect("reset");
+    assert_eq!(
+        store.surface_label(&ui).expect("label").as_deref(),
+        Some("StackSpirit · mac-studio")
+    );
+    assert!(matches!(
+        store.set_surface_label(&SurfaceId::new(), Some("x")),
+        Err(StoreError::NotFound { .. })
+    ));
+}
+
+#[test]
+fn session_owner_activity_is_idle_running_or_waiting() {
+    let (_tmp, store, session) = owner_home();
+    let ui = SurfaceId::new();
+    store.upsert_surface(&ui_surface(&ui, "StackSpirit")).expect("surface");
+    store
+        .take_lease(&lease_for(
+            &session,
+            Some(&ui),
+            SurfaceKind::DesktopUi,
+            &"u".repeat(52),
+            T0,
+        ))
+        .expect("lease");
+    let activity = |store: &Store| {
+        store
+            .session_owner(&session, ts(T0))
+            .expect("owner")
+            .expect("row")
+            .activity
+    };
+    assert_eq!(activity(&store), SurfaceActivity::Idle);
+    for (state, expected) in [
+        (SessionState::Running, SurfaceActivity::Running),
+        (SessionState::Switching, SurfaceActivity::Running),
+        (SessionState::Blocked, SurfaceActivity::Waiting),
+        (SessionState::Idle, SurfaceActivity::Idle),
+    ] {
+        store.set_session_state(&session, state, None).expect("state");
+        assert_eq!(activity(&store), expected, "{state:?}");
+    }
 }

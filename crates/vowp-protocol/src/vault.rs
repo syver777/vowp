@@ -66,6 +66,8 @@ pub enum VaultMode {
     VaultUser,
     /// Files are owned by the current user.
     Basic,
+    /// Files are encrypted at rest with an age keyfile owned by the current user.
+    Encrypted,
 }
 
 /// The one-time paste-page document returned by `vowp secret request`.

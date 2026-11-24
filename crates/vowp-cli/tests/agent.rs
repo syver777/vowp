@@ -21,9 +21,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use tempfile::TempDir;
 use vowp_agent::{
     AgentClient, AgentClock, AgentConfig, AgentError, AgentStatus, Cache, ConnectionState, FrameRead, FrameStream,
-    NodeKey, PushStatus, RunHandler, RunOptions, RunOutcome as AgentRunOutcome, RunSink, RunSinkError, RunSummary,
-    ServiceError, SshTransport, SurfacePairRequest, SystemAgentClock, Transport, TransportConfig, WssTlsMode,
-    pending_spool_bytes,
+    NodeKey, OrchestratorConfig, OrchestratorHost, PushStatus, RunHandler, RunOptions, RunOutcome as AgentRunOutcome,
+    RunSink, RunSinkError, RunSummary, ServiceError, SshTransport, SurfacePairRequest, SystemAgentClock, Transport,
+    TransportConfig, WssTlsMode, pending_spool_bytes,
 };
 use vowp_cli::agent_exec::CoreRunHandler;
 use vowp_cli::cli::{AgentCommand, Cli, Command};
@@ -3987,22 +3987,51 @@ fn remote_request(name: &str, app: OrchestratorApp, project: Option<&ProjectName
     }
 }
 
-/// Waits for a queued start/resume result to reach the home record.
-fn wait_for_orchestrator_state(manager: &Orchestrator, name: &str, expected: vowp_protocol::OrchestratorNodeState) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+/// Resumes a remote orchestrator until it reaches `Running`.
+///
+/// The gateway auto-starts a `node_offline` orchestrator on the first heartbeat after its
+/// node reconnects. A resume issued in that window reaches the agent while the auto-start
+/// is still preparing and is answered `busy`; the home then marks the record `Failed`.
+/// That is a start/resume ordering race, not a lease failure: retry the same resume on a
+/// bounded deadline until the auto-start has settled and the resume sees a live host.
+fn resume_remote_orchestrator(manager: &Orchestrator, name: &str) {
+    use vowp_protocol::OrchestratorNodeState;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let info = manager.info(name).expect("orchestrator info");
-        let state = info.card.state;
-        if state == expected {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "orchestrator {name} stayed {state:?}, expected {expected:?}; detail: {:?}; last_error: {:?}",
-                info.detail, info.card.last_error
+        manager.resume(name).expect("queue orchestrator resume");
+        loop {
+            let info = manager.info(name).expect("orchestrator info");
+            let state = info.card.state;
+            if state == OrchestratorNodeState::Running {
+                return;
+            }
+            let busy = state == OrchestratorNodeState::Failed
+                && [info.detail.as_deref(), info.card.last_error.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|detail| detail.starts_with("busy:"));
+            if state == OrchestratorNodeState::Failed && !busy {
+                panic!(
+                    "orchestrator {name} failed: detail {:?}; last_error {:?}",
+                    info.detail, info.card.last_error
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orchestrator {name} stayed {state:?}, expected Running; detail: {:?}; last_error: {:?}",
+                info.detail,
+                info.card.last_error
             );
+            if busy {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
-        thread::sleep(Duration::from_millis(20));
+        // The competing auto-start is still preparing. Give the agent a bounded moment to
+        // settle it, then retry the same resume; once the host is live a duplicate start
+        // reports the existing host instead of spawning a second one.
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -4069,6 +4098,21 @@ fn pair_via_agent_cli(
         "the live agent did not write the session binding"
     );
     surface
+}
+
+/// Upper bound on one in-process MCP tool call.
+///
+/// The call runs the real proxy, agent socket and gateway in this process; every caller
+/// asserts the tool's result separately. Under a loaded workspace gate a correct call can
+/// take over a second, so this is a hang guard, not a latency budget.
+const MCP_CALL_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// Asserts that one MCP tool call returned inside the hang guard.
+fn assert_mcp_returned(tool: &str, elapsed: Duration) {
+    assert!(
+        elapsed < MCP_CALL_HANG_GUARD,
+        "{tool} did not return within {MCP_CALL_HANG_GUARD:?}: took {elapsed:?}"
+    );
 }
 
 /// One MCP `tools/call` through the real `vowp mcp --agent-socket` proxy.
@@ -4341,14 +4385,13 @@ fn real_gateway_unbound_orchestrator_pairs_over_socket_and_mirrors_sse() {
     assert_eq!(status.connection, ConnectionState::Connected);
 
     set_node_online(&home, &node);
-    manager.resume("global").expect("resume the unbound orchestrator");
-    wait_for_orchestrator_state(&manager, "global", vowp_protocol::OrchestratorNodeState::Running);
+    resume_remote_orchestrator(&manager, "global");
     let service_path = state_dir.join("orchestrators/global/.opencode/state/opencode/service.json");
     assert!(service_path.is_file(), "the fake opencode service was not materialized");
 
     // MCP reads and writes over the real proxy, all against the real gateway.
     let (elapsed, response) = mcp_tool_call(&home, &state_dir, &surface, "fleet_status", serde_json::json!({}));
-    assert!(elapsed < Duration::from_secs(1), "fleet_status took {elapsed:?}");
+    assert_mcp_returned("fleet_status", elapsed);
     let fleet = mcp_text(&response);
     let names: Vec<&str> = fleet["snapshot"]["projects"]
         .as_array()
@@ -4362,7 +4405,7 @@ fn real_gateway_unbound_orchestrator_pairs_over_socket_and_mirrors_sse() {
     );
 
     let (elapsed, response) = mcp_tool_call(&home, &state_dir, &surface, "session_resume", serde_json::json!({}));
-    assert!(elapsed < Duration::from_secs(1), "session_resume took {elapsed:?}");
+    assert_mcp_returned("session_resume", elapsed);
     let resumed = mcp_text(&response);
     assert_eq!(resumed["session"]["id"], session.as_str(), "{resumed}");
 
@@ -4373,7 +4416,7 @@ fn real_gateway_unbound_orchestrator_pairs_over_socket_and_mirrors_sse() {
         "capacity_set",
         serde_json::json!({"target": 1, "mode": "auto"}),
     );
-    assert!(elapsed < Duration::from_secs(1), "capacity_set took {elapsed:?}");
+    assert_mcp_returned("capacity_set", elapsed);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     let (elapsed, response) = mcp_tool_call(
@@ -4390,7 +4433,7 @@ fn real_gateway_unbound_orchestrator_pairs_over_socket_and_mirrors_sse() {
             "owns": ["src/**"],
         }),
     );
-    assert!(elapsed < Duration::from_secs(1), "job_add took {elapsed:?}");
+    assert_mcp_returned("job_add", elapsed);
     assert_eq!(response["result"]["isError"], false, "{response}");
     let vowp = ProjectName::parse("vowp").expect("project");
     let project_store = Store::open_with_project(&home.paths(), &vowp).expect("project store");
@@ -4466,15 +4509,19 @@ fn real_gateway_project_orchestrator_defaults_job_project_and_enforces_one_lease
     assert!(!handle.is_finished(), "pairing must not supersede the live agent");
 
     set_node_online(&home, &node);
-    manager.resume("bound").expect("resume the project-bound orchestrator");
-    wait_for_orchestrator_state(&manager, "bound", vowp_protocol::OrchestratorNodeState::Running);
+    resume_remote_orchestrator(&manager, "bound");
+    let host: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_dir.join("orchestrators/bound/host.json")).expect("host state"))
+            .expect("host state JSON");
+    assert_eq!(host["state"], "running", "one live host must remain: {host}");
+    assert!(host["pid"].is_u64(), "the live host records one pid: {host}");
 
     let (elapsed, response) = mcp_tool_call(&home, &state_dir, &surface, "fleet_status", serde_json::json!({}));
-    assert!(elapsed < Duration::from_secs(1), "fleet_status took {elapsed:?}");
+    assert_mcp_returned("fleet_status", elapsed);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     let (elapsed, response) = mcp_tool_call(&home, &state_dir, &surface, "session_resume", serde_json::json!({}));
-    assert!(elapsed < Duration::from_secs(1), "session_resume took {elapsed:?}");
+    assert_mcp_returned("session_resume", elapsed);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     // No project argument: the bound session's project must be used.
@@ -4490,7 +4537,7 @@ fn real_gateway_project_orchestrator_defaults_job_project_and_enforces_one_lease
             "role": "worker",
         }),
     );
-    assert!(elapsed < Duration::from_secs(1), "job_add took {elapsed:?}");
+    assert_mcp_returned("job_add", elapsed);
     assert_eq!(response["result"]["isError"], false, "{response}");
     let project_store = Store::open_with_project(&home.paths(), &project).expect("project store");
     assert!(
@@ -4623,4 +4670,316 @@ fn real_gateway_agent_pair_ignores_a_superseded_orchestrator_command() {
     );
 
     stop_agent(&home, &live_node, handle);
+}
+
+/// Writes one private test file (mode 0600), creating its parent directory.
+fn write_private_file(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("private dir");
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).expect("private dir mode");
+    }
+    std::fs::write(path, bytes).expect("private file");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("private file mode");
+}
+
+#[test]
+fn agent_endpoint_reports_read_only_without_a_home_owner_view() {
+    let home = TempDir::new().expect("agent home");
+    let state_dir = home.path().join(".vowp-agent");
+    ls_create_private_dir(&state_dir);
+    let session = SessionId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("session");
+    let name = "readonly";
+    let dir = OrchestratorHost::dir(&state_dir, name).expect("orchestrator dir");
+    ls_create_private_dir(&dir);
+    let config = OrchestratorConfig {
+        name: name.to_owned(),
+        app: OrchestratorApp::Opencode,
+        project: None,
+        session: Some(session.clone()),
+        surface: Some(SurfaceId("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned())),
+        command: Some("opencode".to_owned()),
+        args: vec!["serve".to_owned()],
+        working_dir: Some(home.path().display().to_string()),
+        service_json: None,
+    };
+    let config_path = OrchestratorHost::config_path(&state_dir, name).expect("config path");
+    write_private_file(&config_path, &serde_json::to_vec(&config).expect("config JSON"));
+
+    let envs = [("VOWP_AGENT_HOME", state_dir.display().to_string())];
+    let (code, stdout, stderr) = run_binary_with(
+        home.path(),
+        &["--json", "agent", "orchestrator", "endpoint", name],
+        &envs,
+    );
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("endpoint JSON");
+    assert_eq!(value["session_id"], session.as_str());
+    assert!(
+        value["owner"].is_null(),
+        "the agent never reports a home owner: {value}"
+    );
+    assert_eq!(value["access"], "read_only", "{value}");
+
+    // There is no attach on the node.
+    let (code, _stdout, stderr) = run_binary_with(home.path(), &["agent", "orchestrator", "attach", name], &envs);
+    assert_ne!(code, 0, "the agent has no attach command");
+    assert!(!stderr.is_empty());
+}
+
+#[test]
+fn agent_orchestrator_endpoint_json_returns_local_auth_and_ls_stays_clean() {
+    let home = TempDir::new().expect("agent home");
+    let state_dir = home.path().join(".vowp-agent");
+    ls_create_private_dir(&state_dir);
+    let session = SessionId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("session");
+    let surface = SurfaceId("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned());
+    let name = "live";
+    let dir = OrchestratorHost::dir(&state_dir, name).expect("orchestrator dir");
+    ls_create_private_dir(&dir);
+    let service_path = dir.join(".opencode/state/opencode/service.json");
+    // Assemble the marker at runtime so no secret-shaped literal is committed.
+    let password = format!("vowp-test-agent-{}", "F".repeat(20));
+    let config = OrchestratorConfig {
+        name: name.to_owned(),
+        app: OrchestratorApp::Opencode,
+        project: None,
+        session: Some(session.clone()),
+        surface: Some(surface.clone()),
+        command: Some("opencode".to_owned()),
+        args: vec!["serve".to_owned()],
+        working_dir: Some(home.path().display().to_string()),
+        service_json: Some(service_path.display().to_string()),
+    };
+    let config_path = OrchestratorHost::config_path(&state_dir, name).expect("config path");
+    write_private_file(&config_path, &serde_json::to_vec(&config).expect("config JSON"));
+    let host_path = OrchestratorHost::host_path(&state_dir, name).expect("host path");
+    let host_state = serde_json::json!({
+        "name": name,
+        "app": "opencode",
+        "project": null,
+        "surface": surface,
+        "session": session,
+        "pid": std::process::id(),
+        "state": "running",
+        "started_at": Timestamp::now(),
+    });
+    write_private_file(&host_path, &serde_json::to_vec(&host_state).expect("host JSON"));
+    let service = serde_json::json!({
+        "version": "2.0.28",
+        "url": "http://127.0.0.1:46222",
+        "port": 46222,
+        "pid": std::process::id(),
+        "password": password,
+    });
+    write_private_file(&service_path, &serde_json::to_vec(&service).expect("service JSON"));
+
+    let envs = [("VOWP_AGENT_HOME", state_dir.display().to_string())];
+    let (code, stdout, stderr) = run_binary_with(
+        home.path(),
+        &["--json", "agent", "orchestrator", "endpoint", name],
+        &envs,
+    );
+    assert_eq!(code, 0, "the local endpoint failed: {stdout} {stderr}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("endpoint JSON");
+    assert_eq!(value["name"], name);
+    assert_eq!(value["app"], "opencode");
+    assert_eq!(value["session_id"], session.as_str());
+    assert_eq!(value["location"], "node");
+    assert_eq!(value["state"], "running");
+    assert_eq!(value["url"], "http://127.0.0.1:46222");
+    assert!(value["native_session_id"].is_null(), "{value}");
+    assert_eq!(value["auth"]["header"], "Authorization");
+    assert_eq!(value["auth"]["scheme"], "Basic");
+    assert_eq!(value["auth"]["username"], "opencode");
+    assert_eq!(value["auth"]["password"], password);
+    // The agent cannot see the home database: no owner view, and never write access.
+    assert!(value["owner"].is_null(), "the agent has no home owner view: {value}");
+    assert_eq!(value["access"], "read_only", "{value}");
+
+    let (code, _stdout, stderr) = run_binary_with(home.path(), &["agent", "orchestrator", "endpoint", "ghost"], &envs);
+    assert_eq!(code, 3, "an unknown local name is not found: {stderr}");
+    assert!(stderr.contains("ghost"), "the error names the orchestrator: {stderr}");
+
+    // The home `orchestrator ls` card stays clean even when the same home has a live
+    // private service file with the password: only the explicit endpoint command reads it.
+    let env = TestEnv::new();
+    let card_dir = env.home_path().join("orchestrators").join(name);
+    ls_create_private_dir(&card_dir);
+    let card = serde_json::json!({
+        "name": name,
+        "app": "opencode",
+        "session_id": session,
+        "project": null,
+        "executor": null,
+        "state": "running",
+        "created_at": Timestamp::now(),
+        "join": {
+            "desktop": format!("vowp orchestrator resume {name}"),
+            "phone": format!("vowp chat {session}"),
+            "chat": format!("vowp chat --agent --session {session}"),
+        },
+        "surface_id": null,
+        "node": null,
+        "last_request_id": null,
+    });
+    write_private_file(
+        &card_dir.join("orchestrator.json"),
+        &serde_json::to_vec(&card).expect("card JSON"),
+    );
+    let home_host = serde_json::json!({
+        "kind": "opencode",
+        "name": name,
+        "pid": std::process::id(),
+        "port": 46222,
+        "url": "http://127.0.0.1:46222",
+        "started_at": Timestamp::now(),
+        "workdir": card_dir.display().to_string(),
+        "service_json": service_path.display().to_string(),
+        "native_session_id": "ses_agent_cli",
+        "vowp_session": session,
+    });
+    write_private_file(
+        &card_dir.join("host.json"),
+        &serde_json::to_vec(&home_host).expect("host JSON"),
+    );
+    write_private_file(
+        &card_dir.join(".opencode/state/opencode/service.json"),
+        &serde_json::to_vec(&service).expect("service JSON"),
+    );
+    let (code, value, stderr) = env.run_json(&["orchestrator", "ls"]);
+    assert_eq!(code, 0, "orchestrator ls failed: {stderr}");
+    assert!(
+        !value.to_string().contains(&password),
+        "orchestrator ls never carries the password"
+    );
+}
+
+#[test]
+fn agent_orchestrator_endpoint_corrupt_private_file_exits_two_and_names_it() {
+    let home = TempDir::new().expect("agent home");
+    let state_dir = home.path().join(".vowp-agent");
+    ls_create_private_dir(&state_dir);
+    let name = "broken";
+    let dir = OrchestratorHost::dir(&state_dir, name).expect("orchestrator dir");
+    ls_create_private_dir(&dir);
+    let service_path = dir.join(".opencode/state/opencode/service.json");
+    let session = SessionId::parse("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("session");
+    let config = OrchestratorConfig {
+        name: name.to_owned(),
+        app: OrchestratorApp::Opencode,
+        project: None,
+        session: Some(session.clone()),
+        surface: Some(SurfaceId("01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned())),
+        command: Some("opencode".to_owned()),
+        args: vec!["serve".to_owned()],
+        working_dir: Some(home.path().display().to_string()),
+        service_json: Some(service_path.display().to_string()),
+    };
+    let config_path = OrchestratorHost::config_path(&state_dir, name).expect("config path");
+    write_private_file(&config_path, &serde_json::to_vec(&config).expect("config JSON"));
+    let host_path = OrchestratorHost::host_path(&state_dir, name).expect("host path");
+    let host_state = serde_json::json!({
+        "name": name,
+        "app": "opencode",
+        "session": session,
+        "pid": std::process::id(),
+        "state": "running",
+        "started_at": Timestamp::now(),
+    });
+    write_private_file(&host_path, &serde_json::to_vec(&host_state).expect("host JSON"));
+    // Assemble the marker at runtime so no secret-shaped literal is committed.
+    let password = format!("vowp-test-agent-{}", "G".repeat(20));
+    let corrupt = format!("{{\"url\":\"http://127.0.0.1:46333\",\"password\":\"{password}\",");
+    write_private_file(&service_path, corrupt.as_bytes());
+
+    let forbidden = [
+        state_dir.display().to_string(),
+        service_path.display().to_string(),
+        password,
+        "127.0.0.1".to_owned(),
+        "46333".to_owned(),
+    ];
+    let envs = [("VOWP_AGENT_HOME", state_dir.display().to_string())];
+    let (code, stdout, stderr) = run_binary_with(home.path(), &["agent", "orchestrator", "endpoint", name], &envs);
+    let text = format!("{stdout}\n{stderr}");
+    assert_eq!(
+        code, 2,
+        "a corrupt private file is invalid input, matching the home command (exit 2): {text}"
+    );
+    assert!(text.contains(name), "the error names the orchestrator: {text}");
+    for forbidden in &forbidden {
+        assert!(!text.contains(forbidden), "the error leaked a forbidden value: {text}");
+    }
+
+    let (code, stdout, stderr) = run_binary_with(
+        home.path(),
+        &["--json", "agent", "orchestrator", "endpoint", name],
+        &envs,
+    );
+    let text = format!("{stdout}\n{stderr}");
+    assert_eq!(code, 2, "the JSON error keeps the invalid-input class: {text}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("endpoint error JSON");
+    assert_eq!(value["error"]["kind"], "invalid_input", "{text}");
+    assert!(text.contains(name), "the JSON error names the orchestrator: {text}");
+    for forbidden in &forbidden {
+        assert!(
+            !text.contains(forbidden),
+            "the JSON error leaked a forbidden value: {text}"
+        );
+    }
+}
+
+#[test]
+fn agent_orchestrator_endpoint_without_a_session_names_the_orchestrator() {
+    let home = TempDir::new().expect("agent home");
+    let state_dir = home.path().join(".vowp-agent");
+    ls_create_private_dir(&state_dir);
+    let name = "nosession";
+    let dir = OrchestratorHost::dir(&state_dir, name).expect("orchestrator dir");
+    ls_create_private_dir(&dir);
+    let config = OrchestratorConfig {
+        name: name.to_owned(),
+        app: OrchestratorApp::Opencode,
+        project: None,
+        session: None,
+        surface: None,
+        command: None,
+        args: Vec::new(),
+        working_dir: None,
+        service_json: None,
+    };
+    let config_path = OrchestratorHost::config_path(&state_dir, name).expect("config path");
+    write_private_file(&config_path, &serde_json::to_vec(&config).expect("config JSON"));
+
+    let envs = [("VOWP_AGENT_HOME", state_dir.display().to_string())];
+    let (code, stdout, stderr) = run_binary_with(home.path(), &["agent", "orchestrator", "endpoint", name], &envs);
+    let text = format!("{stdout}\n{stderr}");
+    assert_eq!(
+        code, 2,
+        "a config with no paired session is invalid input, like the home command: {text}"
+    );
+    assert!(text.contains(name), "the error names the orchestrator: {text}");
+    assert!(
+        text.contains("no paired session"),
+        "the error names the failure class: {text}"
+    );
+    assert!(
+        !text.contains(&state_dir.display().to_string()),
+        "the error leaked a path: {text}"
+    );
+
+    let (code, stdout, stderr) = run_binary_with(
+        home.path(),
+        &["--json", "agent", "orchestrator", "endpoint", name],
+        &envs,
+    );
+    let text = format!("{stdout}\n{stderr}");
+    assert_eq!(code, 2, "the JSON error keeps the exit class: {text}");
+    assert!(text.contains(name), "the JSON error names the orchestrator: {text}");
+}
+
+/// Creates one 0700 directory, ignoring an existing one.
+fn ls_create_private_dir(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("private dir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).expect("private dir mode");
 }

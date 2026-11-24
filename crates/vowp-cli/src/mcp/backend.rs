@@ -15,12 +15,13 @@ use vowp_core::fleet;
 use vowp_core::ledger::Ledger;
 use vowp_core::requests::{self, Request};
 use vowp_core::session::service::SessionService;
+use vowp_core::surface::lease::{TakeoverConfirmation, lease_status, takeover_confirmation};
 use vowp_core::surface::{AcquireLease, LeaseGuard, check_lease_with, takeover};
 use vowp_core::vault;
 use vowp_core::{AdapterRegistry, CapacityManager, CoreError, Deps};
 use vowp_protocol::{
-    CapsuleTrigger, FleetStatus, InboxId, InboxItem, JobId, JobState, LeaseStatus, LedgerEntry, LedgerKind, NewJob,
-    Project, ProjectName, SecretName, SecretRequest, Session, SessionId, Surface, SurfaceId, SurfaceKind, TargetMode,
+    CapsuleTrigger, FleetStatus, InboxId, InboxItem, JobId, JobState, LedgerEntry, LedgerKind, NewJob, Project,
+    ProjectName, SecretName, SecretRequest, Session, SessionId, Surface, SurfaceId, SurfaceKind, TargetMode,
 };
 use vowp_store::session_log::SessionLog;
 use vowp_store::{SessionFilter, Store, StoreError};
@@ -325,23 +326,30 @@ impl<'a> Backend<'a> {
         self.check_lease_token(session, &token)
     }
 
-    /// Checks the lease when the token file exists, for read-only resume.
-    fn lease_gate_optional(&self, session: &SessionId) -> Result<(), ToolError> {
-        let text = match std::fs::read_to_string(&self.opts.token_file) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(ToolError::new(
-                    "not_found",
-                    format!("lease token file {}: {error}", self.opts.token_file.display()),
-                ));
-            }
-        };
-        let token = text.trim_end_matches(['\r', '\n']).to_owned();
-        if token.is_empty() {
-            return Ok(());
-        }
-        self.check_lease_token(session, &token)
+    /// Reads the lease token file, when it exists and holds a token.
+    fn read_token(&self) -> Option<String> {
+        let text = std::fs::read_to_string(&self.opts.token_file).ok()?;
+        let token = text.trim_end_matches(['\r', '\n']);
+        (!token.is_empty()).then(|| token.to_owned())
+    }
+
+    /// Returns the structured ownership view: the token-free owner and whether this
+    /// server's token is the live owner's.
+    fn ownership_view(&self, store: &Store, session: &SessionId) -> Result<Value, ToolError> {
+        let owner = store.session_owner(session, self.ctx.clock().now())?;
+        let is_owner = self
+            .read_token()
+            .is_some_and(|token| check_lease_with(store, session, Some(&token)).is_ok());
+        Ok(json!({"owner": owner, "is_owner": is_owner}))
+    }
+
+    /// Builds a refusal whose text ends with one `ownership: {json}` line a harness can parse.
+    fn refusal_with_owner(&self, store: &Store, session: &SessionId, notice: String) -> ToolError {
+        let view = self
+            .ownership_view(store, session)
+            .map(|view| view.to_string())
+            .unwrap_or_else(|_| "{}".to_owned());
+        ToolError::refused(format!("{notice}\nownership: {view}"))
     }
 
     /// Compares one token with the live lease row.
@@ -349,12 +357,14 @@ impl<'a> Backend<'a> {
         let store = self.global()?;
         match check_lease_with(&store, session, Some(token)) {
             Ok(()) => Ok(()),
-            Err(CoreError::Refused(_)) => {
-                let notice = store
-                    .lease(session)?
-                    .map(|lease| takeover::notice(&lease.holder, lease.acquired_at, self.ctx.tz_offset_minutes()))
-                    .unwrap_or_else(|| "this surface is read-only".to_owned());
-                Err(ToolError::refused(notice))
+            Err(CoreError::Refused(reason)) => {
+                let notice = match store.lease(session)? {
+                    Some(lease) if reason.contains("read-only; taken over") => {
+                        takeover::notice(&lease.holder, lease.acquired_at, self.ctx.tz_offset_minutes())
+                    }
+                    _ => reason,
+                };
+                Err(self.refusal_with_owner(&store, session, notice))
             }
             Err(error) => Err(error.into()),
         }
@@ -1028,6 +1038,19 @@ impl<'a> Backend<'a> {
         let project = self.session_project(&row)?;
 
         if takeover_requested {
+            let now = self.ctx.clock().now();
+            // A live owner that is mid-turn needs a second, explicit confirmation.
+            if takeover_confirmation(&global, &session, now)? == TakeoverConfirmation::Extra
+                && !opt_bool(args, "confirm_running")?.unwrap_or(false)
+            {
+                return Err(self.refusal_with_owner(
+                    &global,
+                    &session,
+                    "the current owner is running a turn; ask the user to confirm, then call session_resume \
+                     again with takeover and confirm_running set to true"
+                        .to_owned(),
+                ));
+            }
             let surface_id = opt_str(args, "surface")?
                 .map(|text| SurfaceId(text.to_owned()))
                 .unwrap_or_else(|| self.opts.surface.clone());
@@ -1058,9 +1081,9 @@ impl<'a> Backend<'a> {
             // Keep the guard's heartbeat alive for the MCP process lifetime. Dropping it
             // would release the lease this resume just acquired.
             std::mem::forget(guard);
-        } else {
-            self.lease_gate_optional(&session)?;
         }
+        // A read never needs the lease: a taken-over surface can still resume read-only and
+        // learn who owns the session. Only the takeover above and the write tools gate on it.
 
         let capsule = global.latest_capsule(&session)?;
         let tail = match SessionLog::open_read(self.ctx.paths(), &session) {
@@ -1077,15 +1100,10 @@ impl<'a> Backend<'a> {
             Err(StoreError::NotFound { .. }) => Vec::new(),
             Err(error) => return Err(error.into()),
         };
-        let lease = global.lease(&session)?.map(|lease| LeaseStatus {
-            held: true,
-            holder: Some(lease.holder),
-            kind: Some(lease.surface_kind),
-            node: Some(lease.node),
-            acquired_at: Some(lease.acquired_at),
-            heartbeat_at: Some(lease.heartbeat_at),
-            token: None,
-        });
+        let lease = global
+            .ownership(&session)?
+            .map(|record| lease_status(&record, self.ctx.clock().now()));
+        let ownership = self.ownership_view(&global, &session)?;
 
         let store = self.project_store(&project)?;
         self.record(
@@ -1106,6 +1124,8 @@ impl<'a> Backend<'a> {
             "capsule": capsule,
             "tail": tail,
             "lease": lease,
+            "owner": ownership["owner"],
+            "is_owner": ownership["is_owner"],
         }))
     }
 

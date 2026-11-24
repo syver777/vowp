@@ -192,8 +192,12 @@ pub fn is_interactive(command: &CliCommand) -> bool {
             command: SessionCommand::Chat(_),
         } => true,
         CliCommand::Board(args) => !args.once,
-        // §9.3: the home's hidden prompt needs a TTY, so the routed write uses `ssh -t`.
-        CliCommand::Secret(args) => matches!(args.command, SecretCommand::Set(_)),
+        // §9.3: the hidden prompt needs a TTY, so that form uses `ssh -t`. `--stdin` reads
+        // the caller's pipe instead, so it is routed without `-t`.
+        CliCommand::Secret(args) => match &args.command {
+            SecretCommand::Set(set) => !set.stdin,
+            _ => false,
+        },
         _ => false,
     }
 }

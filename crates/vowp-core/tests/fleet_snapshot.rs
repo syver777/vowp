@@ -17,6 +17,10 @@ use vowp_protocol::{
     RunPurpose, RunRole, SNAPSHOT_FORMAT, SNAPSHOT_VERSION, SecretName, Session, SessionId, SessionRole, SessionState,
     Snapshot, TargetMode, Timestamp, Tokens,
 };
+use vowp_protocol::{Actor, CostEvent, EventBody, EventIndexRow, EventSource, EventType};
+use vowp_protocol::{HostSample, SampleSource};
+use vowp_protocol::{Lease, OwnershipMode, OwnershipState, SurfaceActivity, SurfaceId, SurfaceKind};
+use vowp_store::session_log::{NewEvent, SessionLog};
 use vowp_store::{NodePaths, StateChange, Store};
 use vowp_tmux::fake::FakeWindows;
 
@@ -1402,4 +1406,523 @@ fn supervisor_card_reports_l1_fail_streak() {
         snapshot.supervisor.fail_streak, 3,
         "the card mirrors loops['l1-supervisor'].fail_streak"
     );
+}
+
+/// Inserts one owned session and returns its id.
+fn owned_session(fixture: &Fixture, role: SessionRole, state: SessionState) -> SessionId {
+    let id = SessionId::new();
+    let now = fixture.clock.now();
+    fixture
+        .store
+        .upsert_session(&Session {
+            id: id.clone(),
+            project: Some(fixture.alpha.clone()),
+            job_id: None,
+            role: Some(role),
+            title: "owned session".to_owned(),
+            parent_session_id: None,
+            node: NodeName::parse("local").expect("node"),
+            cwd: "/srv/vowp".to_owned(),
+            state,
+            executor: None,
+            last_seq: 0,
+            last_capsule_id: None,
+            log_bytes: 0,
+            created_at: now.minus(Duration::from_secs(60)),
+            updated_at: now.minus(Duration::from_secs(5)),
+        })
+        .expect("session");
+    id
+}
+
+/// Registers a surface and takes the lease for it; returns the plaintext token.
+fn own(fixture: &Fixture, session: &SessionId, kind: SurfaceKind, holder: &str, heartbeat_age_secs: u64) -> String {
+    let now = fixture.clock.now();
+    let surface = vowp_protocol::Surface {
+        id: SurfaceId::new(),
+        kind,
+        node: NodeName::parse("local").expect("node"),
+        holder: holder.to_owned(),
+        app: None,
+        cwd: None,
+        metadata: serde_json::json!({}),
+        created_at: now,
+        last_seen_at: now,
+    };
+    fixture.store.upsert_surface(&surface).expect("surface");
+    let token = vowp_core::surface::new_lease_token();
+    fixture
+        .store
+        .take_lease(&Lease {
+            session_id: session.clone(),
+            surface_id: Some(surface.id),
+            surface_kind: kind,
+            node: NodeName::parse("local").expect("node"),
+            holder: holder.to_owned(),
+            token: token.clone(),
+            acquired_at: now.minus(Duration::from_secs(heartbeat_age_secs)),
+            heartbeat_at: now.minus(Duration::from_secs(heartbeat_age_secs)),
+        })
+        .expect("lease");
+    token
+}
+
+fn card_owner(snapshot: &Snapshot, session: &SessionId) -> Option<vowp_protocol::SessionOwner> {
+    snapshot
+        .sessions
+        .iter()
+        .find(|card| card.id == *session)
+        .expect("session card")
+        .owner
+        .clone()
+}
+
+#[test]
+fn session_card_reports_the_live_interactive_owner() {
+    let fixture = Fixture::new();
+    let session = owned_session(&fixture, SessionRole::Orchestrator, SessionState::Idle);
+    own(&fixture, &session, SurfaceKind::DesktopUi, "StackSpirit", 4);
+    let snapshot = fixture.snapshot();
+    let owner = card_owner(&snapshot, &session).expect("owner on the card");
+    assert_eq!(owner.kind, SurfaceKind::DesktopUi);
+    assert_eq!(owner.holder, "StackSpirit");
+    assert_eq!(owner.mode, OwnershipMode::Interactive);
+    assert_eq!(owner.state, OwnershipState::Active);
+    assert_eq!(owner.epoch, 1);
+    assert!(owner.surface_id.is_some());
+    let card = snapshot.sessions.iter().find(|card| card.id == session).expect("card");
+    assert_eq!(card.active_surface, None, "active_surface stays null for compatibility");
+}
+
+#[test]
+fn session_card_reports_a_job_owner_with_no_surface_id() {
+    let fixture = Fixture::new();
+    let session = owned_session(&fixture, SessionRole::Worker, SessionState::Running);
+    let now = fixture.clock.now();
+    fixture
+        .store
+        .take_ownership(
+            &Lease {
+                session_id: session.clone(),
+                surface_id: None,
+                surface_kind: SurfaceKind::Agent,
+                node: NodeName::parse("local").expect("node"),
+                holder: "agent".to_owned(),
+                token: vowp_core::surface::new_lease_token(),
+                acquired_at: now,
+                heartbeat_at: now,
+            },
+            OwnershipMode::Job,
+            Some(now.plus(Duration::from_secs(600))),
+        )
+        .expect("job owner");
+    let owner = card_owner(&fixture.snapshot(), &session).expect("job owner");
+    assert_eq!(owner.surface_id, None);
+    assert_eq!(owner.mode, OwnershipMode::Job);
+    assert_eq!(owner.state, OwnershipState::Active);
+    assert_eq!(owner.activity, SurfaceActivity::Running);
+    assert_eq!(owner.expires_at, Some(now.plus(Duration::from_secs(600))));
+}
+
+#[test]
+fn session_card_shows_a_stale_owner_before_the_sweep() {
+    let fixture = Fixture::new();
+    let session = owned_session(&fixture, SessionRole::User, SessionState::Idle);
+    own(&fixture, &session, SurfaceKind::Chat, "laptop", 90);
+    let owner = card_owner(&fixture.snapshot(), &session).expect("stale owner is still shown");
+    assert_eq!(owner.state, OwnershipState::Stale);
+    assert!(fixture.store.lease(&session).expect("lease").is_some(), "no sweep ran");
+}
+
+#[test]
+fn stale_lease_on_a_running_orchestrator_still_populates_the_owner() {
+    let fixture = Fixture::new();
+    let session = owned_session(&fixture, SessionRole::Orchestrator, SessionState::Running);
+    own(&fixture, &session, SurfaceKind::Opencode, "macbook", 8 * 3600);
+    let dropped = vowp_core::surface::sweep_leases(&fixture.deps, &fixture.store, fixture.clock.now()).expect("sweep");
+    assert_eq!(dropped, 0, "a running orchestrator's lease survives the sweep");
+    let owner = card_owner(&fixture.snapshot(), &session).expect("owner is never null");
+    assert_eq!(owner.state, OwnershipState::Stale);
+    assert_eq!(owner.label.as_deref(), Some("OpenCode · local"));
+    assert_eq!(owner.node.as_str(), "local");
+    assert_eq!(owner.holder, "macbook");
+
+    // A stale lease on a session that is not a running orchestrator is still swept.
+    let worker = owned_session(&fixture, SessionRole::Worker, SessionState::Idle);
+    own(&fixture, &worker, SurfaceKind::Chat, "laptop", 8 * 3600);
+    let dropped = vowp_core::surface::sweep_leases(&fixture.deps, &fixture.store, fixture.clock.now()).expect("sweep");
+    assert_eq!(dropped, 1);
+    assert!(card_owner(&fixture.snapshot(), &worker).is_none());
+}
+
+#[test]
+fn snapshot_owner_never_contains_a_token_or_password() {
+    let fixture = Fixture::new();
+    let session = owned_session(&fixture, SessionRole::User, SessionState::Idle);
+    let token = own(&fixture, &session, SurfaceKind::DesktopUi, "ui", 1);
+    let hash = vowp_store::hash_lease_token(&token);
+    let snapshot = fixture.snapshot();
+    let text = serde_json::to_string(&snapshot).expect("snapshot json");
+    assert!(!text.contains(&token), "the plaintext token is in the snapshot");
+    assert!(!text.contains(&hash), "the token hash is in the snapshot");
+    let owner = serde_json::to_value(card_owner(&snapshot, &session).expect("owner")).expect("owner json");
+    for key in owner.as_object().expect("object").keys() {
+        assert!(
+            !key.contains("token") && !key.contains("password") && !key.contains("hash"),
+            "unexpected owner key {key}"
+        );
+    }
+}
+
+#[test]
+fn snapshot_owner_reports_label_and_activity() {
+    let fixture = Fixture::new();
+    let idle = owned_session(&fixture, SessionRole::Orchestrator, SessionState::Idle);
+    own(&fixture, &idle, SurfaceKind::Opencode, "main", 2);
+    let running = owned_session(&fixture, SessionRole::Orchestrator, SessionState::Running);
+    own(&fixture, &running, SurfaceKind::ClaudeCode, "cc", 2);
+    let waiting = owned_session(&fixture, SessionRole::Orchestrator, SessionState::Blocked);
+    let token = own(&fixture, &waiting, SurfaceKind::DesktopUi, "StackSpirit", 2);
+    let _ = token;
+    let snapshot = fixture.snapshot();
+    let idle_owner = card_owner(&snapshot, &idle).expect("idle");
+    assert_eq!(idle_owner.label.as_deref(), Some("OpenCode · local"));
+    assert_eq!(idle_owner.activity, SurfaceActivity::Idle);
+    let running_owner = card_owner(&snapshot, &running).expect("running");
+    assert_eq!(running_owner.label.as_deref(), Some("Claude Code · local"));
+    assert_eq!(running_owner.activity, SurfaceActivity::Running);
+    let waiting_owner = card_owner(&snapshot, &waiting).expect("waiting");
+    assert_eq!(waiting_owner.label.as_deref(), Some("StackSpirit · local"));
+    assert_eq!(waiting_owner.activity, SurfaceActivity::Waiting);
+}
+
+#[test]
+fn capacity_measured_carries_the_latest_host_sample() {
+    let fixture = Fixture::new();
+    let now = fixture.clock.now();
+    let sample = |age: u64, load1: f64| HostSample {
+        at: now.minus(Duration::from_secs(age)),
+        interval_secs: 5,
+        mem_total_bytes: 16 << 30,
+        mem_available_bytes: 8 << 30,
+        swap_used_bytes: 0,
+        load1,
+        load5: 0.5,
+        load15: 0.5,
+        cpu_count: 8,
+        cpu_quota_cores: None,
+        disk_free_home_bytes: 100 << 30,
+        disk_free_worktrees_bytes: None,
+        pressure_cpu_avg10: Some(0.25),
+        pressure_mem_avg10: None,
+        pressure_io_avg10: None,
+        source: SampleSource::Proc,
+    };
+    fixture
+        .store
+        .insert_host_sample(&sample(30, 3.0))
+        .expect("older sample");
+    fixture.store.insert_host_sample(&sample(5, 1.5)).expect("newer sample");
+
+    let snapshot = fixture.snapshot();
+    let measured = snapshot.capacity.measured.expect("measured sample is populated");
+    assert_eq!(measured.load1, 1.5, "the newest sample wins");
+    assert_eq!(measured.cpu_count, 8);
+    assert_eq!(measured.mem_total_bytes, 16 << 30);
+    assert_eq!(measured.disk_free_home_bytes, 100 << 30);
+    assert_eq!(measured.pressure_cpu_avg10, Some(0.25));
+}
+
+#[test]
+fn gate_failures_exclude_terminal_jobs() {
+    let fixture = Fixture::new();
+    let store = fixture.store_for(&fixture.alpha);
+    let now = fixture.clock.now();
+    let failing = |job: &Job| GateResult {
+        id: None,
+        job_id: job.id.clone(),
+        run_id: None,
+        attempt: 0,
+        gate_index: 0,
+        gate: Gate::Report(ReportGate::default()),
+        passed: false,
+        evidence: Evidence::Report {
+            front_matter: None,
+            missing_fields: vec!["status".to_owned()],
+            problems: Vec::new(),
+        },
+        output_blob: None,
+        duration_ms: 1,
+        ts: now.minus(Duration::from_secs(10)),
+    };
+    let no_change = || StateChange {
+        note: None,
+        parked_reason: None,
+    };
+    let live = fixture.job(&fixture.alpha, "t01-live", 50);
+    fixture.set_state(&fixture.alpha, &live, JobState::Failed, no_change());
+    store.insert_gate_result(&failing(&live)).expect("live failure");
+    for (id, state) in [
+        ("t02-done", JobState::Done),
+        ("t03-cancelled", JobState::Cancelled),
+        ("t04-replanned", JobState::Replanned),
+    ] {
+        let job = fixture.job(&fixture.alpha, id, 50);
+        store.insert_gate_result(&failing(&job)).expect("terminal failure");
+        fixture.set_state(&fixture.alpha, &job, state, no_change());
+    }
+
+    let snapshot = fixture.snapshot();
+    let alpha = snapshot
+        .projects
+        .iter()
+        .find(|project| project.name == fixture.alpha)
+        .expect("alpha card");
+    let jobs: Vec<&str> = alpha.gate_failures.iter().map(|failure| failure.job.as_str()).collect();
+    assert_eq!(jobs, vec!["t01-live"], "only the failed (live) job keeps its failure");
+}
+
+#[test]
+fn queue_card_needs_carries_real_upstream_dependencies() {
+    let fixture = Fixture::new();
+    let up_one = fixture.job(&fixture.alpha, "up-one", 10);
+    let up_two = fixture.job(&fixture.alpha, "up-two", 10);
+    let waiting = fixture.job(&fixture.alpha, "waiting", 20);
+    let independent = fixture.job(&fixture.alpha, "independent", 5);
+    let store = fixture.store_for(&fixture.alpha);
+    for upstream in [&up_one, &up_two] {
+        store
+            .add_edge(&vowp_protocol::Edge {
+                src: waiting.id.clone(),
+                dst: upstream.id.clone(),
+                kind: vowp_protocol::EdgeKind::Needs,
+            })
+            .expect("needs edge");
+    }
+    for job in [&waiting, &independent] {
+        fixture.set_state(
+            &fixture.alpha,
+            job,
+            JobState::Ready,
+            StateChange {
+                note: None,
+                parked_reason: None,
+            },
+        );
+    }
+
+    let snapshot = fixture.snapshot();
+    let alpha = snapshot
+        .projects
+        .iter()
+        .find(|project| project.name == fixture.alpha)
+        .expect("alpha card");
+    let card = |id: &JobId| alpha.queue.iter().find(|card| &card.job == id).expect("queue card");
+    assert_eq!(card(&waiting.id).needs, vec![up_one.id.clone(), up_two.id.clone()]);
+    assert!(card(&independent.id).needs.is_empty());
+    let json = serde_json::to_value(card(&independent.id)).expect("json");
+    assert!(json.get("needs").is_none(), "empty needs is not serialized");
+}
+
+#[test]
+fn queue_cards_plan_an_executor_and_running_cards_report_usage() {
+    let fixture = Fixture::new();
+    let now = fixture.clock.now();
+    let ready = fixture.job(&fixture.alpha, "q01-ready", 50);
+    fixture.set_state(
+        &fixture.alpha,
+        &ready,
+        JobState::Ready,
+        StateChange {
+            note: None,
+            parked_reason: None,
+        },
+    );
+    let pinned = fixture.job(&fixture.alpha, "q02-pinned", 40);
+    let store = fixture.store_for(&fixture.alpha);
+    store
+        .kv_set("job_executor:q02-pinned", "claude-code:claude-sonnet-5-5@high")
+        .expect("override");
+    let running = fixture.job(&fixture.alpha, "q03-run", 30);
+    fixture.set_state(
+        &fixture.alpha,
+        &running,
+        JobState::Running,
+        StateChange {
+            note: None,
+            parked_reason: None,
+        },
+    );
+    let _ = pinned;
+    let make_run = |job: &Job, executor: &str, cost: Cost| Run {
+        id: RunId::new(),
+        job_id: Some(job.id.clone()),
+        session_id: None,
+        role: RunRole::Worker,
+        purpose: RunPurpose::Start,
+        profile: None,
+        rung: 0,
+        executor: Some(Executor::parse(executor).expect("executor")),
+        provider: None,
+        node: NodeName::parse("local").expect("node"),
+        native_session_id: None,
+        pid: None,
+        window: None,
+        cwd: None,
+        started_at: now.minus(Duration::from_secs(10)),
+        ended_at: None,
+        exit_code: None,
+        outcome: None,
+        limit_kind: None,
+        cost,
+        detail: String::new(),
+    };
+    // Production inserts the run with an unknown cost; usage arrives as `cost` events in the
+    // run's session log.
+    let session_id = SessionId::new();
+    let log = SessionLog::create(&fixture.paths, &session_id, Arc::new(fixture.clock.clone())).expect("log");
+    let appended = log
+        .append(NewEvent {
+            actor: Actor::System,
+            source: EventSource {
+                harness: HarnessKind::Opencode,
+                model: Some("deepseek/deepseek-flash".to_owned()),
+                node: None,
+                native_session_id: None,
+            },
+            body: EventBody::Cost(CostEvent {
+                cost: Cost::receipt(0.25, tokens(1000, 200)),
+                run_id: None,
+            }),
+            raw: None,
+            ts: None,
+        })
+        .expect("append cost");
+    store
+        .upsert_session(&Session {
+            id: session_id.clone(),
+            project: Some(fixture.alpha.clone()),
+            job_id: Some(running.id.clone()),
+            role: Some(SessionRole::Worker),
+            title: "usage".to_owned(),
+            parent_session_id: None,
+            node: NodeName::parse("local").expect("node"),
+            cwd: String::new(),
+            state: SessionState::Running,
+            executor: None,
+            last_seq: 0,
+            last_capsule_id: None,
+            log_bytes: 0,
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("session");
+    store
+        .index_event(&EventIndexRow {
+            session_id: session_id.clone(),
+            seq: appended.envelope.seq,
+            id: appended.envelope.id.clone(),
+            ts: appended.envelope.ts,
+            event_type: EventType::Cost,
+            actor: Actor::System,
+            harness: HarnessKind::Opencode,
+            model: None,
+            byte_offset: appended.byte_offset,
+            byte_len: appended.byte_len,
+            summary: String::new(),
+        })
+        .expect("index");
+    let mut run = make_run(&running, "opencode:deepseek/deepseek-flash", Cost::unknown());
+    run.session_id = Some(session_id);
+    store.insert_run(&run).expect("run");
+    store
+        .kv_set("model_context_window:deepseek/deepseek-flash", "128000")
+        .expect("window");
+
+    let snapshot = fixture.snapshot();
+    let alpha = snapshot
+        .projects
+        .iter()
+        .find(|p| p.name == fixture.alpha)
+        .expect("alpha");
+    let queue = |id: &str| {
+        alpha
+            .queue
+            .iter()
+            .find(|card| card.job.as_str() == id)
+            .expect("queue card")
+    };
+    assert_eq!(
+        queue("q01-ready").planned_executor.as_deref(),
+        Some("opencode:deepseek/deepseek-flash"),
+        "first ladder rung"
+    );
+    assert_eq!(
+        queue("q02-pinned").planned_executor.as_deref(),
+        Some("claude-code:claude-sonnet-5-5@high"),
+        "explicit override wins"
+    );
+    let card = alpha
+        .running
+        .iter()
+        .find(|card| card.job.as_str() == "q03-run")
+        .expect("running");
+    assert_eq!(card.tokens_input, Some(1000));
+    assert_eq!(card.tokens_output, Some(200));
+    assert_eq!(card.billing_mode.as_deref(), Some("api"));
+    assert_eq!(card.cost_usd, Some(0.25));
+    assert_eq!(card.context_window, Some(128_000));
+}
+
+#[test]
+fn running_card_never_invents_usage_or_cost_for_subscriptions() {
+    let fixture = Fixture::new();
+    let now = fixture.clock.now();
+    let job = fixture.job(&fixture.alpha, "s01-sub", 50);
+    fixture.set_state(
+        &fixture.alpha,
+        &job,
+        JobState::Running,
+        StateChange {
+            note: None,
+            parked_reason: None,
+        },
+    );
+    let store = fixture.store_for(&fixture.alpha);
+    store
+        .insert_run(&Run {
+            id: RunId::new(),
+            job_id: Some(job.id.clone()),
+            session_id: None,
+            role: RunRole::Worker,
+            purpose: RunPurpose::Start,
+            profile: None,
+            rung: 0,
+            executor: Some(Executor::parse("claude-code:claude-sonnet-5-5").expect("executor")),
+            provider: None,
+            node: NodeName::parse("local").expect("node"),
+            native_session_id: None,
+            pid: None,
+            window: None,
+            cwd: None,
+            started_at: now.minus(Duration::from_secs(5)),
+            ended_at: None,
+            exit_code: None,
+            outcome: None,
+            limit_kind: None,
+            cost: Cost::unknown(),
+            detail: String::new(),
+        })
+        .expect("run");
+    let snapshot = fixture.snapshot();
+    let alpha = snapshot
+        .projects
+        .iter()
+        .find(|p| p.name == fixture.alpha)
+        .expect("alpha");
+    let card = &alpha.running[0];
+    assert_eq!(card.billing_mode.as_deref(), Some("subscription"));
+    assert_eq!(card.tokens_input, None);
+    assert_eq!(card.cost_usd, None);
+    assert_eq!(card.context_window, None);
 }

@@ -17,23 +17,25 @@ use vowp_agent::service::{
     self, InstallOptions, ServiceError, ServicePlatform, ServiceSpec, SystemManager, run_marker_path,
 };
 use vowp_agent::{
-    AgentClient, AgentConfig, AgentError, AgentStatus, ConnectionState, IsolationError, NodeKey, PairedSurface,
-    RunOptions, RunOutcome, ServiceRunOutcome, SurfacePairRequest, SurfaceStatus, SystemAgentClock, TransportConfig,
-    WssIngress, WssListener, WssTls, WssTlsMode, WssTransport, check_state_dir, current_uid, ensure_not_root,
-    ensure_state_dir, fingerprint_of, is_fingerprint, load_public, pending_spool_bytes, surface_statuses,
-    surface_token_expiry, transport_for_config, validate_enrollment_code,
+    AgentClient, AgentConfig, AgentError, AgentStatus, ConnectionState, IsolationError, NodeKey, OrchestratorHost,
+    PairedSurface, RunOptions, RunOutcome, ServiceRunOutcome, SurfacePairRequest, SurfaceStatus, SystemAgentClock,
+    TransportConfig, WssIngress, WssListener, WssTls, WssTlsMode, WssTransport, check_state_dir, current_uid,
+    ensure_not_root, ensure_state_dir, fingerprint_of, is_fingerprint, load_public, pending_spool_bytes,
+    surface_statuses, surface_token_expiry, transport_for_config, validate_enrollment_code,
 };
 use vowp_core::Deps;
 use vowp_core::agent::gateway;
 use vowp_protocol::{
-    AGENT_PROTOCOL, AgentPathMap, AgentRole, ErrorKind, Project, ProjectName, SessionId, SurfaceId, Timestamp,
+    AGENT_PROTOCOL, AgentPathMap, AgentRole, ErrorKind, OrchestratorEndpoint, OrchestratorError, OrchestratorLocation,
+    Project, ProjectName, SessionId, SurfaceId, Timestamp,
 };
 use vowp_store::{NodePaths, Store};
 
 use crate::agent_exec::CoreRunHandler;
 use crate::cli::{
-    AgentCommand, AgentDoctorArgs, AgentEnrollArgs, AgentGatewayArgs, AgentPairArgs, AgentPathsAddArgs, AgentPathsArgs,
-    AgentPathsCommand, AgentPathsRmArgs, AgentRunArgs, AgentServiceArgs, AgentServiceCommand, AgentServiceInstallArgs,
+    AgentCommand, AgentDoctorArgs, AgentEnrollArgs, AgentGatewayArgs, AgentOrchestratorArgs, AgentOrchestratorCommand,
+    AgentOrchestratorEndpointArgs, AgentPairArgs, AgentPathsAddArgs, AgentPathsArgs, AgentPathsCommand,
+    AgentPathsRmArgs, AgentRunArgs, AgentServiceArgs, AgentServiceCommand, AgentServiceInstallArgs,
     AgentServiceStatusArgs, AgentServiceUninstallArgs, AgentStatusArgs, AgentTrustArgs,
 };
 use crate::node_ctx::{self, NodeRole};
@@ -54,7 +56,88 @@ pub fn run(global: &Global, io: &mut dyn IoStreams, command: &AgentCommand) -> R
         AgentCommand::Service(args) => service(global, io, args),
         AgentCommand::Doctor(args) => doctor(global, io, args),
         AgentCommand::Trust(args) => trust(global, io, args),
+        AgentCommand::Orchestrator(args) => orchestrator(global, io, args),
         AgentCommand::Gateway(args) => gateway(global, io, args),
+    }
+}
+
+/// Runs `vowp agent orchestrator`, local inspection only.
+fn orchestrator(global: &Global, io: &mut dyn IoStreams, args: &AgentOrchestratorArgs) -> Result<i32, CliError> {
+    match &args.command {
+        AgentOrchestratorCommand::Endpoint(args) => orchestrator_endpoint(global, io, args),
+    }
+}
+
+/// Runs `vowp agent orchestrator endpoint`.
+///
+/// The command reads only this machine's `~/.vowp-agent`: the orchestrator's private
+/// `config.json` and, for a live opencode host, its 0600 `service.json`. It never contacts
+/// the home, opens a socket or prints a path, port, password, token or pair link in an
+/// error. The password appears only in `--json` for a live local host.
+fn orchestrator_endpoint(
+    global: &Global,
+    io: &mut dyn IoStreams,
+    args: &AgentOrchestratorEndpointArgs,
+) -> Result<i32, CliError> {
+    let state_dir = AgentConfig::default_state_dir().map_err(map_agent_error)?;
+    let host = OrchestratorHost::new(state_dir);
+    let endpoint = host.endpoint(&args.name).map_err(map_host_error)?;
+    if global.json {
+        print_json(io, &endpoint)?;
+        return Ok(0);
+    }
+    print_agent_endpoint(io, &endpoint)?;
+    Ok(0)
+}
+
+/// Prints one agent endpoint as a compact key/value block without its password.
+fn print_agent_endpoint(io: &mut dyn IoStreams, endpoint: &OrchestratorEndpoint) -> Result<(), CliError> {
+    let node = endpoint
+        .node
+        .as_ref()
+        .map(|node| node.as_str().to_owned())
+        .unwrap_or_else(|| "-".to_owned());
+    writeln!(io.out(), "name: {}", endpoint.name)?;
+    writeln!(io.out(), "app: {}", vowp_agent::app_name(endpoint.app))?;
+    writeln!(io.out(), "session: {}", endpoint.session_id)?;
+    writeln!(
+        io.out(),
+        "location: {}",
+        match endpoint.location {
+            OrchestratorLocation::Home => "home",
+            OrchestratorLocation::Node => "node",
+        }
+    )?;
+    writeln!(io.out(), "node: {node}")?;
+    writeln!(io.out(), "state: {}", endpoint.state)?;
+    writeln!(io.out(), "url: {}", endpoint.url.as_deref().unwrap_or("-"))?;
+    writeln!(
+        io.out(),
+        "native session: {}",
+        endpoint.native_session_id.as_deref().unwrap_or("-")
+    )?;
+    match &endpoint.auth {
+        Some(auth) => writeln!(
+            io.out(),
+            "auth: {} {} via {} (password in --json)",
+            auth.scheme,
+            auth.username,
+            auth.header
+        )?,
+        None => writeln!(io.out(), "auth: -")?,
+    }
+    Ok(())
+}
+
+/// Maps a typed local endpoint failure onto the CLI exit classes.
+///
+/// Only a missing local record (`not_found`) exits 3. A corrupt, too-wide or unreadable
+/// private file is invalid input and exits 2, the same class as the home command's invalid
+/// error for that corruption; the agent library keeps its typed `config_invalid` code.
+fn map_host_error(error: OrchestratorError) -> CliError {
+    match error.code.as_str() {
+        "not_found" => CliError::NotFound(error.message),
+        _ => CliError::Invalid(error.message),
     }
 }
 

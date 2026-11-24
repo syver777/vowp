@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.1-dev"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -160,6 +160,14 @@ name = "status"
 path = "crates/vowp-cli/tests/status.rs"
 
 [[test]]
+name = "surface"
+path = "crates/vowp-cli/tests/surface.rs"
+
+[[test]]
+name = "surface_lease"
+path = "crates/vowp-cli/tests/surface_lease.rs"
+
+[[test]]
 name = "tmux_isolation"
 path = "crates/vowp-cli/tests/tmux_isolation.rs"
 
@@ -168,7 +176,7 @@ name = "up"
 path = "crates/vowp-cli/tests/up.rs"
 
 # The version test lives under scripts/release/ so it can be updated with the release
-# version. It asserts the actual package version (0.4.0).
+# version. It asserts the actual package version (0.5.1-dev).
 [[test]]
 name = "version"
 path = "scripts/release/version-test.rs"
@@ -182,13 +190,13 @@ signal-hook = "0.4.6"
 thiserror = "2.0.21"
 time = "0.3.45"
 toml = "1.2.1"
-vowp-adapters = { version = "0.4.0", path = "crates/vowp-adapters" }
-vowp-agent = { version = "0.4.0", path = "crates/vowp-agent" }
-vowp-core = { version = "0.4.0", path = "crates/vowp-core" }
-vowp-graph = { version = "0.4.0", path = "crates/vowp-graph" }
-vowp-protocol = { version = "0.4.0", path = "crates/vowp-protocol" }
-vowp-store = { version = "0.4.0", path = "crates/vowp-store" }
-vowp-tmux = { version = "0.4.0", path = "crates/vowp-tmux" }
+vowp-adapters = { version = "0.5.1-dev", path = "crates/vowp-adapters" }
+vowp-agent = { version = "0.5.1-dev", path = "crates/vowp-agent" }
+vowp-core = { version = "0.5.1-dev", path = "crates/vowp-core" }
+vowp-graph = { version = "0.5.1-dev", path = "crates/vowp-graph" }
+vowp-protocol = { version = "0.5.1-dev", path = "crates/vowp-protocol" }
+vowp-store = { version = "0.5.1-dev", path = "crates/vowp-store" }
+vowp-tmux = { version = "0.5.1-dev", path = "crates/vowp-tmux" }
 
 [lints]
 workspace = true

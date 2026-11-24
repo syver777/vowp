@@ -7,9 +7,12 @@
 //! remains a separate backstop.
 //!
 //! Values are files, never rows: basic mode keeps them in `<VOWP_HOME>/secrets/<NAME>` owned
-//! by the current user, and vault-user mode keeps them in
+//! by the current user, vault-user mode keeps them in
 //! `$VOWP_VAULT_HOME/secrets/<NAME>` (default `/home/vowp-vault/secrets`) owned by
-//! `vowp-vault`. Both are mode 0600. The mode file is `<VOWP_HOME>/secrets/mode`.
+//! `vowp-vault`, and encrypted mode keeps age ciphertext in
+//! `<VOWP_HOME>/secrets/encrypted/<NAME>` with the identity in
+//! `<VOWP_HOME>/secrets/age.key`. All secret files and the key are mode 0600. The mode file is
+//! `<VOWP_HOME>/secrets/mode`.
 //!
 //! Metadata lives in the global `secret_index` table: name, last four characters and
 //! timestamps. Values never enter the database. Rows left by the earlier vault implementation
@@ -30,6 +33,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use age::secrecy::ExposeSecret;
+use age::x25519::{Identity as AgeIdentity, Recipient as AgeRecipient};
 use serde_json::Value;
 use vowp_protocol::{
     Capsule, EventBody, HarnessKind, JobId, Level, SecretInfo, SecretName, Timestamp, TurnRequest, VaultMode,
@@ -80,8 +85,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the node's vault mode.
 ///
-/// A missing mode file means basic mode. Any value other than `vault` or `basic` is a
-/// configuration error rather than a silent fallback.
+/// A missing mode file means basic mode. Any value other than `vault`, `basic` or `encrypted`
+/// is a configuration error rather than a silent fallback.
 pub fn mode(deps: &Deps) -> Result<VaultMode, CoreError> {
     let path = deps.paths.root().join("secrets").join("mode");
     let text = match fs::read_to_string(&path) {
@@ -92,8 +97,9 @@ pub fn mode(deps: &Deps) -> Result<VaultMode, CoreError> {
     match text.trim() {
         "vault" => Ok(VaultMode::VaultUser),
         "basic" => Ok(VaultMode::Basic),
+        "encrypted" => Ok(VaultMode::Encrypted),
         other => Err(CoreError::Invalid(format!(
-            "{} must contain `vault` or `basic`, found `{other}`",
+            "{} must contain `vault`, `basic` or `encrypted`, found `{other}`",
             path.display()
         ))),
     }
@@ -302,9 +308,16 @@ pub fn redact_job_artifacts(deps: &Deps, store: &Store, job: Option<&JobId>) -> 
 ///
 /// Returns `None` when the name is not stored. The hidden helper runs as `vowp-vault` and
 /// cannot read the mode file in the `vowp` user's home, so it tries the vault directory
-/// directly before falling back to a normal mode-aware read.
+/// directly before falling back to a normal mode-aware read. In encrypted mode the vault
+/// directory is absent and the fallback decrypts with `<VOWP_HOME>/secrets/age.key`; a
+/// missing or wrong key is an error, never an empty value.
 pub fn read_value_for_exec(deps: &Deps, name: &SecretName) -> Result<Option<String>, CoreError> {
     let layout = Layout::from_deps(deps);
+    // Encrypted mode has no vault user: read the ciphertext directly so a stale plaintext
+    // file in a vault directory can never become a fallback.
+    if mode(deps)? == VaultMode::Encrypted {
+        return read_encrypted_value(&layout, name);
+    }
     match read_value_at(&layout.vault_dir(), name) {
         Ok(Some(value)) => return Ok(Some(value)),
         Ok(None) => {}
@@ -343,12 +356,23 @@ pub fn admin_probe(deps: &Deps) -> Result<(), CoreError> {
 pub enum Upgrade {
     /// Secrets are already stored as the vault user and the helper can run.
     AlreadyVault,
+    /// Secrets are already encrypted at rest; the vault-user upgrade is not applicable.
+    AlreadyEncrypted,
     /// The vault user was found and the mode file was switched.
     Switched,
     /// The owner must run this one shell command, then re-run `vowp secret upgrade`.
     NeedsCommand(String),
     /// The `sudo` program is missing, so the vault user cannot be created here.
     NoSudo(String),
+}
+
+/// What `vowp secret upgrade --encrypted` should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptedUpgrade {
+    /// Secrets are already encrypted at rest.
+    AlreadyEncrypted,
+    /// Every basic-mode value was encrypted and the mode file was switched.
+    Switched,
 }
 
 /// Plans or completes the switch from basic mode to vault-user mode.
@@ -361,9 +385,88 @@ pub fn upgrade(deps: &Deps) -> Result<Upgrade, CoreError> {
     upgrade_impl(deps, &layout)
 }
 
+/// Moves basic-mode secrets into the encrypted-at-rest backend.
+///
+/// Every value is encrypted before any plaintext copy is removed, and the mode file is written
+/// only after all of them succeeded. Index metadata is left untouched so `last4` and the
+/// timestamps survive. Vault-user mode is refused here: the owner must not silently mix the
+/// two backends. Running it again in encrypted mode is an idempotent no-op.
+pub fn upgrade_encrypted(deps: &Deps) -> Result<EncryptedUpgrade, CoreError> {
+    let layout = Layout::from_deps(deps);
+    upgrade_encrypted_impl(deps, &layout)
+}
+
+/// Completes the encrypted upgrade through an explicit layout.
+fn upgrade_encrypted_impl(deps: &Deps, layout: &Layout) -> Result<EncryptedUpgrade, CoreError> {
+    match mode(deps)? {
+        VaultMode::Encrypted => return Ok(EncryptedUpgrade::AlreadyEncrypted),
+        VaultMode::VaultUser => {
+            return Err(CoreError::Guard {
+                name: "secret upgrade --encrypted".to_owned(),
+                detail: "vault-user mode is active; `vowp secret upgrade --encrypted` only moves \
+                         basic-mode secrets and refuses to mix the two backends"
+                    .to_owned(),
+            });
+        }
+        VaultMode::Basic => {}
+    }
+
+    let identity = load_or_create_age_identity(layout)?;
+    let recipient = identity.to_public();
+    ensure_private_dir(&layout.encrypted_dir())?;
+    let entries = match fs::read_dir(&layout.basic_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_mode(deps, VaultMode::Encrypted)?;
+            return Ok(EncryptedUpgrade::Switched);
+        }
+        Err(source) => return Err(io_error(&layout.basic_dir, source)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error(&layout.basic_dir, source))?;
+        let Ok(name) = SecretName::parse(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        names.push(name);
+    }
+    let indexed: BTreeSet<String> = list_index(deps)?
+        .into_iter()
+        .map(|info| info.name.to_string())
+        .collect();
+    for name in &names {
+        let value = read_value_at(&layout.basic_dir, name)?
+            .ok_or_else(|| CoreError::Invalid(format!("secret {name} disappeared during upgrade")))?;
+        let ciphertext = encrypt_value(&recipient, name, &value)?;
+        write_atomic(&layout.encrypted_dir().join(name.as_str()), &ciphertext, 0o600)?;
+        if !indexed.contains(name.as_str()) {
+            let now = deps.clock.now();
+            put_index(
+                deps,
+                &SecretInfo {
+                    name: name.clone(),
+                    last4: last4(&value),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )?;
+        }
+    }
+    for name in &names {
+        remove_file_if_present(&layout.basic_dir.join(name.as_str()))?;
+    }
+    write_mode(deps, VaultMode::Encrypted)?;
+    Ok(EncryptedUpgrade::Switched)
+}
+
 /// Completes the upgrade through an explicit layout (also used by the module tests).
 fn upgrade_impl(deps: &Deps, layout: &Layout) -> Result<Upgrade, CoreError> {
     let current = mode(deps)?;
+    // The vault-user upgrade must never silently switch away from encrypted storage: the
+    // ciphertext would be left without its mode and the owner would see missing values.
+    if current == VaultMode::Encrypted {
+        return Ok(Upgrade::AlreadyEncrypted);
+    }
     if vault_user_ready(layout) {
         if current == VaultMode::VaultUser {
             return Ok(Upgrade::AlreadyVault);
@@ -424,7 +527,7 @@ impl Redactor {
         match mode {
             // Basic storage is complete on disk; avoid a store query on every event.
             VaultMode::Basic => collect_secret_names(&layout.basic_dir, &mut names),
-            VaultMode::VaultUser => {
+            VaultMode::VaultUser | VaultMode::Encrypted => {
                 names.extend(list_index(deps)?.into_iter().map(|info| info.name.to_string()));
                 for dir in storage_dirs(&layout, mode) {
                     collect_secret_names(&dir, &mut names);
@@ -497,6 +600,7 @@ fn storage_dirs(layout: &Layout, mode: VaultMode) -> Vec<PathBuf> {
     match mode {
         VaultMode::Basic => vec![layout.basic_dir.clone()],
         VaultMode::VaultUser => vec![layout.basic_dir.clone(), layout.vault_dir()],
+        VaultMode::Encrypted => vec![layout.encrypted_dir()],
     }
 }
 
@@ -554,6 +658,16 @@ impl Layout {
         self.vault_home.join("secrets")
     }
 
+    /// Returns the directory that holds encrypted-mode ciphertext.
+    fn encrypted_dir(&self) -> PathBuf {
+        self.basic_dir.join("encrypted")
+    }
+
+    /// Returns the age identity file that decrypts the encrypted-mode secrets.
+    fn age_key_path(&self) -> PathBuf {
+        self.basic_dir.join("age.key")
+    }
+
     /// Returns the private node home the hidden helper receives instead of the owner's home.
     fn helper_home(&self) -> PathBuf {
         self.vault_home.join("helper")
@@ -585,6 +699,12 @@ fn write_secret_impl(deps: &Deps, layout: &Layout, name: &SecretName, value: &st
                 .stderr(Stdio::piped());
             run_helper_with_value(command, value.as_bytes(), "set")?;
         }
+        VaultMode::Encrypted => {
+            let identity = load_or_create_age_identity(layout)?;
+            let ciphertext = encrypt_value(&identity.to_public(), &name, value)?;
+            ensure_private_dir(&layout.encrypted_dir())?;
+            write_atomic(&layout.encrypted_dir().join(name.as_str()), &ciphertext, 0o600)?;
+        }
     }
     let info = SecretInfo {
         name,
@@ -607,6 +727,7 @@ fn remove_secret_impl(deps: &Deps, layout: &Layout, name: &SecretName) -> Result
             let output = run_helper_capture(command, None, "rm")?;
             String::from_utf8_lossy(&output).trim_start().starts_with("removed")
         }
+        VaultMode::Encrypted => remove_file_if_present(&layout.encrypted_dir().join(name.as_str()))?,
     };
     let removed_index = remove_index(deps, &name)?;
     Ok(file_existed || removed_index || indexed)
@@ -630,6 +751,7 @@ fn read_value_impl(deps: &Deps, layout: &Layout, name: &SecretName) -> Result<Op
             }
             Err(error) => Err(error),
         },
+        VaultMode::Encrypted => read_encrypted_value(layout, name),
     }
 }
 
@@ -689,11 +811,29 @@ fn admin_probe_at(dir: &Path) -> Result<(), CoreError> {
 
 /// Reads one secret file from an explicit directory.
 fn read_value_at(dir: &Path, name: &SecretName) -> Result<Option<String>, CoreError> {
-    let path = dir.join(name.as_str());
-    let metadata = match fs::symlink_metadata(&path) {
+    let Some(bytes) = read_bytes_at(dir, name)? else {
+        return Ok(None);
+    };
+    let value = String::from_utf8(bytes).map_err(|_| {
+        CoreError::Invalid(format!(
+            "secret file {} is not valid UTF-8",
+            dir.join(name.as_str()).display()
+        ))
+    })?;
+    Ok(Some(value))
+}
+
+/// Reads the bytes of one secret file from an explicit directory.
+fn read_bytes_at(dir: &Path, name: &SecretName) -> Result<Option<Vec<u8>>, CoreError> {
+    read_private_bytes(&dir.join(name.as_str()))
+}
+
+/// Reads one private mode-0600 file, rejecting a symlink or a lax mode.
+fn read_private_bytes(path: &Path) -> Result<Option<Vec<u8>>, CoreError> {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(&path, source)),
+        Err(source) => return Err(io_error(path, source)),
     };
     if metadata.file_type().is_symlink() {
         return Err(CoreError::Invalid(format!(
@@ -713,10 +853,104 @@ fn read_value_at(dir: &Path, name: &SecretName) -> Result<Option<String>, CoreEr
             path.display()
         )));
     }
-    let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
-    let value = String::from_utf8(bytes)
-        .map_err(|_| CoreError::Invalid(format!("secret file {} is not valid UTF-8", path.display())))?;
-    Ok(Some(value))
+    fs::read(path).map(Some).map_err(|source| io_error(path, source))
+}
+
+/// Decrypts one encrypted-mode secret.
+///
+/// A missing, unreadable or wrong key is a typed error. There is no plaintext fallback and a
+/// failed decryption never becomes an empty value.
+fn read_encrypted_value(layout: &Layout, name: &SecretName) -> Result<Option<String>, CoreError> {
+    let Some(ciphertext) = read_bytes_at(&layout.encrypted_dir(), name)? else {
+        return Ok(None);
+    };
+    let identity = load_age_identity(layout)?;
+    let plaintext = age::decrypt(&identity, &ciphertext).map_err(|_| {
+        CoreError::Invalid(format!(
+            "secret {name} could not be decrypted with {}; the age key is wrong or does not match",
+            layout.age_key_path().display()
+        ))
+    })?;
+    String::from_utf8(plaintext)
+        .map(Some)
+        .map_err(|_| CoreError::Invalid(format!("secret {name} is not valid UTF-8")))
+}
+
+/// Loads the encrypted-mode age identity.
+///
+/// The key file must exist and be a valid mode-0600 age identity. A missing key is an error
+/// here: generating a fresh one would silently orphan every stored ciphertext.
+fn load_age_identity(layout: &Layout) -> Result<AgeIdentity, CoreError> {
+    let path = layout.age_key_path();
+    let Some(bytes) = read_private_bytes(&path)? else {
+        return Err(CoreError::Invalid(format!(
+            "encrypted vault key {} is missing; encrypted secrets cannot be read or written",
+            path.display()
+        )));
+    };
+    parse_age_identity(&path, bytes)
+}
+
+/// Loads the age identity, creating it on the first encrypted write.
+///
+/// A new identity is generated only when no ciphertext exists. Once any encrypted secret is
+/// present, a missing key is refused instead of replaced.
+fn load_or_create_age_identity(layout: &Layout) -> Result<AgeIdentity, CoreError> {
+    let path = layout.age_key_path();
+    match read_private_bytes(&path)? {
+        Some(bytes) => parse_age_identity(&path, bytes),
+        None => {
+            if has_encrypted_secrets(layout)? {
+                return Err(CoreError::Invalid(format!(
+                    "encrypted vault key {} is missing while encrypted secrets exist; refusing to \
+                     generate a new key that could not decrypt them",
+                    path.display()
+                )));
+            }
+            ensure_private_dir(&layout.basic_dir)?;
+            let identity = AgeIdentity::generate();
+            write_atomic(&path, identity.to_string().expose_secret().as_bytes(), 0o600)?;
+            Ok(identity)
+        }
+    }
+}
+
+/// Returns whether the encrypted directory holds at least one valid secret ciphertext.
+///
+/// A missing directory is empty; any other I/O error is propagated so a new key is never
+/// generated on top of ciphertext that could not be inspected.
+fn has_encrypted_secrets(layout: &Layout) -> Result<bool, CoreError> {
+    let dir = layout.encrypted_dir();
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error(&dir, source)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error(&dir, source))?;
+        if SecretName::parse(&entry.file_name().to_string_lossy()).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Parses one age identity file.
+fn parse_age_identity(path: &Path, bytes: Vec<u8>) -> Result<AgeIdentity, CoreError> {
+    let text = String::from_utf8(bytes)
+        .map_err(|_| CoreError::Invalid(format!("encrypted vault key {} is not valid UTF-8", path.display())))?;
+    text.trim().parse::<AgeIdentity>().map_err(|error| {
+        CoreError::Invalid(format!(
+            "encrypted vault key {} is not a valid age identity: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Encrypts one secret value to the node's age recipient.
+fn encrypt_value(recipient: &AgeRecipient, name: &SecretName, value: &str) -> Result<Vec<u8>, CoreError> {
+    age::encrypt(recipient, value.as_bytes())
+        .map_err(|error| CoreError::Invalid(format!("could not encrypt secret {name}: {error}")))
 }
 
 /// Writes the mode file atomically with mode 0600.
@@ -726,6 +960,7 @@ fn write_mode(deps: &Deps, mode: VaultMode) -> Result<(), CoreError> {
     let text = match mode {
         VaultMode::VaultUser => "vault\n",
         VaultMode::Basic => "basic\n",
+        VaultMode::Encrypted => "encrypted\n",
     };
     write_atomic(&dir.join("mode"), text.as_bytes(), 0o600)
 }

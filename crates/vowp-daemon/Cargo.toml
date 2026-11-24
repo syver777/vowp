@@ -30,11 +30,11 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 time = { version = "0.3.45", features = ["macros", "parsing"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "macros", "time", "fs", "io-util"] }
-vowp-core = { version = "0.4.0", path = "../vowp-core" }
-vowp-graph = { version = "0.4.0", path = "../vowp-graph" }
-vowp-protocol = { version = "0.4.0", path = "../vowp-protocol" }
-vowp-store = { version = "0.4.0", path = "../vowp-store" }
-vowp-tmux = { version = "0.4.0", path = "../vowp-tmux" }
+vowp-core = { version = "0.5.1-dev", path = "../vowp-core" }
+vowp-graph = { version = "0.5.1-dev", path = "../vowp-graph" }
+vowp-protocol = { version = "0.5.1-dev", path = "../vowp-protocol" }
+vowp-store = { version = "0.5.1-dev", path = "../vowp-store" }
+vowp-tmux = { version = "0.5.1-dev", path = "../vowp-tmux" }
 
 [lints]
 workspace = true

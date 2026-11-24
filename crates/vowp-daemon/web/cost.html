@@ -52,6 +52,7 @@
   h2 { margin: 0; font-size: 1rem; }
   a { color: var(--accent); }
   .page-head { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: baseline; justify-content: space-between; }
+  .status { display: grid; gap: .2rem; justify-items: start; }
   .page-nav { margin: .15rem 0 0; font-weight: 600; }
   .page-nav a { margin-right: .75rem; }
   .card {
@@ -122,7 +123,10 @@
       </nav>
       <p class="muted">Read-only ledger totals grouped by <span id="by-label">job</span>.</p>
     </div>
-    <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+    <div class="status">
+      <p id="updated" class="muted" aria-live="polite">Last updated: waiting for first load</p>
+      <p id="live" class="muted" aria-live="polite">Live updates: connecting…</p>
+    </div>
   </header>
 
   <p id="error" class="error" role="alert" hidden></p>
@@ -180,9 +184,12 @@
   "use strict";
 
   const REFRESH_MS = 5000;
+  const RETRY_MIN_MS = 1000;
+  const RETRY_MAX_MS = 15000;
   const GROUPS = ["job", "day", "role", "provider", "model"];
   const errorLine = document.getElementById("error");
   const updatedLine = document.getElementById("updated");
+  const liveLine = document.getElementById("live");
   const bySelect = document.getElementById("by");
   const byLabel = document.getElementById("by-label");
   const rowsBody = document.getElementById("rows");
@@ -192,6 +199,10 @@
   const chartByLabel = document.getElementById("chart-by-label");
   const chartUnknown = document.getElementById("chart-unknown");
   let lastUpdated = null;
+  let eventSource = null;
+  let retryTimer = null;
+  let retryDelay = RETRY_MIN_MS;
+  let fallbackTimer = null;
 
   const initial = new URLSearchParams(window.location.search).get("by");
   let by = GROUPS.includes(initial) ? initial : "job";
@@ -365,14 +376,135 @@
     }
   }
 
+  function setLive(message) {
+    liveLine.textContent = message;
+  }
+
+  function markUpdated() {
+    lastUpdated = new Date();
+    updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+  }
+
+  function closeStream() {
+    if (eventSource === null) return;
+    const source = eventSource;
+    eventSource = null;
+    source.onopen = null;
+    source.onerror = null;
+    source.close();
+  }
+
+  function clearRetry() {
+    if (retryTimer === null) return;
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  function stopFallbackPolling() {
+    if (fallbackTimer === null) return;
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+
+  function startFallbackPolling() {
+    if (fallbackTimer !== null) return;
+    fallbackTimer = setInterval(refresh, REFRESH_MS);
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null) return;
+    const delay = retryDelay;
+    retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      startStream();
+    }, delay);
+  }
+
+  function handleStreamFailure() {
+    closeStream();
+    setLive("Reconnecting... polling every 5 seconds.");
+    startFallbackPolling();
+    scheduleRetry();
+    refresh();
+  }
+
+  function markHeartbeat(value) {
+    let at = "now";
+    if (value) {
+      const date = new Date(value);
+      at = Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    }
+    setLive("Live updates: streaming · heartbeat " + at);
+  }
+
+  function applyReport(report) {
+    render(report);
+    markUpdated();
+    errorLine.hidden = true;
+    errorLine.textContent = "";
+    setLive("Live updates: streaming");
+    stopFallbackPolling();
+  }
+
+  function startStream() {
+    clearRetry();
+    closeStream();
+    if (typeof EventSource !== "function") {
+      setLive("Live updates unavailable in this browser; polling every 5 seconds.");
+      startFallbackPolling();
+      return;
+    }
+    let source;
+    try {
+      const query = by === "job" ? "" : "?by=" + encodeURIComponent(by);
+      source = new EventSource("/api/v1/cost/stream" + query);
+    } catch (_error) {
+      setLive("Live updates could not start; polling every 5 seconds.");
+      startFallbackPolling();
+      scheduleRetry();
+      return;
+    }
+    eventSource = source;
+    source.onopen = () => {
+      clearRetry();
+      retryDelay = RETRY_MIN_MS;
+      setLive("Live updates: streaming");
+      stopFallbackPolling();
+    };
+    source.addEventListener("cost", (message) => {
+      let report;
+      try {
+        report = JSON.parse(message.data);
+      } catch (_error) {
+        return;
+      }
+      retryDelay = RETRY_MIN_MS;
+      applyReport(report);
+    });
+    source.addEventListener("heartbeat", (message) => {
+      let at = null;
+      try {
+        at = JSON.parse(message.data).at;
+      } catch (_error) {
+        at = null;
+      }
+      retryDelay = RETRY_MIN_MS;
+      markHeartbeat(at);
+    });
+    source.onerror = () => {
+      if (eventSource !== source) return;
+      handleStreamFailure();
+    };
+  }
+
   async function refresh() {
     try {
       const response = await fetch("/api/v1/cost?by=" + encodeURIComponent(by));
       if (!response.ok) throw new Error("HTTP " + response.status);
       const report = await response.json();
       render(report);
-      lastUpdated = new Date();
-      updatedLine.textContent = "Last updated: " + lastUpdated.toLocaleString();
+      markUpdated();
       errorLine.hidden = true;
       errorLine.textContent = "";
     } catch (error) {
@@ -381,6 +513,13 @@
       errorLine.textContent = "Could not load the cost report (" + detail + ")." + when;
       errorLine.hidden = false;
     }
+  }
+
+  async function load() {
+    setLive("Live updates: connecting…");
+    startFallbackPolling();
+    await refresh();
+    startStream();
   }
 
   bySelect.addEventListener("change", () => {
@@ -393,10 +532,10 @@
     }
     window.history.replaceState(null, "", url);
     refresh();
+    startStream();
   });
 
-  refresh();
-  setInterval(refresh, REFRESH_MS);
+  load();
 })();
 </script>
 <script>

@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use vowp_adapters::proc::{Signal, process_alive, signal_group};
-use vowp_protocol::{ActiveState, Loop, LoopKind, NodeName, Run, RunId, RunOutcome, WorkerState};
+use vowp_protocol::{ActiveState, JobId, Loop, LoopKind, NodeName, ProjectName, Run, RunId, RunOutcome, WorkerState};
 use vowp_store::{RunFinish, Store};
 
 use crate::CoreError;
@@ -161,6 +161,65 @@ pub(crate) fn ensure_windows(deps: &Deps) -> Result<u32, CoreError> {
     Ok(u32::try_from(vowp_tmux::FIXED_WINDOWS.len()).unwrap_or(5))
 }
 
+/// Closes one tagged `job-<id>` window, treating an absent window as already closed.
+///
+/// Best effort: an untagged or missing window is left alone and a tmux failure is logged
+/// rather than returned, so a state transition never fails because its view is gone.
+pub(crate) fn close_job_window(deps: &Deps, project: &ProjectName, job_id: &JobId) {
+    let session = vowp_tmux::session_name_for_project(project.as_str());
+    let window = vowp_tmux::window_name_for_job(job_id.as_str());
+    match deps.windows.kill_window(&session, &window) {
+        Ok(()) | Err(vowp_tmux::TmuxError::WindowNotFound { .. }) | Err(vowp_tmux::TmuxError::NotTagged { .. }) => {}
+        Err(error) => deps.log.log(
+            vowp_protocol::Level::Warn,
+            "l1",
+            &format!("cannot close {session}:{window} for job {job_id}: {error}"),
+        ),
+    }
+}
+
+/// Closes tagged `job-<id>` windows whose job is missing or no longer active.
+///
+/// Only the exact `job-<id>` name this tool creates is considered and the manager refuses
+/// untagged windows, so the fixed supervisor windows and any foreign window are untouched.
+pub(crate) fn stale_job_windows(deps: &Deps, store: &Store, project: &ProjectName) -> Result<u32, CoreError> {
+    let session = vowp_tmux::session_name_for_project(project.as_str());
+    let windows = deps.windows.list_windows(&session).map_err(CoreError::Tmux)?;
+    let mut closed = 0;
+    // Window names of active jobs, computed forward: a long id's hashed name cannot be parsed
+    // back into the id, so compare against `window_name_for_job` instead.
+    let active_names: HashSet<String> = store
+        .list_jobs(&vowp_store::JobFilter::default())?
+        .into_iter()
+        .filter(|job| job.state.needs_window())
+        .map(|job| vowp_tmux::window_name_for_job(job.id.as_str()))
+        .collect();
+    for window in windows {
+        if !window.tagged {
+            continue;
+        }
+        let Some(raw_id) = window.name.strip_prefix("job-") else {
+            continue;
+        };
+        if JobId::parse(raw_id).is_err() {
+            continue;
+        }
+        if active_names.contains(&window.name) {
+            continue;
+        }
+        match deps.windows.kill_window(&session, &window.name) {
+            Ok(()) => closed += 1,
+            Err(vowp_tmux::TmuxError::WindowNotFound { .. }) => {}
+            Err(error) => deps.log.log(
+                vowp_protocol::Level::Warn,
+                "l1",
+                &format!("cannot close stale {session}:{}: {error}", window.name),
+            ),
+        }
+    }
+    Ok(closed)
+}
+
 /// Runs startup reconciliation and returns the report counters.
 pub(crate) fn startup(
     deps: &Deps,
@@ -173,6 +232,15 @@ pub(crate) fn startup(
     let orphaned_runs = orphaned_runs(deps, store, open, active)?;
     let session_report = crate::session::service::SessionService::new(deps.clone()).recover(store)?;
     ensure_loops(store, deps)?;
+    // Close leftover views before ensuring the layout: a session that held only job windows
+    // is empty afterwards and gets its fixed windows back in the same startup.
+    if let Err(error) = stale_job_windows(deps, store, &deps.config.project.name) {
+        deps.log.log(
+            vowp_protocol::Level::Warn,
+            "l1",
+            &format!("cannot reconcile job windows: {error}"),
+        );
+    }
     let windows_recreated = ensure_windows(deps).unwrap_or_else(|error| {
         deps.log.log(
             vowp_protocol::Level::Warn,

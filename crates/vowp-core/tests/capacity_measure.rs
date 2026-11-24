@@ -853,6 +853,154 @@ fn oom_kill_marks_run_usage() {
     assert_eq!(stored.project, project);
 }
 
+/// Owns a spawned child and its sentinel file; kills, reaps and removes both on drop.
+///
+/// Dropping runs even when the test panics, so no shell loop outlives the test body.
+#[cfg(target_os = "linux")]
+struct ProbeGuard {
+    child: std::process::Child,
+    sentinel: Option<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl ProbeGuard {
+    fn spawn(script: &str, sentinel: Option<PathBuf>) -> Self {
+        let child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child, sentinel }
+    }
+
+    /// Spawns `args[0]` with `args[1..]` (stdout discarded) under the same drop guard.
+    fn spawn_args(args: &[String], sentinel: Option<PathBuf>) -> Self {
+        let child = std::process::Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        Self { child, sentinel }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(path) = self.sentinel.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Returns the pids of live processes whose command line mentions `needle`.
+#[cfg(target_os = "linux")]
+fn processes_mentioning(needle: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&raw).replace('\0', " ").contains(needle) {
+            found.push(pid);
+        }
+    }
+    found
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scope_leaves_no_probe_child_after_drop() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path().join("node");
+    let store = test_store(&root);
+    let project = insert_project(&store);
+    let job = insert_job(&store, &project, "no-leak");
+    let run_id = RunId::new();
+    insert_run(&store, &job, &run_id, &NodeName::parse("local").unwrap());
+    let deps = test_deps(&root);
+    let needle = root.display().to_string();
+    {
+        let child = ProbeGuard::spawn("while :; do :; done", None);
+        let scope = RunScope::begin(&deps, &run_id, child.id()).unwrap();
+        let _ = scope.sample().unwrap();
+        // Dropped without `finish`: the holder shell and its hold file must still go away.
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let leaked = processes_mentioning(&needle);
+        if leaked.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "scope holder processes survived the drop: {leaked:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(deps.paths.tmp_dir())
+        .map(|dir| dir.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        leftovers
+            .iter()
+            .all(|path| path.extension().is_none_or(|ext| ext != "hold")),
+        "hold files survived the drop: {leftovers:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn holder_loop_exits_when_its_parent_is_gone() {
+    let tmp = tempdir().unwrap();
+    let hold = tmp.path().join("probe.hold");
+    std::fs::write(&hold, b"hold").unwrap();
+    // A reaped child's pid is dead, so `kill -0` fails while the hold file still exists.
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    let args = scope::holder_args(&hold.display().to_string(), dead_pid);
+    let mut holder = ProbeGuard::spawn_args(&args, Some(hold.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exited = loop {
+        if holder.child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(exited, "the holder outlived its dead parent");
+    assert!(
+        hold.exists(),
+        "the hold file must still exist: the exit was the parent check"
+    );
+
+    // With a live parent (this process) and the hold file present it keeps running.
+    let args = scope::holder_args(&hold.display().to_string(), std::process::id());
+    let mut live = ProbeGuard::spawn_args(&args, None);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        live.child.try_wait().unwrap().is_none(),
+        "the holder exited although its parent is alive"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn scope_begin_measures_a_real_child() {
@@ -868,10 +1016,7 @@ fn scope_begin_measures_a_real_child() {
     // after `sleep 0.2` has exited and read zeros. Keep a real child alive and busy until
     // the scope has observed it, then poll for the measurement instead of betting on one
     // sample.
-    let mut child = std::process::Command::new("sh")
-        .args(["-c", "while :; do :; done"])
-        .spawn()
-        .unwrap();
+    let mut child = ProbeGuard::spawn("while :; do :; done", None);
     let scope = RunScope::begin(&deps, &run_id, child.id()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut sample = scope.sample().unwrap();
@@ -885,8 +1030,8 @@ fn scope_begin_measures_a_real_child() {
     }
     assert!(sample.peak_rss_bytes > 0, "no memory measured: {sample:?}");
     assert!(sample.cpu_usec > 0, "no CPU measured: {sample:?}");
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.child.kill();
+    let _ = child.child.wait();
     let usage = scope.finish(&store, BuildMode::Unknown).unwrap();
     assert!(usage.peak_rss_bytes > 0);
     assert!(usage.cpu_usec > 0, "the usage row lost the child's CPU: {usage:?}");
@@ -1058,7 +1203,10 @@ fn estimates_use_exact_group_then_pool_then_default() {
     let exact = capacity::estimate_for(&store, &admit_request(&project, "exact")).unwrap();
     assert_eq!(exact.source, vowp_protocol::EstimateSource::Measured);
     assert_eq!(exact.samples, 5);
-    assert_eq!(exact.ram_p90_bytes, 500);
+    assert_eq!(
+        exact.ram_p90_bytes, 250,
+        "p90 uses the anon working set (peak / 2 in the fixture)"
+    );
 
     let other = ProjectName::parse("other").unwrap();
     for index in 0..5 {
@@ -1117,7 +1265,7 @@ fn estimates_pool_across_harnesses() {
     let pooled = capacity::estimate_for(&store, &request).unwrap();
     assert_eq!(pooled.source, vowp_protocol::EstimateSource::Pooled);
     assert_eq!(pooled.samples, 5);
-    assert_eq!(pooled.ram_p90_bytes, 600);
+    assert_eq!(pooled.ram_p90_bytes, 300);
 }
 
 #[test]
@@ -1235,4 +1383,48 @@ impl StreamParser for StubParser {
 #[allow(dead_code)]
 fn raw_path(root: &Path, run: &RunId) -> PathBuf {
     NodePaths::new(root).run_raw_path(run)
+}
+
+#[test]
+fn scope_working_set_tracks_anon_peak_not_cache() {
+    let tmp = tempdir().unwrap();
+    let deps = test_deps(&tmp.path().join("node"));
+    let cgroup = tmp.path().join("scope");
+    let mut fake = FakeProcFs::default();
+    // 9.6 GiB memory.peak, almost all reclaimable file cache from a cargo build.
+    fake.files
+        .insert(format!("{}/memory.peak", cgroup.display()), "10307921510\n".to_owned());
+    fake.files.insert(
+        format!("{}/memory.stat", cgroup.display()),
+        "anon 1500000000\nfile 8500000000\nkernel 100000000\n".to_owned(),
+    );
+    let run = RunId::new();
+    let scope = RunScope::begin_cgroup_with(&deps, Arc::new(fake), &run, cgroup);
+    let sample = scope.sample().unwrap();
+    assert_eq!(sample.anon_peak_bytes, Some(1_500_000_000));
+    assert_eq!(sample.file_peak_bytes, Some(8_500_000_000));
+}
+
+#[test]
+fn estimates_exclude_reclaimable_page_cache() {
+    let tmp = tempdir().unwrap();
+    let store = test_store(&tmp.path().join("node"));
+    let project = insert_project(&store);
+    for index in 0..5 {
+        let mut row = usage_row(&project, JobKind::Build, "cache", 9_600 * 1024 * 1024, index);
+        row.anon_peak_bytes = Some(1_400 * 1024 * 1024);
+        row.kernel_peak_bytes = Some(100 * 1024 * 1024);
+        row.file_peak_bytes = Some(8_000 * 1024 * 1024);
+        store.upsert_run_usage(&row).unwrap();
+    }
+    // A legacy row with only a file share still drops the cache.
+    let mut legacy = usage_row(&project, JobKind::Build, "cache", 9_600 * 1024 * 1024, 9);
+    legacy.anon_peak_bytes = None;
+    legacy.kernel_peak_bytes = None;
+    legacy.file_peak_bytes = Some(8_100 * 1024 * 1024);
+    assert_eq!(capacity::estimates::working_set_bytes(&legacy), 1_500 * 1024 * 1024);
+    capacity::recompute(&store, now()).unwrap();
+    let estimate = capacity::estimate_for(&store, &admit_request(&project, "cache")).unwrap();
+    assert_eq!(estimate.ram_p90_bytes, 1_500 * 1024 * 1024);
+    assert_eq!(estimate.ram_p50_bytes, 1_500 * 1024 * 1024);
 }

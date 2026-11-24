@@ -7,6 +7,7 @@
 
 use clap::Args;
 use serde_json::json;
+use vowp_core::surface::lease::lease_status;
 use vowp_core::surface::{AcquireLease, LeaseGuard};
 use vowp_protocol::{LeaseStatus, NodeName, Session, SessionId, Surface, SurfaceId, SurfaceKind};
 use vowp_store::{SessionFilter, Store};
@@ -28,6 +29,9 @@ pub struct LeaseArgs {
     /// Node the surface runs on.
     #[arg(long, value_name = "NAME")]
     pub node: Option<String>,
+    /// Friendly saved name for the surface (default: `<kind name> · <node>`).
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
 }
 
 /// Arguments for the hidden `vowp session takeover`.
@@ -44,6 +48,9 @@ pub struct TakeoverArgs {
     /// Node the new surface runs on.
     #[arg(long, value_name = "NAME")]
     pub node: String,
+    /// Friendly saved name for the new surface.
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
 }
 
 /// Runs the hidden `vowp session lease`.
@@ -62,17 +69,15 @@ pub fn lease(ctx: &Ctx, io: &mut dyn IoStreams, args: &LeaseArgs) -> Result<i32,
                 takeover: false,
             },
         )?;
-        let lease = store
-            .lease(&session.id)?
+        if let Some(label) = &args.label {
+            store.set_surface_label(&surface.id, Some(label))?;
+        }
+        let record = store
+            .ownership(&session.id)?
             .ok_or_else(|| CliError::Invalid("lease acquisition left no lease row".to_owned()))?;
         let status = LeaseStatus {
-            held: true,
-            holder: Some(lease.holder.clone()),
-            kind: Some(lease.surface_kind),
-            node: Some(lease.node.clone()),
-            acquired_at: Some(lease.acquired_at),
-            heartbeat_at: Some(lease.heartbeat_at),
             token: Some(guard.token().to_owned()),
+            ..lease_status(&record, ctx.clock().now())
         };
         let token = guard.token().to_owned();
         // `--acquire` is the one-shot form: the caller keeps the token and heartbeats the
@@ -86,16 +91,8 @@ pub fn lease(ctx: &Ctx, io: &mut dyn IoStreams, args: &LeaseArgs) -> Result<i32,
         return Ok(0);
     }
 
-    let status = match store.lease(&session.id)? {
-        Some(lease) => LeaseStatus {
-            held: true,
-            holder: Some(lease.holder),
-            kind: Some(lease.surface_kind),
-            node: Some(lease.node),
-            acquired_at: Some(lease.acquired_at),
-            heartbeat_at: Some(lease.heartbeat_at),
-            token: None,
-        },
+    let status = match store.ownership(&session.id)? {
+        Some(record) => lease_status(&record, ctx.clock().now()),
         None => LeaseStatus {
             held: false,
             holder: None,
@@ -104,6 +101,12 @@ pub fn lease(ctx: &Ctx, io: &mut dyn IoStreams, args: &LeaseArgs) -> Result<i32,
             acquired_at: None,
             heartbeat_at: None,
             token: None,
+            mode: None,
+            state: None,
+            epoch: None,
+            expires_at: None,
+            label: None,
+            activity: None,
         },
     };
     if ctx.json() {
@@ -111,7 +114,7 @@ pub fn lease(ctx: &Ctx, io: &mut dyn IoStreams, args: &LeaseArgs) -> Result<i32,
     } else if status.held {
         writeln!(
             io.out(),
-            "held by {} ({}) on {} since {} (heartbeat {})",
+            "held by {} ({}) on {} since {} (heartbeat {}); mode {} state {} activity {} epoch {}{}",
             status.holder.as_deref().unwrap_or("unknown"),
             status.kind.map(kind_name).unwrap_or("unknown"),
             status.node.as_ref().map(NodeName::as_str).unwrap_or("unknown"),
@@ -123,6 +126,14 @@ pub fn lease(ctx: &Ctx, io: &mut dyn IoStreams, args: &LeaseArgs) -> Result<i32,
                 .heartbeat_at
                 .map(|ts| ts.as_rfc3339())
                 .unwrap_or_else(|| "unknown".to_owned()),
+            status.mode.map(|mode| mode.as_str()).unwrap_or("unknown"),
+            status.state.map(|state| state.as_str()).unwrap_or("unknown"),
+            status.activity.map(|activity| activity.as_str()).unwrap_or("unknown"),
+            status.epoch.unwrap_or(0),
+            status
+                .expires_at
+                .map(|ts| format!(" expires {}", ts.as_rfc3339()))
+                .unwrap_or_default(),
         )?;
     } else {
         writeln!(io.out(), "no lease on session {}", session.id)?;
@@ -136,7 +147,11 @@ pub fn takeover(ctx: &Ctx, io: &mut dyn IoStreams, args: &TakeoverArgs) -> Resul
     let session = resolve_session(&store, &args.session)?;
     let kind = parse_kind(&args.kind)?;
     let surface = build_surface(ctx, kind, Some(&args.holder), Some(&args.node))?;
-    let report = vowp_core::takeover(ctx.deps(), &store, &session.id, &surface, ctx.clock().now())?;
+    let now = ctx.clock().now();
+    let report = vowp_core::takeover(ctx.deps(), &store, &session.id, &surface, now)?;
+    if let Some(label) = &args.label {
+        store.set_surface_label(&surface.id, Some(label))?;
+    }
     if ctx.json() {
         print_json(io, &report)?;
     } else {
@@ -192,23 +207,16 @@ fn parse_kind(value: &str) -> Result<SurfaceKind, CliError> {
         "mirror" => Ok(SurfaceKind::Mirror),
         "api" => Ok(SurfaceKind::Api),
         "agent" => Ok(SurfaceKind::Agent),
+        "desktop-ui" | "desktop_ui" | "desktopui" => Ok(SurfaceKind::DesktopUi),
         other => Err(CliError::Invalid(format!(
-            "unknown surface kind {other:?}; use chat, opencode, claude-code, mcp, mirror, api or agent"
+            "unknown surface kind {other:?}; use chat, opencode, claude-code, mcp, mirror, api, agent or desktop-ui"
         ))),
     }
 }
 
 /// Returns the CLI name of a surface kind.
 fn kind_name(kind: SurfaceKind) -> &'static str {
-    match kind {
-        SurfaceKind::Chat => "chat",
-        SurfaceKind::Opencode => "opencode",
-        SurfaceKind::ClaudeCode => "claude-code",
-        SurfaceKind::Mcp => "mcp",
-        SurfaceKind::Mirror => "mirror",
-        SurfaceKind::Api => "api",
-        SurfaceKind::Agent => "agent",
-    }
+    kind.store_name()
 }
 
 /// Resolves a session id or unique prefix of at least six characters.

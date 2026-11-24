@@ -21,15 +21,32 @@ use vowp_store::{NodePaths, SessionFilter, Store};
 
 /// Returns the `vowp` binary Cargo built for this package.
 fn vowp_binary() -> PathBuf {
-    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp") {
-        return PathBuf::from(path);
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_vowp").map(PathBuf::from)
+        && path.is_file()
+    {
+        return path;
     }
-    let current = std::env::current_exe().expect("test executable");
-    current
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target = match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() { dir } else { manifest.join(dir) }
+        }
+        None => manifest.join("target"),
+    };
+    let name = format!("vowp{}", std::env::consts::EXE_SUFFIX);
+    for profile in ["debug", "release"] {
+        let candidate = target.join(profile).join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    std::env::current_exe()
+        .expect("test executable")
         .parent()
         .and_then(Path::parent)
         .expect("target directory")
-        .join("vowp")
+        .join(&name)
 }
 
 /// Builds the real `vowp` binary once so the checks run the same code a user runs.

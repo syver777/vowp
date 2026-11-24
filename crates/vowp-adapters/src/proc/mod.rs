@@ -374,6 +374,11 @@ struct CgroupMeter {
     oom_accounted: bool,
 }
 
+/// Shell loop of the cgroup holder: print the pid, then idle while the hold file (`$1`) exists
+/// and the owning process (`$2`) is alive, so a killed owner cannot leak the shell.
+#[cfg(target_os = "linux")]
+const HOLDER_SCRIPT: &str = "echo $$; while [ -e \"$1\" ] && kill -0 \"$2\" 2>/dev/null; do sleep 0.05; done";
+
 impl CgroupMeter {
     /// Creates a fixture meter over an existing cgroup directory.
     #[cfg(test)]
@@ -421,6 +426,7 @@ impl CgroupMeter {
             return None;
         }
         let hold_arg = hold.display().to_string();
+        let parent_arg = std::process::id().to_string();
         let mut child = match Command::new("systemd-run")
             .args([
                 "--user",
@@ -431,9 +437,10 @@ impl CgroupMeter {
                 "--",
                 "sh",
                 "-c",
-                "echo $$; while [ -e \"$1\" ]; do sleep 0.05; done",
+                HOLDER_SCRIPT,
                 "sh",
                 &hold_arg,
+                &parent_arg,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1402,6 +1409,43 @@ fn own_process_group_from_ps() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn holder_exits_when_parent_pid_is_gone_even_if_hold_file_remains() {
+        let dir = std::env::temp_dir().join(format!("vowp-holder-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let hold = dir.join("x.hold");
+        std::fs::write(&hold, b"hold").expect("hold file");
+        // A pid that is certainly gone: a child we already reaped.
+        let mut dead = Command::new("true").spawn().expect("spawn true");
+        let dead_pid = dead.id();
+        dead.wait().expect("wait true");
+        let mut holder = Command::new("sh")
+            .args(["-c", HOLDER_SCRIPT, "sh"])
+            .arg(&hold)
+            .arg(dead_pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn holder");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut exited = false;
+        while Instant::now() < deadline {
+            if holder.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = holder.kill();
+        let _ = holder.wait();
+        let hold_still_there = hold.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(exited, "holder kept running after its parent pid was gone");
+        assert!(hold_still_there, "hold file should not have been removed");
+    }
 
     #[test]
     fn child_env_always_sets_dumb_terminal() {

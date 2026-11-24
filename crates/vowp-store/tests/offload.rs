@@ -253,7 +253,7 @@ fn migration_v5_to_v6_adds_agent_assignments_and_node_limits_preserving_rows() {
     drop(backup);
 
     let store = Store::open(&paths).expect("open migrated home");
-    assert_eq!(store.global_schema_version().expect("version"), 7);
+    assert_eq!(store.global_schema_version().expect("version"), 8);
     assert_eq!(store.kv_get("seed").expect("kv"), Some("kept".to_owned()));
     assert_eq!(
         store.require_session(&session_id).expect("session").title,

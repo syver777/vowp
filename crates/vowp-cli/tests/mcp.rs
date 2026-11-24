@@ -14,6 +14,7 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -397,25 +398,65 @@ fn insert_resume_capsule(env: &TestEnv, session: &str, at_seq: u64) {
 }
 
 /// Returns the built `vowp` binary, including when this file runs as a lib unit test.
+///
+/// Integration tests get `CARGO_BIN_EXE_vowp`. The same file is also included as a
+/// library unit-test module, where Cargo does not set it and the test executable can sit
+/// in a build-script directory (`target/debug/build/vowp-cli/<hash>/out`), so the target
+/// directory comes from the manifest first and every candidate is checked before use.
 fn vowp_binary() -> PathBuf {
-    if let Some(path) = option_env!("CARGO_BIN_EXE_vowp") {
-        let path = PathBuf::from(path);
+    if let Some(path) = option_env!("CARGO_BIN_EXE_vowp").map(PathBuf::from) {
         if path.is_file() {
             return path;
         }
     }
-    let exe = std::env::current_exe().expect("current test executable");
-    let candidate = exe
-        .parent()
-        .and_then(Path::parent)
-        .map(|dir| dir.join("vowp"))
-        .expect("target directory");
-    assert!(
-        candidate.is_file(),
+    let target = vowp_target_dir();
+    let name = vowp_exe_name();
+    let mut candidates: Vec<PathBuf> = ["debug", "release"]
+        .iter()
+        .map(|profile| target.join(profile).join(&name))
+        .collect();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent().and_then(Path::parent) {
+            candidates.push(dir.join(&name));
+        }
+    }
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    static BUILD: Once = Once::new();
+    BUILD.call_once(|| {
+        // `cargo test --lib` does not rebuild the binary the test runs. Build it once so
+        // the tests always exercise the code compiled from this checkout.
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let _ = Command::new(cargo)
+            .args(["build", "--bin", "vowp"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status();
+    });
+    if let Some(found) = candidates.iter().find(|path| path.is_file()) {
+        return found.clone();
+    }
+    panic!(
         "vowp binary not found at {}; run `cargo build --bin vowp` first",
-        candidate.display()
+        candidates[0].display()
     );
-    candidate
+}
+
+/// The target directory Cargo used for this checkout.
+fn vowp_target_dir() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            if dir.is_absolute() { dir } else { manifest.join(dir) }
+        }
+        None => manifest.join("target"),
+    }
+}
+
+/// The host binary name.
+fn vowp_exe_name() -> String {
+    format!("vowp{}", std::env::consts::EXE_SUFFIX)
 }
 
 /// A temporary control machine with a fake `ssh` that answers the routed calls.
@@ -1407,4 +1448,166 @@ fn mcp_proxy_never_prints_arguments_or_the_socket_path() {
     assert!(!stderr.contains(marker), "stderr printed a payload: {stderr}");
     assert!(!stdout.contains(&root), "stdout printed the state path: {stdout}");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+/// Pulls the `ownership: {json}` line out of a refusal text.
+fn ownership_line(text: &str) -> Value {
+    let line = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ownership: "))
+        .unwrap_or_else(|| panic!("no ownership line in {text:?}"));
+    serde_json::from_str(line).expect("ownership JSON")
+}
+
+#[test]
+fn mcp_read_tools_work_read_only_and_write_tools_refuse_after_takeover() {
+    let env = TestEnv::new();
+    let session = create_idle_session(&env);
+    let old_token = lease_token("laptop");
+    take_lease(&env, &session, &old_token, "laptop");
+    let token = token_file(&env, &old_token);
+    // A desktop UI takes the session over; the MCP server still holds the old token.
+    let ui_token = lease_token("ui");
+    let store = env.store();
+    let now = store.clock().now();
+    let ui = SurfaceId("surf-ui".to_owned());
+    store
+        .upsert_surface(&Surface {
+            id: ui.clone(),
+            kind: SurfaceKind::DesktopUi,
+            node: NodeName::parse("local").expect("node"),
+            holder: "StackSpirit".to_owned(),
+            app: Some("opencode".to_owned()),
+            cwd: None,
+            metadata: json!({}),
+            created_at: now,
+            last_seen_at: now,
+        })
+        .expect("ui surface");
+    store
+        .take_lease(&Lease {
+            session_id: SessionId::parse(&session).expect("session id"),
+            surface_id: Some(ui),
+            surface_kind: SurfaceKind::DesktopUi,
+            node: NodeName::parse("local").expect("node"),
+            holder: "StackSpirit".to_owned(),
+            token: ui_token,
+            acquired_at: now,
+            heartbeat_at: now,
+        })
+        .expect("ui takes over");
+    drop(store);
+
+    let input = format!(
+        "{}\n{}\n{}\n",
+        tool_call(1, "fleet_status", json!({})),
+        tool_call(2, "session_tail", json!({"session": session, "limit": 3})),
+        tool_call(
+            3,
+            "capacity_set",
+            json!({"target": 2, "mode": "fixed", "override": true})
+        ),
+    );
+    let (code, stdout, stderr) = run_mcp(&env, &session, "old-surface", &token, &input);
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    assert_eq!(response(&values, 1)["result"]["isError"], false, "reads still work");
+    assert_eq!(response(&values, 2)["result"]["isError"], false, "reads still work");
+    let refused = response(&values, 3);
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("Taken over by StackSpirit"), "{text}");
+    let view = ownership_line(text);
+    assert_eq!(view["is_owner"], false);
+    assert_eq!(view["owner"]["kind"], "desktop_ui");
+    assert_eq!(view["owner"]["holder"], "StackSpirit");
+    assert_eq!(view["owner"]["label"], "StackSpirit · local");
+    assert_eq!(view["owner"]["activity"], "idle");
+    assert!(!text.contains(&lease_token("ui")), "the refusal must not carry a token");
+    assert!(
+        env.store().latest_capacity_target().expect("target query").is_none(),
+        "a refused write must not change the target"
+    );
+}
+
+#[test]
+fn mcp_read_resume_works_after_takeover_without_takeover() {
+    let env = TestEnv::new();
+    let session = create_idle_session(&env);
+    take_lease(&env, &session, &lease_token("new-owner"), "phone");
+    // The server's token file holds a token that no longer matches the lease.
+    let token = token_file(&env, &lease_token("lost"));
+    let input = format!("{}\n", tool_call(1, "session_resume", json!({})));
+    let (code, stdout, stderr) = run_mcp(&env, &session, "old-surface", &token, &input);
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let result = response(&values, 1);
+    assert_eq!(
+        result["result"]["isError"], false,
+        "a read-only resume is not refused: {result}"
+    );
+    let context = tool_text(result);
+    assert_eq!(context["lease"]["holder"], "phone");
+    assert_eq!(context["is_owner"], false);
+    assert_eq!(context["owner"]["holder"], "phone");
+    let rewritten = std::fs::read_to_string(&token).expect("token file");
+    assert_eq!(
+        rewritten.trim(),
+        lease_token("lost"),
+        "a read does not touch the token file"
+    );
+}
+
+#[test]
+fn mcp_session_resume_reports_structured_ownership_and_refusal() {
+    let env = TestEnv::new();
+    let session = create_idle_session(&env);
+    let mine = lease_token("mine");
+    take_lease(&env, &session, &mine, "laptop");
+    let token = token_file(&env, &mine);
+    let input = format!("{}\n", tool_call(1, "session_resume", json!({})));
+    let (code, stdout, stderr) = run_mcp(&env, &session, "surf-test", &token, &input);
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let context = tool_text(response(&values, 1));
+    assert_eq!(context["is_owner"], true, "{context}");
+    assert_eq!(context["owner"]["kind"], "mcp");
+    assert_eq!(context["owner"]["node"], "local");
+    assert_eq!(context["owner"]["activity"], "idle");
+    assert_eq!(context["owner"]["state"], "active");
+    assert_eq!(context["owner"]["label"], "MCP · local");
+    assert_eq!(context["lease"]["epoch"], 1);
+    assert!(context["owner"].get("token").is_none() && context["owner"].get("token_hash").is_none());
+
+    // Another surface now owns a running session: takeover needs the extra confirmation, and
+    // the refusal tells the harness who owns it and that it is mid-turn.
+    take_lease(&env, &session, &lease_token("other"), "phone");
+    let id = SessionId::parse(&session).expect("session id");
+    env.store()
+        .set_session_state(&id, vowp_protocol::SessionState::Running, None)
+        .expect("running");
+    let input = format!("{}\n", tool_call(1, "session_resume", json!({"takeover": true})));
+    let (code, stdout, stderr) = run_mcp(&env, &session, "surf-test", &token, &input);
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let refused = response(&values, 1);
+    assert_eq!(refused["result"]["isError"], true, "{refused}");
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("confirm_running"), "{text}");
+    let view = ownership_line(text);
+    assert_eq!(view["is_owner"], false);
+    assert_eq!(view["owner"]["holder"], "phone");
+    assert_eq!(view["owner"]["activity"], "running");
+
+    // With the second confirmation the takeover goes through and the caller is the owner.
+    let input = format!(
+        "{}\n",
+        tool_call(1, "session_resume", json!({"takeover": true, "confirm_running": true}))
+    );
+    let (code, stdout, stderr) = run_mcp(&env, &session, "surf-test", &token, &input);
+    assert_eq!(code, 0, "{stderr}");
+    let values = responses(&stdout);
+    let context = tool_text(response(&values, 1));
+    assert_eq!(context["is_owner"], true, "{context}");
+    assert_eq!(context["owner"]["holder"], "mcp");
 }

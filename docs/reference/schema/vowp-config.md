@@ -384,7 +384,7 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
       "type": "object"
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobKind": {
@@ -956,11 +956,16 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
       "type": "object"
     },
     "OnCreditsExhausted": {
-      "description": "What to do when a provider reports exhausted credits.",
+      "description": "What to do when a provider reports exhausted credits or an authentication failure.",
       "oneOf": [
         {
           "const": "park",
           "description": "Park affected jobs and raise an inbox item; never switch silently.",
+          "type": "string"
+        },
+        {
+          "const": "next",
+          "description": "Move the affected session to the next healthy rung declared in its ladder.\n\nThis is an explicit owner opt-in: the fallback rung is a provider the owner\nlisted and pays for. Authentication failures follow the same policy.",
           "type": "string"
         }
       ]
@@ -1172,7 +1177,7 @@ Exported by `vowp schema VowpConfig` and generated from the protocol types in
         "on_credits_exhausted": {
           "$ref": "#/$defs/OnCreditsExhausted",
           "default": "park",
-          "description": "Credits-exhaustion policy; v0.1 only parks."
+          "description": "Credits/auth exhaustion policy; defaults to `park`."
         },
         "prices": {
           "additionalProperties": {

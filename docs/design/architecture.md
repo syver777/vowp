@@ -196,7 +196,7 @@ refuse with exit 5 because the control machine has no local truth. A path accept
 | | `on_quota` | `next_then_probe_back`\|`next`\|`park` | `next_then_probe_back` | |
 | | `node` | string | project home | run this profile's sessions on that node |
 | `[providers.<p>]` | `max_concurrent` | int | 4 | concurrent runs for provider `p`; reloaded live (a raise admits on the next tick, a lower only stops new admissions) and lowered after 429s |
-| | `on_credits_exhausted` | `"park"` | `park` | the only v0.1 option |
+| | `on_credits_exhausted` | `"park"` \| `"next"` | `park` | credits/auth policy: `park` parks the jobs and asks the owner; `next` moves the affected session to the next declared rung (an explicit spend opt-in) |
 | `[providers.<p>.prices."<model>"]` | `input_per_m`, `output_per_m`, `cache_read_per_m`, `cache_write_per_m` | float USD per 1M tokens | — | price table for `cost.source = "price-table"` |
 | `[harnesses.<name>]` | `binary`, `extra_args`, `env_pass`, `permission_mode`, `mapping` | | PATH lookup | per-harness overrides; `mapping` = generic cli adapter file |
 | `[env.<name>]` | `checkout`, `build`, `env_pass`, `deploy`, `guards`, `approval`, `serving_bank`, `probe`, `rollback` | | | Work→Production (`promote` module); `build` is the `build` guard's command list, empty means the `[merge].check_cmds` / `[project].check_cmds` fallback; `env_pass` lists secret **names** for the bank, deploy, probe and rollback commands |
@@ -397,7 +397,7 @@ admitted. Schedules and loops are project rows; the node-level lifecycle schedul
 | Guarded promotion | `promote` runs guards → serving bank → diff → approval (human default) → deploy → probe; refusals are staged (`ReleaseState::Refused`), never retried with a workaround. |
 | Nothing public | no command publishes, deploys or flips visibility without an `approval` inbox item answered by a human. |
 | Secret scan | gate `secret_scan` (rules by name only) on every job diff and again on the merge queue's rebased tree before the push. |
-| Provider spend | a rung not listed in the profile is never used; `credits` ⇒ park + inbox, never switch (`on_credits_exhausted = "park"`). Admission also respects the provider `max_concurrent` and 429 backoff. |
+| Provider spend | a rung not listed in the profile is never used; `credits`/`auth` default to park + inbox (`on_credits_exhausted = "park"`). The explicit `"next"` opt-in writes the same limit row and moves the affected session to the next declared rung, which spends on that provider. Admission also respects the provider `max_concurrent` and 429 backoff. |
 | Honest limit | any agent that can run arbitrary code in a process holding a secret can print it. The design keeps values out of files an agent can read, transcripts and git; it cannot make a value unreadable to code that is given it. |
 
 ## 8. Compatibility and versioning

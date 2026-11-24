@@ -539,7 +539,7 @@ fn backup_produces_openable_copy() {
     fixture.store.backup(&destination).expect("backup");
     let copy = Store::open_path(&destination).expect("open backup");
     copy.integrity_check().expect("backup integrity");
-    assert_eq!(copy.global_schema_version().expect("global version"), 7);
+    assert_eq!(copy.global_schema_version().expect("global version"), 8);
     assert!(copy.bound_project().is_none(), "the legacy file is a global-only copy");
     assert_eq!(
         copy.list_projects().expect("projects").len(),

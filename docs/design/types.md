@@ -1,6 +1,6 @@
 # types.md — protocol types (crate `vowp-protocol`)
 
-Status: current for v0.2.
+Status: current for v0.5.
 
 Every type here lives in `vowp-protocol` and is the **only** definition: other crates import it, never redefine it.
 All types derive `Debug, Clone, PartialEq, Serialize, Deserialize` (and `Eq`/`Hash`/`Copy` where noted as "plain
@@ -15,11 +15,11 @@ Module → file map:
 | `ids`, `time`, `error`, `cost`, `limit`, `executor` | foundations |
 | `event`, `capsule` | event log + capsule |
 | `job`, `gate`, `report`, `run`, `session`, `inbox`, `loops`, `release` | domain rows |
-| `capacity` | v0.2 host samples, run usage, estimates, admission, brakes, targets, advice (§16.1) |
-| `surface` | v0.2 surfaces, leases, remote-exec lines, orchestrator cards (§16.2) |
+| `capacity` | v0.2 host samples, run usage, estimates, admission, brakes, targets, advice, and the v0.5 additive cluster card (§16.1) |
+| `surface` | v0.2 surfaces, leases, remote-exec lines, orchestrator cards and the v0.5 endpoint document (§16.2, §16.14) |
 | `snapshot` | v0.2 `snapshot.json` and the project registry view (§16.3) |
 | `catalog` | v0.2 lifecycle classes, catalog rows, GC and backup reports (§16.4) |
-| `vault` | v0.2 secret names, metadata, modes and the one-time request (§16.5) |
+| `vault` | v0.2 secret names, metadata, modes (including v0.5 `encrypted`) and the one-time request (§16.5) |
 | `agent` | v0.4 local-node path refs, capabilities, capacity, frames, redacted cards and app-surface frames (§16.7, §16.12) |
 | `offload` | v0.4 placement, waiting reasons, assignment payload and resume records (§16.8) |
 | `asif` | v0.4 adapter-free ASIF report summaries and import response (§16.11) |
@@ -517,6 +517,7 @@ pub enum JobState {
 }
 impl JobState {
     pub fn is_terminal(&self) -> bool;      // Done | Replanned | Cancelled   (Failed and Parked are NOT terminal)
+    pub fn needs_window(&self) -> bool;     // false for Done | Failed | Parked | Replanned | Cancelled
     pub fn holds_lock(&self) -> bool;       // Running | Stalled | Gating | Reviewing | Fixing | Merging  (ownership + worktree)
     pub fn as_str(&self) -> &'static str;
 }
@@ -946,7 +947,7 @@ pub struct ProviderConfig { #[serde(default = "four")] pub max_concurrent: u32 /
                             #[serde(default)] pub on_credits_exhausted: OnCreditsExhausted /* park */,
                             #[serde(default)] pub prices: BTreeMap<String, PriceEntry> /* model -> $/M; default empty */ }
 #[serde(rename_all = "snake_case")]
-pub enum OnCreditsExhausted { #[default] Park }                                      // v0.1: only park (never switch silently)
+pub enum OnCreditsExhausted { #[default] Park, Next }                                // default park; next uses the next declared rung (spends on it)
 pub struct PriceEntry { pub input_per_m: f64, pub output_per_m: f64, pub cache_read_per_m: Option<f64>, pub cache_write_per_m: Option<f64> }
 pub struct HarnessConfig { pub binary: Option<String>, pub extra_args: Vec<String>, pub env_pass: Vec<String> /* env var NAMES to forward */,
                            pub permission_mode: Option<String>, pub mapping: Option<String> /* cli adapter: path to mapping .toml */ }
@@ -1001,6 +1002,12 @@ All structs except `LoopConfig` use `#[serde(deny_unknown_fields)]`. **Every fie
 default fn) giving exactly the value in its comment**; `Default` impls match. Config enums (`OnCreditsExhausted`, `Approval`, `MissedPolicy`, `OnQuota`, `ActiveState`)
 use `#[serde(rename_all = "snake_case")]`. `JobLoop` (§7) likewise: `#[serde(default = "...")]` on `until` (`gates`), `max_attempts` (3), `on_exhausted` (`escalate`).
 The only required keys in the whole file are `[project] name`, each profile's `ladder`, each `[env.*] checkout`, and each `[[schedules]] name` + `action`.
+
+`on_credits_exhausted = "park"` is the default and the safe behaviour: park the jobs and ask the owner.
+`"next"` is an explicit owner opt-in that writes the same limit row and then moves the affected session
+to the next healthy rung declared in its profile ladder; auth follows the same policy and also defaults
+to `park`. A ladder is a budget declaration, so `next` is only valid when rung 2 is explicitly
+configured for that profile and the owner accepts spending on it.
 
 `[offload]` is the §7.4 policy file embedded in `vowp.toml`. Offload is disabled by default, so
 every job stays on the home until the owner enables it and a project opts in. Validation refuses:
@@ -1364,15 +1371,24 @@ pub struct RunningCapacity { pub runs: u32, pub ram_p90_bytes: u64, pub cpu_p90_
 pub struct WaitingJob { pub project: ProjectName, pub job: JobId, pub reason: WaitReason, pub since: Timestamp }
 
 #[derive(Default)]
+pub struct ClusterCapacity {
+    pub online_worker_nodes: u32,
+    pub target_workers: u32, pub busy_workers: u32, pub cpu_cores: u32,
+    pub mem_total_bytes: u64, pub mem_available_bytes: u64, pub disk_free_bytes: u64,
+}
+
+#[derive(Default)]
 pub struct CapacitySnapshot {
     pub measured: Option<HostSample>, pub running: RunningCapacity, pub target: CapacityTarget,
     pub advised_target: Option<u32>, pub brake: BrakeState,
     pub reserve_ram_bytes: u64, pub min_disk_bytes: u64,
+    pub cluster: ClusterCapacity,
 }
 pub struct CapacityReport {
     pub generated_at: Timestamp, pub host: Option<HostSample>, pub target: CapacityTarget,
     pub running: RunningCapacity, pub brakes: BrakeState,
     pub reserve_ram_bytes: u64, pub min_disk_bytes: u64,
+    pub cluster: ClusterCapacity,
     pub estimates: Vec<UsageEstimate>, pub waiting: Vec<WaitingJob>, pub limits: Vec<Limit>,
 }
 
@@ -1395,6 +1411,14 @@ an empty range is an empty `points` array, never a fabricated zero. A `fallback`
 memory and load values are not a measurement. Raw `host_samples` are kept 48 hours and the
 rollups 30 days.
 
+`CapacitySnapshot.cluster` and `CapacityReport.cluster` are additive and `serde(default)`: a
+document written before the field existed still parses and reads as an all-zero card, and the
+existing Home fields keep their meaning. `online_worker_nodes` counts enrolled opaque agent nodes
+that are `active` with an under-30-second heartbeat; `target_workers` is Home's target plus each
+online node's reported `max_slots`; `busy_workers` is Home's running runs plus each online node's
+`busy_slots`; `cpu_cores`, `mem_total_bytes`, `mem_available_bytes` and `disk_free_bytes` are
+saturating sums across Home and those nodes. A single-machine home reports zero worker nodes.
+
 ### 16.2 Surfaces, leases, remote execution and orchestrators (`surface`)
 
 ```rust
@@ -1402,7 +1426,7 @@ rollups 30 days.
 pub fn new_lease_token() -> String;                       // two ULIDs, 160 random bits
 
 #[serde(rename_all = "snake_case")]
-pub enum SurfaceKind { Chat, Opencode, ClaudeCode, Mcp, Mirror, Api, Agent }
+pub enum SurfaceKind { Chat, Opencode, ClaudeCode, Mcp, Mirror, Api, Agent, DesktopUi }  // v0.5.1: DesktopUi (wire `desktop_ui`, store `desktop-ui`)
 
 pub struct Surface {
     pub id: SurfaceId, pub kind: SurfaceKind, pub node: NodeName, pub holder: String,
@@ -1430,6 +1454,9 @@ pub struct Lease {
     pub token: String,  // lowercase hex SHA-256; the plaintext exists only in the grant
     pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
 }
+// `Lease` is the stored row's shape and did not change in v0.5.1. The ownership mode, epoch and
+// expiry live in the same `leases` row (`owner_mode`, `owner_epoch`, `expires_at`) and are read back
+// as `SessionOwner`; the epoch is assigned by the store, never by a caller.
 pub struct SurfaceRef {
     pub surface_id: SurfaceId, pub kind: SurfaceKind, pub holder: String,
     pub node: NodeName, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
@@ -1438,7 +1465,32 @@ pub struct LeaseStatus {
     pub held: bool, pub holder: Option<String>, pub kind: Option<SurfaceKind>,
     pub node: Option<NodeName>, pub acquired_at: Option<Timestamp>,
     pub heartbeat_at: Option<Timestamp>, pub token: Option<String>,  // only on --acquire
+    // v0.5.1, all `None` when no lease is held:
+    pub mode: Option<OwnershipMode>, pub state: Option<OwnershipState>,
+    pub epoch: Option<u64>, pub expires_at: Option<Timestamp>,
+    pub label: Option<String>, pub activity: Option<SurfaceActivity>,
 }
+
+// v0.5.1 session ownership. Design: v0.5.1/session-ownership.md.
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipMode { Interactive, Job }          // default Interactive
+#[serde(rename_all = "snake_case")]
+pub enum OwnershipState { Active, Stale, Expired }   // derived at read time
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceActivity { Idle, Running, Waiting }  // default Idle
+
+/// Read projection of the `leases` row; never carries a token or password.
+pub struct SessionOwner {
+    pub session_id: SessionId, pub surface_id: Option<SurfaceId>,  // None for a job with no surface
+    pub kind: SurfaceKind, pub label: Option<String>, pub holder: String, pub node: NodeName,
+    pub mode: OwnershipMode, pub state: OwnershipState, pub activity: SurfaceActivity,
+    pub epoch: u64, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
+    pub expires_at: Option<Timestamp>,               // set for a job owner
+}
+// `interactive`: Active while the heartbeat is younger than 60 s, else Stale.
+// `job`: Active while `expires_at` is in the future, else Expired.
+// `SessionSurfaceCard.owner: Option<SessionOwner>` is the authoritative read model;
+// `SessionSurfaceCard.active_surface` stays `None` in this release.
 pub struct TakeoverReport {
     pub previous: Option<String>, pub drained: bool, pub capsule_id: Option<CapsuleId>,
 }
@@ -1557,7 +1609,19 @@ pub struct SessionSurfaceCard {
     pub id: SessionId, pub project: Option<ProjectName>, pub job_id: Option<JobId>,
     pub role: Option<SessionRole>, pub title: String, pub state: SessionState,
     pub executor: Option<String>, pub node: NodeName,
-    pub active_surface: Option<SurfaceRef>, pub last_event_at: Timestamp,
+    pub active_surface: Option<SurfaceRef>,
+    #[serde(default)] pub owner: Option<SessionOwner>,   // v0.5.1; authoritative owner view
+    pub last_event_at: Timestamp,
+}
+pub enum OwnershipMode { Interactive, Job }              // snake_case
+pub enum OwnershipState { Active, Stale, Expired }       // derived at read time
+pub enum SurfaceActivity { Idle, Running, Waiting }      // from the session state
+pub struct SessionOwner {                                // never carries a token or password
+    pub session_id: SessionId, pub surface_id: Option<SurfaceId>, pub kind: SurfaceKind,
+    pub label: Option<String>, pub holder: String, pub node: NodeName,
+    pub mode: OwnershipMode, pub state: OwnershipState, pub activity: SurfaceActivity,
+    pub epoch: u64, pub acquired_at: Timestamp, pub heartbeat_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 pub struct ProjectSnapshot {
     pub name: ProjectName, pub path: String, pub state: ProjectState, pub weight: u8,
@@ -1577,7 +1641,8 @@ pub struct Snapshot {
 
 The snapshot is derived. In this build the capacity card's `measured` is `null` and
 `running.runs` is populated from the open runs, while its p90 RAM/CPU fields stay zero; a session
-card's `active_surface` is `null`. `vowp capacity show` is the measured report and the lease is live
+card's `active_surface` is `null` and its `owner` is the session's lease row as a `SessionOwner`
+(stale and job owners included; `null` when nobody owns it). `vowp capacity show` is the measured report and the lease is live
 in `vowp session lease`.
 
 ### 16.4 Lifecycle catalog (`catalog`)
@@ -1586,7 +1651,7 @@ in `vowp session lease`.
 #[serde(rename_all = "snake_case")]
 pub enum CatalogClass {
     Production, Truth, OpenWork, Secrets, ClosedSession,
-    RunOutput, Worktree, Sample, Cache,
+    RunOutput, Worktree, JobWindow, Sample, Cache,
 }
 pub struct CatalogEntry {
     pub id: String, pub path: String, pub class: CatalogClass,
@@ -1621,14 +1686,16 @@ pub struct SecretInfo {
     pub created_at: Timestamp, pub updated_at: Timestamp,
 }
 #[serde(rename_all = "snake_case")]
-pub enum VaultMode { VaultUser, Basic }
+pub enum VaultMode { VaultUser, Basic, Encrypted }
 pub struct SecretRequest {
     pub name: SecretName, pub url: String, pub expires_at: Timestamp, pub single_use: bool,
 }
 ```
 
-Values never appear in these types. The vault stores files, keeps only the last four characters
-for display, and `secret request` returns a loopback URL and expiry, never the value.
+`VaultMode::Encrypted` is the v0.5 encrypted-at-rest age-keyfile mode; its wire value is
+`encrypted`. Values never appear in these types. The vault stores files, keeps only the last
+four characters for display, and `secret request` returns a loopback URL and expiry, never the
+value. See [`v0.5/vault-encrypted.md`](v0.5/vault-encrypted.md).
 
 ### 16.6 CLI-local result types
 
@@ -2113,3 +2180,63 @@ typed `OrchestratorError` (`code`, `message`, `retryable`) or a redacted `detail
 `OrchestratorNodeState` values are `starting|running|stopped|degraded|node_offline|failed`.
 Neither frame carries a port, password, pair link, absolute local path or secret value. The
 home runs the same redaction over a result before it writes `orchestrator.json`.
+
+### 16.14 Orchestrator endpoint discovery (`surface`)
+
+These are the v0.5 discovery documents for a UI client that connects directly to an
+orchestrator's paired app process. The home and the agent return the same shape; the
+`location` says which machine runs the app. The design note is
+[`v0.5/orchestrator-endpoint.md`](v0.5/orchestrator-endpoint.md).
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorLocation { Home, Node }
+
+pub struct OrchestratorAuth {
+    pub header: String,   // e.g. "Authorization"
+    pub scheme: String,   // e.g. "Basic"
+    pub username: String, // e.g. "opencode"
+    pub password: String, // secret; explicit local endpoint command only
+}
+
+pub struct OrchestratorEndpoint {
+    pub name: String,
+    pub app: OrchestratorApp,
+    pub session_id: SessionId,
+    pub location: OrchestratorLocation,
+    pub node: Option<NodeName>,
+    pub state: OrchestratorNodeState,
+    pub url: Option<String>,             // loopback http://127.0.0.1:<port> only
+    pub native_session_id: Option<String>,
+    pub auth: Option<OrchestratorAuth>,
+    // v0.5.1 (both `#[serde(default)]`, so an older document still parses):
+    pub owner: Option<SessionOwner>,     // read from the home, also for a node-hosted record
+    pub access: EndpointAccess,          // default ReadOnly
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum EndpointAccess { Owner, ReadOnly }
+
+/// Output of `vowp orchestrator attach`; printed once.
+pub struct OrchestratorAttach {
+    pub surface_id: SurfaceId,           // the DesktopUi surface the attach created
+    pub token: String,                   // one-time lease token; a secret, `[REDACTED]` in Debug
+    pub owner: SessionOwner,
+    pub endpoint: OrchestratorEndpoint,  // access: Owner
+    pub expires_at: Timestamp,           // heartbeat_at + 60 s if the attach process stops
+}
+```
+
+`access` is `owner` only when `vowp orchestrator endpoint <name> --surface <id>` names the live
+owner's surface; every other caller, including one that names no surface, gets `read_only`.
+`vowp agent orchestrator endpoint` reports `read_only` with no `owner`. Ownership is recorded and
+cooperative: `access` tells a well-behaved client whether to write, and nothing here stops a UI that
+calls the app's HTTP API directly with the engine password. The loopback engine proxy that would
+enforce it is planned and deferred; see [`v0.5.1/session-ownership.md`](v0.5.1/session-ownership.md).
+
+`OrchestratorAuth` has a custom `Debug` that prints `password: [REDACTED]`. The password is
+present only in the explicit local endpoint document; a node-hosted or stopped orchestrator
+has `url`, `native_session_id` and `auth` all `null`. The URL must be
+`http://127.0.0.1:<port>` or `http://localhost:<port>`; anything else is refused. Errors
+name the orchestrator and the failure class, never a path, port, password, token or pair
+link.

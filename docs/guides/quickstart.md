@@ -12,6 +12,7 @@ phone. It uses one home for every project; there is no separate "laptop-only" mo
 | Placeholder | Replace with |
 |---|---|
 | `<your-repo>` | The path to the git repository on the **home**. |
+| `<your-url>` | The clone URL of a repository the home can read; never put a password in it. |
 | `<your-project>` | The project name; it names the project database and tmux session too. |
 | `<your-harness>` | `opencode` or `claude-code`, installed and signed in on the home. |
 | `<your-model>` | A model identifier that harness accepts. |
@@ -62,6 +63,25 @@ vowp project ls
 The registry commands work from any directory on the home; a path passed to `project add` is a path
 on the home, not on the control machine.
 
+One command can clone, initialise, register and create the orchestrator. The clone lands in
+`<home-parent>/<name>`, where `<home-parent>` is the directory above `~/.vowp`:
+
+```sh
+vowp project add --git <your-url> --init --orchestrator chat --json
+```
+
+The JSON summary names the project, its checkout path, whether this command initialised it and the
+orchestrator card (`null` when `--orchestrator` is omitted). A later `vowp up` starts the supervisor;
+the chat orchestrator is reachable through its printed `join.chat` command. Use
+`--orchestrator opencode` or `--orchestrator claude-code` to start a hosted app and its keeper
+instead of `chat`.
+
+To move that orchestrator to an enrolled agent node later, use
+`vowp orchestrator move <your-project> --node <node>`; `--home` moves it back. The move keeps the
+same session id and the one home log. `vowp orchestrator endpoint <your-project> --json` returns
+the local UI connection document when you need one; see
+[Operating a home](operating.md#orchestrators).
+
 ## 3. Point the profiles at real executors
 
 Edit `vowp.toml` on the project branch. At minimum, every role needs a ladder rung your home can
@@ -104,6 +124,9 @@ vowp fleet queue
 for every non-archived project (including paused ones), then detaches the supervisor. Run it from the
 home, or from a checkout to register that checkout on the way. `vowp up --foreground` is what the systemd unit runs; `--once` runs one tick
 for a smoke test.
+
+When an enrolled agent node is online, `vowp fleet status` adds a `cluster:` line with the pooled
+workers and summed RAM, CPU and free disk. A single home reports only its own capacity.
 
 `vowp up` also starts the loopback web window as a separate `vowp-daemon` child, prints
 `web window: http://127.0.0.1:<port>/`, and prints the control-machine command for that actual

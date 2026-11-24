@@ -5,8 +5,8 @@
 use pretty_assertions::assert_eq;
 
 use vowp_protocol::config::{
-    Approval, CapsuleConfig, IngressConfig, MergeConfig, NodeConfig, NodeFile, OffloadConfig, ProjectConfig,
-    ResultTransport, VowpConfig, WssIngressConfig,
+    Approval, CapsuleConfig, IngressConfig, MergeConfig, NodeConfig, NodeFile, OffloadConfig, OnCreditsExhausted,
+    ProjectConfig, ResultTransport, VowpConfig, WssIngressConfig,
 };
 use vowp_protocol::{CmdGate, Executor, Gate, JobKind, Placement, ProtocolError};
 
@@ -103,6 +103,37 @@ fn env_pass_parses_names_and_defaults_empty() {
     // Unknown keys beside env_pass are still rejected.
     reject(&format!(
         "{BASE}\n[env.bad]\ncheckout = \"~/bad\"\nenv_pass = [\"DEPLOY_TOKEN\"]\nnot_a_key = true\n"
+    ));
+}
+
+#[test]
+fn on_credits_exhausted_parses_park_and_next_with_park_as_default() {
+    // No provider table at all: the effective default is park.
+    assert!(parse(BASE).providers.is_empty());
+    // An empty provider table also defaults to park.
+    let defaults = parse(&format!("{BASE}\n[providers.example]\n"));
+    assert_eq!(
+        defaults.providers["example"].on_credits_exhausted,
+        OnCreditsExhausted::Park
+    );
+
+    let park = parse(&format!(
+        "{BASE}\n[providers.example]\non_credits_exhausted = \"park\"\n"
+    ));
+    assert_eq!(park.providers["example"].on_credits_exhausted, OnCreditsExhausted::Park);
+
+    let next = parse(&format!(
+        "{BASE}\n[providers.example]\non_credits_exhausted = \"next\"\n"
+    ));
+    assert_eq!(next.providers["example"].on_credits_exhausted, OnCreditsExhausted::Next);
+
+    // A value outside the two documented policies stays a validation error.
+    reject(&format!(
+        "{BASE}\n[providers.example]\non_credits_exhausted = \"retry\"\n"
+    ));
+    // The provider table still rejects unknown fields.
+    reject(&format!(
+        "{BASE}\n[providers.example]\non_credits_exhausted = \"next\"\nnot_a_key = true\n"
     ));
 }
 

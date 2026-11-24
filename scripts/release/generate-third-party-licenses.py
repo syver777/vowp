@@ -100,6 +100,8 @@ NOTICE_PLACEHOLDERS = (
     "<year>",
     "name of copyright owner",
     "fullname",
+    # The FSF's GPL-2.0 appendix sample notice names no real holder.
+    "year name of author",
 )
 NOTICE_BOILERPLATE_PREFIXES = (
     "and ",

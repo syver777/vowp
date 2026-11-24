@@ -84,6 +84,18 @@ impl JobState {
         matches!(self, Self::Done | Self::Replanned | Self::Cancelled)
     }
 
+    /// Returns true while the job still needs its `job-<id>` tmux window.
+    ///
+    /// [`JobState::Failed`] and [`JobState::Parked`] can return to the graph, but a new
+    /// dispatch recreates the window, so both leave the active set here just like the
+    /// terminal states.
+    pub fn needs_window(&self) -> bool {
+        !matches!(
+            self,
+            Self::Done | Self::Failed | Self::Parked | Self::Replanned | Self::Cancelled
+        )
+    }
+
     /// Returns true when the job holds its ownership paths and worktree.
     pub fn holds_lock(&self) -> bool {
         matches!(

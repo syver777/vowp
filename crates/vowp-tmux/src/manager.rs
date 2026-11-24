@@ -104,10 +104,25 @@ pub fn session_name_for_project(project: &str) -> String {
 
 /// tmux window name for a job: `job-<id>`.
 ///
-/// Names longer than [`validate_name`](crate::quote::validate_name) allows are
-/// rejected by the manager call.
+/// A raw name longer than 64 characters (the [`validate_name`](crate::quote::validate_name)
+/// cap) is shortened deterministically to `job-<first 50 chars>-<8 hex of FNV-1a>`, where the
+/// hash covers the whole raw name, so distinct long ids stay distinct. Shorter names are
+/// returned unchanged.
 pub fn window_name_for_job(job_id: &str) -> String {
-    format!("job-{job_id}")
+    let raw = format!("job-{job_id}");
+    if raw.len() <= 64 {
+        return raw;
+    }
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in raw.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    // Raw names are ASCII slugs plus suffixes, so byte slicing is on a char boundary; fall back
+    // safely for anything else.
+    let head: String = raw.chars().take(50).collect();
+    let head = head.trim_end_matches('-');
+    format!("{head}-{hash:08x}")
 }
 
 /// Check that a session is inside the `vowp-` namespace and is a safe name.
@@ -123,4 +138,37 @@ pub(crate) fn require_vowp_session(session: &str) -> Result<(), TmuxError> {
 /// Validate a window name with the shared naming rules.
 pub(crate) fn require_window_name(name: &str) -> Result<(), TmuxError> {
     validate_name("window", name)
+}
+
+#[cfg(test)]
+mod window_name_tests {
+    use super::window_name_for_job;
+    use crate::quote::validate_name;
+
+    #[test]
+    fn short_names_unchanged() {
+        assert_eq!(window_name_for_job("abc"), "job-abc");
+    }
+
+    #[test]
+    fn long_ids_with_suffixes_are_valid_and_deterministic() {
+        for len in [57, 100, 110, 120] {
+            let id = "a".repeat(len);
+            for suffix in ["", "-fix-1", "-verify-2", "-decision"] {
+                let full = format!("{id}{suffix}");
+                let name = window_name_for_job(&full);
+                assert!(name.len() <= 64, "{name}");
+                validate_name("window", &name).unwrap();
+                assert_eq!(name, window_name_for_job(&full));
+            }
+        }
+    }
+
+    #[test]
+    fn long_ids_differing_late_do_not_collide() {
+        let base = "b".repeat(110);
+        let one = window_name_for_job(&format!("{base}-fix-1"));
+        let two = window_name_for_job(&format!("{base}-fix-2"));
+        assert_ne!(one, two);
+    }
 }

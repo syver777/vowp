@@ -325,6 +325,10 @@ pub struct OpencodeBridge {
     surface: SurfaceId,
     session: SessionId,
     native_session: Option<String>,
+    /// App-side session id last reported by the event stream.
+    observed_native_session: Option<String>,
+    /// Private hint path; when set, a first sight or change is persisted atomically.
+    native_session_state: Option<PathBuf>,
     endpoint: Endpoint,
     bridge_dir: PathBuf,
     mirror_path: PathBuf,
@@ -374,6 +378,11 @@ impl OpencodeBridge {
     /// The path and port are private configuration: no error or `Debug` output includes
     /// the port, password or pair link. A missing, invalid or wider-than-0600 file is a
     /// typed [`AgentError::Config`].
+    ///
+    /// When the service file belongs to a local orchestrator, the bridge discovers the
+    /// orchestrator's private `native-session.json` beside `host.json`, so a mirrored
+    /// event persists the latest app-side session id without extra wiring at the call
+    /// site.
     pub fn load(
         service_json: &Path,
         state_dir: &Path,
@@ -382,6 +391,7 @@ impl OpencodeBridge {
     ) -> Result<Self, AgentError> {
         validate_surface_id(&surface)?;
         let endpoint = Endpoint::load(service_json)?;
+        let native_session_state = native_session_state_path(state_dir, service_json);
         let bridge_dir = state_dir.join(BRIDGE_DIR).join(&surface.0);
         ensure_private_dir(&bridge_dir)?;
         let mirror_path = bridge_dir.join(MIRROR_FILE);
@@ -405,6 +415,8 @@ impl OpencodeBridge {
             surface,
             session,
             native_session: None,
+            observed_native_session: None,
+            native_session_state,
             endpoint,
             bridge_dir,
             mirror_path,
@@ -430,6 +442,21 @@ impl OpencodeBridge {
     pub fn with_native_session(mut self, native_session: impl Into<String>) -> Self {
         self.native_session = Some(native_session.into());
         self
+    }
+
+    /// Persists the latest app-side session id at `path` on first sight and on change.
+    ///
+    /// This overrides the hint [`Self::load`] discovers for an orchestrator's service
+    /// file. The file is written through the orchestrator host's atomic 0600 helper and
+    /// holds only the id. A bridge without a path still observes the id in memory.
+    pub fn with_native_session_state(mut self, path: impl Into<PathBuf>) -> Self {
+        self.native_session_state = Some(path.into());
+        self
+    }
+
+    /// Returns the app-side session id last reported by the event stream, when any.
+    pub fn observed_native_session(&self) -> Option<&str> {
+        self.observed_native_session.as_deref()
     }
 
     /// Replaces the root map used before spooling.
@@ -725,6 +752,11 @@ impl OpencodeBridge {
             return Ok(());
         };
         let data = event.get("data").unwrap_or(&Value::Null);
+        if let Some(actual) = session_of(&event) {
+            // Record the app-side session before any filter: a re-created app session must
+            // replace the old hint even when the bridge mirrors only the old one.
+            self.record_native_session(actual);
+        }
         if let (Some(expected), Some(actual)) = (&self.native_session, session_of(&event)) {
             if expected != actual {
                 return Ok(());
@@ -1071,6 +1103,23 @@ impl OpencodeBridge {
         Ok(())
     }
 
+    /// Keeps the latest app-side session id and persists it when it changed.
+    ///
+    /// A hint write failure is not fatal: the mirrored frames are already spooled and the
+    /// home remains the authority, so the id is retried on the next event.
+    fn record_native_session(&mut self, native_session: &str) {
+        let id = native_session.trim();
+        if id.is_empty() || self.observed_native_session.as_deref() == Some(id) {
+            return;
+        }
+        if let Some(path) = self.native_session_state.as_deref()
+            && crate::orchestrator::write_native_session_file(path, id).is_err()
+        {
+            return;
+        }
+        self.observed_native_session = Some(id.to_owned());
+    }
+
     fn remember_raw(&mut self, key: String) {
         if self.raw_seen.iter().any(|seen| seen == &key) {
             return;
@@ -1218,6 +1267,38 @@ impl fmt::Debug for OpencodeBridge {
             .field("pending", &self.spool.pending_count().unwrap_or(0))
             .finish_non_exhaustive()
     }
+}
+
+/// Resolves the native-session hint that belongs beside `host.json` for `service_json`.
+///
+/// The bridge does not receive the orchestrator name; the private config is the same
+/// local record the caller read to find the service file, so it is the only record that
+/// ties the two together. Discovery is best-effort: a missing or unreadable config
+/// directory leaves the bridge observing the id in memory only.
+fn native_session_state_path(state_dir: &Path, service_json: &Path) -> Option<PathBuf> {
+    let host = crate::orchestrator::OrchestratorHost::new(state_dir);
+    let root = crate::orchestrator::OrchestratorHost::root(state_dir);
+    let wanted = comparable_path(service_json);
+    for entry in fs::read_dir(root).ok()?.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Ok(Some(config)) = host.config(&name) else {
+            continue;
+        };
+        let Some(configured) = config.service_json.as_deref() else {
+            continue;
+        };
+        if comparable_path(Path::new(configured)) == wanted {
+            return crate::orchestrator::OrchestratorHost::native_session_path(state_dir, &name).ok();
+        }
+    }
+    None
+}
+
+/// Compares a configured path with the one the bridge was loaded from.
+fn comparable_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

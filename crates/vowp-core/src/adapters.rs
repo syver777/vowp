@@ -1,20 +1,21 @@
 //! Built-in adapter construction and adapter-registry wiring.
 //! Spec: `docs/design/crates/vowp-core.md` §2 and `docs/design/adapters.md` §10.
 
-use vowp_adapters::acp::{AcpAdapter, AcpConfig};
+use vowp_adapters::acp::AcpConfig;
 use vowp_protocol::VowpConfig;
 
-/// Builds the ACP adapter from `[harnesses.acp]`.
+/// Builds the ACP configuration from `[harnesses.acp]`.
 ///
-/// A missing table uses [`AcpConfig::default`] (`claude-code-acp` on `PATH`). The adapter's
-/// extra arguments come from the harness table, like the other built-in adapters.
-pub(crate) fn acp_adapter(config: &VowpConfig) -> AcpAdapter {
+/// A missing table uses [`AcpConfig::default`] (`claude-code-acp` on `PATH`). The
+/// configured value stays a name or path; [`crate::deps::AdapterRegistry`] resolves it
+/// immediately before each spawn.
+pub(crate) fn acp_config(config: &VowpConfig) -> AcpConfig {
     let harness = config.harnesses.get("acp").cloned().unwrap_or_default();
-    AcpAdapter::new(AcpConfig {
+    AcpConfig {
         binary: harness.binary,
         extra_args: harness.extra_args,
         ..AcpConfig::default()
-    })
+    }
 }
 
 #[cfg(test)]

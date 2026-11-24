@@ -264,6 +264,15 @@ fn cost_page_serves_the_shell_and_the_fixture_report() {
         "\"/api/v1/cost?by=\"",
         "REFRESH_MS = 5000",
         "setInterval(refresh, REFRESH_MS)",
+        "const RETRY_MIN_MS = 1000;",
+        "const RETRY_MAX_MS = 15000;",
+        "id=\"live\"",
+        "Live updates: connecting",
+        "Reconnecting... polling every 5 seconds.",
+        "new EventSource(\"/api/v1/cost/stream\" + query)",
+        "source.addEventListener(\"cost\"",
+        "source.addEventListener(\"heartbeat\"",
+        "startStream();",
         "<th>Key</th>",
         "<th>Runs</th>",
         "<th>USD</th>",
@@ -358,6 +367,15 @@ fn inbox_page_serves_the_shell_and_the_fixture_items() {
         "DEFAULT_STATE = \"open\"",
         "REFRESH_MS = 5000",
         "setInterval(refresh, REFRESH_MS)",
+        "const RETRY_MIN_MS = 1000;",
+        "const RETRY_MAX_MS = 15000;",
+        "id=\"live\"",
+        "Live updates: connecting",
+        "Reconnecting... polling every 5 seconds.",
+        "new EventSource(\"/api/v1/inbox/stream?state=\" + encodeURIComponent(state))",
+        "source.addEventListener(\"inbox\"",
+        "source.addEventListener(\"heartbeat\"",
+        "startStream();",
         "<th>ID</th>",
         "<th>Kind</th>",
         "<th>Job</th>",
@@ -443,4 +461,27 @@ fn inbox_page_serves_the_shell_and_the_fixture_items() {
             assert_eq!(page.items[0].answer.as_deref(), Some("yes"));
         }
     }
+}
+
+#[test]
+fn service_worker_bypasses_api_and_stream_urls() {
+    let fixture = Fixture::new();
+    let server = support::Server::start_for(&fixture.paths);
+
+    let response = support::get(server.address, "/sw.js");
+    assert_eq!(response.status, 200, "body: {}", response.body);
+    for needle in [
+        "url.pathname.startsWith(\"/api/\")",
+        "url.pathname.endsWith(\"/stream\")",
+        "accept.includes(\"text/event-stream\")",
+    ] {
+        assert!(
+            response.body.contains(needle),
+            "the service worker must bypass {needle:?}"
+        );
+    }
+    assert!(
+        !response.body.contains("/api/v1/"),
+        "the service worker must not cache an API route"
+    );
 }

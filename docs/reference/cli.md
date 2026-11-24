@@ -42,6 +42,7 @@ python3 docs/reference/check-reference.py
 | [`vowp job replan`](#vowp-job-replan) | Replace a job through a planner turn |
 | [`vowp job fail`](#vowp-job-fail) | Give up on a stalled job |
 | [`vowp job cancel`](#vowp-job-cancel) | Cancel a non-terminal job |
+| [`vowp job set-executor`](#vowp-job-set-executor) | Pin a job to an executor, or switch a running job's session onto it |
 | [`vowp graph`](#vowp-graph) | Print, export or import the job graph |
 | [`vowp attach`](#vowp-attach) | Attach to a job's tmux window |
 | [`vowp session`](#vowp-session) | List and operate universal sessions |
@@ -138,8 +139,11 @@ python3 docs/reference/check-reference.py
 | [`vowp orchestrator`](#vowp-orchestrator) | Create and manage orchestrator sessions |
 | [`vowp orchestrator new`](#vowp-orchestrator-new) | Create and start an orchestrator |
 | [`vowp orchestrator ls`](#vowp-orchestrator-ls) | List orchestrators |
+| [`vowp orchestrator move`](#vowp-orchestrator-move) | Move an orchestrator between the home and an agent node, keeping its session |
 | [`vowp orchestrator stop`](#vowp-orchestrator-stop) | Stop an orchestrator's host and release its lease |
 | [`vowp orchestrator resume`](#vowp-orchestrator-resume) | Start an orchestrator's host again |
+| [`vowp orchestrator endpoint`](#vowp-orchestrator-endpoint) | Show the typed discovery document a local UI client uses to connect |
+| [`vowp orchestrator attach`](#vowp-orchestrator-attach) | Attach a desktop UI as the session owner, then hold the lease until stdin closes |
 | [`vowp orchestrator __keepalive`](#vowp-orchestrator-__keepalive) | Hidden: keep one orchestrator's lease alive after the CLI exits |
 | [`vowp migrate`](#vowp-migrate) | Migrate a v0.1 home to the v0.2 layout |
 | [`vowp mcp`](#vowp-mcp) | Run the stdio MCP server or the Mac-side proxy |
@@ -158,11 +162,14 @@ python3 docs/reference/check-reference.py
 | [`vowp agent service status`](#vowp-agent-service-status) | Show the unit path and the manager's reported state |
 | [`vowp agent doctor`](#vowp-agent-doctor) | Report local agent warnings without failing on them |
 | [`vowp agent trust`](#vowp-agent-trust) | Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band |
+| [`vowp agent orchestrator`](#vowp-agent-orchestrator) | Inspect one local orchestrator on this agent machine |
+| [`vowp agent orchestrator endpoint`](#vowp-agent-orchestrator-endpoint) | Show the local endpoint document for one orchestrator |
 | [`vowp surface`](#vowp-surface) | Create, list or revoke a paired local surface; `--node` names the surface's node |
 | [`vowp surface pair`](#vowp-surface-pair) | Create a pending surface and print its one-time pairing code |
 | [`vowp surface ls`](#vowp-surface-ls) | List surfaces, their scopes and token expiry |
 | [`vowp surface revoke`](#vowp-surface-revoke) | Revoke a surface and every token it holds |
 | [`vowp surface rotate`](#vowp-surface-rotate) | Rotate a surface token, keeping the old token for a ten-minute overlap |
+| [`vowp surface rename`](#vowp-surface-rename) | Save a friendly name for a surface |
 | [`vowp offload`](#vowp-offload) | Show the effective offload policy or the offload read model |
 | [`vowp offload policy`](#vowp-offload-policy) | Show the effective offload policy |
 | [`vowp offload status`](#vowp-offload-status) | Show nodes, live assignments and waiting jobs |
@@ -386,17 +393,18 @@ Add, inspect or change jobs
 Usage: vowp job [OPTIONS] <COMMAND>
 
 Commands:
-  add      Add one job and its brief
-  update   Change a job's editable fields
-  ls       List jobs
-  show     Show one job
-  retry    Retry a failed, stalled or parked job
-  park     Park a non-terminal job
-  nudge    Ask a stalled job to continue
-  restart  Restart a stalled job with a fresh process
-  replan   Replace a job through a planner turn
-  fail     Give up on a stalled job
-  cancel   Cancel a non-terminal job
+  add           Add one job and its brief
+  update        Change a job's editable fields
+  ls            List jobs
+  show          Show one job
+  retry         Retry a failed, stalled or parked job
+  park          Park a non-terminal job
+  nudge         Ask a stalled job to continue
+  restart       Restart a stalled job with a fresh process
+  replan        Replace a job through a planner turn
+  fail          Give up on a stalled job
+  cancel        Cancel a non-terminal job
+  set-executor  Pin a job to an executor, or switch a running job's session onto it
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -655,6 +663,28 @@ Usage: vowp job cancel [OPTIONS] <ID>
 
 Arguments:
   <ID>  Job id
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+#### `vowp job set-executor`
+
+```text
+Pin a job to an executor, or switch a running job's session onto it
+
+Usage: vowp job set-executor [OPTIONS] <ID> <EXECUTOR>
+
+Arguments:
+  <ID>        Job id
+  <EXECUTOR>  Executor as `<harness>:<provider>/<model>[@effort|#variant]`
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -1171,6 +1201,7 @@ Options:
       --node <NAME>          Node the surface runs on
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --label <LABEL>        Friendly saved name for the surface (default: `<kind name> · <node>`)
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
@@ -1194,6 +1225,7 @@ Options:
       --node <NAME>          Node the new surface runs on
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --label <LABEL>        Friendly saved name for the new surface
       --no-color             Disable colour even when stdout is a terminal
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
@@ -2008,19 +2040,22 @@ Options:
 ```text
 Register a git checkout as a project
 
-Usage: vowp project add [OPTIONS] <PATH>
+Usage: vowp project add [OPTIONS] [PATH]
 
 Arguments:
-  <PATH>  Path of the checkout on the home
+  [PATH]  Path of the checkout, or the explicit clone target with `--git`
 
 Options:
+      --git <URL>            Clone this repository before initialising and registering it
       --json                 Print one machine-readable JSON document on stdout
-      --name <NAME>          Project name; defaults to the directory name
+      --init                 Initialise the checkout when it has no `vowp.toml`
       --node <NAME>          Run the command on that node over ssh
-      --weight <N>           Fairness weight, `1..=100`
+      --orchestrator <APP>   Create the project orchestrator for this app
       --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --name <NAME>          Project name; defaults to the directory name or the clone URL basename
       --no-color             Disable colour even when stdout is a terminal
+      --weight <N>           Fairness weight, `1..=100`
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
@@ -2510,17 +2545,43 @@ List lifecycle classes and collect garbage
 Usage: vowp gc [OPTIONS]
 
 Options:
-      --apply                Delete eligible files instead of only reporting
-      --json                 Print one machine-readable JSON document on stdout
-      --class <CLASS>        Restrict to one lifecycle class
-      --node <NAME>          Run the command on that node over ssh
-      --now <RFC3339>        Clock override for tests (RFC 3339)
-      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
-      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
-      --no-color             Disable colour even when stdout is a terminal
-  -q, --quiet                Suppress non-essential human output
-  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
-  -h, --help                 Print help
+      --apply
+          Delete eligible files instead of only reporting
+
+      --json
+          Print one machine-readable JSON document on stdout
+
+      --class <CLASS>
+          Restrict to one lifecycle class
+
+      --node <NAME>
+          Run the command on that node over ssh
+
+      --older-than <DURATION>
+          Collect closed sessions and run output older than this window (for example 7d, 36h, 2w).
+          
+          Applies only to `closed_session` and `run_output`; every other class keeps its default.
+
+      --project <NAME|PATH>
+          Project name or path; defaults to the nearest ancestor with `vowp.toml`
+
+      --home <DIR>
+          Node home (default `$VOWP_HOME`, else `~/.vowp`)
+
+      --now <RFC3339>
+          Clock override for tests (RFC 3339)
+
+      --no-color
+          Disable colour even when stdout is a terminal
+
+  -q, --quiet
+          Suppress non-essential human output
+
+  -v, --verbose...
+          Increase log verbosity (`-v`, `-vv`)
+
+  -h, --help
+          Print help (see a summary with '-h')
 ```
 
 ### `vowp tunnel`
@@ -2822,10 +2883,13 @@ Create and manage orchestrator sessions
 Usage: vowp orchestrator [OPTIONS] <COMMAND>
 
 Commands:
-  new     Create and start an orchestrator
-  ls      List orchestrators
-  stop    Stop an orchestrator's host and release its lease
-  resume  Start an orchestrator's host again
+  new       Create and start an orchestrator
+  ls        List orchestrators
+  move      Move an orchestrator between the home and an agent node, keeping its session
+  stop      Stop an orchestrator's host and release its lease
+  resume    Start an orchestrator's host again
+  endpoint  Show the typed discovery document a local UI client uses to connect
+  attach    Attach a desktop UI as the session owner, then hold the lease until stdin closes
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -2880,6 +2944,29 @@ Options:
   -h, --help                 Print help
 ```
 
+#### `vowp orchestrator move`
+
+```text
+Move an orchestrator between the home and an agent node, keeping its session
+
+Usage: vowp orchestrator move <NAME> (--node <NAME> | --home)
+
+Arguments:
+  <NAME>  Orchestrator name
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+For `orchestrator move`, --node <name> names the target node that runs the orchestrator, not an SSH redirect; use --home to move it back to this home. Exactly one of --node or --home is required.
+```
+
 #### `vowp orchestrator stop`
 
 ```text
@@ -2920,6 +3007,56 @@ Options:
   -q, --quiet                Suppress non-essential human output
   -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
   -h, --help                 Print help
+```
+
+#### `vowp orchestrator endpoint`
+
+```text
+Show the typed discovery document a local UI client uses to connect
+
+Usage: vowp orchestrator endpoint [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Orchestrator name
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --surface <ID>         The caller's surface id; `access: owner` is reported only for the live owner surface
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+For `orchestrator endpoint`, --node is not an SSH redirect: the command inspects this home and never opens SSH or a node's files.
+```
+
+#### `vowp orchestrator attach`
+
+```text
+Attach a desktop UI as the session owner, then hold the lease until stdin closes
+
+Usage: vowp orchestrator attach [OPTIONS] --holder <NAME> <NAME>
+
+Arguments:
+  <NAME>  Orchestrator name
+
+Options:
+      --holder <NAME>        Holder name shown to other surfaces, for example `opencode-desktop`
+      --json                 Print one machine-readable JSON document on stdout
+      --label <LABEL>        Friendly surface label, for example `StackSpirit · macbook`
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --takeover             Take the session over from a live owner
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+
+Prints the one-time grant, then heartbeats the lease until stdin reaches end-of-file and releases it. Keep this process (as a child of the UI) alive while the UI writes. Recorded ownership is cooperative: it does not stop a UI that calls the app's HTTP API directly. --node is not an SSH redirect; attach works only on a home-hosted orchestrator.
 ```
 
 #### `vowp orchestrator __keepalive`
@@ -2994,14 +3131,15 @@ Enroll, run or inspect the Mac-side agent
 Usage: vowp agent [OPTIONS] <COMMAND>
 
 Commands:
-  enroll   Enroll this Mac with a one-time code
-  paths    Add, remove or list the local project path map
-  pair     Redeem a home surface pairing code and store the token
-  run      Run the agent client until revoked or superseded
-  status   Show the last local agent status
-  service  Install, remove or inspect the launchd or systemd-user service
-  doctor   Report local agent warnings without failing on them
-  trust    Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band
+  enroll        Enroll this Mac with a one-time code
+  paths         Add, remove or list the local project path map
+  pair          Redeem a home surface pairing code and store the token
+  run           Run the agent client until revoked or superseded
+  status        Show the last local agent status
+  service       Install, remove or inspect the launchd or systemd-user service
+  doctor        Report local agent warnings without failing on them
+  trust         Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band
+  orchestrator  Inspect one local orchestrator on this agent machine
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -3299,6 +3437,48 @@ Options:
   -h, --help                      Print help
 ```
 
+#### `vowp agent orchestrator`
+
+```text
+Inspect one local orchestrator on this agent machine
+
+Usage: vowp agent orchestrator [OPTIONS] <COMMAND>
+
+Commands:
+  endpoint  Show the local endpoint document for one orchestrator
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
+##### `vowp agent orchestrator endpoint`
+
+```text
+Show the local endpoint document for one orchestrator
+
+Usage: vowp agent orchestrator endpoint [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>  Orchestrator name
+
+Options:
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
+```
+
 ### `vowp surface`
 
 ```text
@@ -3311,6 +3491,7 @@ Commands:
   ls      List surfaces, their scopes and token expiry
   revoke  Revoke a surface and every token it holds
   rotate  Rotate a surface token, keeping the old token for a ten-minute overlap
+  rename  Save a friendly name for a surface
 
 Options:
       --json                 Print one machine-readable JSON document on stdout
@@ -3341,6 +3522,7 @@ Options:
       --project <NAME|PATH>   Project name or path; defaults to the nearest ancestor with `vowp.toml`
       --home <DIR>            Node home (default `$VOWP_HOME`, else `~/.vowp`)
       --replace <SURFACE-ID>  Revoke this surface and create the replacement pending surface in one transaction
+      --label <LABEL>         Friendly saved name for the surface (default: `<kind name> · <node>`)
       --no-color              Disable colour even when stdout is a terminal
   -q, --quiet                 Suppress non-essential human output
   -v, --verbose...            Increase log verbosity (`-v`, `-vv`)
@@ -3414,6 +3596,29 @@ Options:
   -h, --help                 Print help
 
 For this command --node <name> names the node the surface runs on, not an SSH redirect.
+```
+
+#### `vowp surface rename`
+
+```text
+Save a friendly name for a surface
+
+Usage: vowp surface rename [OPTIONS] <ID> [LABEL]
+
+Arguments:
+  <ID>     Surface id
+  [LABEL]  New friendly name, for example `Kitchen laptop`
+
+Options:
+      --clear                Restore the default name (`<kind name> · <node>`)
+      --json                 Print one machine-readable JSON document on stdout
+      --node <NAME>          Run the command on that node over ssh
+      --project <NAME|PATH>  Project name or path; defaults to the nearest ancestor with `vowp.toml`
+      --home <DIR>           Node home (default `$VOWP_HOME`, else `~/.vowp`)
+      --no-color             Disable colour even when stdout is a terminal
+  -q, --quiet                Suppress non-essential human output
+  -v, --verbose...           Increase log verbosity (`-v`, `-vv`)
+  -h, --help                 Print help
 ```
 
 ### `vowp offload`

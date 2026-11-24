@@ -3,7 +3,9 @@
 
 mod support;
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,15 +13,19 @@ use std::time::Duration;
 use support::fake_adapter::FakeAdapter;
 use support::fake_git::FakeGit;
 use tempfile::tempdir;
+use vowp_core::deps::HARNESS_BINARY_HINT;
+use vowp_core::session::service::SessionService;
 use vowp_core::{
     AdapterRegistry, CommandOutput, CommandRunner, CommandSpec, CoreError, Deps, FixedRng, GitOps, RebaseResult, Rng,
     SystemGit, SystemRunner,
 };
 use vowp_protocol::{
-    AdapterError, ErrorKind, Executor, FakeClock, HarnessConfig, HarnessKind, LimitEvent, LimitKind, MemoryLog,
-    NodeName, ProtocolError, ServiceError, StartInput, Timestamp, VowpConfig,
+    AdapterError, AttachAction, CancelToken, ErrorKind, EventBody, Executor, ExecutorRef, FakeClock, HarnessConfig,
+    HarnessKind, LimitEvent, LimitKind, MemoryLog, NewSession, NodeName, ProtocolError, RunOutcome, RunPurpose,
+    RunRole, ServiceError, SessionId, SessionRole, StartInput, Timestamp, TurnRequest, VowpConfig,
 };
 use vowp_store::NodePaths;
+use vowp_store::session_log::SessionLog;
 use vowp_tmux::TmuxError;
 use vowp_tmux::fake::FakeWindows;
 
@@ -471,4 +477,240 @@ fn fixed_and_system_rng_stay_in_bounds() {
     for _ in 0..64 {
         assert!(system.jitter_secs(9) <= 9);
     }
+}
+/// Returns a config for a turn in `root/project` with one claude-code override.
+fn session_config(root: &Path, harness: Option<HarnessConfig>) -> VowpConfig {
+    let project = root.join("project");
+    fs::create_dir_all(&project).expect("create project");
+    let mut config = VowpConfig::with_defaults_for_tests();
+    config.project.path = Some(project.to_string_lossy().into_owned());
+    if let Some(harness) = harness {
+        config.harnesses.insert("claude-code".to_owned(), harness);
+    }
+    config
+}
+
+/// Returns test dependencies wired to a per-spawn resolving registry.
+fn session_deps(root: &Path, config: &VowpConfig, search_path: Option<OsString>) -> Deps {
+    let mut deps = test_deps(root);
+    deps.config = Arc::new(config.clone());
+    deps.paths.ensure().expect("node paths");
+    deps.adapters =
+        Arc::new(AdapterRegistry::from_config_with_search_path(config, search_path).expect("registry builds"));
+    deps
+}
+
+fn claude_harness(binary: &Path) -> HarnessConfig {
+    HarnessConfig {
+        binary: Some(binary.to_string_lossy().into_owned()),
+        ..HarnessConfig::default()
+    }
+}
+
+fn claude_executor() -> Executor {
+    Executor::parse("claude-code:claude-sonnet-5-5").expect("claude executor")
+}
+
+fn create_worker_session(service: &SessionService, root: &Path) -> SessionId {
+    service
+        .create_session(NewSession {
+            project: None,
+            job_id: None,
+            role: SessionRole::Worker,
+            title: "binary locator".to_owned(),
+            cwd: root.join("project"),
+            parent: None,
+            executor: Some(claude_executor()),
+        })
+        .expect("create session")
+}
+
+fn worker_turn(session: &SessionId) -> TurnRequest {
+    TurnRequest {
+        session_id: session.clone(),
+        executor: ExecutorRef {
+            executor: claude_executor(),
+            node: None,
+        },
+        purpose: RunPurpose::Start,
+        role: RunRole::Worker,
+        job_id: None,
+        prompt: "do the work".to_owned(),
+        profile: Some("worker".to_owned()),
+        rung: 0,
+        window: None,
+        timeout: None,
+    }
+}
+
+fn write_script(path: &Path, body: &str) {
+    fs::create_dir_all(path.parent().expect("script parent")).expect("create script dir");
+    fs::write(path, body).expect("write script");
+    let mut permissions = fs::metadata(path).expect("stat script").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod script");
+}
+
+/// A fake claude that writes `MARKER` and emits one successful turn.
+const CLAUDE_FAKE: &str = r#"#!/bin/sh
+printf ran > 'MARKER'
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"607b6f5f-88b0-4133-8716-9270d9d52c99","model":"claude-sonnet-5-5","cwd":"/tmp"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","stop_reason":"end_turn","terminal_reason":"completed","num_turns":1,"duration_ms":10,"total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens_details":{"thinking_tokens":0}},"session_id":"607b6f5f-88b0-4133-8716-9270d9d52c99"}'
+exit 0
+"#;
+
+#[test]
+fn missing_harness_binary_is_a_locator_error_without_provider_marks() {
+    let tmp = tempdir().unwrap();
+    let empty_path = tmp.path().join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let missing = tmp.path().join("moved/claude");
+    let config = session_config(tmp.path(), Some(claude_harness(&missing)));
+    let deps = session_deps(tmp.path(), &config, Some(empty_path.into_os_string()));
+    let service = SessionService::new(deps.clone());
+    let session = create_worker_session(&service, tmp.path());
+
+    let error = service
+        .run_turn(worker_turn(&session), &CancelToken::default())
+        .expect_err("a missing binary fails the turn");
+    assert_eq!(error.kind(), ErrorKind::AdapterUnavailable);
+    match error {
+        CoreError::Adapter(AdapterError::Unavailable(message)) => {
+            assert!(message.contains("harness not found"), "{message}");
+            assert!(message.contains(&missing.to_string_lossy().into_owned()), "{message}");
+            assert!(message.contains(HARNESS_BINARY_HINT), "{message}");
+        }
+        other => panic!("expected a locator error, got {other:?}"),
+    }
+
+    let events = SessionLog::open_read(&deps.paths, &session)
+        .expect("open session log")
+        .read_all()
+        .expect("read session log");
+    let run_id = events
+        .iter()
+        .find_map(|event| match event.body() {
+            Ok(EventBody::SessionExecutor(payload)) if payload.action == AttachAction::Attach => payload.run_id.clone(),
+            _ => None,
+        })
+        .expect("the failed run was attached");
+    let store = deps.open_store().unwrap();
+    let run = store.require_run(&run_id).expect("run row");
+    assert_eq!(run.outcome, Some(RunOutcome::Error));
+    assert!(
+        run.detail.contains(HARNESS_BINARY_HINT),
+        "the run detail carries the actionable hint: {}",
+        run.detail
+    );
+    assert!(
+        store.kv_prefix("limit:").unwrap().is_empty(),
+        "a locator miss must not write limit:*"
+    );
+    assert!(
+        store.kv_prefix("probe_back:").unwrap().is_empty(),
+        "a locator miss must not write probe_back:*"
+    );
+    assert!(store.limit_for("claude").unwrap().is_none());
+}
+
+#[test]
+fn a_failed_spawn_does_not_clear_an_existing_provider_mark() {
+    let tmp = tempdir().unwrap();
+    let empty_path = tmp.path().join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let missing = tmp.path().join("moved/claude");
+    let config = session_config(tmp.path(), Some(claude_harness(&missing)));
+    let deps = session_deps(tmp.path(), &config, Some(empty_path.into_os_string()));
+    let service = SessionService::new(deps.clone());
+    let session = create_worker_session(&service, tmp.path());
+    {
+        let store = deps.open_store().unwrap();
+        store.kv_set("limit:claude", "unavailable").unwrap();
+        store.kv_set("probe_back:claude", "1").unwrap();
+    }
+
+    let _ = service
+        .run_turn(worker_turn(&session), &CancelToken::default())
+        .expect_err("the binary is missing");
+
+    let store = deps.open_store().unwrap();
+    assert_eq!(
+        store.kv_get("limit:claude").unwrap().as_deref(),
+        Some("unavailable"),
+        "a failed spawn must not clear or rewrite a provider mark"
+    );
+    assert_eq!(
+        store.kv_get("probe_back:claude").unwrap().as_deref(),
+        Some("1"),
+        "a failed spawn must not clear probe_back"
+    );
+}
+
+#[test]
+fn moved_harness_binary_is_recovered_without_provider_marks() {
+    let tmp = tempdir().unwrap();
+    let stale_dir = tmp.path().join("stale");
+    let path_dir = tmp.path().join("path");
+    let marker = tmp.path().join("ran");
+    let stale = stale_dir.join("claude");
+    write_script(
+        &stale,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.319 (Claude Code)'; exit 0; fi\nexit 0\n",
+    );
+    write_script(
+        &path_dir.join("claude"),
+        &CLAUDE_FAKE.replace("MARKER", &marker.display().to_string()),
+    );
+
+    let config = session_config(tmp.path(), Some(claude_harness(&stale)));
+    let deps = session_deps(tmp.path(), &config, Some(path_dir.into_os_string()));
+    let adapter = deps.adapters.get(&claude_executor()).expect("claude adapter");
+    assert!(adapter.probe().ok, "the stale binary answers the version probe");
+    fs::remove_file(&stale).expect("the cached binary moves away");
+
+    let service = SessionService::new(deps.clone());
+    let session = create_worker_session(&service, tmp.path());
+    let result = service
+        .run_turn(worker_turn(&session), &CancelToken::default())
+        .expect("the PATH binary is found and spawned");
+
+    assert_eq!(result.summary.outcome, RunOutcome::Ok);
+    assert!(marker.is_file(), "the moved binary ran from PATH");
+    let store = deps.open_store().unwrap();
+    assert!(store.kv_prefix("limit:").unwrap().is_empty());
+    assert!(store.kv_prefix("probe_back:").unwrap().is_empty());
+}
+
+#[test]
+fn repeated_locator_misses_do_not_advance_the_provider_failure_streak() {
+    let tmp = tempdir().unwrap();
+    let empty_path = tmp.path().join("empty-path");
+    fs::create_dir_all(&empty_path).unwrap();
+    let missing = tmp.path().join("moved/claude");
+    let config = session_config(tmp.path(), Some(claude_harness(&missing)));
+    let deps = session_deps(tmp.path(), &config, Some(empty_path.into_os_string()));
+    let service = SessionService::new(deps.clone());
+    let session = create_worker_session(&service, tmp.path());
+
+    for _ in 0..3 {
+        let error = service
+            .run_turn(worker_turn(&session), &CancelToken::default())
+            .expect_err("a missing binary fails every start");
+        assert_eq!(error.kind(), ErrorKind::AdapterUnavailable);
+    }
+
+    let store = deps.open_store().unwrap();
+    assert!(
+        store.kv_prefix("fail_streak:").unwrap().is_empty(),
+        "a failed start is not an L6 unknown-failure input"
+    );
+    assert!(
+        store.kv_prefix("limit:").unwrap().is_empty(),
+        "three locator misses must not mark the provider unavailable"
+    );
+    assert!(
+        store.kv_prefix("probe_back:").unwrap().is_empty(),
+        "three locator misses must not schedule a provider probe"
+    );
+    assert!(store.limit_for("claude").unwrap().is_none());
 }

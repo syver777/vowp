@@ -102,7 +102,7 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 3. **Timestamp** always serialises as exactly `YYYY-MM-DDTHH:MM:SS.mmmZ`. Parsing accepts RFC 3339 with any offset and 0–9 fractional
    digits; fractional digits beyond 3 are truncated (not rounded). `Timestamp` ordering equals string ordering of `as_rfc3339()`.
 4. **Ids.** ULID ids: 26 chars `[0-9A-HJKMNP-TV-Z]`, uppercase on output; parsing accepts lowercase and normalises to uppercase.
-   `CapsuleId` = `cap_` + ULID. Slugs (`JobId`, `NodeName`, `ProjectName`): `^[a-z0-9][a-z0-9-]{0,63}$`, no trailing `-`.
+   `CapsuleId` = `cap_` + ULID. Slugs: `JobId` = `^[a-z0-9][a-z0-9-]{0,119}$` (max 120 chars); `NodeName` and `ProjectName` = `^[a-z0-9][a-z0-9-]{0,63}$` (max 64 chars); none may end in `-`.
    `new()` is monotonic within one process (shared `Mutex<ulid::Generator>`; on overflow in the same ms, wait 1 ms and retry).
 5. **Executor grammar.** `harness ":" model [ "@" effort ] [ "#" variant ]`. `harness` ∈ {claude-code, opencode, cli, acp, vowp}.
    `model` non-empty, chars `[A-Za-z0-9._:/-]`. `effort`/`variant` `[a-z0-9_-]+`. `@effort` is only valid for `claude-code`, `#variant`
@@ -155,6 +155,9 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
     The v0.4 offload set adds `"AssignmentPayload"`, `"NodeFallback"`, `"Placement"`,
     `"RemoteRunState"`, `"RunRejectReason"`, `"RunResume"`, `"RunResumeResult"`,
     `"SurfaceResume"`, `"SurfaceResumeResult"`, `"WaitingReason"`.
+    The v0.5 set adds `"ClusterCapacity"`, `"OrchestratorLocation"`, `"OrchestratorAuth"` and
+    `"OrchestratorEndpoint"`. `VaultMode` is a protocol enum but is not in `all_schemas()`;
+    `SecretInfo` and `SecretRequest` remain the exported vault documents.
     Output is deterministic (BTreeMap, stable ordering).
 13. **No panics**: all constructors/parsers return `Result`; regex literals inside use `// invariant:` comments.
 14. **v0.4 agent protocol.** `PathRef` serialises as one string (`project:vowp`,
@@ -224,6 +227,20 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
     newtype variants `OrchestratorCommand` and `OrchestratorResult`; the inner tagged maps are
     flattened under the outer `type` tag. Neither frame carries a port, password, pair link,
     absolute local path or secret value.
+
+18. **v0.5 cluster and endpoint documents.** `ClusterCapacity` is additive and
+    `serde(default)` on `CapacityReport` and `CapacitySnapshot`: `online_worker_nodes` counts
+    online, active agent nodes (the home is not counted), `target_workers` and `busy_workers`
+    are the home totals plus each online node's `max_slots` and `busy_slots`, and the CPU,
+    memory and free-disk values are saturating sums. A document from before the field reads as
+    an all-zero card. `OrchestratorLocation` is `home|node`; `OrchestratorAuth` carries
+    `header`, `scheme`, `username` and `password`; `OrchestratorEndpoint` carries `name`, `app`,
+    `session_id`, `location`, `node`, `state`, `url`, `native_session_id` and `auth`. Every
+    field is always present and an unavailable value is `null`. `OrchestratorAuth`'s custom
+    `Debug` prints `[REDACTED]` for the password, and no card, snapshot, log or error carries
+    the value. The URL is loopback-only. `VaultMode` adds `encrypted` as the wire value for the
+    age-keyfile mode; `SecretInfo` still carries only the name, last four characters and
+    timestamps.
 
 ## 5. Error enum
 
@@ -315,6 +332,8 @@ offset used by the adapters to read wall-clock reset times like `resets 11pm`. v
 | `orchestrator_node_state_wire_names_are_stable` | all six `OrchestratorNodeState` values serialise to their documented names, display identically and reject an unknown value |
 | `orchestrator_card_carries_its_node_and_typed_state` | a card carries `node` and a typed state, round-trips, and its JSON has no path, token or password |
 | `orchestrator_card_decodes_a_v0_2_row_without_a_node` | a v0.2 card without `node` decodes to `node: None` and its old `running` state |
+| `orchestrator_endpoint_round_trips_home_and_node_documents` | home and node `OrchestratorEndpoint` documents round-trip; `location` is `home`/`node`, the home document carries `url`/`native_session_id`/Basic `auth`, and the node document has all three null |
+| `orchestrator_endpoint_schema_is_exported_and_auth_debug_redacts_the_password` | `OrchestratorLocation`, `OrchestratorAuth` and `OrchestratorEndpoint` have schemas; `OrchestratorAuth` requires `header`/`scheme`/`username`/`password`; its `Debug` and the endpoint's `Debug` print `[REDACTED]` and never the password |
 
 ## 7. Out of scope / v0.2
 

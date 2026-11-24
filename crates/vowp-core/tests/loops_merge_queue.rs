@@ -334,3 +334,30 @@ fn merge_queue_check_failure_returns_job_to_fixing() {
         "the fix prompt must carry the failed merge check: {prompts:?}"
     );
 }
+
+#[test]
+fn merging_a_decision_job_settles_its_stalled_or_failed_parent() {
+    for parent_state in [JobState::Stalled, JobState::Failed, JobState::Fixing] {
+        let node = TestNode::new_real_git();
+        let parent = node.insert_job("ss-81-thing", JobKind::Build, Role::Worker, Some(vec![]));
+        node.force_state(&parent, parent_state);
+        let bystander = node.insert_job("ss-82-other", JobKind::Build, Role::Worker, Some(vec![]));
+        node.force_state(&bystander, JobState::Failed);
+        let decision = merging_job(&node, "ss-81-thing-decision");
+
+        let step = MergeQueue::new(node.deps.clone())
+            .step(&node.store())
+            .expect("merge step");
+        assert_eq!(step, MergeStep::Merged(decision.id.clone()));
+
+        let settled = node.store().require_job(&parent.id).expect("parent");
+        assert_eq!(settled.state, JobState::Replanned, "parent {parent_state:?} is settled");
+        assert!(
+            settled.note.contains("ss-81-thing-decision"),
+            "note names the decision job: {:?}",
+            settled.note
+        );
+        let other = node.store().require_job(&bystander.id).expect("bystander");
+        assert_eq!(other.state, JobState::Failed, "unrelated jobs are untouched");
+    }
+}

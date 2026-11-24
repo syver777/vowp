@@ -118,7 +118,7 @@ pub mod fake {
 | — | `job-<job-id>` | core at dispatch (`window_name_for_job`) ; verifier windows are `job-<verify-job-id>` |
 | last | `inbox` | `ensure_layout` (created with the others; later job windows are appended after it) |
 
-Job ids are validated slugs (`[a-z0-9-]`), so `job-<id>` always passes `validate_name`; ids > 59 chars are rejected by `window_name_for_job` returning `Err(InvalidName)` in the manager call.
+Job ids are validated slugs (`[a-z0-9-]`, up to 120 chars), so the window name always passes `validate_name`. `window_name_for_job` is infallible and returns `String`: when the raw name `job-<id>` is at most 64 chars it is returned unchanged; when it is longer, the name becomes `job-<first 50 chars of the raw name, trailing '-' trimmed>-<8 hex FNV-1a of the full raw name>` (at most 59 chars). The hash covers the whole raw name, so ids that differ only late stay distinct, and the result is deterministic. It is not a reversible job id: recovery (`loops/reconcile.rs`, `lifecycle/classes.rs`) therefore compares windows forward, computing `window_name_for_job` for each active job and matching it to the window name, rather than parsing `job-<id>` back out of the name.
 
 ## 5. Errors
 

@@ -235,6 +235,7 @@ fn dispatch_caps(deps: &Deps, free: &std::collections::BTreeMap<String, u32>) ->
         limited: HashMap::new(),
         profiles: deps.config_now().profiles.clone().into_iter().collect(),
         now: now(),
+        overrides: HashMap::new(),
     }
 }
 

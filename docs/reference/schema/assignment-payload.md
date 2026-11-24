@@ -15,7 +15,7 @@ Exported by `vowp schema AssignmentPayload` and generated from the protocol type
       "type": "string"
     },
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "PathRef": {

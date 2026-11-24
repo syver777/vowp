@@ -65,6 +65,7 @@ const LISTED_TYPES: &[&str] = &[
     "CapacityTarget",
     "CapacityAdvice",
     "CapacityReport",
+    "ClusterCapacity",
     "RunningCapacity",
     "WaitingJob",
     "CapacitySnapshot",
@@ -72,6 +73,10 @@ const LISTED_TYPES: &[&str] = &[
     "Surface",
     "Lease",
     "SurfaceRef",
+    "SessionOwner",
+    "OwnershipMode",
+    "OwnershipState",
+    "SurfaceActivity",
     "LeaseStatus",
     "TakeoverReport",
     "RemoteEvent",
@@ -83,6 +88,11 @@ const LISTED_TYPES: &[&str] = &[
     "OrchestratorCommand",
     "OrchestratorResult",
     "OrchestratorError",
+    "OrchestratorLocation",
+    "OrchestratorAuth",
+    "OrchestratorEndpoint",
+    "EndpointAccess",
+    "OrchestratorAttach",
     "JoinInstructions",
     "Snapshot",
     "SupervisorSnapshot",
@@ -461,4 +471,44 @@ fn check_structure(fixture: &str, schema: &Value, value: &Value) {
             );
         }
     }
+}
+
+#[test]
+fn schema_export_covers_lease_session_owner_and_session_card() {
+    for name in [
+        "Lease",
+        "LeaseStatus",
+        "SessionOwner",
+        "OwnershipMode",
+        "OwnershipState",
+        "SurfaceActivity",
+        "SessionSurfaceCard",
+    ] {
+        assert!(schema_for_name(name).is_some(), "{name} must be exported");
+    }
+    let owner = schema_for_name("SessionOwner").expect("SessionOwner is exported");
+    assert!(
+        owner.to_string().contains("desktop_ui"),
+        "SessionOwner.kind must list desktop_ui"
+    );
+    for name in owner["properties"].as_object().expect("properties").keys() {
+        assert!(
+            !name.contains("token") && !name.contains("password") && !name.contains("hash"),
+            "SessionOwner must carry no secret field, found {name}"
+        );
+    }
+    let required = owner["required"].as_array().expect("required list");
+    assert!(
+        !required
+            .iter()
+            .any(|name| name == "mode" || name == "epoch" || name == "activity"),
+        "owner additions are optional on the wire: {required:?}"
+    );
+    let card = schema_for_name("SessionSurfaceCard").expect("card is exported");
+    assert!(card["properties"].get("owner").is_some(), "card has an owner property");
+    let lease = schema_for_name("Lease").expect("Lease is exported");
+    assert!(
+        lease["properties"].get("owner_epoch").is_none() && lease["properties"].get("mode").is_none(),
+        "Lease stays unchanged"
+    );
 }

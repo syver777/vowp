@@ -13,27 +13,32 @@
 //! only reported as running while that host's pid is alive.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use vowp_adapters::proc::{Signal, signal_group};
 use vowp_protocol::{
-    AgentFrame, ExecutorRef, JoinInstructions, Lease, Level, NewSession, NodeName, NodePresence, NodeStatus,
-    OrchestratorApp, OrchestratorCard, OrchestratorCommand, OrchestratorError, OrchestratorNodeState,
-    OrchestratorResult, Project, ProjectName, SessionId, SessionRole, Surface, SurfaceId, SurfaceKind, Timestamp,
+    AgentFrame, CapsuleTrigger, EndpointAccess, EventType, ExecutorRef, JoinInstructions, Lease, Level, NewSession,
+    NodeName, NodePresence, NodeStatus, OrchestratorApp, OrchestratorAttach, OrchestratorCard, OrchestratorCommand,
+    OrchestratorEndpoint, OrchestratorError, OrchestratorLocation, OrchestratorNodeState, OrchestratorResult,
+    OwnershipMode, Project, ProjectName, SessionId, SessionRole, Surface, SurfaceId, SurfaceKind, Timestamp,
 };
+use vowp_store::session_log::SessionLog;
 use vowp_store::{Store, StoreError, hash_lease_token};
 
 use super::claude_remote::ClaudeRemoteHost;
-use super::lease::{AcquireLease, LeaseGuard};
+use super::lease::{AcquireLease, LeaseGuard, STALE_AFTER};
 use super::mirror::{self, MirrorCursor};
 use super::native::{AppHandle, AppHost, HostRequest, process_alive, write_private_json};
 use super::opencode_host::OpencodeHost;
 use crate::CoreError;
+use crate::agent::dispatch;
 use crate::deps::Deps;
 use crate::session::service::SessionService;
 
@@ -138,6 +143,9 @@ const COMMAND_POLL: Duration = Duration::from_millis(20);
 /// Default time a home command waits for the live agent's result before treating the
 /// command as durably queued.
 pub const COMMAND_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Counter that makes a private temporary file name unique within one process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// How the home delivers orchestrator commands to a node's live agent connection.
 ///
@@ -405,6 +413,33 @@ enum CommandDelivery {
     Applied,
     /// The command is durably queued for a live gateway; the state is still `starting`.
     Queued,
+}
+
+/// A held attach: the lease heartbeat plus the one-time grant.
+///
+/// The caller keeps this alive while the attach process runs. Dropping it, or calling
+/// [`AttachGuard::release`], releases the session. There is no detached keeper.
+pub struct AttachGuard {
+    lease: LeaseGuard,
+    grant: OrchestratorAttach,
+}
+
+impl AttachGuard {
+    /// Returns the grant. It carries the lease token: never log it or put it in an error.
+    pub fn grant(&self) -> &OrchestratorAttach {
+        &self.grant
+    }
+
+    /// Releases the lease and stops the heartbeat.
+    pub fn release(self) -> Result<(), CoreError> {
+        self.lease.release()
+    }
+}
+
+impl std::fmt::Debug for AttachGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AttachGuard").field("grant", &self.grant).finish()
+    }
 }
 
 /// The orchestrator manager.
@@ -684,6 +719,238 @@ impl Orchestrator {
         }
     }
 
+    /// Moves an orchestrator between the home and an enrolled agent node.
+    ///
+    /// The session id, the home session log and the project binding are preserved: the
+    /// current host is stopped and its lease released, a handoff capsule is written on the
+    /// existing session when it has events beyond its creation and placement notes, and the
+    /// orchestrator is re-materialized on the target bound to the same session. Moving to the placement the
+    /// orchestrator already occupies is idempotent: a live record is returned unchanged and
+    /// a stopped or degraded record is resumed there.
+    ///
+    /// The target is validated before anything is stopped. An unknown, pending, revoked or
+    /// offline node, or a project that the target node has not mapped, is refused with the
+    /// current host left running. A capsule failure is logged and does not abort the move,
+    /// because the home session log remains the authoritative context.
+    ///
+    /// After the old host is stopped, the session index row follows the move: `sessions.node`
+    /// and `sessions.cwd` name the target, while `last_seq`, `log_bytes`, the log and every
+    /// event stay exactly as they were. A no-op move writes no row.
+    pub fn move_to_node(&self, name: &str, target: Option<NodeName>) -> Result<OrchestratorInfo, CoreError> {
+        validate_name(name)?;
+        let dir = self.dir(name);
+        let state = read_state(&dir)?.ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
+        let target_node = match target {
+            Some(node) if !self.is_home_node(&node)? => Some(node),
+            _ => None,
+        };
+        let currently_remote = self.state_is_remote(&state)?;
+
+        // A no-op move must not stop or restart a healthy host. A stopped record on the
+        // requested placement is resumed there.
+        if currently_remote == target_node.is_some()
+            && (target_node.is_none() || state.node.as_ref() == target_node.as_ref())
+        {
+            return self.resume_or_return(name, state, dir);
+        }
+
+        let target_card = match target_node.as_ref() {
+            Some(node) => {
+                let card = self.require_active_node(node)?;
+                // The move stops the old host before the target starts. A target that cannot
+                // start now would leave no live placement, so refuse it before stopping.
+                if card.presence != NodePresence::Online {
+                    return Err(CoreError::Refused(format!(
+                        "node_offline: node {node} is {}; `vowp orchestrator move` needs the node online",
+                        presence_name(card.presence)
+                    )));
+                }
+                let global = Store::open_global(&self.deps.paths)?;
+                self.prepare_project(&global, state.project.as_ref())?;
+                if let Some(project) = state.project.as_ref()
+                    && !global
+                        .list_node_paths(node)?
+                        .iter()
+                        .any(|path| path.project == *project)
+                {
+                    return Err(CoreError::Refused(format!(
+                        "project {project} is not mapped on node {node}; add the local checkout on that node first"
+                    )));
+                }
+                drop(global);
+                Some(card)
+            }
+            None => None,
+        };
+
+        let old_node = state.node.clone();
+        self.stop(name)?;
+        let mut state = read_state(&dir)?.ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
+        if let Some(node) = old_node.as_ref() {
+            self.release_remote_lease(&state, node)?;
+        }
+        self.write_move_capsule(&state);
+
+        // The session index row is what `session ls`, the snapshot and a session lookup
+        // read. Follow the placement with a location-only write so the log position and
+        // the log itself do not move. A row that still names the old placement must not
+        // start the target.
+        let (location_node, location_cwd) = match target_card.as_ref() {
+            Some(card) => (card.name.clone(), ".".to_owned()),
+            None => (self.deps.node.clone(), dir.display().to_string()),
+        };
+        let scoped = self.scoped_deps(state.project.as_ref())?;
+        let store = scoped.open_store()?;
+        store
+            .set_session_location(&state.session_id, &location_node, &location_cwd)
+            .map_err(|error| {
+                CoreError::Store(StoreError::Conflict(format!(
+                    "session {} location was not updated after stopping the old host: {error}",
+                    state.session_id
+                )))
+            })?;
+
+        match target_card {
+            Some(card) => self.start_move_on_remote_node(&dir, state, card),
+            None => {
+                state.node = None;
+                state.surface_id = None;
+                state.last_request_id = None;
+                state.join = None;
+                state.state = OrchestratorNodeState::Stopped;
+                state.detail = None;
+                state.last_error = None;
+                write_state(&dir, &state)?;
+                self.resume(name)
+            }
+        }
+    }
+
+    /// Returns a live orchestrator unchanged, or resumes one that is stopped or degraded.
+    fn resume_or_return(&self, name: &str, state: StateFile, dir: PathBuf) -> Result<OrchestratorInfo, CoreError> {
+        let info = self.info_from_dir(state, dir);
+        if matches!(
+            info.card.state,
+            OrchestratorNodeState::Running | OrchestratorNodeState::Starting
+        ) {
+            return Ok(info);
+        }
+        self.resume(name)
+    }
+
+    /// Re-materializes one moved orchestrator on an active local node.
+    ///
+    /// `Start` is used rather than `Resume` so a node that has never hosted this
+    /// orchestrator writes its own private copy. The home record keeps the existing
+    /// session id; the node's paired surface must already be bound to that session.
+    fn start_move_on_remote_node(
+        &self,
+        dir: &Path,
+        mut state: StateFile,
+        card: vowp_protocol::NodeCard,
+    ) -> Result<OrchestratorInfo, CoreError> {
+        let request_id = new_request_id();
+        let online = card.presence == NodePresence::Online;
+        state.node = Some(card.name.clone());
+        state.surface_id = None;
+        state.last_request_id = Some(request_id.clone());
+        state.state = if online {
+            OrchestratorNodeState::Starting
+        } else {
+            OrchestratorNodeState::NodeOffline
+        };
+        state.detail = if online {
+            None
+        } else {
+            Some(format!("node {} is {}", card.name, presence_name(card.presence)))
+        };
+        state.last_error = None;
+        state.join = Some(node_join(state.app, &card.name, &state.session_id));
+        write_state(dir, &state)?;
+        if !online {
+            return Ok(info_from_state(state, dir.to_path_buf(), None));
+        }
+        let command = OrchestratorCommand::Start {
+            request_id,
+            name: state.name.clone(),
+            app: state.app,
+            project: state.project.clone(),
+        };
+        let result = self.send_command(&card.name, &command, &mut state);
+        if !matches!(&result, Ok(CommandDelivery::Queued)) {
+            write_state(dir, &state)?;
+        }
+        match result {
+            Ok(CommandDelivery::Applied) if state.state == OrchestratorNodeState::Failed => {
+                Err(refused_by_node(&card.name, "start", &state))
+            }
+            Ok(_) => Ok(info_from_state(state, dir.to_path_buf(), None)),
+            Err(error) => {
+                self.deps.log.log(
+                    Level::Warn,
+                    "orchestrator",
+                    &format!(
+                        "cannot deliver move start for {} to node {}: {error}",
+                        state.name, card.name
+                    ),
+                );
+                Ok(info_from_state(state, dir.to_path_buf(), None))
+            }
+        }
+    }
+
+    /// Releases a lease left on the node an orchestrator just left.
+    ///
+    /// A remote host detaches its surface on `Stop`, which releases the lease through the
+    /// gateway. When that node is unreachable the row can remain; release it only when it
+    /// still belongs to this orchestrator's app on the old node, so a takeover by another
+    /// surface is preserved. A surface paired without `--app` (the command `node_join`
+    /// prints) is held by the node name, so that holder is accepted too.
+    fn release_remote_lease(&self, state: &StateFile, node: &NodeName) -> Result<(), CoreError> {
+        let store = Store::open_global(&self.deps.paths)?;
+        let Some(lease) = store.lease(&state.session_id)? else {
+            return Ok(());
+        };
+        let own_holder =
+            lease.holder == state.name || lease.holder == app_name(state.app) || lease.holder == node.as_str();
+        if lease.node == *node && own_holder {
+            store.release_lease_hash(&state.session_id, &lease.token)?;
+        }
+        Ok(())
+    }
+
+    /// Writes a handoff capsule on the existing session after a real placement change.
+    ///
+    /// A session with only its creation and placement notes has no context to hand off, so
+    /// no capsule turn runs. The move continues when the capsule writer fails; the session
+    /// log on the home is still the authoritative record the new host resumes from.
+    fn write_move_capsule(&self, state: &StateFile) {
+        let result = (|| -> Result<(), CoreError> {
+            let scoped = self.scoped_deps(state.project.as_ref())?;
+            let store = scoped.open_store()?;
+            store.require_session(&state.session_id)?;
+            let events = SessionLog::open_read(&self.deps.paths, &state.session_id)?.read_all()?;
+            if !events
+                .iter()
+                .any(|event| !matches!(event.event_type, EventType::SessionCreated | EventType::Note))
+            {
+                return Ok(());
+            }
+            SessionService::new(scoped).write_capsule(&state.session_id, CapsuleTrigger::Manual)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.deps.log.log(
+                Level::Warn,
+                "orchestrator",
+                &format!(
+                    "cannot write handoff capsule for {} on {}: {error}",
+                    state.name, state.session_id
+                ),
+            );
+        }
+    }
+
     /// Lists every orchestrator.
     pub fn list(&self) -> Result<Vec<OrchestratorInfo>, CoreError> {
         let root = self.root();
@@ -721,6 +988,210 @@ impl Orchestrator {
         let dir = self.dir(name);
         let state = read_state(&dir)?.ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
         Ok(self.info_from_dir(state, dir))
+    }
+
+    /// Returns the discovery document a local UI client uses to reach one orchestrator.
+    ///
+    /// The base fields always come from the home record. A node-hosted orchestrator is
+    /// metadata only: this method never opens SSH, a socket or the node's files. A
+    /// home-hosted orchestrator fills `url`, `native_session_id` and `auth` from the live
+    /// app host's private 0600 state; a stopped host, or one with no loopback endpoint,
+    /// leaves them `None` rather than guessing. Every failure names the orchestrator and
+    /// the failure class, never a path, port, password, token or pair link.
+    ///
+    /// `owner` is read from the project-scoped store at the injected clock's `now`, for a
+    /// node-hosted record too. `access` is [`EndpointAccess::Owner`] only when `surface` is
+    /// the live owner's surface id; no caller identity, another surface, a stale or expired
+    /// owner, or no owner all read as [`EndpointAccess::ReadOnly`]. Recorded ownership is
+    /// cooperative: a UI that talks to the app's HTTP API directly is not stopped by it.
+    pub fn endpoint(&self, name: &str, surface: Option<&SurfaceId>) -> Result<OrchestratorEndpoint, CoreError> {
+        let (mut endpoint, project) = self.endpoint_base(name, false)?;
+        let now = self.deps.clock.now();
+        let store = self
+            .scoped_deps(project.as_ref())?
+            .open_store()
+            .map_err(|_| owner_unreadable(name))?;
+        let record = store
+            .ownership(&endpoint.session_id)
+            .map_err(|_| owner_unreadable(name))?;
+        if let Some(record) = record {
+            let live = record.is_live_at(now);
+            if live && surface.is_some() && surface == record.lease.surface_id.as_ref() {
+                endpoint.access = EndpointAccess::Owner;
+            }
+            endpoint.owner = Some(record.to_owner(now));
+        }
+        Ok(endpoint)
+    }
+
+    /// Builds the endpoint document without the owner view, and the orchestrator's project.
+    ///
+    /// `for_attach` turns a corrupt local record or service file into the typed attach
+    /// refusal that suggests `vowp orchestrator resume`; the read path keeps its existing
+    /// error text and classes.
+    fn endpoint_base(
+        &self,
+        name: &str,
+        for_attach: bool,
+    ) -> Result<(OrchestratorEndpoint, Option<ProjectName>), CoreError> {
+        validate_name(name)?;
+        let dir = self.dir(name);
+        let state = read_endpoint_state(name, &dir)
+            .map_err(|error| {
+                if for_attach {
+                    attach_endpoint_unavailable(name)
+                } else {
+                    error
+                }
+            })?
+            .ok_or_else(|| CoreError::NotFound(format!("orchestrator {name}")))?;
+        let remote = self.state_is_remote(&state)?;
+        let info = self.info_from_dir(state, dir);
+        let project = info.card.project.clone();
+        let location = if remote {
+            OrchestratorLocation::Node
+        } else {
+            OrchestratorLocation::Home
+        };
+        let mut endpoint = OrchestratorEndpoint {
+            name: info.card.name.clone(),
+            app: info.card.app,
+            session_id: info.card.session_id.clone(),
+            location,
+            node: info.card.node.clone(),
+            state: info.card.state,
+            url: None,
+            native_session_id: None,
+            auth: None,
+            owner: None,
+            access: EndpointAccess::ReadOnly,
+        };
+        if remote {
+            return Ok((endpoint, project));
+        }
+        let Some(handle) = info.host.as_ref() else {
+            return Ok((endpoint, project));
+        };
+        let Some(host) = self.host_for(info.card.app)? else {
+            return Ok((endpoint, project));
+        };
+        let Some(parts) = host.endpoint(handle).map_err(|_| {
+            if for_attach {
+                attach_endpoint_unavailable(name)
+            } else {
+                CoreError::Invalid(format!("orchestrator {name}: the app endpoint state is not readable"))
+            }
+        })?
+        else {
+            return Ok((endpoint, project));
+        };
+        endpoint.url = Some(parts.url);
+        endpoint.native_session_id = parts.native_session_id;
+        endpoint.auth = parts.auth;
+        Ok((endpoint, project))
+    }
+
+    /// Attaches a desktop UI to one home-hosted orchestrator and returns the held grant.
+    ///
+    /// This is the writer path. It creates a [`SurfaceKind::DesktopUi`] surface for `holder`
+    /// and acquires the session lease through [`LeaseGuard::acquire`], so a live interactive
+    /// owner needs `takeover` and a stale one is replaced. A job owner that is expired, or
+    /// live with `takeover`, is fenced first through [`dispatch::fence_job_owner`]: the run
+    /// closes through `lose`, the job stays `ready` and the owner row is released. A live job
+    /// takeover then records the capsule and the one note with [`dispatch::record_takeover`];
+    /// an interactive takeover already wrote its note.
+    ///
+    /// A node-hosted orchestrator is refused (the home cannot heartbeat a node-local engine),
+    /// and so is a stopped or corrupt host whose endpoint is unavailable. The returned
+    /// [`AttachGuard`] owns the heartbeat; the caller keeps it alive while the attach process
+    /// runs and releases or drops it to give the session up. No keeper is started.
+    pub fn attach(
+        &self,
+        name: &str,
+        holder: &str,
+        label: Option<&str>,
+        takeover: bool,
+    ) -> Result<AttachGuard, CoreError> {
+        let (mut endpoint, project) = self.endpoint_base(name, true)?;
+        if endpoint.location == OrchestratorLocation::Node {
+            return Err(CoreError::Refused(format!(
+                "orchestrator {name} runs on a node; the home cannot heartbeat a node-local engine, so it cannot be attached from here"
+            )));
+        }
+        if endpoint.url.is_none() || endpoint.auth.is_none() {
+            return Err(CoreError::Refused(format!(
+                "orchestrator {name} has no live app endpoint to attach to; run `vowp orchestrator resume {name}` first"
+            )));
+        }
+        let holder = holder.trim();
+        if holder.is_empty() {
+            return Err(CoreError::Invalid("an attach needs a non-empty holder name".to_owned()));
+        }
+        let session = endpoint.session_id.clone();
+        let scoped = self.scoped_deps(project.as_ref())?;
+        let store = scoped.open_store()?;
+        let now = self.deps.clock.now();
+        let surface = Surface {
+            id: SurfaceId::new(),
+            kind: SurfaceKind::DesktopUi,
+            node: self.deps.node.clone(),
+            holder: holder.to_owned(),
+            app: Some(app_name(endpoint.app).to_owned()),
+            cwd: None,
+            metadata: serde_json::json!({"orchestrator": name}),
+            created_at: now,
+            last_seen_at: now,
+        };
+        let surface_id = surface.id.clone();
+
+        let mut job_takeover_from = None;
+        if let Some(record) = store.ownership(&session)?
+            && record.mode == OwnershipMode::Job
+        {
+            let live = record.is_live_at(now);
+            if !live || takeover {
+                dispatch::fence_job_owner(&scoped, &store, &session, holder, now)?;
+                if live {
+                    job_takeover_from = Some(record.lease.holder);
+                }
+            }
+        }
+        let guard = LeaseGuard::acquire(
+            &scoped,
+            &store,
+            &AcquireLease {
+                session: session.clone(),
+                surface,
+                takeover,
+            },
+        )?;
+        if let Some(previous) = job_takeover_from
+            && let Err(error) = dispatch::record_takeover(&scoped, &store, &session, &previous, holder, now)
+        {
+            // The lease already moved; a failed note must not drop the grant.
+            self.deps.log.log(
+                Level::Warn,
+                "orchestrator",
+                &format!("attach to {name}: could not record the takeover note: {error}"),
+            );
+        }
+        if let Some(label) = label {
+            // Dropping the guard releases the row, so a bad label leaves no owner behind.
+            store.set_surface_label(&surface_id, Some(label))?;
+        }
+        let owner = store
+            .session_owner(&session, now)?
+            .ok_or_else(|| CoreError::Invalid(format!("orchestrator {name}: the attach did not record an owner")))?;
+        endpoint.owner = Some(owner.clone());
+        endpoint.access = EndpointAccess::Owner;
+        let grant = OrchestratorAttach {
+            surface_id,
+            token: guard.token().to_owned(),
+            expires_at: owner.heartbeat_at.plus(STALE_AFTER),
+            owner,
+            endpoint,
+        };
+        Ok(AttachGuard { lease: guard, grant })
     }
 
     /// Stops one orchestrator's host and releases its lease. The session stays.
@@ -1490,7 +1961,7 @@ impl Orchestrator {
                         }
                     }
                 });
-                write_private_json(&dir.join("opencode.json"), &config)?;
+                write_private_json_atomic(&dir.join("opencode.json"), &config)?;
             }
             OrchestratorApp::ClaudeCode => {
                 let config = serde_json::json!({
@@ -1509,7 +1980,7 @@ impl Orchestrator {
                         }
                     }
                 });
-                write_private_json(&dir.join(".mcp.json"), &config)?;
+                write_private_json_atomic(&dir.join(".mcp.json"), &config)?;
             }
             OrchestratorApp::Chat => {}
         }
@@ -1969,6 +2440,34 @@ fn read_state(dir: &Path) -> Result<Option<StateFile>, CoreError> {
     }
 }
 
+/// The path-free failure for an owner view that cannot be read.
+fn owner_unreadable(name: &str) -> CoreError {
+    CoreError::Invalid(format!("orchestrator {name}: the session owner could not be read"))
+}
+
+/// The typed refusal for an attach whose local endpoint record or service file is unusable.
+///
+/// It names the orchestrator, leaks no path or password, and tells the owner how to rebuild
+/// the local endpoint.
+fn attach_endpoint_unavailable(name: &str) -> CoreError {
+    CoreError::Refused(format!(
+        "orchestrator {name} has no usable app endpoint to attach to; run `vowp orchestrator resume {name}` first"
+    ))
+}
+
+/// Reads one endpoint's state file, naming the orchestrator and never a path.
+fn read_endpoint_state(name: &str, dir: &Path) -> Result<Option<StateFile>, CoreError> {
+    read_state(dir).map_err(|error| match error {
+        CoreError::Invalid(_) => CoreError::Invalid(format!(
+            "orchestrator {name}: the local orchestrator record is not valid JSON"
+        )),
+        CoreError::Io { .. } => CoreError::Invalid(format!(
+            "orchestrator {name}: the local orchestrator record could not be read"
+        )),
+        other => other,
+    })
+}
+
 /// Writes an orchestrator state file with mode 0600.
 ///
 /// The persisted document also carries the derived [`OrchestratorCard::last_error`] so the
@@ -1976,7 +2475,7 @@ fn read_state(dir: &Path) -> Result<Option<StateFile>, CoreError> {
 fn write_state(dir: &Path, state: &StateFile) -> Result<(), CoreError> {
     let mut stored = state.clone();
     stored.last_error = state.last_error();
-    write_private_json(&dir.join(STATE_FILE), &stored)
+    write_private_json_atomic(&dir.join(STATE_FILE), &stored)
 }
 
 /// Returns the live app handle recorded by a host, when its pid is still alive.
@@ -1996,18 +2495,58 @@ fn host_handle(dir: &Path, app: OrchestratorApp) -> Option<AppHandle> {
     })
 }
 
-/// Writes one private text file (mode 0600), creating its parent.
+/// Writes one private text file (mode 0600) atomically, creating its parent.
 fn write_private_text(path: &Path, text: &str) -> Result<(), CoreError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CoreError::Io {
-            path: parent.display().to_string(),
-            source,
-        })?;
-    }
-    fs::write(path, text).map_err(|source| CoreError::Io {
-        path: path.display().to_string(),
+    write_private_bytes(path, text.as_bytes())
+}
+
+/// Writes one private JSON document (mode 0600) atomically, creating its parent.
+fn write_private_json_atomic(path: &Path, value: &impl Serialize) -> Result<(), CoreError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| CoreError::Invalid(error.to_string()))?;
+    write_private_bytes(path, &bytes)
+}
+
+/// Writes one private file (mode 0600) through a unique temporary file and a rename.
+///
+/// A reader either sees the old document or the new one, never a truncated file: the
+/// bytes go to a `create_new` temporary file in the same directory, `sync_all` flushes
+/// them, and `rename` replaces the target in one step. The temporary file is removed on
+/// every error path so a failed write leaves no `.tmp-*` litter.
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| CoreError::Invalid(format!("the private file {} has no parent", path.display())))?;
+    fs::create_dir_all(parent).map_err(|source| CoreError::Io {
+        path: parent.display().to_string(),
         source,
     })?;
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".tmp-{}-{counter}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .map_err(|source| CoreError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(CoreError::Io {
+            path: path.display().to_string(),
+            source,
+        });
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| CoreError::Io {
         path: path.display().to_string(),
         source,
@@ -2094,7 +2633,26 @@ fn fallback_join(app: OrchestratorApp, session: &SessionId) -> JoinInstructions 
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_text, validate_name};
+    use std::fs;
+
+    use super::{redact_text, validate_name, write_private_text};
+
+    #[test]
+    fn a_failed_atomic_write_removes_its_temp_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("state.json");
+        fs::create_dir(&target).expect("block the target with a directory");
+        fs::write(target.join("occupied"), b"keep").expect("occupant");
+
+        let error = write_private_text(&target, "{}").expect_err("a rename over a non-empty directory fails");
+        assert!(matches!(error, crate::CoreError::Io { .. }), "{error}");
+        let leftovers: Vec<String> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left behind: {leftovers:?}");
+    }
 
     #[test]
     fn names_cannot_escape_the_orchestrator_root() {

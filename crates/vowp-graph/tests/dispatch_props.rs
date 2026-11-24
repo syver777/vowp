@@ -93,6 +93,7 @@ fn caps(profiles: &[(&str, Profile)], free_workers: u32, free_verifiers: u32) ->
             .map(|(name, profile)| ((*name).to_owned(), profile.clone()))
             .collect::<BTreeMap<_, _>>(),
         now: at(1_700_000_500),
+        overrides: HashMap::new(),
     }
 }
 

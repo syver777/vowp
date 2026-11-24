@@ -26,7 +26,7 @@ pub fn run(ctx: &Ctx, io: &mut dyn IoStreams, command: &InboxCommand) -> Result<
 
 /// Lists open items, or every item with `--all`.
 fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxLsArgs) -> Result<i32, CliError> {
-    let store = ctx.store()?;
+    let store = open_inbox_store(ctx)?;
     let items = store.list_inbox(if args.all { None } else { Some(InboxState::Open) })?;
     if ctx.json() {
         print_json(io, &items)?;
@@ -52,8 +52,7 @@ fn list(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxLsArgs) -> Result<i32, Cl
 
 /// Shows one item, including its body, options and answer.
 fn show(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxShowArgs) -> Result<i32, CliError> {
-    let store = ctx.store()?;
-    let item = resolve_item(&store, &args.id)?;
+    let (_, item) = open_item(ctx, &args.id)?;
     if ctx.json() {
         print_json(io, &item)?;
         return Ok(0);
@@ -138,8 +137,7 @@ fn ask(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxAskArgs) -> Result<i32, Cl
 
 /// Stores an answer and queues the job resolution for the next tick.
 fn answer(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxAnswerArgs) -> Result<i32, CliError> {
-    let store = ctx.store()?;
-    let item = resolve_item(&store, &args.id)?;
+    let (store, item) = open_item(ctx, &args.id)?;
     let answer_text = match (&args.text, args.approve, args.reject) {
         (Some(text), false, false) if !text.trim().is_empty() => text.clone(),
         (None, true, false) => {
@@ -193,8 +191,7 @@ fn answer(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxAnswerArgs) -> Result<i
 
 /// Dismisses an open item without resolving anything.
 fn dismiss(ctx: &Ctx, io: &mut dyn IoStreams, args: &InboxDismissArgs) -> Result<i32, CliError> {
-    let store = ctx.store()?;
-    let item = resolve_item(&store, &args.id)?;
+    let (store, item) = open_item(ctx, &args.id)?;
     if item.state != InboxState::Open {
         return Err(CliError::Conflict(format!("inbox item {} is not open", item.id)));
     }
@@ -229,6 +226,59 @@ fn park_job(store: &Store, job_id: &JobId, reason: ParkedReason) -> Result<(), C
         },
     )?;
     Ok(())
+}
+
+/// Opens the store `inbox ls` reads.
+///
+/// With a selected project this is the project store (which also merges `node_inbox`). With
+/// no project selected (no `--project` and a cwd outside a checkout) it is the global node
+/// store, so the global `_node` inbox is listed instead of failing with `no project selected`.
+fn open_inbox_store(ctx: &Ctx) -> Result<Store, CliError> {
+    if ctx.project_selected() {
+        ctx.store()
+    } else {
+        ctx.fleet_store()
+    }
+}
+
+/// Opens the store holding inbox item `input` and returns it with the item.
+///
+/// With a selected project the project store is used. Otherwise the global `_node` inbox is
+/// searched first, then every registered project database; the item must be unique across them.
+fn open_item(ctx: &Ctx, input: &str) -> Result<(Store, InboxItem), CliError> {
+    if ctx.project_selected() {
+        let store = ctx.store()?;
+        let item = resolve_item(&store, input)?;
+        return Ok((store, item));
+    }
+    let global = ctx.fleet_store()?;
+    match resolve_item(&global, input) {
+        Ok(item) => return Ok((global, item)),
+        Err(CliError::NotFound(_)) => {}
+        Err(other) => return Err(other),
+    }
+    let mut found: Vec<(Store, InboxItem)> = Vec::new();
+    for project in global.list_projects()? {
+        if project.name.as_str() == vowp_store::RESERVED_NODE_PROJECT
+            || !ctx.paths().project_db_path(&project.name).is_file()
+        {
+            continue;
+        }
+        let store = Store::open_with_project(ctx.paths(), &project.name)?.with_clock(ctx.deps().clock.clone());
+        match resolve_item(&store, input) {
+            Ok(item) => found.push((store, item)),
+            Err(CliError::NotFound(_)) => {}
+            Err(other) => return Err(other),
+        }
+    }
+    if found.len() > 1 {
+        return Err(CliError::Invalid(format!(
+            "inbox item {input} exists in several projects; pass --project <name>"
+        )));
+    }
+    found
+        .pop()
+        .ok_or_else(|| CliError::NotFound(format!("inbox item {input}")))
 }
 
 /// Resolves an inbox id or unique prefix.

@@ -2,7 +2,7 @@
 
 VOWP creates databases, session logs, blobs, run mirrors, worktrees, backups and samples. The lifecycle
 model answers one question for every file: **what is it, and may it ever be deleted?** The answer is a
-class. Four classes are permanent by construction; five are disposable and collected by vowp `gc --apply`.
+class. Four classes are permanent by construction; six are disposable and collected by vowp `gc --apply`.
 
 > **Status: current.** Classes, vowp `gc`, closed-session compaction, backup/restore and the nightly
 > GC schedule are implemented on `main`. The binding specification is
@@ -19,6 +19,7 @@ class. Four classes are permanent by construction; five are disposable and colle
 | **closed session** | `log.jsonl` and blobs of an idle session whose job is done, or an explicitly closed session | Kept 30 days after the last update, then compacted to a capsule and summary | `sessions.state='closed'` or a done job |
 | **run output** | `runs/*.jsonl`, `*.stderr` | 14 days; gzip after 1 day | `runs/` and the run rows |
 | **worktree** | a job worktree | Removed after merge; a failed, cancelled or replanned job's worktree is kept 7 days | job state and worktree path |
+| **job_window** | tagged tmux window `job-<id>` | Listed once the job is done, cancelled, failed, parked or replanned; `--apply` closes it | `jobs` state and the project's tmux session |
 | **sample** | `host_samples` | One row per supervisor tick, kept for 24 hours; no automatic one-minute rollup | the table |
 | **cache** | disposable `tmp/` files | 24 hours | `tmp/` |
 
@@ -41,12 +42,13 @@ to the closed-session class.
 ## `gc`
 
 vowp `gc` is a dry run by default. It lists files per class, their bytes and a five-path sample, and
-changes nothing. vowp `gc --apply` deletes only the five disposable classes once their expiry has
+changes nothing. vowp `gc --apply` deletes only the six disposable classes once their expiry has
 passed:
 
 - **closed sessions:** compact first, then remove the full log and non-evidence blobs;
 - **run output:** gzip after one day and delete after fourteen;
 - **worktrees:** remove per the worktree rule, never the main checkout and never an open job;
+- **job windows:** close tagged `job-<id>` windows whose job is missing or no longer active;
 - **samples:** prune expired host-sample rows;
 - **cache:** remove expired temporary files.
 

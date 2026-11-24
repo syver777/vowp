@@ -121,3 +121,67 @@ fn inbox_dismiss_does_not_resolve_a_job() {
         InboxState::Dismissed
     );
 }
+
+/// Runs one command against the env's home with no `--project`, from a non-project cwd.
+fn run_global(env: &common::TestEnv, args: &[&str]) -> (i32, String, String) {
+    let mut full = vec![
+        "vowp".to_owned(),
+        "--home".to_owned(),
+        env.home_path().display().to_string(),
+    ];
+    full.extend(args.iter().map(|value| (*value).to_owned()));
+    let mut io = vowp_cli::BufferIo::new("");
+    let code = vowp_cli::run(full, &mut io);
+    (code, io.stdout(), io.stderr())
+}
+
+#[test]
+fn global_inbox_works_without_project() {
+    let env = common::TestEnv::new();
+    let store = env.store();
+    let now = store.clock().now();
+    // A second registered project makes "the only project" ambiguous, so with no
+    // `--project` and a cwd outside any registered checkout there is no project selected.
+    let other = env.project.path().join("other");
+    store
+        .upsert_project(&vowp_protocol::Project {
+            name: vowp_protocol::ProjectName::parse("other").expect("name"),
+            path: other.display().to_string(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            config: serde_json::json!({}),
+            created_at: now,
+            updated_at: now,
+        })
+        .expect("second project");
+    let item = vowp_protocol::InboxItem {
+        id: vowp_protocol::InboxId::new(),
+        project: None,
+        job_id: None,
+        kind: vowp_protocol::InboxKind::Decision,
+        title: "Capacity decision".to_owned(),
+        body: String::new(),
+        options: vec!["keep".to_owned(), "drop".to_owned()],
+        state: InboxState::Open,
+        answer: None,
+        answered_by: None,
+        created_at: now,
+        answered_at: None,
+    };
+    store.insert_inbox(&item).expect("node inbox item");
+
+    let (code, stdout, stderr) = run_global(&env, &["inbox", "ls"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("Capacity decision"), "{stdout}");
+
+    let id = item.id.to_string();
+    let (code, stdout, stderr) = run_global(&env, &["inbox", "show", &id]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stdout.contains("Capacity decision"), "{stdout}");
+
+    let (code, _, stderr) = run_global(&env, &["inbox", "answer", &id, "keep", "--by", "owner"]);
+    assert_eq!(code, 0, "{stderr}");
+    let answered = store.inbox_item(&item.id).expect("lookup").expect("item");
+    assert_eq!(answered.state, InboxState::Answered);
+    assert_eq!(answered.answer.as_deref(), Some("keep"));
+}

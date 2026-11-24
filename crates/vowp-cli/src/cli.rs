@@ -123,13 +123,15 @@ impl Parser for Cli {
         let mut args: Vec<OsString> = itr.into_iter().map(Into::into).collect();
         record_agent_chat(false);
         inject_agent_chat_id(&mut args);
+        rewrite_move_home(&mut args);
         ParsedCli::try_parse_from(args).map(|mut parsed| {
-            // `orchestrator new --node <name>` names the node that runs the app, not an
-            // SSH redirect. Move the global value into the subcommand before
-            // `remote::maybe_run` sees it; every other command keeps the global meaning.
+            // `orchestrator new --node <name>` and `orchestrator move --node <name>`
+            // name the node that runs the orchestrator, not an SSH redirect. Move the
+            // global value into the subcommand before `remote::maybe_run` sees it; every
+            // other command keeps the global meaning.
             let node = parsed.global.node.take();
             if let Command::Orchestrator(args) = &mut parsed.command {
-                parsed.global.node = args.take_new_node(node);
+                parsed.global.node = args.take_orchestrator_node(node);
             } else {
                 parsed.global.node = node;
             }
@@ -138,6 +140,26 @@ impl Parser for Cli {
                 command: parsed.command,
             }
         })
+    }
+}
+
+/// Rewrites `--home` after `orchestrator move` to its hidden switch.
+///
+/// `--home <DIR>` is a global flag, and clap rejects a second argument with the same long
+/// name on a subcommand. For `orchestrator move` the owner spelling is the target switch,
+/// so every `--home` after the subcommand is rewritten; a global home directory still goes
+/// before the command. The user-facing spelling remains `--home`.
+fn rewrite_move_home(args: &mut [OsString]) {
+    let Some(orchestrator) = args.iter().position(|arg| arg == "orchestrator") else {
+        return;
+    };
+    if args.get(orchestrator + 1).and_then(|arg| arg.to_str()) != Some("move") {
+        return;
+    }
+    for arg in args.iter_mut().skip(orchestrator + 2) {
+        if arg == "--home" {
+            *arg = OsString::from("--move-home");
+        }
     }
 }
 
@@ -474,6 +496,17 @@ pub enum JobCommand {
     Fail(JobFailArgs),
     /// Cancel a non-terminal job.
     Cancel(JobIdArgs),
+    /// Pin a job to an executor, or switch a running job's session onto it.
+    SetExecutor(JobSetExecutorArgs),
+}
+
+/// Arguments for `vowp job set-executor`.
+#[derive(Debug, Clone, Args)]
+pub struct JobSetExecutorArgs {
+    /// Job id.
+    pub id: String,
+    /// Executor as `<harness>:<provider>/<model>[@effort|#variant]`.
+    pub executor: String,
 }
 
 /// Arguments for `vowp job add`.
@@ -1291,6 +1324,8 @@ pub enum AgentCommand {
     Doctor(AgentDoctorArgs),
     /// Confirm a changed system-mode WSS leaf fingerprint after verifying it out of band.
     Trust(AgentTrustArgs),
+    /// Inspect one local orchestrator on this agent machine.
+    Orchestrator(AgentOrchestratorArgs),
     /// Hidden: serve the home side of one agent stdio or WebSocket connection.
     #[command(hide = true)]
     Gateway(AgentGatewayArgs),
@@ -1405,6 +1440,28 @@ pub struct AgentRunArgs {
 #[derive(Debug, Clone, Default, Args)]
 pub struct AgentStatusArgs {}
 
+/// Arguments for `vowp agent orchestrator`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentOrchestratorArgs {
+    /// The local orchestrator inspection subcommand.
+    #[command(subcommand)]
+    pub command: AgentOrchestratorCommand,
+}
+
+/// `vowp agent orchestrator` subcommands.
+#[derive(Debug, Clone, Subcommand)]
+pub enum AgentOrchestratorCommand {
+    /// Show the local endpoint document for one orchestrator.
+    Endpoint(AgentOrchestratorEndpointArgs),
+}
+
+/// Arguments for `vowp agent orchestrator endpoint`.
+#[derive(Debug, Clone, Args)]
+pub struct AgentOrchestratorEndpointArgs {
+    /// Orchestrator name.
+    pub name: String,
+}
+
 /// Arguments for the hidden `vowp agent gateway`.
 #[derive(Debug, Clone, Default, Args)]
 pub struct AgentGatewayArgs {
@@ -1484,6 +1541,20 @@ pub enum SurfaceCommand {
     Revoke(SurfaceRevokeArgs),
     /// Rotate a surface token, keeping the old token for a ten-minute overlap.
     Rotate(SurfaceRotateArgs),
+    /// Save a friendly name for a surface.
+    Rename(SurfaceRenameArgs),
+}
+
+/// Arguments for `vowp surface rename`.
+#[derive(Debug, Clone, Args)]
+pub struct SurfaceRenameArgs {
+    /// Surface id.
+    pub id: String,
+    /// New friendly name, for example `Kitchen laptop`.
+    pub label: Option<String>,
+    /// Restore the default name (`<kind name> · <node>`).
+    #[arg(long)]
+    pub clear: bool,
 }
 
 /// Arguments for `vowp surface pair`.
@@ -1505,6 +1576,9 @@ pub struct SurfacePairArgs {
     /// Revoke this surface and create the replacement pending surface in one transaction.
     #[arg(long, value_name = "SURFACE-ID")]
     pub replace: Option<String>,
+    /// Friendly saved name for the surface (default: `<kind name> · <node>`).
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
 }
 
 /// Arguments for `vowp surface ls`.

@@ -20,7 +20,7 @@ crates/vowp-store/
   src/lib.rs            // forbid(unsafe), warn(missing_docs); re-exports
   src/error.rs          // StoreError
   src/paths.rs          // NodePaths
-  src/schema/global.sql // the embedded global schema (v7)
+  src/schema/global.sql // the embedded global schema (v8)
   src/schema/project.sql // the embedded project schema (v2)
   src/schema/001_init.sql // the earlier byte-identical v0.1 schema used by the v0.1 migration
   src/db.rs              // Store, open/migrate/pragmas/transaction/backup/integrity_check
@@ -82,7 +82,7 @@ impl NodePaths {
 
 ```rust
 pub struct Store { /* rusqlite::Connection, Arc<dyn Clock> */ }
-pub const GLOBAL_SCHEMA_VERSION: i64 = 7;
+pub const GLOBAL_SCHEMA_VERSION: i64 = 8;
 pub const PROJECT_SCHEMA_VERSION: i64 = 2;
 pub const SCHEMA_VERSION: i64 = 1;   // compatibility alias for the pre-split/v0.1 API
 
@@ -116,16 +116,16 @@ Migration/pragma rules (all in `Store::open*`):
 5. Insert `kv('schema_created_at')` and `kv('node_id')` (a fresh ULID) on first creation.
 6. `open_writable(paths, project)` is the daemon's narrow write constructor. It requires the
    existing `vowp.db` (missing → `NotFound`), uses read-write flags without create, sets the busy
-   timeout and foreign keys, checks `user_version = 7` (newer → `SchemaTooNew`, older →
+   timeout and foreign keys, checks `user_version = 8` (newer → `SchemaTooNew`, older →
    `MigrationRequired`), and attaches an existing registered project with the same schema check.
    It never calls `paths.ensure`, `resume_migration` or a schema file, so opening it cannot create
    or migrate a home. It is not a general write-open: `Store::open` remains the CLI/supervisor
    constructor.
 7. `Store::open` and `Store::open_global` migrate an existing v2 global file to v3, an
-   existing v3 file to v4, an existing v4 file to v5, an existing v5 file to v6 and an existing v6
-   file to v7 before opening it. `migrate_v02` follows the v0.1 migration's
+   existing v3 file to v4, an existing v4 file to v5, an existing v5 file to v6, an existing v6
+   file to v7 and an existing v7 file to v8 before opening it. `migrate_v02` follows the v0.1 migration's
    staged-swap recipe: it copies the original file to `backups/pre-0.3-<ms>.db`, writes a fresh
-   v3 file in `tmp/` (the embedded v7 schema shaped back to the v3 `surfaces` and
+   v3 file in `tmp/` (the embedded v8 schema shaped back to the v3 `surfaces` and
    plaintext-`leases` tables, without the later-only tables), copies all
    21 v2 global tables (including `native_events`), verifies per-table counts, integrity and
    foreign keys, and then renames the staged file into place. `nodes` is copied with an explicit
@@ -171,6 +171,33 @@ Migration/pragma rules (all in `Store::open*`):
     `migrate_v06_if_needed` is called from `Store::open_global_unbound` in `db.rs`, after
     `migrate_v05_if_needed`, so `Store::open` and `Store::open_global` reach it through the
     shared path; `Store::open_writable` does not migrate and returns `MigrationRequired` for v6.
+
+13. `migrate_v07` is the v7 → v8 session-ownership upgrade
+    (`docs/design/v0.5.1/session-ownership.md` §3.3). SQLite cannot widen a CHECK, so it
+    **rebuilds** `surfaces` and `leases`: the original file is copied to `backups/pre-0.8-<ms>.db`;
+    foreign keys are switched off outside the transaction (the pragma is a no-op inside one) so
+    dropping `surfaces` cannot cascade into `surface_tokens`; inside one `BEGIN IMMEDIATE`
+    transaction the new tables are created, every row is copied with its id, the old tables are
+    dropped and the new ones renamed, and `leases_heartbeat` plus `leases_expires` are recreated.
+    `surfaces` gains `label` (NULL) and the `desktop-ui` kind; `leases` gains `owner_mode`,
+    `owner_epoch` and `expires_at` and the `desktop-ui` kind. Every lease keeps its token hash and
+    times with `owner_mode = 'interactive'`, `owner_epoch = 0`, no expiry — none is cleared — except
+    an old offload run lease (`agent` kind, no surface), which becomes `job` mode with
+    `expires_at = heartbeat_at + 600 s`. Before commit every table count is compared and
+    `integrity_check` and `foreign_key_check` must pass; a failure rolls back and leaves the v7
+    file readable. A v8 home is a no-op (no backup). `migrate_v07_if_needed` runs after
+    `migrate_v06_if_needed`; `open_writable` does not migrate. The staged v2–v4 migrations copy
+    `surfaces` with an explicit column list because the embedded table has the extra `label`.
+14. Ownership API (`repo_surfaces.rs`): `take_ownership(lease, mode, expires_at)` writes the row
+    and assigns `owner_epoch = previous + 1` itself (a caller epoch does not exist);
+    `take_lease` is the interactive wrapper. `ownership`, `session_owner(session, now)` and
+    `list_session_owners(now)` (one query) derive `OwnershipState` at read time and `activity`
+    from `sessions.state`; they never read a token. `stale_leases`/`release_stale_lease` select
+    only interactive rows and skip the legacy run-lease shape; `expired_job_leases(now)` selects
+    `expires_at <= now`; `renew_job_lease` extends a job owner; `set_surface_label` /
+    `surface_label` keep the friendly name (default `<kind name> · <node>`, saved on first
+    registration, never overwritten by an upsert). A read-only handle on a not-yet-migrated v7
+    file reads leases with the v7 defaults.
 
 ### 3.3 Filters and small structs
 
@@ -369,6 +396,10 @@ pub fn session(&self, id: &SessionId) -> Result<Option<Session>, StoreError>;
 pub fn require_session(&self, id: &SessionId) -> Result<Session, StoreError>;
 pub fn list_sessions(&self, f: &SessionFilter) -> Result<Vec<Session>, StoreError>;        // updated_at DESC
 pub fn set_session_state(&self, id: &SessionId, state: SessionState, executor: Option<&Executor>) -> Result<(), StoreError>;
+/// Placement-only update for an orchestrator move: writes `node`, `cwd` and `updated_at`, and leaves
+/// `last_seq`, `last_capsule_id`, `log_bytes`, `state`, `executor` and every project/job column alone.
+/// Separate from `upsert_session`, which rewrites every column; an unknown id is `NotFound` and inserts no row.
+pub fn set_session_location(&self, id: &SessionId, node: &NodeName, cwd: &str) -> Result<(), StoreError>;
 pub fn index_event(&self, row: &EventIndexRow) -> Result<(), StoreError>;             // also bumps sessions.last_seq / updated_at / log_bytes in the same tx
 pub fn event_rows(&self, id: &SessionId, after_seq: u64, limit: u32) -> Result<Vec<EventIndexRow>, StoreError>;
 pub fn event_row_by_id(&self, id: &EventId) -> Result<Option<EventIndexRow>, StoreError>;
@@ -767,6 +798,9 @@ impl From<rusqlite::Error> for StoreError { /* maps SQLITE_BUSY → Busy, UNIQUE
 | `migration_v5_to_v6_failure_leaves_the_v5_file_intact` | a conflicting pre-existing `node_limits` makes the migration fail; the version stays 5, no partial `agent_assignments` row/table remains and existing rows stay readable |
 | `capacity_rollups_migrates_v6_to_v7_with_a_backup` | a v6 fixture with host samples migrates additively to v7; `capacity_rollups` and its bucket index exist and start empty, every existing count is unchanged, the backup stays v6, and the v6 file still opens at v6 |
 | `capacity_rollups_migration_failure_leaves_the_v6_file_readable` | a conflicting pre-existing `capacity_rollups` makes the migration fail; the version stays 6, no partial row/table remains and existing rows stay readable |
+| `v7_home_migrates_to_v8_preserving_surfaces_tokens_and_leases` | a real v7 home keeps every surface, token and lease with their ids and hashes; `desktop-ui` is accepted; a job lease without an expiry is rejected |
+| `v7_agent_run_lease_becomes_job_mode_with_an_expiry` | an old `agent`/no-surface lease becomes `job` with `heartbeat + 600 s` |
+| `v8_migration_is_idempotent_and_writes_a_backup_first` | opening migrates once with one untouched v7 `pre-0.8` backup; a second run is a no-op |
 | `capacity_rollups_table_has_the_v7_columns_and_index` | the v7 table has every documented column, the `source` CHECK and the `capacity_rollups_bucket` index |
 | `rollup_host_samples_aggregates_the_bucket_and_skips_empty_ones` | one completed bucket aggregates min/avg/max, load and disk free, and a bucket with no raw rows writes nothing |
 | `rollup_host_samples_is_idempotent_across_a_repeated_write` | a repeated rollup for one bucket updates the same row and recomputes `samples` instead of duplicating it |

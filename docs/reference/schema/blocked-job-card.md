@@ -11,7 +11,7 @@ Exported by `vowp schema BlockedJobCard` and generated from the protocol types i
 {
   "$defs": {
     "JobId": {
-      "description": "Job id slug, for example `example-job`.",
+      "description": "Job id slug, for example `example-job`, at most 120 characters.",
       "type": "string"
     },
     "JobState": {

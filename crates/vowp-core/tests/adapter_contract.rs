@@ -12,7 +12,11 @@ use vowp_adapters::acp::{AcpAdapter, AcpConfig};
 use vowp_adapters::claude_code::{ClaudeCodeAdapter, ClaudeConfig};
 use vowp_adapters::cli::CliAdapter;
 use vowp_adapters::opencode::{OpencodeAdapter, OpencodeConfig};
-use vowp_protocol::{Adapter, AdapterRun, EventBody, HarnessEvent, HarnessKind, RunOutcome, StartInput, StopReason};
+use vowp_core::deps::{AdapterRegistry, BinarySource, HARNESS_BINARY_HINT, resolve_harness_binary};
+use vowp_protocol::{
+    Adapter, AdapterError, AdapterRun, EventBody, HarnessConfig, HarnessEvent, HarnessKind, RunOutcome, StartInput,
+    StopReason, VowpConfig,
+};
 
 /// An in-test fake harness; no real `claude`, `opencode` or cli binary is ever reached.
 const FAKE_HARNESS: &str = r#"#!/bin/sh
@@ -230,4 +234,247 @@ fn adapter_kinds_match_their_contract() {
             HarnessKind::Acp
         ]
     );
+}
+/// Writes an executable script named `name` under `directory` and returns its path.
+fn write_named_script(directory: &Path, name: &str, body: &str) -> PathBuf {
+    std::fs::create_dir_all(directory).expect("create script directory");
+    let path = directory.join(name);
+    std::fs::write(&path, body).expect("write script");
+    let mut permissions = std::fs::metadata(&path).expect("stat script").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod script");
+    path
+}
+
+/// Builds an opencode config that names `binary` (a path or a bare name).
+fn opencode_config(binary: Option<&str>) -> VowpConfig {
+    let mut config = VowpConfig::with_defaults_for_tests();
+    config.harnesses.insert(
+        "opencode".to_owned(),
+        HarnessConfig {
+            binary: binary.map(str::to_owned),
+            ..HarnessConfig::default()
+        },
+    );
+    config
+}
+
+/// Builds a registry whose built-ins resolve through `search_path`.
+fn registry_with_path(config: &VowpConfig, search_path: &Path) -> AdapterRegistry {
+    AdapterRegistry::from_config_with_search_path(config, Some(search_path.as_os_str().to_os_string()))
+        .expect("registry builds")
+}
+
+fn opencode_executor() -> vowp_protocol::Executor {
+    vowp_protocol::Executor::parse("opencode:deepseek/deepseek-flash").expect("executor")
+}
+
+#[test]
+fn configured_binary_resolution_prefers_config_then_path() {
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("config");
+    let path_dir = tmp.path().join("path");
+    let configured = write_named_script(&config_dir, "fake-harness", "#!/bin/sh\nexit 0\n");
+    let on_path = write_named_script(&path_dir, "fake-harness", "#!/bin/sh\nexit 0\n");
+    let search = Some(path_dir.as_os_str());
+
+    let absolute = resolve_harness_binary(
+        Some(configured.to_string_lossy().as_ref()),
+        "fake-harness",
+        search,
+        None,
+        None,
+    )
+    .expect("the configured absolute path wins");
+    assert_eq!(absolute.path, configured, "an absolute configured path wins over PATH");
+    assert_eq!(absolute.source, BinarySource::Config);
+
+    let bare = resolve_harness_binary(Some("fake-harness"), "fake-harness", search, None, None)
+        .expect("a bare configured name uses PATH");
+    assert_eq!(bare.path, on_path);
+    assert_eq!(bare.source, BinarySource::Path);
+
+    let missing = tmp.path().join("moved/fake-harness");
+    let never_resolved = resolve_harness_binary(
+        Some(missing.to_string_lossy().as_ref()),
+        "fake-harness",
+        search,
+        None,
+        None,
+    );
+    assert!(
+        never_resolved.is_none(),
+        "a configured path that never resolved is a config error, not a PATH guess"
+    );
+
+    let moved = resolve_harness_binary(
+        Some(missing.to_string_lossy().as_ref()),
+        "fake-harness",
+        search,
+        None,
+        Some(missing.as_path()),
+    )
+    .expect("a previously resolved configured path that moved falls back to PATH");
+    assert_eq!(moved.path, on_path);
+    assert_eq!(moved.source, BinarySource::Path);
+
+    let default = resolve_harness_binary(None, "fake-harness", search, None, None).expect("the default name uses PATH");
+    assert_eq!(default.path, on_path);
+    assert_eq!(default.source, BinarySource::Path);
+}
+
+#[test]
+fn adapter_start_recovers_when_the_configured_binary_moved_to_path() {
+    let tmp = tempdir().expect("tempdir");
+    let stale_dir = tmp.path().join("stale");
+    let path_dir = tmp.path().join("path");
+    let marker = tmp.path().join("recovered");
+    let stale = write_named_script(
+        &stale_dir,
+        "opencode",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.0.28'; exit 0; fi\nexit 0\n",
+    );
+
+    // The PATH binary runs the same JSON fixture the contract tests use.
+    let (_, fixture, _) = write_fixtures(tmp.path());
+    write_named_script(
+        &path_dir,
+        "opencode",
+        &format!(
+            "#!/bin/sh\nprintf ran > '{}'\ncat '{}'\nexit 0\n",
+            marker.display(),
+            fixture.display()
+        ),
+    );
+
+    let config = opencode_config(Some(stale.to_string_lossy().as_ref()));
+    let registry = registry_with_path(&config, &path_dir);
+    let adapter = registry.get(&opencode_executor()).expect("opencode is registered");
+    let probe = adapter.probe();
+    assert!(probe.ok, "{}", probe.detail);
+    assert_eq!(probe.path.as_deref(), Some(stale.to_string_lossy().as_ref()));
+    std::fs::remove_file(&stale).expect("remove the probed binary");
+
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let mut run = adapter
+        .start(start_input(&cwd, &tmp.path().join("missing.jsonl"), "0", false))
+        .expect("start re-resolves the moved binary from PATH");
+    let summary = run.wait().expect("the recovered run finishes");
+    assert_eq!(summary.outcome, RunOutcome::Ok);
+    assert!(marker.is_file(), "the PATH binary ran after re-resolution");
+}
+
+#[test]
+fn probe_names_the_resolved_path_and_origin() {
+    let tmp = tempdir().expect("tempdir");
+    let config_dir = tmp.path().join("config");
+    let path_dir = tmp.path().join("path");
+    let configured = write_named_script(
+        &config_dir,
+        "opencode",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.0.28'; exit 0; fi\nexit 0\n",
+    );
+    write_named_script(
+        &path_dir,
+        "opencode",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '9.9.9'; exit 0; fi\nexit 0\n",
+    );
+
+    let configured_config = opencode_config(Some(configured.to_string_lossy().as_ref()));
+    let configured_probe = registry_with_path(&configured_config, &path_dir)
+        .get(&opencode_executor())
+        .expect("opencode is registered")
+        .probe();
+    assert!(configured_probe.ok, "{}", configured_probe.detail);
+    let configured_text = configured.to_string_lossy();
+    assert_eq!(
+        configured_probe.path.as_deref(),
+        Some(configured_text.as_ref()),
+        "the probe reports the configured path"
+    );
+    assert!(
+        configured_probe.detail.contains("resolved from config:")
+            && configured_probe.detail.contains(configured_text.as_ref()),
+        "vowp doctor receives the path and its origin: {}",
+        configured_probe.detail
+    );
+
+    let path_probe = registry_with_path(&opencode_config(None), &path_dir)
+        .get(&opencode_executor())
+        .expect("opencode is registered")
+        .probe();
+    assert!(path_probe.ok, "{}", path_probe.detail);
+    let on_path = path_dir.join("opencode");
+    assert_eq!(
+        path_probe.path.as_deref(),
+        Some(on_path.to_string_lossy().as_ref()),
+        "the probe reports the PATH path"
+    );
+    assert!(
+        path_probe.detail.contains("resolved from PATH:") && path_probe.detail.contains("9.9.9"),
+        "vowp doctor receives the version, path and origin: {}",
+        path_probe.detail
+    );
+}
+
+#[test]
+fn adapter_retries_once_when_the_configured_binary_cannot_be_spawned() {
+    let tmp = tempdir().expect("tempdir");
+    let stale_dir = tmp.path().join("stale");
+    let path_dir = tmp.path().join("path");
+    let marker = tmp.path().join("retried");
+    // The file exists and is executable, but its interpreter does not: the first spawn
+    // returns ENOENT, so the adapter must fall back to a PATH lookup and retry once.
+    let unspawnable = write_named_script(&stale_dir, "opencode", "#!/definitely/not/an/interpreter\n");
+
+    let (_, fixture, _) = write_fixtures(tmp.path());
+    write_named_script(
+        &path_dir,
+        "opencode",
+        &format!(
+            "#!/bin/sh\nprintf ran > '{}'\ncat '{}'\nexit 0\n",
+            marker.display(),
+            fixture.display()
+        ),
+    );
+
+    let config = opencode_config(Some(unspawnable.to_string_lossy().as_ref()));
+    let registry = registry_with_path(&config, &path_dir);
+    let adapter = registry.get(&opencode_executor()).expect("opencode is registered");
+
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let mut run = adapter
+        .start(start_input(&cwd, &tmp.path().join("missing.jsonl"), "0", false))
+        .expect("the locator failure is retried from PATH");
+    let summary = run.wait().expect("the retried run finishes");
+    assert_eq!(summary.outcome, RunOutcome::Ok);
+    assert!(marker.is_file(), "the PATH binary ran after the retry");
+}
+
+#[test]
+fn missing_binary_is_a_locator_error_with_the_install_hint() {
+    let tmp = tempdir().expect("tempdir");
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("empty path");
+    let missing = tmp.path().join("moved/opencode");
+    let config = opencode_config(Some(missing.to_string_lossy().as_ref()));
+    let registry = registry_with_path(&config, &empty);
+    let adapter = registry.get(&opencode_executor()).expect("opencode is registered");
+
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let error = match adapter.start(start_input(&cwd, &tmp.path().join("missing.jsonl"), "0", false)) {
+        Ok(_) => panic!("the binary is missing everywhere"),
+        Err(error) => error,
+    };
+    match error {
+        AdapterError::Unavailable(message) => {
+            assert!(message.contains("harness not found"), "{message}");
+            assert!(message.contains(&missing.to_string_lossy().into_owned()), "{message}");
+            assert!(message.contains(HARNESS_BINARY_HINT), "{message}");
+        }
+        other => panic!("expected a locator error, got {other:?}"),
+    }
 }

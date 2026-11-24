@@ -55,6 +55,11 @@ Exported by `vowp schema SurfaceInfo` and generated from the protocol types in
           "const": "agent",
           "description": "A v0.4 local surface attached through a `vowp agent`.",
           "type": "string"
+        },
+        {
+          "const": "desktop_ui",
+          "description": "A desktop UI that talks to an orchestrator's app engine itself.\n\nWire spelling `desktop_ui`; the store and the CLI spell it `desktop-ui`.",
+          "type": "string"
         }
       ]
     },

@@ -1,6 +1,6 @@
 {
   "name": "vowp",
-  "version": "0.4.0",
+  "version": "0.5.1-dev",
   "description": "Local-first supervisor for AI coding agents",
   "keywords": [
     "ai",

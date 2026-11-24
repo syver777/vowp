@@ -17,7 +17,8 @@ use vowp_core::CapacityManager;
 use vowp_core::capacity::reload::{self, ReloadOutcome};
 use vowp_core::capacity::{HistoryBucket, read_history};
 use vowp_protocol::{
-    CapacityHistory, CapacityReport, CapacityTarget, HistorySource, ProtocolError, SessionId, TargetMode, Timestamp,
+    CapacityHistory, CapacityReport, CapacityTarget, ClusterCapacity, HistorySource, ProtocolError, SessionId,
+    TargetMode, Timestamp,
 };
 use vowp_store::Store;
 
@@ -411,6 +412,9 @@ pub(crate) fn print_report(ctx: &Ctx, io: &mut dyn IoStreams, report: &CapacityR
         format_bytes(report.running.ram_p90_bytes),
         report.running.cpu_p90_cores
     )?;
+    if report.cluster.online_worker_nodes > 0 {
+        writeln!(io.out(), "{}", cluster_line(&report.cluster))?;
+    }
     if report.brakes.active {
         let reasons = report
             .brakes
@@ -590,6 +594,20 @@ fn mode_name(mode: TargetMode) -> &'static str {
         TargetMode::Auto => "auto",
         TargetMode::Fixed => "fixed",
     }
+}
+
+/// Renders the additive cluster card as one human line.
+pub(crate) fn cluster_line(cluster: &ClusterCapacity) -> String {
+    format!(
+        "cluster: {} online worker node(s), workers {}/{}, RAM {} available of {}, {} CPU(s), disk {} free",
+        cluster.online_worker_nodes,
+        cluster.busy_workers,
+        cluster.target_workers,
+        format_bytes(cluster.mem_available_bytes),
+        format_bytes(cluster.mem_total_bytes),
+        cluster.cpu_cores,
+        format_bytes(cluster.disk_free_bytes)
+    )
 }
 
 /// Formats bytes as GiB with one decimal, or MiB for small values.

@@ -23,6 +23,27 @@ use vowp_store::Store;
 use crate::CoreError;
 use crate::deps::{CommandOutput, CommandSpec, Deps};
 
+/// Shell loop of the cgroup holder: print the pid, then idle while the hold file exists
+/// and the owning vowp process (`$2`) is alive.
+#[cfg(target_os = "linux")]
+const HOLDER_SCRIPT: &str = "echo $$; while [ -e \"$1\" ] && kill -0 \"$2\" 2>/dev/null; do sleep 0.05; done";
+
+/// Returns the argv of the holder shell for `hold` owned by process `parent_pid`.
+///
+/// The loop ends when the hold file is removed or when `parent_pid` is gone, so a killed or
+/// timed-out vowp process cannot leave an orphan shell polling forever.
+#[cfg(target_os = "linux")]
+pub fn holder_args(hold: &str, parent_pid: u32) -> Vec<String> {
+    vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        HOLDER_SCRIPT.to_owned(),
+        "sh".to_owned(),
+        hold.to_owned(),
+        parent_pid.to_string(),
+    ]
+}
+
 /// The default peak used when neither cgroup nor `/proc` measurement is available.
 pub const DEFAULT_PEAK_RSS_BYTES: u64 = vowp_adapters::proc::DEFAULT_PEAK_RSS_BYTES;
 
@@ -436,19 +457,8 @@ impl CgroupScope {
         })?;
         let hold_arg = hold.display().to_string();
         let mut child = match Command::new("systemd-run")
-            .args([
-                "--user",
-                "--scope",
-                "--quiet",
-                "--unit",
-                &unit,
-                "--",
-                "sh",
-                "-c",
-                "echo $$; while [ -e \"$1\" ]; do sleep 0.05; done",
-                "sh",
-                &hold_arg,
-            ])
+            .args(["--user", "--scope", "--quiet", "--unit", &unit, "--"])
+            .args(holder_args(&hold_arg, std::process::id()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -564,9 +574,18 @@ impl CgroupScope {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if peak > state.peak {
             state.peak = peak;
-            state.anon = self.read_memory_stat("anon");
-            state.file = self.read_memory_stat("file");
-            state.kernel = self.read_memory_stat("kernel");
+        }
+        // `memory.peak` counts reclaimable page cache, so the breakdown follows the peak of
+        // the non-cache working set (`anon + kernel`), re-read on every tick.
+        if let Some(anon) = self.read_memory_stat("anon") {
+            let kernel = self.read_memory_stat("kernel");
+            let working_set = anon.saturating_add(kernel.unwrap_or(0));
+            let best = state.anon.map(|best| best.saturating_add(state.kernel.unwrap_or(0)));
+            if best.is_none_or(|best| working_set >= best) {
+                state.anon = Some(anon);
+                state.kernel = kernel;
+                state.file = self.read_memory_stat("file");
+            }
         }
         if cpu_usec >= state.cpu_usec {
             state.cpu_usec = cpu_usec;

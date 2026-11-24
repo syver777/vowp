@@ -14,6 +14,61 @@ Exported by `vowp schema LeaseStatus` and generated from the protocol types in
       "description": "Node name slug, for example `vps`.",
       "type": "string"
     },
+    "OwnershipMode": {
+      "description": "How an owner holds a session: as a person's surface or as a worker job run.",
+      "oneOf": [
+        {
+          "const": "interactive",
+          "description": "A person's surface; liveness is its heartbeat.",
+          "type": "string"
+        },
+        {
+          "const": "job",
+          "description": "A worker-node job run; liveness is the run's `expires_at`.",
+          "type": "string"
+        }
+      ]
+    },
+    "OwnershipState": {
+      "description": "Liveness of an owner, derived at read time from its mode and timestamps.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "An interactive heartbeat younger than 60 seconds, or an unexpired job.",
+          "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "An interactive owner whose heartbeat is 60 seconds old or older.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "A job owner whose `expires_at` has passed.",
+          "type": "string"
+        }
+      ]
+    },
+    "SurfaceActivity": {
+      "description": "What the owner of a session is doing right now.",
+      "oneOf": [
+        {
+          "const": "idle",
+          "description": "No turn is running.",
+          "type": "string"
+        },
+        {
+          "const": "running",
+          "description": "A turn or run is in progress.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "The session is blocked, waiting for an answer or a limit to clear.",
+          "type": "string"
+        }
+      ]
+    },
     "SurfaceKind": {
       "description": "Which kind of client holds a surface.",
       "oneOf": [
@@ -51,6 +106,11 @@ Exported by `vowp schema LeaseStatus` and generated from the protocol types in
           "const": "agent",
           "description": "A v0.4 local surface attached through a `vowp agent`.",
           "type": "string"
+        },
+        {
+          "const": "desktop_ui",
+          "description": "A desktop UI that talks to an orchestrator's app engine itself.\n\nWire spelling `desktop_ui`; the store and the CLI spell it `desktop-ui`.",
+          "type": "string"
         }
       ]
     },
@@ -72,6 +132,40 @@ Exported by `vowp schema LeaseStatus` and generated from the protocol types in
         }
       ],
       "description": "Acquisition time, when held."
+    },
+    "activity": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SurfaceActivity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Whether the session is idle, running or waiting, when held."
+    },
+    "epoch": {
+      "default": null,
+      "description": "Owner epoch, when held.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "expires_at": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Expiry of a job owner, when held in job mode."
     },
     "heartbeat_at": {
       "anyOf": [
@@ -106,6 +200,26 @@ Exported by `vowp schema LeaseStatus` and generated from the protocol types in
       ],
       "description": "Surface kind, when held."
     },
+    "label": {
+      "default": null,
+      "description": "Friendly saved surface name, when held and known.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mode": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OwnershipMode"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Interactive surface or job run, when held."
+    },
     "node": {
       "anyOf": [
         {
@@ -116,6 +230,18 @@ Exported by `vowp schema LeaseStatus` and generated from the protocol types in
         }
       ],
       "description": "Holder node, when held."
+    },
+    "state": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OwnershipState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Liveness of the owner, when held."
     },
     "token": {
       "description": "The token, set only in the response to `--acquire`.",

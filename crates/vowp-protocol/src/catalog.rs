@@ -27,6 +27,8 @@ pub enum CatalogClass {
     RunOutput,
     /// Merged, failed or cancelled worktrees.
     Worktree,
+    /// Tagged `job-<id>` tmux windows whose job is no longer active.
+    JobWindow,
     /// Host samples.
     Sample,
     /// Disposable caches.
